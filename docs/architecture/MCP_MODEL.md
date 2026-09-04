@@ -1,5 +1,12 @@
 # MCP model
 
-MCP is intended to run locally and remain subject to the daemon's authority decisions. The bootstrap defines no transport or tools.
+IRIS V0 hosts a minimal MCP transport on the same authoritative local daemon as the HTTP API. It binds only to `127.0.0.1` and does not require OAuth for this local-only foundation.
 
-Codex may later connect as an optional local integration. A ChatGPT tunnel may later be an explicit external integration, but neither is required for runtime operation.
+The transport targets MCP protocol revision `2026-07-28`, the stateless protocol core. V0 exposes only informational tools:
+
+- `runtime_status`
+- `list_projects`
+
+No filesystem mutation, process execution, broad native capability, ChatGPT tunnel, or remote transport is implemented in this mission.
+
+Application sessions are IRIS runtime sessions and are separate from MCP protocol transport state. Multiple local clients may call the same daemon; machine authority remains shared.

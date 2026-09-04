@@ -5,7 +5,8 @@
   "packageManager": "pnpm@10.15.0",
   "engines": { "node": ">=24" },
   "scripts": {
-    "dev": "IRIS_PORT=43110 pnpm --parallel --filter @iris/runtime --filter @iris/web dev",
+    "dev": "node scripts/dev.mjs",
+    "runtime": "pnpm --filter @iris/runtime runtime",
     "test": "pnpm --recursive --if-present test",
     "lint": "eslint .",
     "typecheck": "pnpm --recursive --if-present typecheck",

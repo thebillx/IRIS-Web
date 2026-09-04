@@ -1,17 +1,15 @@
-import { createRuntimeServer, LOOPBACK_ADDRESS, requireLoopbackAddress } from './server.js';
+import { startDaemon } from './daemon.js';
 
-const requestedAddress = process.env.IRIS_BIND_ADDRESS ?? LOOPBACK_ADDRESS;
-const address = requireLoopbackAddress(requestedAddress);
-const configuredPort = process.env.IRIS_PORT;
-const port = configuredPort === undefined ? 0 : Number(configuredPort);
+const daemon = await startDaemon();
+process.stdout.write(`IRIS_RUNTIME_URL=${daemon.apiUrl}\nIRIS_MCP_URL=${daemon.mcpUrl}\n`);
 
-if (!Number.isInteger(port) || port < 0 || port > 65_535) {
-  throw new Error('IRIS_PORT must be an integer from 0 through 65535');
-}
+let stopping = false;
+const shutdown = async () => {
+  if (stopping) return;
+  stopping = true;
+  try { await daemon.close(); process.exitCode = 0; }
+  catch (error) { process.stderr.write(`IRIS shutdown failed: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; }
+};
 
-const server = createRuntimeServer();
-server.listen(port, address, () => {
-  const bound = server.address();
-  if (typeof bound !== 'object' || bound === null) throw new Error('Runtime listener address unavailable');
-  console.log(`IRIS runtime listening at http://${address}:${bound.port}`);
-});
+process.once('SIGINT', () => { void shutdown(); });
+process.once('SIGTERM', () => { void shutdown(); });
