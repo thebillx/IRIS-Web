@@ -1,16 +1,14 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { RuntimeError, type RuntimeHealth } from '@iris/domain';
+import { IRIS_VERSION, RuntimeError, type RuntimeHealth, type RuntimeIdentity } from '@iris/domain';
 import { probeRuntimeAuthority } from './authority.js';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { readEndpoint, type EndpointDocument } from './persistence.js';
 
-export type RuntimeEndpoint = Omit<EndpointDocument, 'controlToken'>;
-
 export interface RuntimeObservedStatus {
   readonly state: 'running' | 'stopped' | 'stale' | 'indeterminate';
-  readonly endpoint: RuntimeEndpoint | null;
+  readonly endpoint: EndpointDocument | null;
   readonly health: RuntimeHealth | null;
   readonly reason?: string;
 }
@@ -23,40 +21,32 @@ export interface StartRuntimeOptions {
 
 export async function runtimeStatus(dataRootInput?: string): Promise<RuntimeObservedStatus> {
   const dataRoot = await canonicalDataRoot(dataRootInput);
-  const privateEndpoint = await readEndpoint(dataRoot);
-  const endpoint = privateEndpoint === null ? null : publicEndpoint(privateEndpoint);
+  let endpoint: EndpointDocument | null;
+  try {
+    endpoint = await readEndpoint(dataRoot);
+  } catch (error: unknown) {
+    return { state: 'indeterminate', endpoint: null, health: null, reason: errorCode(error) };
+  }
   const authority = await probeRuntimeAuthority(dataRoot);
   if (endpoint === null) {
     if (authority.state === 'unowned') return { state: 'stopped', endpoint: null, health: null };
     if (authority.state === 'stale') return { state: 'stale', endpoint: null, health: null, reason: 'STALE_AUTHORITY' };
-    if (authority.state === 'live') {
-      return { state: 'indeterminate', endpoint: null, health: null, reason: 'Live authority has not published an endpoint' };
-    }
+    if (authority.state === 'live') return { state: 'indeterminate', endpoint: null, health: null, reason: 'RUNTIME_STARTING' };
     return { state: 'indeterminate', endpoint: null, health: null, reason: authority.reason };
   }
 
   try {
-    const response = await fetch(`${endpoint.apiUrl}/health`, {
-      signal: AbortSignal.timeout(1_000),
-      cache: 'no-store',
-    });
+    const response = await fetch(`${endpoint.apiUrl}/status`, { signal: AbortSignal.timeout(1_000), cache: 'no-store' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const health = await response.json() as RuntimeHealth;
-    const identityMatches = health.runtimeId === endpoint.runtimeId
-      && health.instanceId === endpoint.instanceId
-      && health.pid === endpoint.pid;
-    if (!identityMatches) return { state: 'stale', endpoint, health, reason: 'Runtime endpoint identity mismatch' };
-    if (authority.state !== 'live'
-      || authority.identity.instanceId !== endpoint.instanceId
-      || authority.identity.runtimeId !== endpoint.runtimeId) {
-      return {
-        state: 'indeterminate',
-        endpoint,
-        health,
-        reason: 'Endpoint and runtime authority do not identify the same daemon',
-      };
+    const remote = await response.json() as unknown;
+    if (!isRemoteStatus(remote)) return { state: 'indeterminate', endpoint, health: null, reason: 'Runtime status response is invalid' };
+    if (!endpointMatchesIdentity(endpoint, remote.identity)) {
+      return { state: 'stale', endpoint, health: remote.health, reason: 'Runtime endpoint identity mismatch' };
     }
-    return { state: 'running', endpoint, health };
+    if (authority.state !== 'live' || !sameIdentity(authority.identity, remote.identity)) {
+      return { state: 'indeterminate', endpoint, health: remote.health, reason: 'Endpoint and runtime authority do not identify the same daemon' };
+    }
+    return { state: 'running', endpoint, health: remote.health };
   } catch {
     return {
       state: authority.state === 'stale' ? 'stale' : 'indeterminate',
@@ -71,8 +61,11 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
   const dataRoot = await canonicalDataRoot(options.dataRoot);
   const existing = await runtimeStatus(dataRoot);
   if (existing.state === 'running') return existing;
-  if (existing.state === 'indeterminate') {
+  if (existing.state === 'indeterminate' && existing.reason !== 'RUNTIME_STARTING') {
     throw new RuntimeError('AUTHORITY_INDETERMINATE', existing.reason ?? 'Runtime authority is indeterminate');
+  }
+  if (existing.reason === 'RUNTIME_STARTING') {
+    return waitForRunningRuntime(dataRoot, options.startupDeadlineMs ?? 10_000);
   }
 
   const sourceEntrypoint = path.resolve(import.meta.dirname, 'main.ts');
@@ -89,17 +82,7 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
     },
   });
   child.unref();
-
-  const deadline = Date.now() + bounded(options.startupDeadlineMs ?? 10_000, 500, 60_000);
-  while (Date.now() < deadline) {
-    const status = await runtimeStatus(dataRoot);
-    if (status.state === 'running') return status;
-    if (status.state === 'indeterminate' && status.reason?.includes('identity mismatch')) {
-      throw new RuntimeError('AUTHORITY_CHANGED', status.reason);
-    }
-    await conditionPoll();
-  }
-  throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Runtime did not become ready before the startup deadline');
+  return waitForRunningRuntime(dataRoot, options.startupDeadlineMs ?? 10_000);
 }
 
 export async function stopRuntime(dataRootInput?: string, shutdownDeadlineMs = 10_000): Promise<RuntimeObservedStatus> {
@@ -109,48 +92,34 @@ export async function stopRuntime(dataRootInput?: string, shutdownDeadlineMs = 1
   if (current.state !== 'running' || current.endpoint === null || current.health === null) {
     throw new RuntimeError('AUTHORITY_INDETERMINATE', current.reason ?? 'Runtime owner cannot be verified');
   }
-
   const target = current.endpoint;
-  if (current.health.instanceId !== target.instanceId
-    || current.health.runtimeId !== target.runtimeId
-    || current.health.pid !== target.pid) {
-    throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime identity changed before shutdown request');
-  }
-  const privateTarget = await readEndpoint(dataRoot);
-  if (privateTarget === null || !sameEndpointIdentity(privateTarget, target)) {
-    throw new RuntimeError('AUTHORITY_CHANGED', 'Private runtime control record changed before shutdown request');
+  const authorityBeforeSignal = await probeRuntimeAuthority(dataRoot);
+  const endpointBeforeSignal = await readEndpoint(dataRoot);
+  if (authorityBeforeSignal.state !== 'live'
+    || endpointBeforeSignal === null
+    || !endpointMatchesIdentity(endpointBeforeSignal, authorityBeforeSignal.identity)
+    || endpointBeforeSignal.instanceId !== target.instanceId
+    || endpointBeforeSignal.runtimeId !== target.runtimeId) {
+    throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime identity changed before shutdown signal');
   }
 
-  let accepted: Response;
   try {
-    accepted = await fetch(`${target.apiUrl}/control/stop`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${privateTarget.controlToken}`,
-      },
-      body: JSON.stringify({ runtimeId: target.runtimeId, instanceId: target.instanceId }),
-      signal: AbortSignal.timeout(Math.min(2_000, bounded(shutdownDeadlineMs, 500, 60_000))),
-    });
-  } catch (error) {
-    throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Verified runtime did not accept the instance-bound stop request', { cause: error });
-  }
-  if (accepted.status !== 202) {
-    throw new RuntimeError('AUTHORITY_INDETERMINATE', `Verified runtime rejected the stop request with HTTP ${accepted.status}`);
+    process.kill(target.pid, 'SIGTERM');
+  } catch (error: unknown) {
+    if (!isProcessMissing(error)) throw new RuntimeError('AUTHORITY_CHANGED', 'Verified runtime process could not be signaled safely', { cause: error });
   }
 
   const deadline = Date.now() + bounded(shutdownDeadlineMs, 500, 60_000);
   while (Date.now() < deadline) {
     const endpoint = await readEndpoint(dataRoot);
-    if (endpoint !== null && endpoint.instanceId !== target.instanceId) {
+    if (endpoint !== null && !sameEndpointIdentity(endpoint, target)) {
       throw new RuntimeError('AUTHORITY_CHANGED', 'A different runtime descriptor appeared during shutdown');
     }
     const authority = await probeRuntimeAuthority(dataRoot);
-    if (authority.state === 'live' && authority.identity.instanceId !== target.instanceId) {
+    if (authority.state === 'live' && !endpointMatchesIdentity(target, authority.identity)) {
       throw new RuntimeError('AUTHORITY_CHANGED', 'A different runtime authority appeared during shutdown');
     }
-    const processGone = !pidExists(target.pid);
-    if (processGone && endpoint === null && authority.state === 'unowned') {
+    if (!pidExists(target.pid) && endpoint === null && authority.state === 'unowned') {
       return { state: 'stopped', endpoint: null, health: null };
     }
     await conditionPoll();
@@ -166,25 +135,66 @@ async function canonicalDataRoot(input: string | undefined): Promise<string> {
     : resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: input });
 }
 
-function publicEndpoint(endpoint: EndpointDocument): RuntimeEndpoint {
-  return {
-    schemaVersion: endpoint.schemaVersion,
-    runtimeId: endpoint.runtimeId,
-    instanceId: endpoint.instanceId,
-    pid: endpoint.pid,
-    apiUrl: endpoint.apiUrl,
-    mcpUrl: endpoint.mcpUrl,
-    startedAt: endpoint.startedAt,
-  };
+async function waitForRunningRuntime(dataRoot: string, timeoutMs: number): Promise<RuntimeObservedStatus> {
+  const deadline = Date.now() + bounded(timeoutMs, 500, 60_000);
+  while (Date.now() < deadline) {
+    const status = await runtimeStatus(dataRoot);
+    if (status.state === 'running') return status;
+    if (status.state === 'indeterminate'
+      && status.reason !== 'RUNTIME_STARTING'
+      && status.reason !== 'Runtime endpoint is unreachable') {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', status.reason ?? 'Runtime startup became indeterminate');
+    }
+    await conditionPoll();
+  }
+  throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Runtime did not become ready before the startup deadline');
 }
 
-function sameEndpointIdentity(left: EndpointDocument, right: RuntimeEndpoint): boolean {
+function endpointMatchesIdentity(endpoint: EndpointDocument, identity: RuntimeIdentity): boolean {
+  return endpoint.runtimeId === identity.runtimeId
+    && endpoint.instanceId === identity.instanceId
+    && endpoint.pid === identity.pid
+    && endpoint.startedAt === identity.startedAt;
+}
+
+function sameEndpointIdentity(left: EndpointDocument, right: EndpointDocument): boolean {
   return left.runtimeId === right.runtimeId
     && left.instanceId === right.instanceId
     && left.pid === right.pid
+    && left.startedAt === right.startedAt
     && left.apiUrl === right.apiUrl
-    && left.mcpUrl === right.mcpUrl
-    && left.startedAt === right.startedAt;
+    && left.mcpUrl === right.mcpUrl;
+}
+
+function sameIdentity(left: RuntimeIdentity, right: RuntimeIdentity): boolean {
+  return left.runtimeId === right.runtimeId
+    && left.instanceId === right.instanceId
+    && left.pid === right.pid
+    && left.startedAt === right.startedAt
+    && left.platform === right.platform
+    && left.version === right.version;
+}
+
+function isRemoteStatus(value: unknown): value is { readonly identity: RuntimeIdentity; readonly health: RuntimeHealth } {
+  if (!isRecord(value) || !isRecord(value.identity) || !isRecord(value.health)) return false;
+  const identity = value.identity;
+  const health = value.health;
+  return typeof identity.runtimeId === 'string'
+    && typeof identity.instanceId === 'string'
+    && Number.isSafeInteger(identity.pid)
+    && typeof identity.startedAt === 'string'
+    && identity.platform === 'darwin'
+    && identity.version === IRIS_VERSION
+    && health.runtimeId === identity.runtimeId
+    && health.instanceId === identity.instanceId
+    && health.pid === identity.pid
+    && health.platform === identity.platform
+    && health.version === identity.version
+    && (health.status === 'ready' || health.status === 'stopping')
+    && health.authority === 'owned'
+    && typeof health.uptimeMs === 'number'
+    && typeof health.apiUrl === 'string'
+    && typeof health.mcpUrl === 'string';
 }
 
 function pidExists(pid: number): boolean {
@@ -192,11 +202,23 @@ function pidExists(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error: unknown) {
-    return !(typeof error === 'object'
-      && error !== null
-      && 'code' in error
-      && (error as NodeJS.ErrnoException).code === 'ESRCH');
+    return !isProcessMissing(error);
   }
+}
+
+function isProcessMissing(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && (error as NodeJS.ErrnoException).code === 'ESRCH';
+}
+
+function errorCode(error: unknown): string {
+  return error instanceof RuntimeError ? error.code : 'PERSISTENCE_FAILURE';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function bounded(value: number, min: number, max: number): number {

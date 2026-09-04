@@ -73,9 +73,15 @@ export type RuntimeFailureCode =
   | 'INVALID_REQUEST';
 
 export class RuntimeError extends Error {
-  public constructor(public readonly code: RuntimeFailureCode, message: string, options?: { readonly cause?: unknown }) {
+  public constructor(
+    public readonly code: RuntimeFailureCode,
+    message: string,
+    options?: { readonly cause?: unknown },
+  ) {
     super(message);
     this.name = 'RuntimeError';
-    if (options?.cause !== undefined) Object.defineProperty(this, 'cause', { value: options.cause, configurable: true });
+    if (options?.cause !== undefined) {
+      Object.defineProperty(this, 'cause', { value: options.cause, configurable: true });
+    }
   }
 }

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { probeRuntimeAuthority } from './authority.js';
 import { startRuntime, stopRuntime } from './lifecycle.js';
+import { MCP_PROTOCOL_VERSION } from './mcp.js';
 import { readEndpoint } from './persistence.js';
 
 const roots: string[] = [];
@@ -29,7 +30,7 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 describe('runtime lifecycle integration', () => {
-  it('proves one daemon, port fallback, multi-session isolation, STOP_COMPLETE, and immediate restart', async () => {
+  it('proves one daemon, safe port fallback, multi-session isolation, STOP_COMPLETE, persistence, and immediate restart', async () => {
     const dataRoot = await temp('iris-lifecycle-data-');
     const projectAPath = await temp('iris-lifecycle-project-a-');
     const projectBPath = await temp('iris-lifecycle-project-b-');
@@ -43,12 +44,15 @@ describe('runtime lifecycle integration', () => {
     expect(first.state).toBe('running');
     expect(first.endpoint).not.toBeNull();
     if (first.endpoint === null) return;
-    expect('controlToken' in first.endpoint).toBe(false);
     expect(new URL(first.endpoint.apiUrl).port).not.toBe(String(occupiedAddress.port));
     expect(first.health?.authority).toBe('owned');
     const firstRuntimeId = first.endpoint.runtimeId;
     const firstInstanceId = first.endpoint.instanceId;
     const firstPid = first.endpoint.pid;
+
+    const attachedAgain = await startRuntime({ dataRoot, preferredPort: 0, startupDeadlineMs: 15_000 });
+    expect(attachedAgain.endpoint?.instanceId).toBe(firstInstanceId);
+    expect(attachedAgain.endpoint?.apiUrl).toBe(first.endpoint.apiUrl);
 
     const projectA = await json<{ id: string }>(`${first.endpoint.apiUrl}/projects`, {
       method: 'POST',
@@ -83,6 +87,9 @@ describe('runtime lifecycle integration', () => {
     expect(updatedA.currentProjectId).toBe(projectB.id);
     expect(unchangedB.currentProjectId).toBeNull();
 
+    const crossClient = await fetch(`${first.endpoint.apiUrl}/sessions/${sessionA.id}`, { headers: { 'x-iris-client-id': 'client-b' } });
+    expect(crossClient.status).toBe(403);
+
     const projects = await json<{ defaultProjectId: string | null }>(`${first.endpoint.apiUrl}/projects`);
     expect(projects.defaultProjectId).toBe(projectA.id);
     const health = await json<{ connectedClients: number; connectedSessions: number }>(`${first.endpoint.apiUrl}/health`);
@@ -90,26 +97,39 @@ describe('runtime lifecycle integration', () => {
     const doctor = await json<{ status: string }>(`${first.endpoint.apiUrl}/doctor`);
     expect(doctor.status).toBe('pass');
 
-    const mcp = await json<{ result: { tools: Array<{ name: string }> } }>(`${first.endpoint.mcpUrl}`, {
+    const mcp = await json<{ result: { tools: Array<{ name: string }> } }>(first.endpoint.mcpUrl, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'MCP-Protocol-Version': '2026-07-28' },
+      headers: {
+        'content-type': 'application/json',
+        'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
+        'Mcp-Method': 'tools/list',
+      },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
     expect(mcp.result.tools.map((tool) => tool.name)).toEqual(['runtime_status', 'list_projects']);
 
     const stopped = await stopRuntime(dataRoot, 15_000);
     expect(stopped.state).toBe('stopped');
-    expect(await readEndpoint(dataRoot)).toBeNull();
-    expect(await probeRuntimeAuthority(dataRoot)).toEqual({ state: 'unowned' });
+    expect(await readEndpoint(await canonicalDataRoot(dataRoot))).toBeNull();
+    expect(await probeRuntimeAuthority(await canonicalDataRoot(dataRoot))).toEqual({ state: 'unowned' });
     expect(pidExists(firstPid)).toBe(false);
 
     const second = await startRuntime({ dataRoot, preferredPort: 0, startupDeadlineMs: 15_000 });
     expect(second.state).toBe('running');
     expect(second.endpoint?.runtimeId).toBe(firstRuntimeId);
     expect(second.endpoint?.instanceId).not.toBe(firstInstanceId);
+    if (second.endpoint === null) return;
+    const persisted = await json<{ projects: Array<{ id: string }>; defaultProjectId: string | null }>(`${second.endpoint.apiUrl}/projects`);
+    expect(persisted.projects.map((project) => project.id)).toEqual([projectA.id, projectB.id]);
+    expect(persisted.defaultProjectId).toBe(projectA.id);
     await stopRuntime(dataRoot, 15_000);
   }, 45_000);
 });
+
+async function canonicalDataRoot(dataRoot: string): Promise<string> {
+  const { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } = await import('./data-root.js');
+  return resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: dataRoot });
+}
 
 function pidExists(pid: number): boolean {
   try { process.kill(pid, 0); return true; }

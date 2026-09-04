@@ -1,4 +1,3 @@
-import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { RuntimeError, type DoctorReport, type RuntimeHealth, type RuntimeIdentity } from '@iris/domain';
 import { handleMcpRequest } from './mcp.js';
@@ -14,8 +13,6 @@ export interface RuntimeServerContext {
   readonly health: () => RuntimeHealth;
   readonly doctor: () => Promise<DoctorReport>;
   readonly isShuttingDown: () => boolean;
-  readonly controlToken: string;
-  readonly requestShutdown: () => void;
 }
 
 export interface RuntimeServerHandle {
@@ -31,10 +28,7 @@ export function requireLoopbackAddress(address: string): typeof LOOPBACK_ADDRESS
   return LOOPBACK_ADDRESS;
 }
 
-export async function startRuntimeServer(
-  context: RuntimeServerContext,
-  preferredPort: number,
-): Promise<RuntimeServerHandle> {
+export async function startRuntimeServer(context: RuntimeServerContext, preferredPort: number): Promise<RuntimeServerHandle> {
   requirePort(preferredPort);
   const server = createServer((request, response) => {
     void routeRequest(request, response, context).catch((error: unknown) => writeError(response, error));
@@ -48,9 +42,7 @@ export async function startRuntimeServer(
     port,
     close: async () => {
       if (!server.listening) return;
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => error ? reject(error) : resolve());
-      });
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     },
   };
 }
@@ -85,21 +77,17 @@ function listen(server: Server, port: number): Promise<number> {
   });
 }
 
-async function routeRequest(
-  request: IncomingMessage,
-  response: ServerResponse,
-  context: RuntimeServerContext,
-): Promise<void> {
+async function routeRequest(request: IncomingMessage, response: ServerResponse, context: RuntimeServerContext): Promise<void> {
   if (!hostAllowed(request.headers.host)) {
-    writeJson(response, 403, { error: { code: 'INVALID_REQUEST', message: 'Host header is not loopback' } });
+    writeJson(response, 403, { error: { code: 'CONTROL_DENIED', message: 'Host header is not loopback' } });
     return;
   }
   if (!originAllowed(request.headers.origin)) {
-    writeJson(response, 403, { error: { code: 'INVALID_REQUEST', message: 'Browser origin is not loopback' } });
+    writeJson(response, 403, { error: { code: 'CONTROL_DENIED', message: 'Origin is not loopback' } });
     return;
   }
   if (request.headers['sec-fetch-site'] === 'cross-site') {
-    writeJson(response, 403, { error: { code: 'INVALID_REQUEST', message: 'Cross-site browser requests are not allowed' } });
+    writeJson(response, 403, { error: { code: 'CONTROL_DENIED', message: 'Cross-site browser requests are not allowed' } });
     return;
   }
   if (context.isShuttingDown()) {
@@ -108,34 +96,19 @@ async function routeRequest(
   }
 
   const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-  if ((request.method === 'POST' || request.method === 'PUT') && url.pathname !== '/mcp') {
-    requireJsonContentType(request);
-  }
+  if ((request.method === 'POST' || request.method === 'PUT') && url.pathname !== '/mcp') requireJsonContentType(request);
 
   if (url.pathname === '/mcp') {
-    requireJsonContentType(request);
-    const body = await readBody(request);
+    if (request.method === 'POST') requireJsonContentType(request);
+    const body = request.method === 'POST' ? await readBody(request) : '';
     const headers = new Headers();
     for (const [name, value] of Object.entries(request.headers)) {
       if (typeof value === 'string') headers.set(name, value);
     }
-    const mcpRequest = new Request('http://127.0.0.1/mcp', {
-      method: request.method ?? 'GET',
-      headers,
-      body: body.length === 0 ? null : body,
-    });
-    await writeFetchResponse(response, await handleMcpRequest(mcpRequest, context.state, context.health));
-    return;
-  }
-
-  if (request.method === 'POST' && url.pathname === '/control/stop') {
-    const body = await readJsonBody(request);
-    authorizeStop(request, body, context);
-    writeJsonThen(response, 202, {
-      accepted: true,
-      runtimeId: context.identity.runtimeId,
-      instanceId: context.identity.instanceId,
-    }, context.requestShutdown);
+    const init: RequestInit = { method: request.method ?? 'GET', headers };
+    if (body.length > 0) init.body = body;
+    const mcpResponse = await handleMcpRequest(new Request('http://127.0.0.1/mcp', init), context.state, context.health);
+    await writeFetchResponse(response, mcpResponse);
     return;
   }
 
@@ -178,19 +151,6 @@ async function routeRequest(
     return;
   }
 
-  const currentProjectMatch = /^\/sessions\/([^/]+)\/current-project$/.exec(url.pathname);
-  if (currentProjectMatch !== null && request.method === 'PUT') {
-    const body = await readJsonBody(request);
-    const sessionId = decodeURIComponent(currentProjectMatch[1]!);
-    const clientId = requiredClientId(request);
-    writeJson(response, 200, await context.state.setSessionCurrentProject(
-      sessionId,
-      clientId,
-      nullableStringField(body, 'projectId'),
-    ));
-    return;
-  }
-
   const sessionMatch = /^\/sessions\/([^/]+)$/.exec(url.pathname);
   if (sessionMatch !== null) {
     const sessionId = decodeURIComponent(sessionMatch[1]!);
@@ -206,43 +166,31 @@ async function routeRequest(
     }
   }
 
+  const currentProjectMatch = /^\/sessions\/([^/]+)\/current-project$/.exec(url.pathname);
+  if (currentProjectMatch !== null && request.method === 'PUT') {
+    const body = await readJsonBody(request);
+    writeJson(
+      response,
+      200,
+      await context.state.setSessionCurrentProject(
+        decodeURIComponent(currentProjectMatch[1]!),
+        requiredClientId(request),
+        nullableStringField(body, 'projectId'),
+      ),
+    );
+    return;
+  }
+
   writeJson(response, 404, { error: { code: 'INVALID_REQUEST', message: 'Route not found' } });
 }
 
-function authorizeStop(
-  request: IncomingMessage,
-  body: Record<string, unknown> | null,
-  context: RuntimeServerContext,
-): void {
-  const authorization = request.headers.authorization;
-  const supplied = typeof authorization === 'string' && authorization.startsWith('Bearer ')
-    ? authorization.slice('Bearer '.length)
-    : '';
-  if (!tokensEqual(supplied, context.controlToken)) {
-    throw new RuntimeError('CONTROL_DENIED', 'Runtime control token is invalid');
-  }
-  if (stringField(body, 'runtimeId') !== context.identity.runtimeId
-    || stringField(body, 'instanceId') !== context.identity.instanceId) {
-    throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime control request does not identify this daemon instance');
-  }
-}
-
-function tokensEqual(left: string, right: string): boolean {
-  const leftBuffer = Buffer.from(left);
-  const rightBuffer = Buffer.from(right);
-  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-async function readJsonBody(
-  request: IncomingMessage,
-  allowEmpty = false,
-): Promise<Record<string, unknown> | null> {
+async function readJsonBody(request: IncomingMessage, allowEmpty = false): Promise<Record<string, unknown> | null> {
   const body = await readBody(request);
   if (body.length === 0 && allowEmpty) return null;
   try {
     const value = JSON.parse(body) as unknown;
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('not object');
-    return value as Record<string, unknown>;
+    if (!isRecord(value)) throw new Error('not object');
+    return value;
   } catch (error) {
     throw new RuntimeError('INVALID_REQUEST', 'Request body must be a JSON object', { cause: error });
   }
@@ -260,16 +208,26 @@ async function readBody(request: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+function requiredClientId(request: IncomingMessage): string {
+  const value = request.headers[CLIENT_ID_HEADER];
+  if (typeof value !== 'string' || value.trim().length === 0 || value.length > 200 || value.includes('\0')) {
+    throw new RuntimeError('CONTROL_DENIED', `${CLIENT_ID_HEADER} is required for session access`);
+  }
+  return value.trim();
+}
+
 function hostAllowed(host: string | undefined): boolean {
-  if (host === undefined) return false;
-  return /^(?:127\.0\.0\.1|localhost)(?::\d+)?$/i.test(host.trim());
+  return typeof host === 'string' && /^(?:127\.0\.0\.1|localhost)(?::\d+)?$/i.test(host.trim());
 }
 
 function originAllowed(origin: string | undefined): boolean {
   if (origin === undefined) return true;
   try {
     const parsed = new URL(origin);
-    return parsed.protocol === 'http:' && (parsed.hostname === LOOPBACK_ADDRESS || parsed.hostname === 'localhost');
+    return parsed.protocol === 'http:'
+      && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+      && parsed.username === ''
+      && parsed.password === '';
   } catch {
     return false;
   }
@@ -277,17 +235,10 @@ function originAllowed(origin: string | undefined): boolean {
 
 function requireJsonContentType(request: IncomingMessage): void {
   const contentType = request.headers['content-type'];
-  if (typeof contentType !== 'string' || !contentType.toLowerCase().startsWith('application/json')) {
+  const mediaType = typeof contentType === 'string' ? contentType.split(';', 1)[0]?.trim().toLowerCase() : undefined;
+  if (mediaType !== 'application/json') {
     throw new RuntimeError('INVALID_REQUEST', 'Mutation requests require application/json');
   }
-}
-
-function requiredClientId(request: IncomingMessage): string {
-  const value = request.headers[CLIENT_ID_HEADER];
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new RuntimeError('CONTROL_DENIED', `${CLIENT_ID_HEADER} is required for session access`);
-  }
-  return value;
 }
 
 function requirePort(port: number): void {
@@ -323,15 +274,6 @@ function nullableStringField(body: Record<string, unknown> | null, name: string)
   return value;
 }
 
-function securityHeaders(): Record<string, string> {
-  return {
-    'cache-control': 'no-store',
-    'x-content-type-options': 'nosniff',
-    'cross-origin-resource-policy': 'same-origin',
-    'referrer-policy': 'no-referrer',
-  };
-}
-
 function writeJson(response: ServerResponse, status: number, value: unknown): void {
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -340,19 +282,16 @@ function writeJson(response: ServerResponse, status: number, value: unknown): vo
   response.end(JSON.stringify(value));
 }
 
-function writeJsonThen(response: ServerResponse, status: number, value: unknown, after: () => void): void {
-  response.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    ...securityHeaders(),
-  });
-  response.end(JSON.stringify(value), () => setImmediate(after));
+function securityHeaders(): Record<string, string> {
+  return {
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
+  };
 }
 
 function writeError(response: ServerResponse, error: unknown): void {
-  if (response.headersSent) {
-    response.destroy();
-    return;
-  }
   const runtimeError = error instanceof RuntimeError
     ? error
     : new RuntimeError('INVALID_REQUEST', 'Runtime request failed', { cause: error });
@@ -360,10 +299,10 @@ function writeError(response: ServerResponse, error: unknown): void {
     ? 404
     : runtimeError.code === 'CONTROL_DENIED'
       ? 403
-      : runtimeError.code === 'AUTHORITY_CHANGED'
-        ? 409
-        : runtimeError.code === 'INVALID_REQUEST' || runtimeError.code === 'INVALID_PROJECT_PATH'
-          ? 400
+      : runtimeError.code === 'INVALID_REQUEST' || runtimeError.code === 'INVALID_PROJECT_PATH'
+        ? 400
+        : runtimeError.code === 'RUNTIME_SHUTTING_DOWN'
+          ? 503
           : 500;
   writeJson(response, status, { error: { code: runtimeError.code, message: runtimeError.message } });
 }
@@ -371,6 +310,12 @@ function writeError(response: ServerResponse, error: unknown): void {
 async function writeFetchResponse(response: ServerResponse, fetchResponse: Response): Promise<void> {
   response.statusCode = fetchResponse.status;
   fetchResponse.headers.forEach((value, key) => response.setHeader(key, value));
-  for (const [name, value] of Object.entries(securityHeaders())) response.setHeader(name, value);
+  for (const [key, value] of Object.entries(securityHeaders())) {
+    if (!response.hasHeader(key)) response.setHeader(key, value);
+  }
   response.end(Buffer.from(await fetchResponse.arrayBuffer()));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

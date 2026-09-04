@@ -7,6 +7,7 @@ import { FoundationStateStore } from './persistence.js';
 export class RuntimeState {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly clients = new Map<string, RuntimeClientState>();
+  private mutationTail: Promise<void> = Promise.resolve();
 
   public constructor(private readonly store: FoundationStateStore) {}
 
@@ -32,23 +33,18 @@ export class RuntimeState {
     return session;
   }
 
-  public getSession(id: string): RuntimeSession {
-    const session = this.sessions.get(id);
-    if (session === undefined) throw new RuntimeError('SESSION_NOT_FOUND', `Session not found: ${id}`);
-    return session;
-  }
-
-  public getSessionForClient(id: string, clientIdInput: string): RuntimeSession {
+  public getSessionForClient(sessionId: string, clientIdInput: string): RuntimeSession {
     const clientId = normalizeClientId(clientIdInput);
-    const session = this.getSession(id);
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) throw new RuntimeError('SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
     if (session.clientId !== clientId) throw new RuntimeError('CONTROL_DENIED', 'Session does not belong to this client');
     this.touchClient(clientId);
     return session;
   }
 
-  public deleteSession(id: string, clientIdInput: string): void {
-    const session = this.getSessionForClient(id, clientIdInput);
-    this.sessions.delete(id);
+  public deleteSession(sessionId: string, clientIdInput: string): void {
+    const session = this.getSessionForClient(sessionId, clientIdInput);
+    this.sessions.delete(sessionId);
     if (![...this.sessions.values()].some((candidate) => candidate.clientId === session.clientId)) {
       this.clients.set(session.clientId, {
         clientId: session.clientId,
@@ -62,29 +58,28 @@ export class RuntimeState {
     return (await this.store.read()).projects;
   }
 
-  public async registerProject(nameInput: string, rootPathInput: string): Promise<ProjectReference> {
-    const name = nameInput.trim();
-    if (name.length === 0 || name.length > 120 || rootPathInput.includes('\0') || !path.isAbsolute(rootPathInput)) {
-      throw new RuntimeError('INVALID_PROJECT_PATH', 'Project name and root path are invalid');
-    }
+  public registerProject(nameInput: string, rootPathInput: string): Promise<ProjectReference> {
+    return this.serializeMachineMutation(async () => {
+      const name = nameInput.trim();
+      if (name.length === 0 || name.length > 120 || rootPathInput.includes('\0') || !path.isAbsolute(rootPathInput)) {
+        throw new RuntimeError('INVALID_PROJECT_PATH', 'Project name and root path are invalid');
+      }
 
-    let canonical: string;
-    try {
-      canonical = await realpath(rootPathInput);
-      if (!(await stat(canonical)).isDirectory()) throw new Error('not directory');
-      if (canonical === path.parse(canonical).root) throw new Error('filesystem root');
-    } catch (error) {
-      throw new RuntimeError('INVALID_PROJECT_PATH', 'Project root must be an existing non-root directory', { cause: error });
-    }
+      let canonical: string;
+      try {
+        canonical = await realpath(rootPathInput);
+        if (!(await stat(canonical)).isDirectory()) throw new Error('not directory');
+        if (canonical === path.parse(canonical).root) throw new Error('filesystem root');
+      } catch (error) {
+        throw new RuntimeError('INVALID_PROJECT_PATH', 'Project root must be an existing non-root directory', { cause: error });
+      }
 
-    return this.store.transact((state) => {
+      const state = await this.store.read();
       const existing = state.projects.find((project) => project.rootPath === canonical);
-      if (existing !== undefined) return { state, result: existing };
+      if (existing !== undefined) return existing;
       const project: ProjectReference = { id: randomUUID(), name, rootPath: canonical };
-      return {
-        state: { ...state, projects: [...state.projects, project] },
-        result: project,
-      };
+      await this.store.write({ ...state, projects: [...state.projects, project] });
+      return project;
     });
   }
 
@@ -92,12 +87,13 @@ export class RuntimeState {
     return (await this.store.read()).defaultProjectId;
   }
 
-  public async setDefaultProject(projectId: string | null): Promise<void> {
-    await this.store.transact((state) => {
+  public setDefaultProject(projectId: string | null): Promise<void> {
+    return this.serializeMachineMutation(async () => {
+      const state = await this.store.read();
       if (projectId !== null && !state.projects.some((project) => project.id === projectId)) {
         throw new RuntimeError('PROJECT_NOT_FOUND', 'Default project does not exist');
       }
-      return { state: { ...state, defaultProjectId: projectId }, result: undefined };
+      await this.store.write({ ...state, defaultProjectId: projectId });
     });
   }
 
@@ -114,6 +110,12 @@ export class RuntimeState {
     this.sessions.set(sessionId, updated);
     this.touchClient(session.clientId);
     return updated;
+  }
+
+  private serializeMachineMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutationTail.then(operation, operation);
+    this.mutationTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   private touchClient(clientId: string): void {
