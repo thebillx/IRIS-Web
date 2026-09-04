@@ -1,0 +1,22 @@
+{
+  "name": "iris",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.15.0",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "IRIS_PORT=43110 pnpm --parallel --filter @iris/runtime --filter @iris/web dev",
+    "test": "pnpm --recursive --if-present test",
+    "lint": "eslint .",
+    "typecheck": "pnpm --recursive --if-present typecheck",
+    "build": "pnpm --recursive --if-present build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.35.0",
+    "eslint": "^9.35.0",
+    "globals": "^16.3.0",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.42.0",
+    "vitest": "^3.2.4"
+  }
+}
