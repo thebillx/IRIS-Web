@@ -24,13 +24,17 @@ A supervisor checkpoint is bounded structured data. Recording a checkpoint puts 
 
 ## Hermes resume
 
-The resume adapter uses an exact `--resume <hermesSessionId>` plus the bound `--in <worktree>`. `latest` is forbidden. The adapter first proves the session ID exists in the bound workspace. For this proof Hermes is restricted to the single MCP selector `iris_v2_bridge_proof:project_git_status`. Missing or stale session mappings fail intentionally and never create a replacement session.
+The resume adapter uses an exact `--resume <hermesSessionId>` plus the bound `--in <worktree>`. `latest` is forbidden. Hermes itself fails closed for a missing exact session, and IRIS accepts completion only when stderr confirms both the exact resumed session and exact returned `session_id`. A receipt-repair turn may resume that same session with tools/delegation explicitly forbidden; it never replays completed child work. Missing or stale mappings never create a replacement session.
 
-## Standard read-only MCP facade
+## Standard governed MCP facade
 
-The Hermes facade speaks MCP protocol `2025-11-25` and implements `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. It exposes exactly one tool: `project_git_status`. No write/delete/shell tool is exposed.
+The Hermes facade speaks MCP protocol `2025-11-25` and implements `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. The V2 Loop Engineer profile exposes bounded runtime/mission/Git/file reads plus mission task/action preparation and exact `project_file_write`. It exposes no direct shell, delete, or unrestricted Git command. Every local capability still enters `CapabilityService`; the MCP facade is translation only.
 
-`project_git_status` verifies the broker mapping, foundation mission, registered worktree, live session, and current project, then calls the existing `CapabilityService` using the LOW / PROJECT / read-only `project.git_status` capability. Git is inspected by IRIS with a bounded `/usr/bin/git status --porcelain=v1 --branch` process; Hermes never receives direct Git execution authority.
+`project_git_status` verifies the broker mapping, foundation mission, registered worktree, live session, and current project, then calls the existing `CapabilityService` using the LOW / PROJECT / read-only `project.git_status` capability. Git is inspected by IRIS with a bounded `/usr/bin/git status --porcelain=v1 --branch` process; Hermes never receives direct Git execution authority. Prepared `project_file_write` preserves the existing IRIS permission/approval path and exact mission/task/action association.
+
+## Pull-based supervisor transport
+
+The owner-authenticated ChatGPT-facing MCP can list missions waiting for supervisor review, read broker-augmented mission state and bounded events, and submit a versioned directive. These operations read/write only the durable mission broker correlation state. A supervisor directive never satisfies permission approval and never executes a local capability. Push-style unsolicited messages into ChatGPT are not required; durable pull-based `AWAITING_SUPERVISOR` state is the V2 transport contract.
 
 ## Live proof status
 

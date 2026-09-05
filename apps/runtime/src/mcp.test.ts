@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { access, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -5,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { PermissionAuditStore } from './audit.js';
 import { CapabilityService } from './capability-service.js';
 import { handleMcpRequest, MCP_PROTOCOL_VERSION } from './mcp.js';
+import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
 import { FoundationStateStore } from './persistence.js';
@@ -23,7 +25,7 @@ describe('local MCP transport and permission boundary', () => {
     const listed = await handleMcpRequest(rpc('tools/list', 2), fixture.service);
     const listedBody = await listed.json() as { result: { tools: Array<{ name: string }> } };
     expect(listedBody.result.tools.map((tool) => tool.name)).toEqual([
-      'runtime_status', 'list_projects', 'mission_list', 'mission_get', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_supervisor_gate_set', 'file_read', 'file_write', 'file_delete', 'directory_create', 'directory_delete',
+      'runtime_status', 'list_projects', 'mission_list', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_supervisor_gate_set', 'file_read', 'file_write', 'file_delete', 'directory_create', 'directory_delete',
     ]);
 
     const status = await handleMcpRequest(rpc('tools/call', 3, { name: 'runtime_status', arguments: {} }, true, 'runtime_status'), fixture.service);
@@ -63,6 +65,72 @@ describe('local MCP transport and permission boundary', () => {
     const missionBody = await readMission.json() as { result: { structuredContent: { tasks: Array<{ actions: Array<{ state: string; result: { evidence: unknown[] } }> }> } } };
     expect(missionBody.result.structuredContent.tasks[0]!.actions[0]).toMatchObject({ state: 'SUCCEEDED', result: { evidence: [expect.objectContaining({ kind: 'CAPABILITY_RESULT' })] } });
     await expect(readFile(targetPath, 'utf8')).resolves.toBe('mission-evidence');
+  });
+
+  it('exposes pull-based supervisor checkpoint state and versioned directives without changing permission authority', async () => {
+    const fixture = await serviceFixture();
+    const mission = await fixture.state.createMission(fixture.session.clientId, fixture.session.id, 'Supervisor pull mission');
+    await fixture.broker.bindHermesSession({ missionId: mission.id, hermesSessionId: '20260905_210000_supervisor', worktreePath: fixture.project.rootPath, branch: 'proof' });
+    const firstDirective = {
+      missionId: mission.id,
+      expectedVersion: 1,
+      directiveId: randomUUID(),
+      directiveSequence: 1,
+      decision: 'CONTINUE' as const,
+      instruction: 'Produce one bounded supervisor checkpoint.',
+      authorizedScope: ['read-only proof'],
+      doNot: ['do not mutate'],
+      successCriteria: ['checkpoint recorded'],
+    };
+    const accepted = await fixture.broker.acceptDirective(firstDirective);
+    const checkpointId = randomUUID();
+    await fixture.broker.recordCheckpoint({
+      checkpointId,
+      missionId: mission.id,
+      missionVersion: accepted.missionVersion,
+      state: 'WAITING_SUPERVISOR',
+      currentPhase: 'review',
+      summary: 'Governed proof is ready for supervisor review.',
+      evidenceRefs: ['project_git_status:clean'],
+      blockers: [],
+      hermesAssessment: 'Ready for next supervisor decision.',
+      proposedNextAction: 'Continue the same Hermes mission.',
+      decisionRequired: true,
+      createdAt: new Date().toISOString(),
+    });
+    const beforePermissions = await fixture.settings.read();
+
+    const waiting = await handleMcpRequest(rpc('tools/call', 20, { name: 'mission_list_waiting_supervisor', arguments: {} }, true, 'mission_list_waiting_supervisor'), fixture.service, fixture.state, fixture.broker);
+    expect(await waiting.json()).toMatchObject({ result: { isError: false, structuredContent: { missions: [{ mission: { id: mission.id }, broker: { state: 'AWAITING_SUPERVISOR', missionVersion: 2 }, checkpoint: { checkpointId } }] } } });
+
+    const get = await handleMcpRequest(rpc('tools/call', 21, { name: 'mission_get', arguments: { missionId: mission.id } }, true, 'mission_get'), fixture.service, fixture.state, fixture.broker);
+    expect(await get.json()).toMatchObject({ result: { isError: false, structuredContent: { id: mission.id, broker: { hermesSessionId: '20260905_210000_supervisor', lastCheckpointId: checkpointId } } } });
+
+    const events = await handleMcpRequest(rpc('tools/call', 22, { name: 'mission_events', arguments: { missionId: mission.id } }, true, 'mission_events'), fixture.service, fixture.state, fixture.broker);
+    const eventsBody = await events.json() as { result: { structuredContent: { events: Array<{ type: string }> } } };
+    expect(eventsBody.result.structuredContent.events.map((event) => event.type)).toContain('SUPERVISOR_CHECKPOINT');
+    expect(eventsBody.result.structuredContent.events.map((event) => event.type)).toContain('SUPERVISOR_DIRECTIVE');
+
+    const secondDirective = {
+      missionId: mission.id,
+      expectedVersion: 2,
+      directiveId: randomUUID(),
+      directiveSequence: 2,
+      decision: 'CONTINUE',
+      instruction: 'Resume the exact same Hermes mission.',
+      authorizedScope: ['same mission only'],
+      doNot: ['do not grant local permission'],
+      successCriteria: ['same session resumes'],
+    };
+    const directiveResponse = await handleMcpRequest(rpc('tools/call', 23, { name: 'mission_directive', arguments: secondDirective }, true, 'mission_directive'), fixture.service, fixture.state, fixture.broker);
+    expect(await directiveResponse.json()).toMatchObject({ result: { isError: false, structuredContent: { missionVersion: 3, lastDirectiveSequence: 2, lastDirectiveId: secondDirective.directiveId } } });
+    const duplicate = await handleMcpRequest(rpc('tools/call', 24, { name: 'mission_directive', arguments: secondDirective }, true, 'mission_directive'), fixture.service, fixture.state, fixture.broker);
+    expect(await duplicate.json()).toMatchObject({ result: { isError: false, structuredContent: { missionVersion: 3, lastDirectiveSequence: 2 } } });
+    const stale = await handleMcpRequest(rpc('tools/call', 25, { name: 'mission_directive', arguments: { ...secondDirective, directiveId: randomUUID(), directiveSequence: 3, expectedVersion: 2 } }, true, 'mission_directive'), fixture.service, fixture.state, fixture.broker);
+    expect(await stale.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'INVALID_REQUEST' } } });
+
+    expect(await fixture.settings.read()).toEqual(beforePermissions);
+    expect(fixture.service.listPendingApprovals()).toHaveLength(0);
   });
 
   it('cannot bypass session/project policy for file mutation', async () => {
@@ -125,13 +193,14 @@ async function serviceFixture() {
   await settings.initialize();
   const policy = new PermissionPolicyEngine(state, settings, sourceRoot, dataRoot, legacyRoot);
   const audit = new PermissionAuditStore(dataRoot);
+  const broker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
   const service = new CapabilityService(state, policy, audit, () => ({
     status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid,
     uptimeMs: 1, authority: 'owned', connectedClients: state.listClients().length, connectedSessions: state.listSessions().length,
     agentExecutorType: 'local-development-executor', productionModelConnected: false,
     apiUrl: 'http://127.0.0.1:43110', mcpUrl: 'http://127.0.0.1:43110/mcp',
   }));
-  return { sourceRoot, dataRoot, legacyRoot, projectRoot, state, project, session, settings, policy, audit, service };
+  return { sourceRoot, dataRoot, legacyRoot, projectRoot, state, project, session, settings, policy, audit, broker, service };
 }
 
 async function temp(prefix: string): Promise<string> {

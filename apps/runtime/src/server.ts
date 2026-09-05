@@ -148,7 +148,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     }
     const init: RequestInit = { method: request.method ?? 'GET', headers };
     if (body.length > 0) init.body = body;
-    const mcpResponse = await handleMcpRequest(new Request('http://127.0.0.1/mcp', init), context.capabilities);
+    const mcpResponse = await handleMcpRequest(new Request('http://127.0.0.1/mcp', init), context.capabilities, context.state, context.missionBroker);
     await writeFetchResponse(response, mcpResponse);
     return;
   }
@@ -173,7 +173,11 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return;
   }
   if (request.method === 'GET' && url.pathname === '/missions') {
-    writeJson(response, 200, { missions: await context.state.listMissions() });
+    const brokerRecords = await context.missionBroker.list();
+    const brokerByMission = new Map(brokerRecords.map((record) => [record.missionId, record]));
+    writeJson(response, 200, {
+      missions: (await context.state.listMissions()).map((mission) => ({ ...mission, broker: brokerByMission.get(mission.id) ?? null })),
+    });
     return;
   }
   const missionBrokerMatch = /^\/missions\/([^/]+)\/broker$/.exec(url.pathname);

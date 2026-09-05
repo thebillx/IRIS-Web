@@ -77,6 +77,14 @@ export class MissionBrokerService {
     private readonly store: MissionBrokerStore,
   ) {}
 
+  public async list(): Promise<readonly MissionBrokerSnapshot[]> {
+    return (await this.store.read()).records;
+  }
+
+  public async listWaitingSupervisor(): Promise<readonly MissionBrokerSnapshot[]> {
+    return (await this.list()).filter((record) => record.state === 'AWAITING_SUPERVISOR');
+  }
+
   public async get(missionIdInput: string): Promise<MissionBrokerSnapshot> {
     const missionId = uuid(missionIdInput, 'missionId');
     const record = (await this.store.read()).records.find((candidate) => candidate.missionId === missionId);
@@ -261,7 +269,7 @@ function normalizeCheckpoint(input: MissionCheckpoint): MissionCheckpoint {
     blockers: textList(input.blockers, 'blockers'),
     hermesAssessment: text(input.hermesAssessment, 'hermesAssessment', 2000),
     proposedNextAction: text(input.proposedNextAction, 'proposedNextAction', 1000),
-    decisionRequired: Boolean(input.decisionRequired),
+    decisionRequired: strictBoolean(input.decisionRequired, 'decisionRequired'),
     createdAt: timestamp(input.createdAt, 'createdAt'),
   };
 }
@@ -367,6 +375,11 @@ function text(value: string, name: string, max: number): string {
 
 function timestamp(value: string, name: string): string {
   if (!isTimestamp(value)) throw new RuntimeError('INVALID_REQUEST', `${name} must be a valid timestamp`);
+  return value;
+}
+
+function strictBoolean(value: boolean, name: string): boolean {
+  if (typeof value !== 'boolean') throw new RuntimeError('INVALID_REQUEST', `${name} must be boolean`);
   return value;
 }
 

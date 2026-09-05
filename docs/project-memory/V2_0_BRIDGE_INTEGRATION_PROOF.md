@@ -13,8 +13,10 @@
 - Versioned directives with idempotent duplicate IDs and fail-closed conflicting/stale/out-of-order directives.
 - Directive acceptance never grants IRIS capability permission or owner approval.
 - Standard Hermes MCP 2025-11-25 initialize/list/call surface.
-- Only `project_git_status` is exposed to Hermes in this proof.
-- `project_git_status` routes through existing IRIS permission policy and `CapabilityService`; successful execution is auditable.
+- The standard Hermes MCP facade now exposes the bounded V2 governed profile: runtime/mission/Git/file reads plus prepared mission task/action and exact `file.write`; it still exposes no direct shell, delete, or unrestricted Git command.
+- All local reads/writes route through existing IRIS permission policy and `CapabilityService`; successful execution is auditable and mission metadata remains correlation-only.
+- The ChatGPT-facing MCP exposes pull-based `mission_list_waiting_supervisor`, broker-augmented `mission_get`, bounded `mission_events`, and versioned `mission_directive`. These broker operations transport supervisor state only and grant no local permission.
+- Web Mission Control renders the broker state, exact Hermes session, current checkpoint/evidence/blockers, and last directive while remaining non-authoritative.
 - Completed broker state is durable and cannot resume/replay.
 - Foundation mission-execution tests remain green after integration.
 
@@ -24,5 +26,14 @@ Hermes v0.20.0 is authenticated through OpenAI Codex OAuth and the live proof co
 
 The durable broker record for mission `775d2e18-e29a-471e-8b8b-8d6db27edd94` is `COMPLETED` at mission version 3 with directive sequence 2. Hermes session history records two MCP tool calls and the governed `project_git_status` result; no direct Git/shell mutation was used for the proof.
 
+## Delegated inner-loop checkpoint recovery
+
+A later live mission (`e4a4d94f-9460-4033-ac9b-39f23bd915e7`) bound parent Hermes session `20260905_205024_29fc7f` and delegated exactly one read-only leaf (`20260905_205101_b45cf3`). The leaf inherited `iris_v2_inner_loop`, called only `project_git_status`, received branch `v2/bridge-integration-proof` with `clean=true`, and used no native terminal/file/git/shell mutation. The parent initially emitted a malformed checkpoint boolean. IRIS preserved the child evidence, rejected the malformed receipt, resumed the same parent session for a receipt-only repair with tools/delegation forbidden, and durably stored checkpoint `da3b4479-4a17-4022-a333-d1a243067c8c` at broker state `AWAITING_SUPERVISOR` without replaying the child.
+
+`HERMES_SUBAGENT_DELEGATION=PASS`
+`SUBAGENT_IRIS_TOOL_INHERITANCE=PASS`
+`SUBAGENT_DIRECT_SHELL_BYPASS=NO`
+`SUBAGENT_DIRECT_FILE_BYPASS=NO`
+`HERMES_CHECKPOINT_SCHEMA=PASS`
 `LIVE_HERMES_REASONING_LOOP=PASS`
 `V2_0_ARCHITECTURAL_LOOP_PROVEN=YES`

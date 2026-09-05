@@ -62,10 +62,19 @@ export class HermesSessionResumeAdapter {
     if (directive.missionId !== mapping.missionId || directive.directiveId !== mapping.lastDirectiveId) {
       throw new RuntimeError('INVALID_REQUEST', 'Hermes resume requires the latest accepted directive for this mission');
     }
-    const prompt = resumePrompt(mapping, directive);
+    return this.runExact(mapping, resumePrompt(mapping, directive), 8);
+  }
+
+  public async repairCheckpointReceipt(mapping: MissionBrokerSnapshot, evidenceSummary: string): Promise<HermesCheckpointReceipt> {
+    if (mapping.state === 'COMPLETED') throw new RuntimeError('INVALID_REQUEST', 'Completed mission cannot be resumed');
+    const evidence = boundedString(evidenceSummary, 'repairEvidence', 2000);
+    return this.runExact(mapping, repairPrompt(mapping, evidence), 2);
+  }
+
+  private async runExact(mapping: MissionBrokerSnapshot, prompt: string, maxTurns: number): Promise<HermesCheckpointReceipt> {
     const args = [
       'chat', '-Q', '--resume', mapping.hermesSessionId, '--in', mapping.worktreePath,
-      '--source', 'tool', '--max-turns', '8', '--pass-session-id', '-t', this.toolsetSelector, '-q', prompt,
+      '--source', 'tool', '--max-turns', String(maxTurns), '--pass-session-id', '-t', this.toolsetSelector, '-q', prompt,
     ] as const;
     if (args.includes('latest')) throw new RuntimeError('INVALID_REQUEST', 'Global latest Hermes resume is forbidden for mission-bound execution');
     const result = await this.runner.run(args, mapping.worktreePath);
@@ -102,7 +111,23 @@ function resumePrompt(mapping: MissionBrokerSnapshot, directive: SupervisorDirec
     'For this proof, use the configured read-only MCP tool project_git_status when the directive asks for project Git status.',
     'Do not run git or shell directly. Do not mutate files. Do not create a new session.',
     'Return ONLY one JSON object with keys currentPhase, summary, evidenceRefs, blockers, hermesAssessment, proposedNextAction, decisionRequired, missionComplete.',
+    'The receipt MUST match this JSON shape exactly: {"currentPhase":"...","summary":"...","evidenceRefs":[],"blockers":[],"hermesAssessment":"...","proposedNextAction":"...","decisionRequired":true,"missionComplete":false}.',
+    'decisionRequired and missionComplete MUST be JSON booleans true or false, never strings or descriptive text.',
     'evidenceRefs must be short references, not raw logs. missionComplete must be true only when the accepted directive decision is COMPLETE and the mission is finished.',
+  ].join('\n');
+}
+
+function repairPrompt(mapping: MissionBrokerSnapshot, evidenceSummary: string): string {
+  return [
+    'You are repairing only the structured supervisor checkpoint receipt for the exact already-bound IRIS mission.',
+    `Mission ID: ${mapping.missionId}`,
+    `Mission version: ${mapping.missionVersion}`,
+    `Preserved bounded evidence: ${evidenceSummary}`,
+    'Do NOT call tools. Do NOT delegate. Do NOT repeat any project work. Use only the prior session context plus the preserved evidence above.',
+    'Return ONLY one JSON object with keys currentPhase, summary, evidenceRefs, blockers, hermesAssessment, proposedNextAction, decisionRequired, missionComplete.',
+    'The receipt MUST match this JSON shape exactly: {"currentPhase":"...","summary":"...","evidenceRefs":[],"blockers":[],"hermesAssessment":"...","proposedNextAction":"...","decisionRequired":true,"missionComplete":false}.',
+    'decisionRequired and missionComplete MUST be JSON booleans true or false, never strings or descriptive text.',
+    'This is a checkpoint repair turn, so missionComplete must remain false unless a COMPLETE supervisor directive was already accepted.',
   ].join('\n');
 }
 

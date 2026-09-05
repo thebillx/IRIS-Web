@@ -102,6 +102,36 @@ describe('durable V2 mission broker', () => {
     expect(resume.args).not.toContain('iris_v2_bridge_proof:project_git_status');
     expect(calls).toHaveLength(1);
 
+    const malformedRunner: HermesCommandRunner = {
+      run: async () => ({
+        exitCode: 0,
+        stdout: JSON.stringify({ currentPhase: 'git-status', summary: 'done', evidenceRefs: [], blockers: [], hermesAssessment: 'clean', proposedNextAction: 'supervisor decision', decisionRequired: 'Supervisor review', missionComplete: false }),
+        stderr: `↻ Resumed session ${accepted.hermesSessionId} "proof"\nsession_id: ${accepted.hermesSessionId}\n`,
+      }),
+    };
+    await expect(new HermesSessionResumeAdapter(malformedRunner).resumeExact(accepted, latest)).rejects.toMatchObject({
+      code: 'AGENT_EXECUTION_FAILED',
+      message: 'Hermes checkpoint decisionRequired must be boolean',
+    });
+
+    const repairCalls: { args: readonly string[]; cwd: string }[] = [];
+    const repairRunner: HermesCommandRunner = {
+      run: async (args, cwd) => {
+        repairCalls.push({ args, cwd });
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ currentPhase: 'delegated-read', summary: 'child proof preserved', evidenceRefs: ['delegation:proof', 'project_git_status:clean'], blockers: [], hermesAssessment: 'governed delegation succeeded', proposedNextAction: 'supervisor review', decisionRequired: true, missionComplete: false }),
+          stderr: `↻ Resumed session ${accepted.hermesSessionId} "proof"\nsession_id: ${accepted.hermesSessionId}\n`,
+        };
+      },
+    };
+    const repaired = await new HermesSessionResumeAdapter(repairRunner).repairCheckpointReceipt(accepted, 'delegation proof and governed project_git_status already completed');
+    expect(repaired).toMatchObject({ decisionRequired: true, missionComplete: false });
+    expect(repairCalls).toHaveLength(1);
+    expect(repairCalls[0]!.args).toContain(accepted.hermesSessionId);
+    expect(repairCalls[0]!.args.join(' ')).toContain('Do NOT call tools');
+    expect(repairCalls[0]!.args.join(' ')).toContain('--max-turns 2');
+
     const staleRunner: HermesCommandRunner = { run: async () => ({ exitCode: 1, stdout: '', stderr: `Session not found: ${accepted.hermesSessionId}\n` }) };
     await expect(new HermesSessionResumeAdapter(staleRunner).resumeExact(accepted, latest)).rejects.toMatchObject({ code: 'MISSION_NOT_FOUND' });
   });

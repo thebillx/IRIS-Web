@@ -44,6 +44,32 @@ type MissionActionResult = {
 };
 type MissionAction = { id: string; capabilityId: string; summary: string; state: string; createdAt: string; updatedAt: string; approvalId: string | null; result: MissionActionResult | null };
 type MissionTask = { id: string; title: string; state: string; createdAt: string; updatedAt: string; actions: MissionAction[] };
+type MissionBrokerCheckpoint = {
+  checkpointId: string;
+  missionVersion: number;
+  currentPhase: string;
+  summary: string;
+  evidenceRefs: string[];
+  blockers: string[];
+  hermesAssessment: string;
+  proposedNextAction: string;
+  decisionRequired: boolean;
+  createdAt: string;
+};
+type MissionBrokerDirective = { directiveId: string; directiveSequence: number; decision: string; instruction: string; acceptedAt: string };
+type MissionBroker = {
+  missionVersion: number;
+  hermesSessionId: string;
+  worktreePath: string;
+  branch: string;
+  state: string;
+  lastCheckpointId: string | null;
+  lastDirectiveId: string | null;
+  lastDirectiveSequence: number;
+  checkpoints: MissionBrokerCheckpoint[];
+  directives: MissionBrokerDirective[];
+  updatedAt: string;
+};
 type Mission = {
   id: string;
   title: string;
@@ -56,6 +82,7 @@ type Mission = {
   supervisorGate: { state: string; reason: string | null; updatedAt: string };
   tasks: MissionTask[];
   timeline: Array<{ id: string; timestamp: string; kind: string; taskId: string | null; actionId: string | null; message: string }>;
+  broker: MissionBroker | null;
 };
 type PermissionMode = 'ASK_EVERY_TIME' | 'AUTO_APPROVE_LOW_RISK' | 'AUTO_APPROVE_PROJECT_SCOPED' | 'FULL_LOCAL_OWNER';
 type RiskClass = 'LOW' | 'MODERATE' | 'HIGH' | 'SYSTEM';
@@ -518,16 +545,33 @@ export function RuntimePage(props: {
 function MissionControl(props: { missions: Mission[]; projects: Project[] }): ReactElement {
   return <section className="mission-control" aria-labelledby="mission-control-heading">
     <div className="section-title-row"><div><p className="section-label">Mission Control</p><h2 id="mission-control-heading">Hermes execution ledger</h2></div><span className="mission-count">{props.missions.length} mission{props.missions.length === 1 ? '' : 's'}</span></div>
-    <p className="mission-help">Hermes owns orchestration. IRIS records governed action state, evidence, approvals, and supervisor-gate representation. Supervisor transport is not connected here.</p>
+    <p className="mission-help">Hermes owns orchestration. IRIS records governed action state, durable supervisor checkpoints/directives, evidence, and approvals. This view never grants execution authority.</p>
     {props.missions.length === 0
       ? <div className="empty-state"><p>No missions recorded yet.</p><span>Mission records appear when an orchestrator registers work through the governed IRIS mission tools.</span></div>
       : <div className="mission-list">{props.missions.map((mission) => {
         const project = mission.projectId === null ? null : props.projects.find((candidate) => candidate.id === mission.projectId) ?? null;
         const actionCount = mission.tasks.reduce((total, task) => total + task.actions.length, 0);
+        const latestCheckpoint = mission.broker?.checkpoints.at(-1) ?? null;
+        const latestDirective = mission.broker?.directives.at(-1) ?? null;
         return <details key={mission.id} className="mission-item">
           <summary><span><strong>{mission.title}</strong><small>{project?.name ?? 'No project'} · {mission.tasks.length} tasks · {actionCount} actions</small></span><span className="mission-state">{mission.state}</span></summary>
           <div className="mission-meta"><div><span>Supervisor gate</span><strong>{mission.supervisorGate.state}</strong></div><div><span>Updated</span><strong>{formatSessionTime(mission.updatedAt)}</strong></div></div>
+          {mission.broker !== null ? <div className="mission-meta broker-meta">
+            <div><span>Broker state</span><strong>{mission.broker.state}</strong></div>
+            <div><span>Mission version</span><strong>{mission.broker.missionVersion}</strong></div>
+            <div><span>Hermes session</span><strong>{mission.broker.hermesSessionId}</strong></div>
+            <div><span>Branch</span><strong>{mission.broker.branch}</strong></div>
+          </div> : null}
           {mission.supervisorGate.reason !== null ? <p className="mission-gate-reason">{mission.supervisorGate.reason}</p> : null}
+          {latestCheckpoint !== null ? <section className="mission-checkpoint" aria-label="Latest supervisor checkpoint">
+            <div className="section-title-row"><strong>{latestCheckpoint.currentPhase}</strong><span>{latestCheckpoint.decisionRequired ? 'Supervisor decision required' : 'Informational checkpoint'}</span></div>
+            <p>{latestCheckpoint.summary}</p>
+            {latestCheckpoint.blockers.length > 0 ? <p><strong>Blockers:</strong> {latestCheckpoint.blockers.join(' · ')}</p> : null}
+            {latestCheckpoint.evidenceRefs.length > 0 ? <p><strong>Evidence:</strong> {latestCheckpoint.evidenceRefs.join(' · ')}</p> : null}
+            <p><strong>Hermes assessment:</strong> {latestCheckpoint.hermesAssessment}</p>
+            <p><strong>Proposed next action:</strong> {latestCheckpoint.proposedNextAction}</p>
+          </section> : null}
+          {latestDirective !== null ? <p className="mission-last-directive"><strong>Last supervisor directive:</strong> #{latestDirective.directiveSequence} {latestDirective.decision} · {latestDirective.instruction}</p> : null}
           <div className="mission-tasks">{mission.tasks.map((task) => <article key={task.id}>
             <header><strong>{task.title}</strong><span>{task.state}</span></header>
             {task.actions.length === 0 ? <p>No governed actions prepared.</p> : <ul>{task.actions.map((action) => <li key={action.id}>

@@ -1,5 +1,7 @@
-import type { MissionExecutionAssociation, MissionState, MissionTaskState, SupervisorGateState } from '@iris/domain';
+import type { MissionCheckpoint, MissionExecutionAssociation, MissionState, MissionTaskState, MissionTimelineEvent, SupervisorDecision, SupervisorDirective, SupervisorGateState } from '@iris/domain';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
+import type { MissionBrokerService } from './mission-broker.js';
+import type { RuntimeState } from './state.js';
 
 export const MCP_PROTOCOL_VERSION = '2026-07-28' as const;
 const CLIENT_ID_HEADER = 'x-iris-client-id';
@@ -12,7 +14,12 @@ interface JsonRpcRequest {
   readonly params?: unknown;
 }
 
-export async function handleMcpRequest(request: Request, capabilities: CapabilityService): Promise<Response> {
+export async function handleMcpRequest(
+  request: Request,
+  capabilities: CapabilityService,
+  state?: RuntimeState,
+  broker?: MissionBrokerService,
+): Promise<Response> {
   if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405, { allow: 'POST' });
 
   let rpc: JsonRpcRequest;
@@ -49,8 +56,8 @@ export async function handleMcpRequest(request: Request, capabilities: Capabilit
     if (toolHeader !== null && toolHeader !== params.name) return jsonRpcError(rpc.id ?? null, -32600, 'Mcp-Name does not match tool name', 400);
 
     try {
-      const outcome = await executeTool(params.name, args, request, capabilities);
-      return jsonRpcResult(rpc.id ?? null, toolOutcome(outcome));
+      const result = await executeTool(params.name, args, request, capabilities, state, broker);
+      return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
     } catch (error) {
       return jsonRpcResult(rpc.id ?? null, toolError('INVALID_REQUEST', error instanceof Error ? error.message : 'Tool call failed'));
     }
@@ -65,13 +72,53 @@ async function executeTool(
   args: Record<string, unknown>,
   request: Request,
   capabilities: CapabilityService,
-): Promise<CapabilityOutcome> {
+  state?: RuntimeState,
+  broker?: MissionBrokerService,
+): Promise<CapabilityOutcome | unknown> {
   const clientId = optionalHeader(request, CLIENT_ID_HEADER);
   const sessionId = optionalHeader(request, SESSION_ID_HEADER);
   if (name === 'runtime_status') return capabilities.execute({ capabilityId: 'runtime.status', clientId, sessionId });
   if (name === 'list_projects') return capabilities.execute({ capabilityId: 'project.list', clientId, sessionId });
   if (name === 'mission_list') return capabilities.execute({ capabilityId: 'mission.list', clientId, sessionId });
-  if (name === 'mission_get') return capabilities.execute({ capabilityId: 'mission.get', clientId, sessionId, missionId: requiredString(args, 'missionId') });
+  if (name === 'mission_list_waiting_supervisor') {
+    const supervisor = requireBrokerContext(state, broker);
+    const records = await supervisor.broker.listWaitingSupervisor();
+    const missions = await Promise.all(records.map(async (record) => ({
+      mission: await supervisor.state.getMission(record.missionId),
+      broker: record,
+      checkpoint: record.checkpoints.at(-1) ?? null,
+    })));
+    return { missions };
+  }
+  if (name === 'mission_get') {
+    const missionId = requiredString(args, 'missionId');
+    const outcome = await capabilities.execute({ capabilityId: 'mission.get', clientId, sessionId, missionId });
+    if (outcome.status !== 'executed' || state === undefined || broker === undefined) return outcome;
+    return { ...asRecord(outcome.value), broker: await brokerSnapshotOrNull(broker, missionId) };
+  }
+  if (name === 'mission_events') {
+    const supervisor = requireBrokerContext(state, broker);
+    const missionId = requiredString(args, 'missionId');
+    const mission = await supervisor.state.getMission(missionId);
+    const mapping = await supervisor.broker.get(missionId);
+    return { missionId, events: supervisorEvents(mission.timeline, mapping.checkpoints, mapping.directives) };
+  }
+  if (name === 'mission_directive') {
+    const supervisor = requireBrokerContext(state, broker);
+    const missionId = requiredString(args, 'missionId');
+    await supervisor.state.getMission(missionId);
+    return supervisor.broker.acceptDirective({
+      missionId,
+      expectedVersion: requiredPositiveInteger(args, 'expectedVersion'),
+      directiveId: requiredBoundedString(args, 'directiveId', 200),
+      directiveSequence: requiredPositiveInteger(args, 'directiveSequence'),
+      decision: supervisorDecision(args, 'decision'),
+      instruction: requiredBoundedString(args, 'instruction', 4000),
+      authorizedScope: requiredStringArray(args, 'authorizedScope'),
+      doNot: requiredStringArray(args, 'doNot'),
+      successCriteria: requiredStringArray(args, 'successCriteria'),
+    });
+  }
 
   const requiredClient = requiredHeader(request, CLIENT_ID_HEADER);
   const requiredSession = requiredHeader(request, SESSION_ID_HEADER);
@@ -113,7 +160,10 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'runtime_status', description: 'Read the local IRIS runtime status.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
     { name: 'list_projects', description: 'List explicitly registered local projects.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
     { name: 'mission_list', description: 'List durable mission execution records visible to the local owner.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-    { name: 'mission_get', description: 'Read one durable mission with tasks, governed actions, evidence, supervisor-gate representation, and timeline.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
+    { name: 'mission_list_waiting_supervisor', description: 'List broker-bound missions durably waiting for supervisor review. This is read-only supervisor transport and grants no execution permission.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+    { name: 'mission_get', description: 'Read one durable mission with tasks, governed actions, evidence, supervisor-gate representation, timeline, and broker checkpoint state when available.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
+    { name: 'mission_events', description: 'Read a bounded merged mission timeline containing governed mission events, supervisor checkpoints, and accepted directives.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
+    { name: 'mission_directive', description: 'Submit one versioned supervisor directive to the durable mission broker. A directive is orchestration input only and never satisfies IRIS permission approval.', inputSchema: { type: 'object', required: ['missionId','expectedVersion','directiveId','directiveSequence','decision','instruction','authorizedScope','doNot','successCriteria'], properties: { missionId: { type: 'string' }, expectedVersion: { type: 'integer', minimum: 1 }, directiveId: { type: 'string' }, directiveSequence: { type: 'integer', minimum: 1 }, decision: { enum: ['CONTINUE','REVISE','PAUSE','COMPLETE'] }, instruction: { type: 'string', maxLength: 4000 }, authorizedScope: { type: 'array', items: { type: 'string' }, maxItems: 24 }, doNot: { type: 'array', items: { type: 'string' }, maxItems: 24 }, successCriteria: { type: 'array', items: { type: 'string' }, maxItems: 24 } }, additionalProperties: false } },
     { name: 'mission_create', description: 'Register mission identity for the live client/session. Hermes remains orchestration authority.', inputSchema: { type: 'object', required: ['title'], properties: { title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
     { name: 'mission_state_set', description: 'Record orchestration-owned mission state; this does not grant execution authority.', inputSchema: { type: 'object', required: ['missionId', 'state'], properties: { missionId: { type: 'string' }, state: { enum: ['PLANNED','RUNNING','WAITING_APPROVAL','WAITING_SUPERVISOR','PAUSED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
     { name: 'mission_task_create', description: 'Register a task identity inside a mission.', inputSchema: { type: 'object', required: ['missionId','title'], properties: { missionId: { type: 'string' }, title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
@@ -126,6 +176,38 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'directory_create', description: 'Create one directory whose parent already exists inside the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
     { name: 'directory_delete', description: 'Remove one empty directory inside the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
   ];
+}
+
+function requireBrokerContext(state: RuntimeState | undefined, broker: MissionBrokerService | undefined): { state: RuntimeState; broker: MissionBrokerService } {
+  if (state === undefined || broker === undefined) throw new Error('Supervisor mission transport is unavailable');
+  return { state, broker };
+}
+
+async function brokerSnapshotOrNull(broker: MissionBrokerService, missionId: string) {
+  return (await broker.list()).find((record) => record.missionId === missionId) ?? null;
+}
+
+function supervisorEvents(
+  timeline: readonly MissionTimelineEvent[],
+  checkpoints: readonly MissionCheckpoint[],
+  directives: readonly SupervisorDirective[],
+): readonly Record<string, unknown>[] {
+  const events: Record<string, unknown>[] = [
+    ...timeline.map((event) => ({ type: 'MISSION_EVENT', timestamp: event.timestamp, event })),
+    ...checkpoints.map((checkpoint) => ({ type: 'SUPERVISOR_CHECKPOINT', timestamp: checkpoint.createdAt, checkpoint })),
+    ...directives.map((directive) => ({ type: 'SUPERVISOR_DIRECTIVE', timestamp: directive.acceptedAt, directive })),
+  ];
+  return events
+    .sort((left, right) => String(left.timestamp).localeCompare(String(right.timestamp)))
+    .slice(-100);
+}
+
+function isCapabilityOutcome(value: unknown): value is CapabilityOutcome {
+  return isRecord(value) && (value.status === 'executed' || value.status === 'owner_required' || value.status === 'denied');
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : { value };
 }
 
 function toolOutcome(outcome: CapabilityOutcome): ReturnType<typeof toolResult> | ReturnType<typeof toolError> {
@@ -160,6 +242,33 @@ function requiredString(record: Record<string, unknown>, name: string): string {
   const value = record[name];
   if (typeof value !== 'string' || value.length === 0) throw new Error(`${name} must be a non-empty string`);
   return value;
+}
+
+function requiredBoundedString(record: Record<string, unknown>, name: string, maxLength: number): string {
+  const value = requiredString(record, name).trim();
+  if (value.length === 0 || value.length > maxLength || value.includes('\0')) throw new Error(`${name} must be a bounded string`);
+  return value;
+}
+
+function requiredPositiveInteger(record: Record<string, unknown>, name: string): number {
+  const value = record[name];
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
+
+function requiredStringArray(record: Record<string, unknown>, name: string): readonly string[] {
+  const value = record[name];
+  if (!Array.isArray(value) || value.length > 24) throw new Error(`${name} must be a bounded string array`);
+  return value.map((item, index) => {
+    if (typeof item !== 'string' || item.trim().length === 0 || item.length > 1000 || item.includes('\0')) throw new Error(`${name}[${index}] must be a bounded string`);
+    return item.trim();
+  });
+}
+
+function supervisorDecision(record: Record<string, unknown>, name: string): SupervisorDecision {
+  const value = record[name];
+  if (value === 'CONTINUE' || value === 'REVISE' || value === 'PAUSE' || value === 'COMPLETE') return value;
+  throw new Error(`${name} is not a supported supervisor decision`);
 }
 
 function optionalString(record: Record<string, unknown>, name: string): string | undefined {

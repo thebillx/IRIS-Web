@@ -254,6 +254,24 @@ describe('daily workspace session experience', () => {
       clientId: 'web-client', sessionId: sessionA.id, projectId: projectA.id,
       createdAt: '2026-09-05T06:00:00.000Z', updatedAt: '2026-09-05T06:10:00.000Z',
       supervisorGate: { state: 'PENDING', reason: 'Await supervisor directive', updatedAt: '2026-09-05T06:09:00.000Z' },
+      broker: {
+        missionVersion: 2,
+        hermesSessionId: '20260905_205024_29fc7f',
+        worktreePath: '/Users/bill/iris-v2-bridge-integration-proof',
+        branch: 'v2/bridge-integration-proof',
+        state: 'AWAITING_SUPERVISOR',
+        lastCheckpointId: '77777777-7777-4777-8777-777777777777',
+        lastDirectiveId: '88888888-8888-4888-8888-888888888888',
+        lastDirectiveSequence: 1,
+        checkpoints: [{
+          checkpointId: '77777777-7777-4777-8777-777777777777', missionVersion: 2, currentPhase: 'supervisor_checkpoint_ready',
+          summary: 'Delegated governed read is proven.', evidenceRefs: ['delegation:deleg_2fbc0e4a', 'project_git_status:clean'], blockers: [],
+          hermesAssessment: 'Subagent used only IRIS MCP.', proposedNextAction: 'Supervisor may continue.', decisionRequired: true,
+          createdAt: '2026-09-05T06:09:30.000Z',
+        }],
+        directives: [{ directiveId: '88888888-8888-4888-8888-888888888888', directiveSequence: 1, decision: 'CONTINUE', instruction: 'Prove governed delegation.', acceptedAt: '2026-09-05T06:05:00.000Z' }],
+        updatedAt: '2026-09-05T06:09:30.000Z',
+      },
       tasks: [{
         id: '22222222-2222-4222-8222-222222222222', title: 'Governed write', state: 'BLOCKED',
         createdAt: '2026-09-05T06:01:00.000Z', updatedAt: '2026-09-05T06:08:00.000Z',
@@ -274,6 +292,11 @@ describe('daily workspace session experience', () => {
     expect(markup).toContain('PENDING');
     expect(markup).toContain('Approval associated');
     expect(markup).toContain('1 evidence item');
+    expect(markup).toContain('AWAITING_SUPERVISOR');
+    expect(markup).toContain('20260905_205024_29fc7f');
+    expect(markup).toContain('supervisor_checkpoint_ready');
+    expect(markup).toContain('delegation:deleg_2fbc0e4a');
+    expect(markup).toContain('Last supervisor directive:');
     expect(markup).toContain('Owner approval is required before the governed action can execute');
   });
 
