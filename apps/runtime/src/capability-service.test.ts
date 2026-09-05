@@ -65,6 +65,32 @@ describe('capability execution and owner approval', () => {
     await expect(fixture.service.resolveApproval(pending.approval.id, 'ALLOW_ONCE')).rejects.toMatchObject({ code: 'APPROVAL_NOT_FOUND' });
   });
 
+  it('binds an instruction approval to the originating live session without exposing instruction text', async () => {
+    const fixture = await serviceFixture();
+    await fixture.settings.setMode('ASK_EVERY_TIME');
+    const instruction = 'sensitive instruction body';
+    const pending = await fixture.service.execute({
+      capabilityId: 'session.instruction.submit',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      submissionId: 'approval-submission',
+      instruction,
+    });
+    expect(pending.status).toBe('owner_required');
+    if (pending.status !== 'owner_required') return;
+    expect(pending.approval.clientId).toBe(fixture.session.clientId);
+    expect(pending.approval.sessionId).toBe(fixture.session.id);
+    expect(pending.approval.exactAction).toContain('sha256=');
+    expect(pending.approval.exactAction).not.toContain(instruction);
+    expect(fixture.state.getSessionForClient(fixture.session.id, fixture.session.clientId).interactions).toEqual([]);
+
+    const approved = await fixture.service.resolveApproval(pending.approval.id, 'ALLOW_ONCE');
+    expect(approved.status).toBe('executed');
+    const completed = fixture.state.getSessionForClient(fixture.session.id, fixture.session.clientId);
+    expect(completed.executionState).toBe('READY');
+    expect(completed.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
+  });
+
   it.each([
     ['ALLOW_ONCE', 'ALLOW_ONCE', true],
     ['ALLOW_ONCE', 'DENY', true],
@@ -256,6 +282,7 @@ async function serviceFixture() {
   const service = new CapabilityService(state, policy, audit, () => ({
     status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid,
     uptimeMs: 1, authority: 'owned', connectedClients: state.listClients().length, connectedSessions: state.listSessions().length,
+    agentExecutorType: 'local-development-executor', productionModelConnected: false,
     apiUrl: 'http://127.0.0.1:43110', mcpUrl: 'http://127.0.0.1:43110/mcp',
   }));
   return { sourceRoot, dataRoot, legacyRoot, projectRoot, state, project, session, settings, policy, audit, service };

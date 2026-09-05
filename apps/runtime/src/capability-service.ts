@@ -18,6 +18,7 @@ export type CapabilityOperation =
   | { readonly capabilityId: 'session.create'; readonly clientId?: string | undefined; readonly agentId?: string | undefined; readonly agentRole?: AgentRole | undefined }
   | { readonly capabilityId: 'session.delete'; readonly clientId: string; readonly sessionId: string }
   | { readonly capabilityId: 'session.current_project.set'; readonly clientId: string; readonly sessionId: string; readonly projectId: string | null }
+  | { readonly capabilityId: 'session.instruction.submit'; readonly clientId: string; readonly sessionId: string; readonly submissionId: string; readonly instruction: string }
   | { readonly capabilityId: 'project.register'; readonly name: string; readonly rootPath: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.default.set'; readonly projectId: string | null; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'file.read'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string }
@@ -183,6 +184,9 @@ export class CapabilityService {
     if (operation.capabilityId === 'session.current_project.set') {
       return this.state.setSessionCurrentProject(operation.sessionId, operation.clientId, operation.projectId);
     }
+    if (operation.capabilityId === 'session.instruction.submit') {
+      return this.state.submitInstruction(operation.sessionId, operation.clientId, operation.submissionId, operation.instruction);
+    }
     if (operation.capabilityId === 'project.register') {
       if (decision.target === null) throw new RuntimeError('CAPABILITY_DENIED', 'Approved project registration lost its canonical physical target');
       return this.state.registerCanonicalProject(operation.name, decision.target);
@@ -267,6 +271,9 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
   if (operation.capabilityId === 'session.current_project.set') {
     return { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   }
+  if (operation.capabilityId === 'session.instruction.submit') {
+    return { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
+  }
   return {
     capabilityId: operation.capabilityId,
     clientId: operation.clientId,
@@ -290,6 +297,11 @@ function describeOperation(operation: CapabilityOperation): string {
   if (operation.capabilityId === 'project.register') return `project.register name=${JSON.stringify(operation.name)} rootPath=${operation.rootPath}`;
   if (operation.capabilityId === 'project.default.set') return `project.default.set projectId=${operation.projectId ?? 'null'}`;
   if (operation.capabilityId === 'session.current_project.set') return `session.current_project.set sessionId=${operation.sessionId} projectId=${operation.projectId ?? 'null'}`;
+  if (operation.capabilityId === 'session.instruction.submit') {
+    const bytes = Buffer.byteLength(operation.instruction, 'utf8');
+    const digest = createHash('sha256').update(operation.instruction).digest('hex');
+    return `session.instruction.submit sessionId=${operation.sessionId} submissionId=${operation.submissionId} bytes=${bytes} sha256=${digest}`;
+  }
   if (operation.capabilityId === 'session.create') return `session.create clientId=${operation.clientId ?? 'generated'} agentId=${operation.agentId ?? 'generated'} role=${operation.agentRole ?? 'other'}`;
   if (operation.capabilityId === 'session.delete') return `session.delete sessionId=${operation.sessionId} clientId=${operation.clientId}`;
   return `policy.mode.set mode=${operation.mode}`;

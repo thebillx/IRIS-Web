@@ -17,17 +17,18 @@ const projectA = { id: 'project-a', name: 'IRIS', rootPath: '/Users/bill/iris' }
 const projectB = { id: 'project-b', name: 'Sandbox', rootPath: '/Users/bill/sandbox' };
 const sessionA: Session = {
   id: 'session-a', clientId: 'web-client', agentId: 'owner-web', agentRole: 'owner',
-  createdAt: '2026-09-05T06:00:00.000Z', currentProjectId: projectA.id,
+  createdAt: '2026-09-05T06:00:00.000Z', currentProjectId: projectA.id, executionState: 'READY', interactions: [],
 };
 const sessionB: Session = {
   id: 'session-b', clientId: 'web-client', agentId: 'owner-web', agentRole: 'owner',
-  createdAt: '2026-09-05T06:05:00.000Z', currentProjectId: projectB.id,
+  createdAt: '2026-09-05T06:05:00.000Z', currentProjectId: projectB.id, executionState: 'READY', interactions: [],
 };
 const ownerToken = 'o'.repeat(48);
 
 const health = {
   status: 'ready', runtimeId: 'runtime', instanceId: 'instance', pid: 123, uptimeMs: 60_000,
   authority: 'owned', connectedClients: 1, connectedSessions: 2,
+  agentExecutorType: 'local-development-executor' as const, productionModelConnected: false,
   apiUrl: 'http://127.0.0.1:43110', mcpUrl: 'http://127.0.0.1:43110/mcp',
 };
 
@@ -65,11 +66,15 @@ function renderWorkspace(selectedSession: Session | null, sessions: Session[] = 
     selectedSession,
     sessionActivity: [],
     pendingApprovalCount: 0,
+    instruction: '',
+    isSubmitting: false,
     name: '',
     rootPath: '',
     setName: () => undefined,
     setRootPath: () => undefined,
+    setInstruction: () => undefined,
     onCreateSession: () => undefined,
+    onSubmitInstruction: () => undefined,
     onSelectSession: () => undefined,
     onRegisterProject: () => undefined,
     onSelectProject: () => undefined,
@@ -136,7 +141,7 @@ describe('daily workspace session experience', () => {
         expect(body.clientId).toBe('web-client');
         const created: Session = {
           id: 'session-c', clientId: body.clientId, agentId: 'owner-web', agentRole: 'owner',
-          createdAt: '2026-09-05T06:10:00.000Z', currentProjectId: null,
+          createdAt: '2026-09-05T06:10:00.000Z', currentProjectId: null, executionState: 'READY', interactions: [],
         };
         runtimeSessions.push(created);
         return jsonResponse(created, 201);

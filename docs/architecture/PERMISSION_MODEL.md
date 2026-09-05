@@ -38,7 +38,7 @@ The same `CapabilityService` is used by HTTP and MCP. No MCP mutation bypass exi
 Implemented V1.3 capability surface is deliberately narrow:
 
 - runtime status and project listing
-- session create/delete/current-project selection
+- session create/delete/current-project selection and session-bound instruction submission
 - project registration and machine default-project selection
 - bounded regular-file read/write/delete within the live session project
 - one-level directory create and empty-directory delete within the live session project
@@ -54,7 +54,7 @@ Execution delegates project file and directory operations to the bundled macOS s
 
 ## Audit
 
-Each policy decision and execution result is appended to private local `audit.jsonl`. Audit records contain timestamp, client/session/agent/capability/risk/project/target/decision/reason/result metadata. For an existing session, agent attribution is derived from that live client-owned session rather than trusted from the request. File contents, credentials, API keys, passwords, tokens, and secret values are not recorded. File-write exact-action review uses byte count and SHA-256 rather than content.
+Each policy decision and execution result is appended to private local `audit.jsonl`. Audit records contain timestamp, client/session/agent/capability/risk/project/target/decision/reason/result metadata. For an existing session, agent attribution is derived from that live client-owned session rather than trusted from the request. File contents, instruction text, credentials, API keys, passwords, tokens, and secret values are not recorded. File-write and instruction-submit exact-action review uses byte count and SHA-256 rather than content.
 
 Permission settings are persisted privately in `permissions.json`. First initialization writes the explicit `FULL_LOCAL_OWNER` default. If the file later disappears or becomes invalid, policy evaluation fails closed instead of inferring owner authority.
 

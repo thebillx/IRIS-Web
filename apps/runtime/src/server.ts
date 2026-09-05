@@ -237,6 +237,19 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     }
   }
 
+  const instructionMatch = /^\/sessions\/([^/]+)\/instructions$/.exec(url.pathname);
+  if (instructionMatch !== null && request.method === 'POST') {
+    const body = await readJsonBody(request);
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'session.instruction.submit',
+      sessionId: decodeURIComponent(instructionMatch[1]!),
+      clientId: requiredClientId(request),
+      submissionId: stringField(body, 'submissionId'),
+      instruction: stringField(body, 'instruction'),
+    }));
+    return;
+  }
+
   const currentProjectMatch = /^\/sessions\/([^/]+)\/current-project$/.exec(url.pathname);
   if (currentProjectMatch !== null && request.method === 'PUT') {
     const body = await readJsonBody(request);
@@ -496,7 +509,7 @@ function writeError(response: ServerResponse, error: unknown): void {
     ? 404
     : runtimeError.code === 'CONTROL_DENIED' || runtimeError.code === 'CAPABILITY_DENIED'
       ? 403
-      : runtimeError.code === 'OWNER_DECISION_REQUIRED'
+      : runtimeError.code === 'OWNER_DECISION_REQUIRED' || runtimeError.code === 'SESSION_BUSY'
         ? 409
         : runtimeError.code === 'INVALID_REQUEST' || runtimeError.code === 'INVALID_PROJECT_PATH'
           ? 400

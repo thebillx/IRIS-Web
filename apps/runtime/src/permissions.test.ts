@@ -19,6 +19,8 @@ describe('permission policy engine', () => {
     await expect(fixture.engine.evaluate(fixture.request('file.read', existing))).resolves.toMatchObject({ decision: 'ALLOW_AUTO', projectId: fixture.project.id });
     await expect(fixture.engine.evaluate(fixture.request('file.write', path.join(fixture.projectRoot, 'new.txt')))).resolves.toMatchObject({ decision: 'ALLOW_AUTO' });
     await expect(fixture.engine.evaluate(fixture.request('file.delete', existing))).resolves.toMatchObject({ decision: 'ALLOW_AUTO' });
+    await expect(fixture.engine.evaluate({ capabilityId: 'session.instruction.submit', clientId: fixture.session.clientId, sessionId: fixture.session.id }))
+      .resolves.toMatchObject({ decision: 'ALLOW_AUTO', sessionId: fixture.session.id });
   });
 
   it('fails closed for outside-root, traversal, symlink escape, and session mismatch', async () => {
@@ -37,6 +39,8 @@ describe('permission policy engine', () => {
     await expect(fixture.engine.evaluate(fixture.request('file.write', hardlinkAlias))).resolves.toMatchObject({ decision: 'DENY' });
     await expect(fixture.engine.evaluate(fixture.request('file.delete', hardlinkAlias))).resolves.toMatchObject({ decision: 'DENY' });
     await expect(fixture.engine.evaluate({ ...fixture.request('file.write', path.join(fixture.projectRoot, 'bad.txt')), clientId: 'other-client' })).resolves.toMatchObject({ decision: 'DENY' });
+    await expect(fixture.engine.evaluate({ capabilityId: 'session.instruction.submit', clientId: 'other-client', sessionId: fixture.session.id }))
+      .resolves.toMatchObject({ decision: 'DENY' });
   });
 
   it('denies legacy mutation, requires owner for external authority expansion and system actions, and denies unknown capability', async () => {

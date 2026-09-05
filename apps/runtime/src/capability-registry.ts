@@ -6,6 +6,7 @@ const DEFINITIONS: readonly CapabilityDefinition[] = [
   { id: 'session.create', title: 'Create local session', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: true, implemented: true },
   { id: 'session.delete', title: 'Delete owned local session', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: true, implemented: true },
   { id: 'session.current_project.set', title: 'Set session current project', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: true, implemented: true },
+  { id: 'session.instruction.submit', title: 'Submit session instruction', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: true, implemented: true },
   { id: 'project.register', title: 'Register project root', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'project.default.set', title: 'Set machine default project', riskClass: 'MODERATE', requiredScope: 'MACHINE', mutation: true, implemented: true },
   { id: 'file.read', title: 'Read project file', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },

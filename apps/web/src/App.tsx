@@ -9,12 +9,32 @@ type Health = {
   authority: string;
   connectedClients: number;
   connectedSessions: number;
+  agentExecutorType: 'local-development-executor' | 'existing-provider' | 'other';
+  productionModelConnected: boolean;
   apiUrl: string;
   mcpUrl: string;
 };
 
 type Project = { id: string; name: string; rootPath: string };
-export type Session = { id: string; clientId: string; agentId: string; agentRole: string; createdAt: string; currentProjectId: string | null };
+type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED';
+type SessionInteraction = {
+  id: string;
+  timestamp: string;
+  kind: 'user' | 'assistant' | 'error';
+  text: string;
+  submissionId: string;
+  executionId: string;
+};
+export type Session = {
+  id: string;
+  clientId: string;
+  agentId: string;
+  agentRole: string;
+  createdAt: string;
+  currentProjectId: string | null;
+  executionState: SessionExecutionState;
+  interactions: SessionInteraction[];
+};
 type PermissionMode = 'ASK_EVERY_TIME' | 'AUTO_APPROVE_LOW_RISK' | 'AUTO_APPROVE_PROJECT_SCOPED' | 'FULL_LOCAL_OWNER';
 type RiskClass = 'LOW' | 'MODERATE' | 'HIGH' | 'SYSTEM';
 type PolicyDecision = 'ALLOW_AUTO' | 'ALLOW_ONCE' | 'DENY' | 'OWNER_REQUIRED';
@@ -66,6 +86,8 @@ export function App(): ReactElement {
   const [selectedApproval, setSelectedApproval] = useState<PendingApproval | null>(null);
   const [name, setName] = useState('');
   const [rootPath, setRootPath] = useState('');
+  const [instruction, setInstruction] = useState('');
+  const [submittingSessionIds, setSubmittingSessionIds] = useState<Set<string>>(() => new Set());
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
@@ -123,6 +145,10 @@ export function App(): ReactElement {
     }
   }, [clientId, selectedApproval, selectedSessionId]);
 
+  useEffect(() => {
+    setInstruction('');
+  }, [selectedSessionId]);
+
   const createSession = async () => {
     const response = await authorizedFetch(ownerAccessToken, '/sessions', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientId, agentId: 'owner-web', agentRole: 'owner' }),
@@ -175,6 +201,49 @@ export function App(): ReactElement {
     const updated = await response.json() as Session;
     setSessions((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
     await refresh();
+  };
+
+  const submitInstruction = async () => {
+    const targetSession = selectedSession;
+    const text = instruction.trim();
+    if (targetSession === null) throw new Error('Select or create a session before sending an instruction.');
+    if (health === null) throw new Error('Runtime is unavailable. The instruction was not sent.');
+    if (text.length === 0) return;
+    if (targetSession.executionState === 'WORKING' || submittingSessionIds.has(targetSession.id)) return;
+
+    const submissionId = crypto.randomUUID();
+    setSubmittingSessionIds((current) => new Set(current).add(targetSession.id));
+    setInstruction('');
+    try {
+      const response = await authorizedFetch(ownerAccessToken, `/sessions/${encodeURIComponent(targetSession.id)}/instructions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-iris-client-id': targetSession.clientId },
+        body: JSON.stringify({ submissionId, instruction: text }),
+      });
+      if (!response.ok) {
+        const failure = await responseErrorDetails(response, 'Could not execute instruction');
+        if (failure.code === 'OWNER_DECISION_REQUIRED') {
+          setNotice('This instruction requires an owner decision before execution.');
+          setView('approvals');
+          await refresh();
+          return;
+        }
+        if (failure.code === 'SESSION_BUSY' || failure.code === 'AGENT_EXECUTION_FAILED') {
+          await refresh();
+          return;
+        }
+        throw new Error(failure.message);
+      }
+      const updated = await response.json() as Session;
+      setSessions((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
+      await refresh();
+    } finally {
+      setSubmittingSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(targetSession.id);
+        return next;
+      });
+    }
   };
 
   const requestMode = async (mode: PermissionMode) => {
@@ -242,7 +311,11 @@ export function App(): ReactElement {
     ? 'Disconnected'
     : visibleApprovals.length > 0
       ? 'Approval required'
-      : health.status === 'ready' ? 'Ready' : 'Working';
+      : selectedSession?.executionState === 'WORKING'
+        ? 'Working'
+        : selectedSession?.executionState === 'FAILED'
+          ? 'Error'
+          : health.status === 'ready' ? 'Ready' : 'Working';
 
   return <div className="app-frame">
     <header className="web-header">
@@ -272,11 +345,15 @@ export function App(): ReactElement {
         selectedSession={selectedSession}
         sessionActivity={currentSessionActivity}
         pendingApprovalCount={visibleApprovals.length}
+        instruction={instruction}
+        isSubmitting={selectedSession !== null && submittingSessionIds.has(selectedSession.id)}
         name={name}
         rootPath={rootPath}
         setName={setName}
         setRootPath={setRootPath}
+        setInstruction={setInstruction}
         onCreateSession={() => run(createSession)}
+        onSubmitInstruction={() => run(submitInstruction)}
         onSelectSession={selectSession}
         onRegisterProject={() => run(registerProject)}
         onSelectProject={(projectId) => run(() => selectProject(projectId))}
@@ -302,18 +379,26 @@ export function RuntimePage(props: {
   selectedSession: Session | null;
   sessionActivity: AuditEvent[];
   pendingApprovalCount: number;
+  instruction: string;
+  isSubmitting: boolean;
   name: string;
   rootPath: string;
   setName(value: string): void;
   setRootPath(value: string): void;
+  setInstruction(value: string): void;
   onCreateSession(): void;
+  onSubmitInstruction(): void;
   onSelectSession(sessionId: string): void;
   onRegisterProject(): void;
   onSelectProject(projectId: string): void;
 }): ReactElement {
   const sessionState = props.health === null
     ? 'Disconnected'
-    : props.pendingApprovalCount > 0 ? 'Approval required' : 'Ready';
+    : props.pendingApprovalCount > 0
+      ? 'Approval required'
+      : props.selectedSession?.executionState === 'WORKING'
+        ? 'Working'
+        : props.selectedSession?.executionState === 'FAILED' ? 'Failed' : 'Ready';
 
   return <>
     <div className="page-heading"><div><p className="eyebrow">Daily workspace</p><h1>IRIS</h1><p>One local daemon, your projects, and resumable browser sessions.</p></div></div>
@@ -353,7 +438,34 @@ export function RuntimePage(props: {
             : <>
               <div className="session-summary"><div><span>Role</span><strong>{props.selectedSession.agentRole}</strong></div><div><span>Agent</span><strong>{humanAgentName(props.selectedSession.agentId)}</strong></div><div><span>Started</span><strong><time dateTime={props.selectedSession.createdAt}>{formatSessionTime(props.selectedSession.createdAt)}</time></strong></div></div>
               <label>Active project<select value={props.selectedSession.currentProjectId ?? ''} onChange={(event) => props.onSelectProject(event.target.value)}><option value="">No active project</option>{props.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
-              <div className="session-activity"><h3>Recent activity</h3>{props.sessionActivity.length === 0 ? <p>No recorded activity in this session yet.</p> : <ul>{props.sessionActivity.map((event) => <li key={event.id}><strong>{humanCapability(event.capabilityId)}</strong><span>{event.result.toLowerCase()}</span></li>)}</ul>}</div>
+              {props.health?.agentExecutorType === 'local-development-executor' && !props.health.productionModelConnected
+                ? <p className="executor-note">Development executor active · no production model connected.</p>
+                : null}
+              <div className="conversation" aria-live="polite">
+                <h3>Conversation</h3>
+                {props.selectedSession.interactions.length === 0
+                  ? <div className="empty-state"><p>No instructions yet.</p><span>Send one instruction to begin this session.</span></div>
+                  : <ol className="conversation-list">{props.selectedSession.interactions.map((interaction) => <li key={interaction.id} className={`conversation-message is-${interaction.kind}`}>
+                    <div><strong>{interactionLabel(interaction.kind)}</strong><time dateTime={interaction.timestamp}>{formatSessionTime(interaction.timestamp)}</time></div>
+                    <p>{interaction.text}</p>
+                  </li>)}</ol>}
+                {props.pendingApprovalCount > 0 ? <p className="conversation-approval">Approval required for this session. Review the exact action in Approval Center.</p> : null}
+              </div>
+              <form className="instruction-composer" onSubmit={(event) => { event.preventDefault(); props.onSubmitInstruction(); }}>
+                <label htmlFor="session-instruction">Instruction</label>
+                <textarea
+                  id="session-instruction"
+                  aria-label="Session instruction"
+                  value={props.instruction}
+                  maxLength={8000}
+                  rows={3}
+                  placeholder={props.health === null ? 'Runtime unavailable' : 'Tell IRIS what to do…'}
+                  disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting}
+                  onChange={(event) => props.setInstruction(event.target.value)}
+                />
+                <div className="composer-actions"><span>{props.selectedSession.executionState === 'WORKING' ? 'Runtime is working on this session.' : 'Enter sends only when you choose Send.'}</span><button type="submit" disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting || props.instruction.trim().length === 0}>{props.isSubmitting ? 'Sending…' : 'Send'}</button></div>
+              </form>
+              <details className="session-runtime-activity"><summary>Runtime activity</summary>{props.sessionActivity.length === 0 ? <p>No recorded runtime activity in this session yet.</p> : <ul>{props.sessionActivity.map((event) => <li key={event.id}><strong>{humanCapability(event.capabilityId)}</strong><span>{event.result.toLowerCase()}</span></li>)}</ul>}</details>
             </>}
         </section>
 
@@ -364,6 +476,7 @@ export function RuntimePage(props: {
 
         {props.health && <details className="runtime-details"><summary>Runtime details</summary><dl>
           <dt>Status</dt><dd>{props.health.status}</dd><dt>Uptime</dt><dd>{Math.floor(props.health.uptimeMs / 1000)}s</dd><dt>Authority</dt><dd>{props.health.authority}</dd>
+          <dt>Executor</dt><dd>{props.health.agentExecutorType}</dd><dt>Production model</dt><dd>{props.health.productionModelConnected ? 'connected' : 'not connected'}</dd>
           <dt>API</dt><dd>{props.health.apiUrl}</dd><dt>MCP</dt><dd>{props.health.mcpUrl}</dd><dt>Daemon sessions</dt><dd>{props.health.connectedSessions}</dd>
         </dl></details>}
       </div>
@@ -485,6 +598,12 @@ function humanCapability(capabilityId: string): string {
   return capabilityId.split('.').map((part) => part.replaceAll('_', ' ')).join(' · ');
 }
 
+function interactionLabel(kind: SessionInteraction['kind']): string {
+  if (kind === 'user') return 'You';
+  if (kind === 'assistant') return 'IRIS';
+  return 'Execution failed';
+}
+
 function readOwnerAccessToken(): string {
   const hash = new URLSearchParams(window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash);
   const supplied = hash.get('owner');
@@ -525,6 +644,15 @@ export async function isAppliedOwnerDenial(response: Response): Promise<boolean>
     return body.error?.code === 'CAPABILITY_DENIED';
   } catch {
     return false;
+  }
+}
+
+async function responseErrorDetails(response: Response, fallback: string): Promise<{ code: string | null; message: string }> {
+  try {
+    const body = await response.json() as { error?: { code?: string; message?: string } };
+    return { code: body.error?.code ?? null, message: body.error?.message ?? fallback };
+  } catch {
+    return { code: null, message: fallback };
   }
 }
 

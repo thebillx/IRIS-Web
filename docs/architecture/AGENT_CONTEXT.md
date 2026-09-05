@@ -13,6 +13,8 @@ Each runtime session carries:
 - `agentId`
 - `agentRole`
 - session-scoped current project
+- bounded provider-neutral interaction events
+- session-scoped `READY` / `WORKING` / `FAILED` execution state
 
 Canonical roles are `owner`, `planner`, `implementer`, `reviewer`, `security`, `explorer`, and `other`.
 
@@ -26,22 +28,24 @@ All agent work inherits the machine permission mode and uses the existing flow:
 
 For operations tied to an existing session, the daemon derives audit `agentId` from the live session owned by the supplied `clientId`; a caller cannot override audit attribution with a different agent identifier.
 
-## Concurrency
+## Interaction and concurrency
 
-Planner, Implementer, Reviewer, Security, and Explorer sessions may coexist concurrently on the same authoritative daemon. Their current-project state remains session-scoped, while runtime authority, project registry, default project, permission mode, and capability registry remain machine-shared.
+The daemon exposes one provider-neutral instruction execution seam per session. A unique submission ID makes retry of the same accepted instruction idempotent, and a second distinct instruction fails with `SESSION_BUSY` while that session is already working. Independent sessions may execute concurrently without a global working lock.
 
-This contract deliberately does not serialize independent read/work contexts into one global active agent or one global active project.
+Planner, Implementer, Reviewer, Security, and Explorer sessions may coexist concurrently on the same authoritative daemon. Their current-project, interaction history, and execution state remain session-scoped, while runtime authority, project registry, default project, permission mode, and capability registry remain machine-shared.
+
+This contract deliberately does not serialize independent read/work contexts into one global active agent or one global active project. Switching the Web selection never changes runtime execution ownership.
 
 ## Audit
 
 Permission audit records include `agentId` in addition to client/session/project/capability/risk/decision/result metadata. Secrets and file contents remain excluded.
 
-## Deliberate V1.3 limit
+## Current executor boundary
 
-V1.3 does not implement an Agent Manager, planner queue, model router, delegation scheduler, or sub-agent lifecycle service. The runtime/session/policy/audit contracts are intentionally sufficient for such a manager to allocate multiple agent sessions later without redesigning daemon authority or bypassing capability policy.
+The current session execution seam is implemented by a deterministic `local-development-executor`. It proves session-bound instruction → runtime execution → session output without a cloud runtime dependency, and runtime health explicitly reports that no production model is connected. The session/UI contracts do not depend on this temporary executor's response format.
+
+IRIS still does not implement an Agent Manager, planner queue, model router, delegation scheduler, or sub-agent lifecycle service. Those remain separate orchestration work and must not bypass daemon authority or capability policy.
 
 `AGENT_MANAGER_FOUNDATION=PASS`
 
 `MULTI_AGENT_READY=PASS`
-
-A full Agent Manager is the next orchestration milestone after V1.3 acceptance.

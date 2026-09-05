@@ -141,6 +141,7 @@ export class PermissionPolicyEngine {
     }
 
     if (definition.id === 'session.current_project.set') return this.validateSessionProjectSelection(input);
+    if (definition.id === 'session.instruction.submit') return this.validateOwnedSession(input);
     if (definition.id === 'project.default.set') return this.validateDefaultProject(input);
 
     if (definition.requiredScope === 'MACHINE') {
@@ -183,6 +184,20 @@ export class PermissionPolicyEngine {
     }
     const inspected = await inspectProjectTarget(project.rootPath, normalizedDisplayTarget(input.targetPath), targetKind);
     return { valid: inspected.valid, reason: inspected.reason, projectId: project.id, target: inspected.target };
+  }
+
+  private validateOwnedSession(input: PolicyRequest): ScopeResult {
+    const sessionId = input.sessionId?.trim() ?? '';
+    const clientId = input.clientId?.trim() ?? '';
+    if (sessionId.length === 0 || clientId.length === 0) {
+      return { valid: false, reason: 'Session instruction requires client and session identity', projectId: null, target: null };
+    }
+    try {
+      this.state.getSessionForClient(sessionId, clientId);
+      return { valid: true, reason: 'Client owns the requested session', projectId: null, target: null };
+    } catch {
+      return { valid: false, reason: 'Client/session identity does not own the requested session', projectId: null, target: null };
+    }
   }
 
   private async validateSessionProjectSelection(input: PolicyRequest): Promise<ScopeResult> {

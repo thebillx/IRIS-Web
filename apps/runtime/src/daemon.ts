@@ -83,6 +83,8 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       authority: 'owned',
       connectedClients: state.listClients().filter((client) => client.connected).length,
       connectedSessions: state.listSessions().length,
+      agentExecutorType: state.executorDescriptor().type,
+      productionModelConnected: state.executorDescriptor().productionModelConnected,
       apiUrl: server?.apiUrl ?? '',
       mcpUrl: server?.mcpUrl ?? '',
     });

@@ -31,11 +31,11 @@ If a different endpoint descriptor, control record, or live authority appears du
 
 Machine-shared state: runtime authority, logical runtime identity, project registry, and default project.
 
-Session-scoped state: session identity, logical `agentId`/agent role attribution, and current project.
+Session-scoped state: session identity, logical `agentId`/agent role attribution, current project, bounded interaction history, and the session's `READY`/`WORKING`/`FAILED` execution state.
 
 Client-scoped state: explicit `clientId`, connected/disconnected state, and last-seen time. Session read/update/delete routes require the matching client identity, so one client cannot silently operate another client's session. Multiple agent sessions may coexist on one daemon; agent identity is attribution rather than a separate authority boundary. Client and session state are in memory; unnecessary transient state is not persisted.
 
-The Web client may list only sessions owned by its stable browser `clientId`. A browser refresh or reconnect to the same daemon can therefore resume an existing authoritative session without creating another one. The selected session ID stored in browser session storage is only a UI preference: it is accepted only when that session still exists in the daemon's client-scoped list. A daemon restart intentionally drops transient sessions and pending approvals; the Web client clears any stale selection and reloads the persisted project registry/default project instead of recreating session authority from browser state.
+The Web client may list only sessions owned by its stable browser `clientId`. A browser refresh or reconnect to the same daemon can therefore resume an existing authoritative session, including its bounded interaction history and execution state, without creating another session or replaying completed work. The selected session ID stored in browser session storage is only a UI preference: it is accepted only when that session still exists in the daemon's client-scoped list. A daemon restart intentionally drops transient sessions, interaction history, execution state, and pending approvals; the Web client clears any stale selection and reloads the persisted project registry/default project instead of recreating session authority or replaying execution from browser state.
 
 ## Endpoint discovery
 
@@ -43,4 +43,4 @@ The default preferred API port is `43110`. The daemon binds `127.0.0.1` only. Th
 
 ## Failure taxonomy
 
-V0 uses machine-readable codes including `AUTHORITY_HELD`, `AUTHORITY_INDETERMINATE`, `AUTHORITY_CHANGED`, `CONTROL_DENIED`, `STALE_AUTHORITY`, `PORT_UNAVAILABLE`, `INVALID_PROJECT_PATH`, `PROJECT_NOT_FOUND`, `SESSION_NOT_FOUND`, `RUNTIME_NOT_RUNNING`, `RUNTIME_SHUTTING_DOWN`, `PERSISTENCE_FAILURE`, and `INVALID_REQUEST`.
+The runtime uses machine-readable codes including `AUTHORITY_HELD`, `AUTHORITY_INDETERMINATE`, `AUTHORITY_CHANGED`, `CONTROL_DENIED`, `STALE_AUTHORITY`, `PORT_UNAVAILABLE`, `INVALID_PROJECT_PATH`, `PROJECT_NOT_FOUND`, `SESSION_NOT_FOUND`, `SESSION_BUSY`, `AGENT_EXECUTION_FAILED`, `RUNTIME_NOT_RUNNING`, `RUNTIME_SHUTTING_DOWN`, `PERSISTENCE_FAILURE`, and `INVALID_REQUEST`.

@@ -157,17 +157,28 @@ describe('runtime lifecycle integration', () => {
     const sessionB = await json<{ id: string; currentProjectId: string | null }>(`${first.endpoint.apiUrl}/sessions`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientId: 'client-b' }),
     });
-    const clientASessions = await json<{ sessions: Array<{ id: string }> }>(`${first.endpoint.apiUrl}/sessions`, {
+    const executedA = await json<{ executionState: string; interactions: Array<{ kind: string; text: string }> }>(`${first.endpoint.apiUrl}/sessions/${sessionA.id}/instructions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-iris-client-id': 'client-a' },
+      body: JSON.stringify({ submissionId: 'lifecycle-interaction-a', instruction: 'Prove local interaction continuity' }),
+    });
+    expect(executedA.executionState).toBe('READY');
+    expect(executedA.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
+    expect(executedA.interactions[0]?.text).toBe('Prove local interaction continuity');
+
+    const clientASessions = await json<{ sessions: Array<{ id: string; interactions: Array<{ kind: string }> }> }>(`${first.endpoint.apiUrl}/sessions`, {
       headers: { 'x-iris-client-id': 'client-a' },
     });
     expect(clientASessions.sessions.map((session) => session.id)).toEqual([sessionA.id]);
+    expect(clientASessions.sessions[0]?.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
 
     const reattachedWithSessions = await startRuntime({ dataRoot, preferredPort: 0, startupDeadlineMs: 15_000 });
     expect(reattachedWithSessions.endpoint?.instanceId).toBe(firstInstanceId);
-    const clientASessionsAfterReconnect = await json<{ sessions: Array<{ id: string }> }>(`${first.endpoint.apiUrl}/sessions`, {
+    const clientASessionsAfterReconnect = await json<{ sessions: Array<{ id: string; interactions: Array<{ kind: string }> }> }>(`${first.endpoint.apiUrl}/sessions`, {
       headers: { 'x-iris-client-id': 'client-a' },
     });
     expect(clientASessionsAfterReconnect.sessions.map((session) => session.id)).toEqual([sessionA.id]);
+    expect(clientASessionsAfterReconnect.sessions[0]?.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
 
     const updatedA = await json<{ currentProjectId: string | null }>(`${first.endpoint.apiUrl}/sessions/${sessionA.id}/current-project`, {
       method: 'PUT',

@@ -19,6 +19,7 @@ export interface ProjectReference {
 }
 
 export type AgentRole = 'owner' | 'planner' | 'implementer' | 'reviewer' | 'security' | 'explorer' | 'other';
+export type AgentExecutorType = 'local-development-executor' | 'existing-provider' | 'other';
 
 export interface RuntimeSession {
   readonly id: string;
@@ -27,6 +28,23 @@ export interface RuntimeSession {
   readonly agentRole: AgentRole;
   readonly createdAt: string;
   readonly currentProjectId: string | null;
+}
+
+export type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED';
+export type SessionInteractionKind = 'user' | 'assistant' | 'error';
+
+export interface SessionInteractionEvent {
+  readonly id: string;
+  readonly timestamp: string;
+  readonly kind: SessionInteractionKind;
+  readonly text: string;
+  readonly submissionId: string;
+  readonly executionId: string;
+}
+
+export interface RuntimeSessionSnapshot extends RuntimeSession {
+  readonly executionState: SessionExecutionState;
+  readonly interactions: readonly SessionInteractionEvent[];
 }
 
 export interface RuntimeClientState {
@@ -46,6 +64,8 @@ export interface RuntimeHealth {
   readonly authority: 'owned';
   readonly connectedClients: number;
   readonly connectedSessions: number;
+  readonly agentExecutorType: AgentExecutorType;
+  readonly productionModelConnected: boolean;
   readonly apiUrl: string;
   readonly mcpUrl: string;
 }
@@ -77,6 +97,7 @@ export type CapabilityId =
   | 'session.create'
   | 'session.delete'
   | 'session.current_project.set'
+  | 'session.instruction.submit'
   | 'project.register'
   | 'project.default.set'
   | 'file.read'
@@ -139,6 +160,8 @@ export type RuntimeFailureCode =
   | 'INVALID_PROJECT_PATH'
   | 'PROJECT_NOT_FOUND'
   | 'SESSION_NOT_FOUND'
+  | 'SESSION_BUSY'
+  | 'AGENT_EXECUTION_FAILED'
   | 'RUNTIME_NOT_RUNNING'
   | 'RUNTIME_SHUTTING_DOWN'
   | 'PERSISTENCE_FAILURE'
