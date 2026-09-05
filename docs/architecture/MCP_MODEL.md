@@ -1,12 +1,21 @@
 # MCP model
 
-IRIS V0 hosts a minimal MCP transport on the same authoritative local daemon as the HTTP API. It binds only to `127.0.0.1` and does not require OAuth for this local-only foundation.
+IRIS hosts a minimal stateless MCP transport on the same authoritative local daemon as the HTTP API. It binds only to `127.0.0.1` and does not require OAuth for the same-user, local-only V1.3 trust boundary.
 
-The transport targets MCP protocol revision `2026-07-28` and uses its stateless discovery/request shape. `server/discover` reports the local server and protocol contract. V0 exposes only informational tools:
+The transport targets MCP protocol revision `2026-07-28` and uses its stateless discovery/request shape. `server/discover` reports the local server and protocol contract.
+
+Exposed tools are intentionally structured:
 
 - `runtime_status`
 - `list_projects`
+- `file_read`
+- `file_write`
+- `file_delete`
+- `directory_create`
+- `directory_delete`
 
-No filesystem mutation, process execution, broad native capability, ChatGPT tunnel, or remote transport is implemented in this mission.
+There is no arbitrary shell, remote account, credential, or cloud capability.
 
-Application sessions are IRIS runtime sessions and are separate from MCP protocol transport state. Multiple local clients may call the same daemon; machine authority remains shared.
+MCP does not own a separate permission path. Every tool call is routed through the same daemon `CapabilityService` used by the localhost Web API. File and directory tools require explicit client/session identity; the live session current project and physical target boundary are revalidated immediately before execution. `DENY` and `OWNER_REQUIRED` outcomes are returned as MCP tool errors and execute nothing.
+
+Application sessions are IRIS runtime sessions and remain separate from MCP protocol transport state. Multiple local clients may call the same daemon; machine authority and permission mode remain machine-shared while current project remains session-scoped.

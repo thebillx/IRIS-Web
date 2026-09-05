@@ -6,6 +6,10 @@ import { RuntimeError } from '@iris/domain';
 
 export const RUNTIME_DATA_ENV = 'IRIS_RUNTIME_DATA_ROOT' as const;
 
+export async function resolveSourceRoot(sourceRoot = path.resolve(import.meta.dirname, '../../..')): Promise<string> {
+  return canonicalizeFuturePath(sourceRoot);
+}
+
 export async function resolveRuntimeDataRoot(
   environment: NodeJS.ProcessEnv = process.env,
   sourceRoot = path.resolve(import.meta.dirname, '../../..'),

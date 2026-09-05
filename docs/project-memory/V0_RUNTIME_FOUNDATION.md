@@ -8,7 +8,7 @@ Implemented from the clean-sheet base commit `109c117716d56475bde946addbf4d7c0f1
 - `RUNTIME_DATA_ROOT`: `~/Library/Application Support/IRIS`, with `IRIS_RUNTIME_DATA_ROOT` reserved for explicit local/test isolation.
 - `RUNTIME_IDENTITY`: persistent `runtimeId` plus per-process `instanceId`, `pid`, `startedAt`, `platform`, and `version`. PID alone is not authoritative.
 - `AUTHORITY`: authority is published as a prewritten private claim file atomically hard-linked to `authority/owner.lock`. Live or ambiguous ownership fails closed. A valid stale owner is isolated and removed only after exact identity reverification and proof that its recorded PID is absent. Probes do not mutate authority.
-- `STOP_COMPLETE`: target PID absent, exact endpoint descriptor absent, and runtime authority observed unowned. API unreachability alone is insufficient.
+- `STOP_COMPLETE`: target PID absent, exact endpoint descriptor absent, private target control record absent, and runtime authority observed unowned. API unreachability alone is insufficient; post-V0 hardening uses an instance-bound private shutdown credential rather than direct PID signaling.
 - `PORT_DISCOVERY`: prefer loopback port `43110`, fall back to an ephemeral loopback port only after authority is established, print and persist the actual API/MCP URLs.
 - `MULTI_CLIENT`: explicit client identities attach to one daemon.
 - `MULTI_SESSION`: explicit sessions coexist in one daemon; sessions are not daemon instances.
@@ -20,7 +20,7 @@ Implemented from the clean-sheet base commit `109c117716d56475bde946addbf4d7c0f1
 - `PROJECT_REGISTRY`: explicit `id`, `name`, and canonical existing absolute non-root `rootPath`; no scanning or implicit registration.
 - `HEALTH`: stable runtime identity, uptime, authority, endpoint, and connected client/session counts.
 - `DOCTOR`: bounded checks for authority identity, private writable data root, loopback bind, readable registry, and duplicate authority.
-- `MCP`: local stateless JSON-RPC transport on `/mcp`, `server/discover`, and only `runtime_status` plus `list_projects` informational tools.
+- `MCP`: local stateless JSON-RPC transport on `/mcp` with `server/discover`; the original informational foundation has since been extended by V1.3 with structured project file/directory tools routed through the shared permission engine.
 - `WEB`: a minimal React client for observing the runtime, creating a session, registering a project, and selecting that session's current project.
 - `CLONE_AND_RUN`: after `pnpm install`, `pnpm dev` starts the authoritative runtime first, discovers its actual URL, and starts the Vite client without an installer or machine-specific source path. The coordinator signals and waits for both development children during shutdown.
 - `MULTI_MACHINE`: each Mac has an independent data root, authority, registry, and sessions. No cloud state or cross-machine synchronization exists.

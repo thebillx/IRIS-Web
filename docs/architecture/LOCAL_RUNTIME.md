@@ -16,23 +16,24 @@ Port availability is independent from authority. A preferred loopback port may f
 
 `start` checks existing authority/status, creates a new `instanceId` only when a daemon must actually be started, acquires authority before binding the API, and publishes endpoint metadata only after the listener is ready. `status` requires endpoint identity, HTTP status identity, and authority identity to agree before reporting `running`.
 
-`stop` first verifies the exact runtime/instance/PID/start-time identity across endpoint metadata and authority, then sends `SIGTERM` to that verified local process. PID is never used by itself as authority. No HTTP/API-unreachable condition is accepted as successful shutdown.
+`stop` first verifies exact endpoint and authority identity, reads the private instance-bound runtime control credential, and asks that verified daemon to shut itself down. It does not send a termination signal to a PID based only on metadata. API unreachability is not accepted as successful shutdown.
 
-`STOP_COMPLETE` means all three conditions are true for the verified target instance:
+`STOP_COMPLETE` means all four conditions are true for the verified target instance:
 
 1. the target PID no longer exists;
-2. the exact target endpoint descriptor is absent; and
-3. the runtime authority probe reports `unowned`.
+2. the exact target endpoint descriptor is absent;
+3. the target private control record is absent; and
+4. the runtime authority probe reports `unowned`.
 
-If a different endpoint descriptor or live authority appears during shutdown, stop fails closed with an authority-change error.
+If a different endpoint descriptor, control record, or live authority appears during shutdown, stop fails closed with an authority-change error. The private authority owner record also carries a macOS process-start marker so a reused PID is not treated as the previous daemon process.
 
 ## State scopes
 
 Machine-shared state: runtime authority, logical runtime identity, project registry, and default project.
 
-Session-scoped state: session identity and current project.
+Session-scoped state: session identity, logical `agentId`/agent role attribution, and current project.
 
-Client-scoped state: explicit `clientId`, connected/disconnected state, and last-seen time. Session read/update/delete routes require the matching client identity, so one client cannot silently operate another client's session. Client and session state are in memory in V0; unnecessary transient state is not persisted.
+Client-scoped state: explicit `clientId`, connected/disconnected state, and last-seen time. Session read/update/delete routes require the matching client identity, so one client cannot silently operate another client's session. Multiple agent sessions may coexist on one daemon; agent identity is attribution rather than a separate authority boundary. Client and session state are in memory; unnecessary transient state is not persisted.
 
 ## Endpoint discovery
 

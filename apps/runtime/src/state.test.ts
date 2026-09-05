@@ -29,6 +29,17 @@ describe('runtime machine, client, and session state', () => {
     expect(state.listClients()).toHaveLength(2);
   });
 
+  it('supports concurrent agent roles on one daemon without sharing session identity', async () => {
+    const state = new RuntimeState(new FoundationStateStore(await temp('iris-agent-state-')));
+    const roles = ['planner', 'implementer', 'reviewer', 'security', 'explorer'] as const;
+    const sessions = roles.map((role) => state.createSession(`client-${role}`, `agent-${role}`, role));
+
+    expect(new Set(sessions.map((session) => session.agentId))).toEqual(new Set(roles.map((role) => `agent-${role}`)));
+    expect(new Set(sessions.map((session) => session.agentRole))).toEqual(new Set(roles));
+    expect(new Set(sessions.map((session) => session.id)).size).toBe(roles.length);
+    expect(state.listClients()).toHaveLength(roles.length);
+  });
+
   it('prevents one client from operating another client session', async () => {
     const state = new RuntimeState(new FoundationStateStore(await temp('iris-state-data-')));
     const session = state.createSession('client-a');

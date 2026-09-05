@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { RuntimeError, type ProjectReference, type RuntimeClientState, type RuntimeSession } from '@iris/domain';
+import { RuntimeError, type AgentRole, type ProjectReference, type RuntimeClientState, type RuntimeSession } from '@iris/domain';
 import { FoundationStateStore } from './persistence.js';
+import { inspectRegistrationRoot } from './project-path.js';
 
 export class RuntimeState {
   private readonly sessions = new Map<string, RuntimeSession>();
@@ -19,12 +20,16 @@ export class RuntimeState {
     return [...this.clients.values()];
   }
 
-  public createSession(clientIdInput?: string): RuntimeSession {
+  public createSession(clientIdInput?: string, agentIdInput?: string, agentRoleInput: AgentRole = 'other'): RuntimeSession {
     const clientId = normalizeClientId(clientIdInput ?? randomUUID());
+    const agentId = normalizeAgentId(agentIdInput ?? randomUUID());
+    const agentRole = normalizeAgentRole(agentRoleInput);
     const now = new Date().toISOString();
     const session: RuntimeSession = {
       id: randomUUID(),
       clientId,
+      agentId,
+      agentRole,
       createdAt: now,
       currentProjectId: null,
     };
@@ -58,26 +63,31 @@ export class RuntimeState {
     return (await this.store.read()).projects;
   }
 
-  public registerProject(nameInput: string, rootPathInput: string): Promise<ProjectReference> {
+  public async registerProject(nameInput: string, rootPathInput: string): Promise<ProjectReference> {
+    const canonical = await canonicalProjectRoot(rootPathInput);
+    return this.registerCanonicalProject(nameInput, canonical);
+  }
+
+  public registerCanonicalProject(nameInput: string, canonicalRoot: string): Promise<ProjectReference> {
     return this.serializeMachineMutation(async () => {
       const name = nameInput.trim();
-      if (name.length === 0 || name.length > 120 || rootPathInput.includes('\0') || !path.isAbsolute(rootPathInput)) {
+      if (name.length === 0 || name.length > 120 || canonicalRoot.includes('\0') || !path.isAbsolute(canonicalRoot)) {
         throw new RuntimeError('INVALID_PROJECT_PATH', 'Project name and root path are invalid');
       }
-
-      let canonical: string;
+      let physical: string;
       try {
-        canonical = await realpath(rootPathInput);
-        if (!(await stat(canonical)).isDirectory()) throw new Error('not directory');
-        if (canonical === path.parse(canonical).root) throw new Error('filesystem root');
+        physical = await realpath(canonicalRoot);
+        if (physical !== canonicalRoot || !(await stat(physical)).isDirectory() || physical === path.parse(physical).root) {
+          throw new Error('project root changed identity');
+        }
       } catch (error) {
-        throw new RuntimeError('INVALID_PROJECT_PATH', 'Project root must be an existing non-root directory', { cause: error });
+        throw new RuntimeError('INVALID_PROJECT_PATH', 'Canonical project root is not a stable existing non-root directory', { cause: error });
       }
 
       const state = await this.store.read();
-      const existing = state.projects.find((project) => project.rootPath === canonical);
+      const existing = state.projects.find((project) => project.rootPath === canonicalRoot);
       if (existing !== undefined) return existing;
-      const project: ProjectReference = { id: randomUUID(), name, rootPath: canonical };
+      const project: ProjectReference = { id: randomUUID(), name, rootPath: canonicalRoot };
       await this.store.write({ ...state, projects: [...state.projects, project] });
       return project;
     });
@@ -123,10 +133,32 @@ export class RuntimeState {
   }
 }
 
+async function canonicalProjectRoot(rootPathInput: string): Promise<string> {
+  const inspected = await inspectRegistrationRoot(rootPathInput);
+  if (!inspected.valid || inspected.target === null) {
+    throw new RuntimeError('INVALID_PROJECT_PATH', inspected.reason);
+  }
+  return inspected.target;
+}
+
 function normalizeClientId(value: string): string {
   const normalized = value.trim();
   if (normalized.length === 0 || normalized.length > 200 || normalized.includes('\0')) {
     throw new RuntimeError('INVALID_REQUEST', 'clientId is invalid');
   }
   return normalized;
+}
+
+function normalizeAgentId(value: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > 200 || normalized.includes('\0')) {
+    throw new RuntimeError('INVALID_REQUEST', 'agentId is invalid');
+  }
+  return normalized;
+}
+
+function normalizeAgentRole(value: AgentRole): AgentRole {
+  if (value === 'owner' || value === 'planner' || value === 'implementer' || value === 'reviewer'
+    || value === 'security' || value === 'explorer' || value === 'other') return value;
+  throw new RuntimeError('INVALID_REQUEST', 'agentRole is invalid');
 }

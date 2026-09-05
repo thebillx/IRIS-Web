@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "runtime": "pnpm --filter @iris/runtime runtime",
+    "permission-smoke": "node scripts/permission-smoke.mjs",
     "test": "pnpm --recursive --if-present test",
     "lint": "eslint .",
     "typecheck": "pnpm --recursive --if-present typecheck",

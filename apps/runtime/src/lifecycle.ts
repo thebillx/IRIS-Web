@@ -2,9 +2,9 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { IRIS_VERSION, RuntimeError, type RuntimeHealth, type RuntimeIdentity } from '@iris/domain';
-import { probeRuntimeAuthority } from './authority.js';
+import { AUTHORITY_RECOVERY_IN_PROGRESS, probeRuntimeAuthority } from './authority.js';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
-import { readEndpoint, type EndpointDocument } from './persistence.js';
+import { readEndpoint, readRuntimeControl, type EndpointDocument, type RuntimeControlDocument } from './persistence.js';
 
 export interface RuntimeObservedStatus {
   readonly state: 'running' | 'stopped' | 'stale' | 'indeterminate';
@@ -28,11 +28,48 @@ export async function runtimeStatus(dataRootInput?: string): Promise<RuntimeObse
     return { state: 'indeterminate', endpoint: null, health: null, reason: errorCode(error) };
   }
   const authority = await probeRuntimeAuthority(dataRoot);
+  let control;
+  try {
+    control = await readRuntimeControl(dataRoot);
+  } catch (error: unknown) {
+    return { state: 'indeterminate', endpoint, health: null, reason: errorCode(error) };
+  }
   if (endpoint === null) {
+    if (control !== null) {
+      if (authority.state === 'live'
+        && control.runtimeId === authority.identity.runtimeId
+        && control.instanceId === authority.identity.instanceId) {
+        return { state: 'indeterminate', endpoint: null, health: null, reason: 'RUNTIME_STARTING' };
+      }
+      return { state: 'indeterminate', endpoint: null, health: null, reason: 'Runtime control metadata exists without a matching live startup authority' };
+    }
     if (authority.state === 'unowned') return { state: 'stopped', endpoint: null, health: null };
     if (authority.state === 'stale') return { state: 'stale', endpoint: null, health: null, reason: 'STALE_AUTHORITY' };
     if (authority.state === 'live') return { state: 'indeterminate', endpoint: null, health: null, reason: 'RUNTIME_STARTING' };
+    if (authority.reason === AUTHORITY_RECOVERY_IN_PROGRESS) {
+      return { state: 'indeterminate', endpoint: null, health: null, reason: 'RUNTIME_STARTING' };
+    }
     return { state: 'indeterminate', endpoint: null, health: null, reason: authority.reason };
+  }
+  if (control === null) {
+    if (authority.state === 'stale' && endpointMatchesIdentity(endpoint, authority.identity)) {
+      return { state: 'stale', endpoint, health: null, reason: 'STALE_AUTHORITY' };
+    }
+    if (authority.state === 'live' && replacedStaleEndpointIsStarting(endpoint, authority.identity, null)) {
+      return { state: 'indeterminate', endpoint, health: null, reason: 'RUNTIME_STARTING' };
+    }
+    if (authority.state === 'indeterminate'
+      && authority.reason === AUTHORITY_RECOVERY_IN_PROGRESS
+      && !pidExists(endpoint.pid)) {
+      return { state: 'indeterminate', endpoint, health: null, reason: 'RUNTIME_STARTING' };
+    }
+    return { state: 'indeterminate', endpoint, health: null, reason: 'Runtime control metadata does not identify the endpoint daemon' };
+  }
+  if (control.runtimeId !== endpoint.runtimeId || control.instanceId !== endpoint.instanceId) {
+    if (authority.state === 'live' && replacedStaleEndpointIsStarting(endpoint, authority.identity, control)) {
+      return { state: 'indeterminate', endpoint, health: null, reason: 'RUNTIME_STARTING' };
+    }
+    return { state: 'indeterminate', endpoint, health: null, reason: 'Runtime control metadata does not identify the endpoint daemon' };
   }
 
   try {
@@ -70,19 +107,22 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
 
   const sourceEntrypoint = path.resolve(import.meta.dirname, 'main.ts');
   const builtEntrypoint = path.resolve(import.meta.dirname, 'main.js');
-  const entrypoint = existsSync(sourceEntrypoint) ? sourceEntrypoint : builtEntrypoint;
-  const args = entrypoint.endsWith('.ts') ? ['--import', 'tsx', entrypoint] : [entrypoint];
-  const child = spawn(process.execPath, args, {
+  const sourceMode = existsSync(sourceEntrypoint);
+  const executable = sourceMode
+    ? path.resolve(import.meta.dirname, '..', 'node_modules', '.bin', 'tsx')
+    : process.execPath;
+  const args = [sourceMode ? sourceEntrypoint : builtEntrypoint];
+  const child = spawn(executable, args, {
     detached: true,
     stdio: 'ignore',
-    env: {
-      ...process.env,
-      [RUNTIME_DATA_ENV]: dataRoot,
-      ...(options.preferredPort === undefined ? {} : { IRIS_RUNTIME_PORT: String(options.preferredPort) }),
-    },
+    env: runtimeChildEnvironment(dataRoot, options.preferredPort),
   });
   child.unref();
-  return waitForRunningRuntime(dataRoot, options.startupDeadlineMs ?? 10_000);
+  return waitForRunningRuntime(
+    dataRoot,
+    options.startupDeadlineMs ?? 10_000,
+    existing.state === 'stale' ? existing.endpoint : null,
+  );
 }
 
 export async function stopRuntime(dataRootInput?: string, shutdownDeadlineMs = 10_000): Promise<RuntimeObservedStatus> {
@@ -95,18 +135,31 @@ export async function stopRuntime(dataRootInput?: string, shutdownDeadlineMs = 1
   const target = current.endpoint;
   const authorityBeforeSignal = await probeRuntimeAuthority(dataRoot);
   const endpointBeforeSignal = await readEndpoint(dataRoot);
+  const control = await readRuntimeControl(dataRoot);
   if (authorityBeforeSignal.state !== 'live'
     || endpointBeforeSignal === null
+    || control === null
     || !endpointMatchesIdentity(endpointBeforeSignal, authorityBeforeSignal.identity)
     || endpointBeforeSignal.instanceId !== target.instanceId
-    || endpointBeforeSignal.runtimeId !== target.runtimeId) {
-    throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime identity changed before shutdown signal');
+    || endpointBeforeSignal.runtimeId !== target.runtimeId
+    || control.instanceId !== target.instanceId
+    || control.runtimeId !== target.runtimeId) {
+    throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime identity changed before shutdown request');
   }
 
+  let accepted: Response;
   try {
-    process.kill(target.pid, 'SIGTERM');
-  } catch (error: unknown) {
-    if (!isProcessMissing(error)) throw new RuntimeError('AUTHORITY_CHANGED', 'Verified runtime process could not be signaled safely', { cause: error });
+    accepted = await fetch(`${target.apiUrl}/control/stop`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${control.secret}` },
+      body: JSON.stringify({ runtimeId: target.runtimeId, instanceId: target.instanceId }),
+      signal: AbortSignal.timeout(Math.min(2_000, bounded(shutdownDeadlineMs, 500, 60_000))),
+    });
+  } catch (error) {
+    throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Verified runtime did not accept the instance-bound shutdown request', { cause: error });
+  }
+  if (accepted.status !== 202) {
+    throw new RuntimeError('AUTHORITY_INDETERMINATE', `Verified runtime rejected shutdown with HTTP ${accepted.status}`);
   }
 
   const deadline = Date.now() + bounded(shutdownDeadlineMs, 500, 60_000);
@@ -115,11 +168,15 @@ export async function stopRuntime(dataRootInput?: string, shutdownDeadlineMs = 1
     if (endpoint !== null && !sameEndpointIdentity(endpoint, target)) {
       throw new RuntimeError('AUTHORITY_CHANGED', 'A different runtime descriptor appeared during shutdown');
     }
+    const controlAfter = await readRuntimeControl(dataRoot);
+    if (controlAfter !== null && (controlAfter.instanceId !== target.instanceId || controlAfter.runtimeId !== target.runtimeId)) {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'A different runtime control record appeared during shutdown');
+    }
     const authority = await probeRuntimeAuthority(dataRoot);
     if (authority.state === 'live' && !endpointMatchesIdentity(target, authority.identity)) {
       throw new RuntimeError('AUTHORITY_CHANGED', 'A different runtime authority appeared during shutdown');
     }
-    if (!pidExists(target.pid) && endpoint === null && authority.state === 'unowned') {
+    if (!pidExists(target.pid) && endpoint === null && controlAfter === null && authority.state === 'unowned') {
       return { state: 'stopped', endpoint: null, health: null };
     }
     await conditionPoll();
@@ -127,7 +184,20 @@ export async function stopRuntime(dataRootInput?: string, shutdownDeadlineMs = 1
   throw new RuntimeError('RUNTIME_SHUTTING_DOWN', 'STOP_COMPLETE was not proven before the shutdown deadline');
 }
 
-export const STOP_COMPLETE_CONTRACT = 'target_pid_gone+target_descriptor_absent+authority_unowned' as const;
+export const STOP_COMPLETE_CONTRACT = 'target_pid_gone+target_descriptor_absent+target_control_absent+authority_unowned' as const;
+
+export function runtimeChildEnvironment(dataRoot: string, preferredPort?: number, source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    PATH: source.PATH ?? '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    [RUNTIME_DATA_ENV]: dataRoot,
+    ...(preferredPort === undefined ? {} : { IRIS_RUNTIME_PORT: String(preferredPort) }),
+  };
+  for (const name of ['HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE'] as const) {
+    const value = source[name];
+    if (value !== undefined && value.length > 0) environment[name] = value;
+  }
+  return environment;
+}
 
 async function canonicalDataRoot(input: string | undefined): Promise<string> {
   return input === undefined
@@ -135,19 +205,41 @@ async function canonicalDataRoot(input: string | undefined): Promise<string> {
     : resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: input });
 }
 
-async function waitForRunningRuntime(dataRoot: string, timeoutMs: number): Promise<RuntimeObservedStatus> {
+async function waitForRunningRuntime(
+  dataRoot: string,
+  timeoutMs: number,
+  recoveryEndpoint: EndpointDocument | null = null,
+): Promise<RuntimeObservedStatus> {
   const deadline = Date.now() + bounded(timeoutMs, 500, 60_000);
   while (Date.now() < deadline) {
     const status = await runtimeStatus(dataRoot);
     if (status.state === 'running') return status;
+    const exactRecoveryTransition = recoveryEndpoint !== null
+      && status.endpoint !== null
+      && sameEndpointIdentity(status.endpoint, recoveryEndpoint)
+      && !pidExists(recoveryEndpoint.pid)
+      && status.reason === 'Runtime control metadata does not identify the endpoint daemon';
     if (status.state === 'indeterminate'
       && status.reason !== 'RUNTIME_STARTING'
-      && status.reason !== 'Runtime endpoint is unreachable') {
+      && status.reason !== 'Runtime endpoint is unreachable'
+      && !exactRecoveryTransition) {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', status.reason ?? 'Runtime startup became indeterminate');
     }
     await conditionPoll();
   }
   throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Runtime did not become ready before the startup deadline');
+}
+
+function replacedStaleEndpointIsStarting(
+  endpoint: EndpointDocument,
+  liveIdentity: RuntimeIdentity,
+  control: RuntimeControlDocument | null,
+): boolean {
+  return endpoint.runtimeId === liveIdentity.runtimeId
+    && !endpointMatchesIdentity(endpoint, liveIdentity)
+    && !pidExists(endpoint.pid)
+    && (control === null
+      || (control.runtimeId === liveIdentity.runtimeId && control.instanceId === liveIdentity.instanceId));
 }
 
 function endpointMatchesIdentity(endpoint: EndpointDocument, identity: RuntimeIdentity): boolean {

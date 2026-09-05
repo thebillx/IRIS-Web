@@ -18,9 +18,13 @@ export interface ProjectReference {
   readonly rootPath: string;
 }
 
+export type AgentRole = 'owner' | 'planner' | 'implementer' | 'reviewer' | 'security' | 'explorer' | 'other';
+
 export interface RuntimeSession {
   readonly id: string;
   readonly clientId: string;
+  readonly agentId: string;
+  readonly agentRole: AgentRole;
   readonly createdAt: string;
   readonly currentProjectId: string | null;
 }
@@ -57,6 +61,74 @@ export interface DoctorReport {
   readonly checks: readonly DoctorCheck[];
 }
 
+export type PermissionMode =
+  | 'ASK_EVERY_TIME'
+  | 'AUTO_APPROVE_LOW_RISK'
+  | 'AUTO_APPROVE_PROJECT_SCOPED'
+  | 'FULL_LOCAL_OWNER';
+
+export type RiskClass = 'LOW' | 'MODERATE' | 'HIGH' | 'SYSTEM';
+export type RequiredScope = 'MACHINE' | 'PROJECT' | 'RUNTIME_DATA' | 'OWNER';
+export type PolicyDecision = 'ALLOW_AUTO' | 'ALLOW_ONCE' | 'DENY' | 'OWNER_REQUIRED';
+
+export type CapabilityId =
+  | 'runtime.status'
+  | 'project.list'
+  | 'session.create'
+  | 'session.delete'
+  | 'session.current_project.set'
+  | 'project.register'
+  | 'project.default.set'
+  | 'file.read'
+  | 'file.write'
+  | 'file.delete'
+  | 'directory.create'
+  | 'directory.delete'
+  | 'project.command.run'
+  | 'git.local'
+  | 'runtime.lifecycle'
+  | 'web.lifecycle'
+  | 'package.project'
+  | 'policy.mode.set'
+  | 'credential.mutate'
+  | 'remote.publish'
+  | 'system.sudo';
+
+export interface CapabilityDefinition {
+  readonly id: CapabilityId;
+  readonly title: string;
+  readonly riskClass: RiskClass;
+  readonly requiredScope: RequiredScope;
+  readonly mutation: boolean;
+  readonly implemented: boolean;
+}
+
+export interface PermissionDecisionRecord {
+  readonly timestamp: string;
+  readonly clientId: string | null;
+  readonly sessionId: string | null;
+  readonly agentId: string | null;
+  readonly capabilityId: CapabilityId | string;
+  readonly riskClass: RiskClass;
+  readonly projectId: string | null;
+  readonly target: string | null;
+  readonly decision: PolicyDecision;
+  readonly reason: string;
+}
+
+export type AuditResult = 'DECISION' | 'PENDING' | 'SUCCESS' | 'FAILED' | 'DENIED';
+
+export interface PermissionAuditEvent extends PermissionDecisionRecord {
+  readonly id: string;
+  readonly result: AuditResult;
+}
+
+export interface PendingApprovalView extends PermissionDecisionRecord {
+  readonly id: string;
+  readonly exactAction: string;
+  readonly canAlwaysAllowProject: boolean;
+}
+
 export type RuntimeFailureCode =
   | 'AUTHORITY_HELD'
   | 'AUTHORITY_INDETERMINATE'
@@ -70,6 +142,9 @@ export type RuntimeFailureCode =
   | 'RUNTIME_NOT_RUNNING'
   | 'RUNTIME_SHUTTING_DOWN'
   | 'PERSISTENCE_FAILURE'
+  | 'OWNER_DECISION_REQUIRED'
+  | 'CAPABILITY_DENIED'
+  | 'APPROVAL_NOT_FOUND'
   | 'INVALID_REQUEST';
 
 export class RuntimeError extends Error {
