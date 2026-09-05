@@ -12,7 +12,10 @@ interface JsonRpcRequest {
   readonly params?: unknown;
 }
 
-const READ_ONLY_TOOLS = [runtimeStatusTool(), missionGetTool(), projectGitStatusTool(), projectFileReadTool()] as const;
+const TOOLS = [
+  runtimeStatusTool(), missionGetTool(), projectGitStatusTool(), projectFileReadTool(),
+  missionTaskCreateTool(), missionActionPrepareTool(), projectFileWriteTool(),
+] as const;
 
 type MissionContext = Awaited<ReturnType<typeof resolveMissionContext>>;
 
@@ -41,7 +44,7 @@ export async function handleHermesMcpRequest(
   }
   if (rpc.method === 'notifications/initialized') return new Response(null, { status: 202 });
   if (rpc.method === 'ping') return rpcResult(rpc.id ?? null, {});
-  if (rpc.method === 'tools/list') return rpcResult(rpc.id ?? null, { tools: READ_ONLY_TOOLS });
+  if (rpc.method === 'tools/list') return rpcResult(rpc.id ?? null, { tools: TOOLS });
   if (rpc.method !== 'tools/call') {
     if (rpc.id === undefined) return new Response(null, { status: 202 });
     return rpcError(rpc.id, -32601, 'Method not found', 404);
@@ -51,11 +54,11 @@ export async function handleHermesMcpRequest(
   if (params === null || typeof params.name !== 'string') return rpcError(rpc.id ?? null, -32602, 'Tool name is required', 400);
   const args = params.arguments === undefined ? {} : params.arguments;
   if (!isRecord(args)) return rpcError(rpc.id ?? null, -32602, 'Tool arguments must be an object', 400);
-  if (!READ_ONLY_TOOLS.some((tool) => tool.name === params.name)) return rpcError(rpc.id ?? null, -32602, 'Tool is not exposed by the governed Hermes adapter', 400);
+  if (!TOOLS.some((tool) => tool.name === params.name)) return rpcError(rpc.id ?? null, -32602, 'Tool is not exposed by the governed Hermes adapter', 400);
 
   try {
     const context = await resolveMissionContext(missionId, state, broker);
-    const result = await executeReadOnlyTool(params.name, args, context, capabilities);
+    const result = await executeTool(params.name, args, context, capabilities);
     return rpcResult(rpc.id ?? null, result);
   } catch (error) {
     const message = error instanceof RuntimeError ? error.message : 'Governed Hermes tool execution failed';
@@ -77,7 +80,7 @@ async function resolveMissionContext(missionId: string, state: RuntimeState, bro
   return { mapping, mission, project, session };
 }
 
-async function executeReadOnlyTool(
+async function executeTool(
   name: string,
   args: Record<string, unknown>,
   context: MissionContext,
@@ -94,22 +97,45 @@ async function executeReadOnlyTool(
   }
   if (name === 'project_git_status') {
     requireNoArguments(args, name);
-    return outcomeResult(await capabilities.execute({
-      capabilityId: 'project.git_status',
-      clientId: mission.clientId,
-      sessionId: mission.sessionId,
-      projectId: mission.projectId ?? undefined,
-    }));
+    return outcomeResult(await capabilities.execute({ capabilityId: 'project.git_status', clientId: mission.clientId, sessionId: mission.sessionId, projectId: mission.projectId ?? undefined }));
   }
   if (name === 'project_file_read') {
-    const targetPath = requiredString(args, 'targetPath');
-    if (Object.keys(args).some((key) => key !== 'targetPath')) throw new RuntimeError('INVALID_REQUEST', 'project_file_read accepts only targetPath');
+    const targetPath = requiredString(args, 'targetPath', 4096);
+    onlyArguments(args, ['targetPath'], name);
     return outcomeResult(await capabilities.execute({
-      capabilityId: 'file.read',
-      clientId: mission.clientId,
-      sessionId: mission.sessionId,
-      projectId: mission.projectId ?? undefined,
-      targetPath,
+      capabilityId: 'file.read', clientId: mission.clientId, sessionId: mission.sessionId,
+      projectId: mission.projectId ?? undefined, targetPath,
+    }));
+  }
+  if (name === 'mission_task_create') {
+    const title = requiredString(args, 'title', 240);
+    onlyArguments(args, ['title'], name);
+    return outcomeResult(await capabilities.execute({
+      capabilityId: 'mission.task.create', clientId: mission.clientId, sessionId: mission.sessionId,
+      missionId: mission.id, title,
+    }));
+  }
+  if (name === 'mission_action_prepare') {
+    const taskId = requiredString(args, 'taskId', 200);
+    const capabilityId = requiredString(args, 'capabilityId', 200);
+    const summary = requiredString(args, 'summary', 400);
+    onlyArguments(args, ['taskId', 'capabilityId', 'summary'], name);
+    if (capabilityId !== 'file.write') throw new RuntimeError('CAPABILITY_DENIED', 'This V2 phase exposes only file.write mission actions');
+    return outcomeResult(await capabilities.execute({
+      capabilityId: 'mission.action.prepare', clientId: mission.clientId, sessionId: mission.sessionId,
+      missionId: mission.id, taskId, actionCapabilityId: 'file.write', summary,
+    }));
+  }
+  if (name === 'project_file_write') {
+    const taskId = requiredString(args, 'taskId', 200);
+    const actionId = requiredString(args, 'actionId', 200);
+    const targetPath = requiredString(args, 'targetPath', 4096);
+    const content = requiredString(args, 'content', 1024 * 1024, false);
+    onlyArguments(args, ['taskId', 'actionId', 'targetPath', 'content'], name);
+    return outcomeResult(await capabilities.execute({
+      capabilityId: 'file.write', clientId: mission.clientId, sessionId: mission.sessionId,
+      projectId: mission.projectId ?? undefined, targetPath, content,
+      mission: { missionId: mission.id, taskId, actionId },
     }));
   }
   throw new RuntimeError('CAPABILITY_DENIED', 'Hermes tool is not implemented');
@@ -117,86 +143,77 @@ async function executeReadOnlyTool(
 
 function outcomeResult(outcome: Awaited<ReturnType<CapabilityService['execute']>>) {
   if (outcome.status === 'executed') return toolResult(outcome.value);
-  if (outcome.status === 'owner_required') return toolError('OWNER_DECISION_REQUIRED', 'Owner approval is required');
+  if (outcome.status === 'owner_required') {
+    return toolError('OWNER_DECISION_REQUIRED', 'Owner approval is required before this exact action can execute', { approval: outcome.approval });
+  }
   return toolError('CAPABILITY_DENIED', outcome.reason);
 }
 
 function runtimeStatusTool() {
-  return {
-    name: 'runtime_status',
-    description: 'Read the current IRIS runtime health through the mission-bound governed capability path.',
-    inputSchema: emptySchema(),
-    annotations: { readOnlyHint: true },
-  } as const;
+  return { name: 'runtime_status', description: 'Read the current IRIS runtime health through the mission-bound governed capability path.', inputSchema: emptySchema(), annotations: { readOnlyHint: true } } as const;
 }
-
 function missionGetTool() {
-  return {
-    name: 'mission_get',
-    description: 'Read the current durable IRIS mission record bound to this Hermes reasoning session.',
-    inputSchema: emptySchema(),
-    annotations: { readOnlyHint: true },
-  } as const;
+  return { name: 'mission_get', description: 'Read the current durable IRIS mission record bound to this Hermes reasoning session.', inputSchema: emptySchema(), annotations: { readOnlyHint: true } } as const;
 }
-
 function projectGitStatusTool() {
-  return {
-    name: 'project_git_status',
-    description: 'Read the branch and clean/dirty state of the mission-bound registered worktree through IRIS governance.',
-    inputSchema: emptySchema(),
-    annotations: { readOnlyHint: true },
-  } as const;
+  return { name: 'project_git_status', description: 'Read the branch and clean/dirty state of the mission-bound registered worktree through IRIS governance.', inputSchema: emptySchema(), annotations: { readOnlyHint: true } } as const;
 }
-
 function projectFileReadTool() {
   return {
-    name: 'project_file_read',
-    description: 'Read one bounded regular file from the mission-bound project through IRIS path and permission governance.',
-    inputSchema: {
-      type: 'object', required: ['targetPath'], additionalProperties: false,
-      properties: { targetPath: { type: 'string', description: 'Absolute file path physically contained by the mission-bound project.' } },
-    },
+    name: 'project_file_read', description: 'Read one bounded regular file from the mission-bound project through IRIS path and permission governance.',
+    inputSchema: { type: 'object', required: ['targetPath'], additionalProperties: false, properties: { targetPath: { type: 'string', description: 'Absolute file path physically contained by the mission-bound project.' } } },
     annotations: { readOnlyHint: true },
   } as const;
 }
-
-function emptySchema() {
-  return { type: 'object', properties: {}, additionalProperties: false } as const;
+function missionTaskCreateTool() {
+  return {
+    name: 'mission_task_create', description: 'Register one orchestration task inside the current durable mission. This grants no local execution authority.',
+    inputSchema: { type: 'object', required: ['title'], additionalProperties: false, properties: { title: { type: 'string', maxLength: 240 } } },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  } as const;
+}
+function missionActionPrepareTool() {
+  return {
+    name: 'mission_action_prepare', description: 'Prepare one exact governed file.write action identity. Preparation does not execute the mutation or satisfy owner approval.',
+    inputSchema: {
+      type: 'object', required: ['taskId', 'capabilityId', 'summary'], additionalProperties: false,
+      properties: { taskId: { type: 'string' }, capabilityId: { const: 'file.write' }, summary: { type: 'string', maxLength: 400 } },
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  } as const;
+}
+function projectFileWriteTool() {
+  return {
+    name: 'project_file_write', description: 'Execute one prepared mission-bound file.write through IRIS permission and exact-action approval governance.',
+    inputSchema: {
+      type: 'object', required: ['taskId', 'actionId', 'targetPath', 'content'], additionalProperties: false,
+      properties: { taskId: { type: 'string' }, actionId: { type: 'string' }, targetPath: { type: 'string' }, content: { type: 'string' } },
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  } as const;
 }
 
-function requireNoArguments(args: Record<string, unknown>, name: string): void {
-  if (Object.keys(args).length !== 0) throw new RuntimeError('INVALID_REQUEST', `${name} does not accept arguments`);
+function emptySchema() { return { type: 'object', properties: {}, additionalProperties: false } as const; }
+function requireNoArguments(args: Record<string, unknown>, name: string): void { if (Object.keys(args).length !== 0) throw new RuntimeError('INVALID_REQUEST', `${name} does not accept arguments`); }
+function onlyArguments(args: Record<string, unknown>, names: readonly string[], tool: string): void {
+  const allowed = new Set(names);
+  if (Object.keys(args).some((key) => !allowed.has(key))) throw new RuntimeError('INVALID_REQUEST', `${tool} received unsupported arguments`);
 }
-
-function requiredString(args: Record<string, unknown>, name: string): string {
+function requiredString(args: Record<string, unknown>, name: string, max: number, trim = true): string {
   const value = args[name];
-  if (typeof value !== 'string' || value.trim().length === 0 || value.length > 4096 || value.includes('\0')) {
-    throw new RuntimeError('INVALID_REQUEST', `${name} must be a bounded non-empty string`);
+  if (typeof value !== 'string' || value.length > max || value.includes('\0') || (trim && value.trim().length === 0)) {
+    throw new RuntimeError('INVALID_REQUEST', `${name} must be a bounded string`);
   }
-  return value;
+  return trim ? value.trim() : value;
 }
-
-function toolResult(value: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value, isError: false as const };
-}
-
-function toolError(code: string, message: string) {
-  const structuredContent = { code, message };
+function toolResult(value: unknown) { return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value, isError: false as const }; }
+function toolError(code: string, message: string, extra: Record<string, unknown> = {}) {
+  const structuredContent = { code, message, ...extra };
   return { content: [{ type: 'text' as const, text: JSON.stringify(structuredContent) }], structuredContent, isError: true as const };
 }
-
-function rpcResult(id: string | number | null, result: unknown): Response {
-  return json({ jsonrpc: '2.0', id, result });
-}
-
-function rpcError(id: string | number | null, code: number, message: string, status = 200): Response {
-  return json({ jsonrpc: '2.0', id, error: { code, message } }, status);
-}
-
+function rpcResult(id: string | number | null, result: unknown): Response { return json({ jsonrpc: '2.0', id, result }); }
+function rpcError(id: string | number | null, code: number, message: string, status = 200): Response { return json({ jsonrpc: '2.0', id, error: { code, message } }, status); }
 function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers } });
 }
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }

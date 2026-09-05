@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -36,11 +36,36 @@ async function fixture() {
     status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid, uptimeMs: 1,
     authority: 'owned', connectedClients: 1, connectedSessions: 1, agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '',
   }));
-  return { state, broker, capabilities, audit, mission, projectRoot: project.rootPath };
+  return { state, broker, capabilities, settings, audit, mission, projectRoot: project.rootPath };
 }
 
 function rpc(method: string, params?: unknown, id: number | null = 1): Request {
   return new Request('http://127.0.0.1/hermes-mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) }) });
+}
+async function call(f: Awaited<ReturnType<typeof fixture>>, name: string, args: Record<string, unknown> = {}) {
+  const response = await handleHermesMcpRequest(rpc('tools/call', { name, arguments: args }), f.mission.id, f.state, f.broker, f.capabilities);
+  return response.json() as Promise<{ result: { isError: boolean; structuredContent: Record<string, unknown> } }>;
+}
+interface TestMissionShape {
+  readonly tasks: readonly { readonly id: string; readonly actions: readonly { readonly id: string }[] }[];
+}
+
+interface TestApprovalShape {
+  readonly id: string;
+}
+
+function asMission(value: Record<string, unknown>): TestMissionShape {
+  return value as unknown as TestMissionShape;
+}
+
+function taskAndAction(mission: TestMissionShape) {
+  const task = mission.tasks.at(-1)!;
+  const action = task.actions.at(-1)!;
+  return { taskId: task.id, actionId: action.id };
+}
+
+function approvalFrom(value: Record<string, unknown>): TestApprovalShape {
+  return value.approval as TestApprovalShape;
 }
 
 describe('standard governed Hermes MCP adapter', () => {
@@ -52,40 +77,74 @@ describe('standard governed Hermes MCP adapter', () => {
     expect(notification.status).toBe(202);
   });
 
-  it('exposes only the bounded read-only Phase 2 toolset', async () => {
+  it('exposes bounded governed tools and no direct shell/delete capability', async () => {
     const f = await fixture();
     const listed = await handleHermesMcpRequest(rpc('tools/list'), f.mission.id, f.state, f.broker, f.capabilities);
-    const listBody = await listed.json() as { result: { tools: { name: string; annotations?: { readOnlyHint?: boolean } }[] } };
-    expect(listBody.result.tools.map((tool) => tool.name)).toEqual(['runtime_status', 'mission_get', 'project_git_status', 'project_file_read']);
-    expect(listBody.result.tools.every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
-    expect(JSON.stringify(listBody)).not.toContain('file_write');
-    expect(JSON.stringify(listBody)).not.toContain('delete');
+    const listBody = await listed.json() as { result: { tools: { name: string }[] } };
+    expect(listBody.result.tools.map((tool) => tool.name)).toEqual([
+      'runtime_status', 'mission_get', 'project_git_status', 'project_file_read',
+      'mission_task_create', 'mission_action_prepare', 'project_file_write',
+    ]);
+    expect(JSON.stringify(listBody)).not.toContain('file_delete');
     expect(JSON.stringify(listBody)).not.toContain('shell');
+    expect(JSON.stringify(listBody)).not.toContain('git_command');
   });
 
   it('routes runtime, mission, Git status, and file reads through governed CapabilityService', async () => {
     const f = await fixture();
-    const runtime = await handleHermesMcpRequest(rpc('tools/call', { name: 'runtime_status', arguments: {} }), f.mission.id, f.state, f.broker, f.capabilities);
-    expect(await runtime.json()).toMatchObject({ result: { isError: false, structuredContent: { status: 'ready', authority: 'owned' } } });
-
-    const mission = await handleHermesMcpRequest(rpc('tools/call', { name: 'mission_get', arguments: {} }), f.mission.id, f.state, f.broker, f.capabilities);
-    expect(await mission.json()).toMatchObject({ result: { isError: false, structuredContent: { id: f.mission.id, title: 'Hermes MCP proof' } } });
-
-    const git = await handleHermesMcpRequest(rpc('tools/call', { name: 'project_git_status', arguments: {} }), f.mission.id, f.state, f.broker, f.capabilities);
-    expect(await git.json()).toMatchObject({ result: { isError: false, structuredContent: { branch: 'proof', clean: false, untrackedChanges: 1 } } });
-
-    const read = await handleHermesMcpRequest(rpc('tools/call', { name: 'project_file_read', arguments: { targetPath: path.join(f.projectRoot, 'untracked.txt') } }), f.mission.id, f.state, f.broker, f.capabilities);
-    expect(await read.json()).toMatchObject({ result: { isError: false, structuredContent: { content: 'read-only proof\n' } } });
-
+    expect(await call(f, 'runtime_status')).toMatchObject({ result: { isError: false, structuredContent: { status: 'ready', authority: 'owned' } } });
+    expect(await call(f, 'mission_get')).toMatchObject({ result: { isError: false, structuredContent: { id: f.mission.id, title: 'Hermes MCP proof' } } });
+    expect(await call(f, 'project_git_status')).toMatchObject({ result: { isError: false, structuredContent: { branch: 'proof', clean: false, untrackedChanges: 1 } } });
+    expect(await call(f, 'project_file_read', { targetPath: path.join(f.projectRoot, 'untracked.txt') })).toMatchObject({ result: { isError: false, structuredContent: { content: 'read-only proof\n' } } });
     const audit = await f.audit.recent(40);
-    for (const capabilityId of ['runtime.status', 'mission.get', 'project.git_status', 'file.read']) {
-      expect(audit.some((event) => event.capabilityId === capabilityId && event.result === 'SUCCESS')).toBe(true);
-    }
+    for (const capabilityId of ['runtime.status', 'mission.get', 'project.git_status', 'file.read']) expect(audit.some((event) => event.capabilityId === capabilityId && event.result === 'SUCCESS')).toBe(true);
   });
 
-  it('does not expose or accept mutation tools', async () => {
+  it('requires prepared mission identity and owner approval, then executes the exact file.write once', async () => {
     const f = await fixture();
-    const response = await handleHermesMcpRequest(rpc('tools/call', { name: 'file_write', arguments: { targetPath: '/tmp/nope', content: 'nope' } }), f.mission.id, f.state, f.broker, f.capabilities);
+    const taskCreated = await call(f, 'mission_task_create', { title: 'Write disposable proof' });
+    expect(taskCreated.result.isError).toBe(false);
+    const taskId = asMission(taskCreated.result.structuredContent).tasks.at(-1)!.id;
+    const prepared = await call(f, 'mission_action_prepare', { taskId, capabilityId: 'file.write', summary: 'Write one disposable proof file' });
+    expect(prepared.result.isError).toBe(false);
+    const ids = taskAndAction(asMission(prepared.result.structuredContent));
+    expect(ids.taskId).toBe(taskId);
+    const targetPath = path.join(f.projectRoot, 'approved.txt');
+    await f.settings.setMode('ASK_EVERY_TIME');
+
+    const pending = await call(f, 'project_file_write', { taskId, actionId: ids.actionId, targetPath, content: 'approved-once' });
+    expect(pending).toMatchObject({ result: { isError: true, structuredContent: { code: 'OWNER_DECISION_REQUIRED', approval: { missionId: f.mission.id, taskId, actionId: ids.actionId } } } });
+    const approval = approvalFrom(pending.result.structuredContent);
+    const resolved = await f.capabilities.resolveApproval(approval.id, 'ALLOW_ONCE');
+    expect(resolved.status).toBe('executed');
+    await expect(readFile(targetPath, 'utf8')).resolves.toBe('approved-once');
+
+    const replay = await call(f, 'project_file_write', { taskId, actionId: ids.actionId, targetPath, content: 'must-not-replay' });
+    expect(replay).toMatchObject({ result: { isError: true, structuredContent: { code: 'CAPABILITY_DENIED' } } });
+    await expect(readFile(targetPath, 'utf8')).resolves.toBe('approved-once');
+    await expect(f.capabilities.resolveApproval(approval.id, 'ALLOW_ONCE')).rejects.toMatchObject({ code: 'APPROVAL_NOT_FOUND' });
+  });
+
+  it('owner denial prevents the prepared mission write from executing', async () => {
+    const f = await fixture();
+    const task = await call(f, 'mission_task_create', { title: 'Denied proof' });
+    const taskId = asMission(task.result.structuredContent).tasks.at(-1)!.id;
+    const prepared = await call(f, 'mission_action_prepare', { taskId, capabilityId: 'file.write', summary: 'Must be denied' });
+    const { actionId } = taskAndAction(asMission(prepared.result.structuredContent));
+    const targetPath = path.join(f.projectRoot, 'denied.txt');
+    await f.settings.setMode('ASK_EVERY_TIME');
+    const pending = await call(f, 'project_file_write', { taskId, actionId, targetPath, content: 'must-not-exist' });
+    const approval = approvalFrom(pending.result.structuredContent);
+    const denied = await f.capabilities.resolveApproval(approval.id, 'DENY');
+    expect(denied.status).toBe('denied');
+    await expect(readFile(targetPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    const mission = await f.state.getMission(f.mission.id);
+    expect((mission.tasks.at(-1)!.actions.at(-1)!)).toMatchObject({ state: 'DENIED', approvalId: approval.id });
+  });
+
+  it('does not expose or accept unprepared or unsupported mutation tools', async () => {
+    const f = await fixture();
+    const response = await handleHermesMcpRequest(rpc('tools/call', { name: 'file_delete', arguments: { targetPath: '/tmp/nope' } }), f.mission.id, f.state, f.broker, f.capabilities);
     expect(response.status).toBe(400);
     expect(await response.text()).toContain('not exposed');
   });
