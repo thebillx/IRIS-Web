@@ -69,6 +69,9 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     const store = new FoundationStateStore(dataRoot);
     const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env));
     const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
+    for (const record of await missionBroker.list()) {
+      if (record.state === 'ACTIVE' || record.state === 'AWAITING_SUPERVISOR') await state.rehydrateBrokerMissionSession(record.missionId);
+    }
     const permissionSettings = new PermissionSettingsStore(dataRoot);
     await permissionSettings.initialize();
     const sourceRoot = await resolveSourceRoot();

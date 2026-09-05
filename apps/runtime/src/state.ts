@@ -67,6 +67,38 @@ export class RuntimeState {
     return mission;
   }
 
+  public async rehydrateBrokerMissionSession(missionIdInput: string): Promise<RuntimeSessionSnapshot> {
+    const mission = await this.getMission(missionIdInput);
+    const existing = this.sessions.get(mission.sessionId);
+    if (existing !== undefined) {
+      if (existing.clientId !== mission.clientId || existing.currentProjectId !== mission.projectId) {
+        throw new RuntimeError('CONTROL_DENIED', 'Persisted mission session identity conflicts with the live runtime session');
+      }
+      return existing;
+    }
+    if (mission.projectId !== null) {
+      const persisted = await this.store.read();
+      if (!persisted.projects.some((project) => project.id === mission.projectId)) {
+        throw new RuntimeError('CONTROL_DENIED', 'Persisted mission project is no longer registered');
+      }
+    }
+    const now = new Date().toISOString();
+    const session: RuntimeSessionSnapshot = {
+      id: mission.sessionId,
+      clientId: mission.clientId,
+      agentId: 'hermes-loop-engineer',
+      agentRole: 'implementer',
+      createdAt: now,
+      currentProjectId: mission.projectId,
+      executionState: 'READY',
+      interactions: [],
+    };
+    this.sessions.set(session.id, session);
+    this.submissionBindings.set(session.id, new Map());
+    this.clients.set(session.clientId, { clientId: session.clientId, connected: true, lastSeenAt: now });
+    return session;
+  }
+
   public createMission(clientIdInput: string, sessionIdInput: string, titleInput: string): Promise<MissionSnapshot> {
     const clientId = normalizeClientId(clientIdInput);
     const sessionId = normalizeUuidIdentity(sessionIdInput, 'sessionId');
