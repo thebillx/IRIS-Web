@@ -36,42 +36,57 @@ async function fixture() {
     status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid, uptimeMs: 1,
     authority: 'owned', connectedClients: 1, connectedSessions: 1, agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '',
   }));
-  return { state, broker, capabilities, audit, mission };
+  return { state, broker, capabilities, audit, mission, projectRoot: project.rootPath };
 }
 
 function rpc(method: string, params?: unknown, id: number | null = 1): Request {
   return new Request('http://127.0.0.1/hermes-mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) }) });
 }
 
-describe('standard read-only Hermes MCP adapter', () => {
+describe('standard governed Hermes MCP adapter', () => {
   it('implements 2025-11-25 initialize and initialized notification', async () => {
     const f = await fixture();
     const initialized = await handleHermesMcpRequest(rpc('initialize', { protocolVersion: HERMES_MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'hermes', version: 'proof' } }), f.mission.id, f.state, f.broker, f.capabilities);
-    expect(await initialized.json()).toMatchObject({ result: { protocolVersion: '2025-11-25', serverInfo: { name: 'iris-hermes-readonly-bridge' } } });
+    expect(await initialized.json()).toMatchObject({ result: { protocolVersion: '2025-11-25', serverInfo: { name: 'iris-hermes-governed-bridge' } } });
     const notification = await handleHermesMcpRequest(rpc('notifications/initialized', {}, null), f.mission.id, f.state, f.broker, f.capabilities);
     expect(notification.status).toBe(202);
   });
 
-  it('exposes only project_git_status and routes it through governed CapabilityService', async () => {
+  it('exposes only the bounded read-only Phase 2 toolset', async () => {
     const f = await fixture();
     const listed = await handleHermesMcpRequest(rpc('tools/list'), f.mission.id, f.state, f.broker, f.capabilities);
-    const listBody = await listed.json() as { result: { tools: { name: string }[] } };
-    expect(listBody.result.tools.map((tool) => tool.name)).toEqual(['project_git_status']);
-    expect(JSON.stringify(listBody)).not.toContain('write');
+    const listBody = await listed.json() as { result: { tools: { name: string; annotations?: { readOnlyHint?: boolean } }[] } };
+    expect(listBody.result.tools.map((tool) => tool.name)).toEqual(['runtime_status', 'mission_get', 'project_git_status', 'project_file_read']);
+    expect(listBody.result.tools.every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
+    expect(JSON.stringify(listBody)).not.toContain('file_write');
     expect(JSON.stringify(listBody)).not.toContain('delete');
+    expect(JSON.stringify(listBody)).not.toContain('shell');
+  });
 
-    const called = await handleHermesMcpRequest(rpc('tools/call', { name: 'project_git_status', arguments: {} }), f.mission.id, f.state, f.broker, f.capabilities);
-    const body = await called.json() as { result: { isError: boolean; structuredContent: { branch: string; clean: boolean; stagedChanges: number; trackedChanges: number; untrackedChanges: number } } };
-    expect(body.result.isError).toBe(false);
-    expect(body.result.structuredContent).toEqual({ branch: 'proof', clean: false, stagedChanges: 0, trackedChanges: 0, untrackedChanges: 1 });
-    const audit = await f.audit.recent(20);
-    expect(audit.some((event) => event.capabilityId === 'project.git_status' && event.result === 'SUCCESS')).toBe(true);
+  it('routes runtime, mission, Git status, and file reads through governed CapabilityService', async () => {
+    const f = await fixture();
+    const runtime = await handleHermesMcpRequest(rpc('tools/call', { name: 'runtime_status', arguments: {} }), f.mission.id, f.state, f.broker, f.capabilities);
+    expect(await runtime.json()).toMatchObject({ result: { isError: false, structuredContent: { status: 'ready', authority: 'owned' } } });
+
+    const mission = await handleHermesMcpRequest(rpc('tools/call', { name: 'mission_get', arguments: {} }), f.mission.id, f.state, f.broker, f.capabilities);
+    expect(await mission.json()).toMatchObject({ result: { isError: false, structuredContent: { id: f.mission.id, title: 'Hermes MCP proof' } } });
+
+    const git = await handleHermesMcpRequest(rpc('tools/call', { name: 'project_git_status', arguments: {} }), f.mission.id, f.state, f.broker, f.capabilities);
+    expect(await git.json()).toMatchObject({ result: { isError: false, structuredContent: { branch: 'proof', clean: false, untrackedChanges: 1 } } });
+
+    const read = await handleHermesMcpRequest(rpc('tools/call', { name: 'project_file_read', arguments: { targetPath: path.join(f.projectRoot, 'untracked.txt') } }), f.mission.id, f.state, f.broker, f.capabilities);
+    expect(await read.json()).toMatchObject({ result: { isError: false, structuredContent: { content: 'read-only proof\n' } } });
+
+    const audit = await f.audit.recent(40);
+    for (const capabilityId of ['runtime.status', 'mission.get', 'project.git_status', 'file.read']) {
+      expect(audit.some((event) => event.capabilityId === capabilityId && event.result === 'SUCCESS')).toBe(true);
+    }
   });
 
   it('does not expose or accept mutation tools', async () => {
     const f = await fixture();
     const response = await handleHermesMcpRequest(rpc('tools/call', { name: 'file_write', arguments: { targetPath: '/tmp/nope', content: 'nope' } }), f.mission.id, f.state, f.broker, f.capabilities);
     expect(response.status).toBe(400);
-    expect(await response.text()).toContain('Only project_git_status');
+    expect(await response.text()).toContain('not exposed');
   });
 });
