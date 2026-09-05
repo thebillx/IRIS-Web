@@ -51,6 +51,8 @@ export type MissionState = 'PLANNED' | 'RUNNING' | 'WAITING_APPROVAL' | 'WAITING
 export type MissionTaskState = 'PENDING' | 'RUNNING' | 'BLOCKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type MissionActionState = 'PLANNED' | 'RUNNING' | 'OWNER_APPROVAL_REQUIRED' | 'SUCCEEDED' | 'DENIED' | 'FAILED' | 'CANCELLED';
 export type SupervisorGateState = 'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'DENIED';
+export type MissionBrokerState = 'ACTIVE' | 'AWAITING_SUPERVISOR' | 'COMPLETED' | 'FAILED';
+export type SupervisorDecision = 'CONTINUE' | 'REVISE' | 'PAUSE' | 'COMPLETE';
 export type MissionEvidenceKind = 'CAPABILITY_RESULT' | 'AUDIT' | 'ARTIFACT' | 'OBSERVATION';
 export type MissionTimelineKind =
   | 'MISSION_CREATED'
@@ -137,6 +139,49 @@ export interface MissionSnapshot {
   readonly timeline: readonly MissionTimelineEvent[];
 }
 
+export interface MissionCheckpoint {
+  readonly checkpointId: string;
+  readonly missionId: string;
+  readonly missionVersion: number;
+  readonly state: MissionState;
+  readonly currentPhase: string;
+  readonly summary: string;
+  readonly evidenceRefs: readonly string[];
+  readonly blockers: readonly string[];
+  readonly hermesAssessment: string;
+  readonly proposedNextAction: string;
+  readonly decisionRequired: boolean;
+  readonly createdAt: string;
+}
+
+export interface SupervisorDirective {
+  readonly missionId: string;
+  readonly expectedVersion: number;
+  readonly directiveId: string;
+  readonly directiveSequence: number;
+  readonly decision: SupervisorDecision;
+  readonly instruction: string;
+  readonly authorizedScope: readonly string[];
+  readonly doNot: readonly string[];
+  readonly successCriteria: readonly string[];
+  readonly acceptedAt: string;
+}
+
+export interface MissionBrokerSnapshot {
+  readonly missionId: string;
+  readonly missionVersion: number;
+  readonly hermesSessionId: string;
+  readonly worktreePath: string;
+  readonly branch: string;
+  readonly state: MissionBrokerState;
+  readonly lastCheckpointId: string | null;
+  readonly lastDirectiveId: string | null;
+  readonly lastDirectiveSequence: number;
+  readonly checkpoints: readonly MissionCheckpoint[];
+  readonly directives: readonly SupervisorDirective[];
+  readonly updatedAt: string;
+}
+
 export interface RuntimeClientState {
   readonly clientId: string;
   readonly connected: boolean;
@@ -184,6 +229,7 @@ export type PolicyDecision = 'ALLOW_AUTO' | 'ALLOW_ONCE' | 'DENY' | 'OWNER_REQUI
 export type CapabilityId =
   | 'runtime.status'
   | 'project.list'
+  | 'project.git_status'
   | 'mission.list'
   | 'mission.get'
   | 'mission.create'

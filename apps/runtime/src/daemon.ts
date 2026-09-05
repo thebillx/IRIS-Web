@@ -10,6 +10,7 @@ import { PermissionPolicyEngine } from './permissions.js';
 import { FoundationStateStore, loadOrCreateOwnerAccessSecret, loadOrCreateRuntimeId, removeEndpointIfInstance, removeRuntimeControlIfInstance, writeEndpoint, writeRuntimeControl } from './persistence.js';
 import { startRuntimeServer, type RuntimeServerHandle } from './server.js';
 import { RuntimeState } from './state.js';
+import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -23,6 +24,7 @@ export interface DaemonHandle {
   readonly dataRoot: string;
   readonly state: RuntimeState;
   readonly capabilities: CapabilityService;
+  readonly missionBroker: MissionBrokerService;
   readonly apiUrl: string;
   readonly mcpUrl: string;
   health(): RuntimeHealth;
@@ -66,6 +68,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   try {
     const store = new FoundationStateStore(dataRoot);
     const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env));
+    const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
     const permissionSettings = new PermissionSettingsStore(dataRoot);
     await permissionSettings.initialize();
     const sourceRoot = await resolveSourceRoot();
@@ -115,6 +118,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         identity,
         state,
         capabilities,
+        missionBroker,
         health,
         doctor,
         isShuttingDown: () => shuttingDown,
@@ -144,6 +148,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       dataRoot,
       state,
       capabilities,
+      missionBroker,
       apiUrl: server.apiUrl,
       mcpUrl: server.mcpUrl,
       health,

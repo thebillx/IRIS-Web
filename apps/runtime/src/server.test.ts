@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { RuntimeError, type RuntimeIdentity } from '@iris/domain';
 import type { AgentExecutor } from './agent-executor.js';
 import type { CapabilityService } from './capability-service.js';
+import type { MissionBrokerService } from './mission-broker.js';
 import { FoundationStateStore } from './persistence.js';
 import { RuntimeState } from './state.js';
 import { LOOPBACK_ADDRESS, requireLoopbackAddress, startRuntimeServer, type RuntimeServerContext, type RuntimeServerHandle } from './server.js';
@@ -40,6 +41,7 @@ describe('runtime listener safety', () => {
       identity,
       state: {} as RuntimeState,
       capabilities: {} as CapabilityService,
+      missionBroker: {} as MissionBrokerService,
       health: () => ({
         status: 'ready',
         version: '0.0.0',
@@ -94,6 +96,7 @@ describe('runtime listener safety', () => {
       identity,
       state: {} as RuntimeState,
       capabilities,
+      missionBroker: {} as MissionBrokerService,
       health: () => ({
         status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: identity.runtimeId, instanceId: identity.instanceId,
         pid: identity.pid, uptimeMs: 1, authority: 'owned', connectedClients: 1, connectedSessions: 1,
@@ -131,6 +134,7 @@ describe('runtime listener safety', () => {
       identity,
       state: {} as RuntimeState,
       capabilities: {} as CapabilityService,
+      missionBroker: {} as MissionBrokerService,
       health: () => ({
         status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: identity.runtimeId, instanceId: identity.instanceId,
         pid: identity.pid, uptimeMs: 1, authority: 'owned', connectedClients: 0, connectedSessions: 0,

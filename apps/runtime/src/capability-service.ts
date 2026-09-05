@@ -6,6 +6,7 @@ import { capabilityDefinition } from './capability-registry.js';
 import { PermissionPolicyEngine, type PolicyRequest } from './permissions.js';
 import { inspectProjectTarget } from './project-path.js';
 import { secureProjectFileRead, secureProjectFileWrite, secureProjectMutation } from './macos-safety.js';
+import { inspectProjectGitStatus } from './git-status.js';
 import type { RuntimeState } from './state.js';
 
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -15,6 +16,7 @@ const APPROVAL_TTL_MS = 15 * 60_000;
 type CapabilityOperationCore =
   | { readonly capabilityId: 'runtime.status'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
+  | { readonly capabilityId: 'project.git_status'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'mission.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'mission.get'; readonly missionId: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'mission.create'; readonly clientId: string; readonly sessionId: string; readonly title: string }
@@ -206,6 +208,10 @@ export class CapabilityService {
       projects: await this.state.listProjects(),
       defaultProjectId: await this.state.getDefaultProjectId(),
     };
+    if (operation.capabilityId === 'project.git_status') {
+      const project = await this.authorizedProject(operation);
+      return inspectProjectGitStatus(project.rootPath);
+    }
     if (operation.capabilityId === 'mission.list') return { missions: await this.state.listMissions() };
     if (operation.capabilityId === 'mission.get') return this.state.getMission(operation.missionId);
     if (operation.capabilityId === 'mission.create') return this.state.createMission(operation.clientId, operation.sessionId, operation.title);
@@ -298,6 +304,8 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
   let request: PolicyRequest;
   if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
+  } else if (operation.capabilityId === 'project.git_status') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'mission.get') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId };
   } else if (operation.capabilityId === 'mission.create') {
@@ -350,6 +358,7 @@ function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is
 
 function describeOperation(operation: CapabilityOperation): string {
   if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') return operation.capabilityId;
+  if (operation.capabilityId === 'project.git_status') return `project.git_status projectId=${operation.projectId ?? 'session-current'}`;
   if (operation.capabilityId === 'mission.get') return `mission.get missionId=${operation.missionId}`;
   if (operation.capabilityId === 'mission.create') return `mission.create sessionId=${operation.sessionId} title=${JSON.stringify(operation.title)}`;
   if (operation.capabilityId === 'mission.state.set') return `mission.state.set missionId=${operation.missionId} state=${operation.state}`;

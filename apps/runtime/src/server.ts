@@ -1,9 +1,11 @@
 import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { RuntimeError, type AgentRole, type DoctorReport, type PermissionMode, type RuntimeHealth, type RuntimeIdentity } from '@iris/domain';
+import { RuntimeError, type AgentRole, type DoctorReport, type MissionState, type PermissionMode, type RuntimeHealth, type RuntimeIdentity, type SupervisorDecision } from '@iris/domain';
 import { handleMcpRequest } from './mcp.js';
 import type { CapabilityOutcome, CapabilityService, OwnerApprovalChoice } from './capability-service.js';
 import type { RuntimeState } from './state.js';
+import type { MissionBrokerService } from './mission-broker.js';
+import { handleHermesMcpRequest } from './hermes-mcp.js';
 
 export const LOOPBACK_ADDRESS = '127.0.0.1' as const;
 export const CLIENT_ID_HEADER = 'x-iris-client-id' as const;
@@ -14,6 +16,7 @@ export interface RuntimeServerContext {
   readonly identity: RuntimeIdentity;
   readonly state: RuntimeState;
   readonly capabilities: CapabilityService;
+  readonly missionBroker: MissionBrokerService;
   readonly health: () => RuntimeHealth;
   readonly doctor: () => Promise<DoctorReport>;
   readonly isShuttingDown: () => boolean;
@@ -111,6 +114,25 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return;
   }
 
+  const hermesMcpMatch = /^\/hermes-mcp\/([^/]+)$/.exec(url.pathname);
+  if (hermesMcpMatch !== null) {
+    if (request.method === 'POST') requireJsonContentType(request);
+    const body = request.method === 'POST' ? await readBody(request) : '';
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(request.headers)) if (typeof value === 'string') headers.set(name, value);
+    const init: RequestInit = { method: request.method ?? 'GET', headers };
+    if (body.length > 0) init.body = body;
+    const bridgeResponse = await handleHermesMcpRequest(
+      new Request(`http://127.0.0.1${url.pathname}`, init),
+      decodeURIComponent(hermesMcpMatch[1]!),
+      context.state,
+      context.missionBroker,
+      context.capabilities,
+    );
+    await writeFetchResponse(response, bridgeResponse);
+    return;
+  }
+
   const publicObservation = request.method === 'GET'
     && (url.pathname === '/health' || url.pathname === '/status' || url.pathname === '/doctor');
   if (!publicObservation) authorizeOwnerAccess(request, context.ownerAccessSecret);
@@ -154,6 +176,56 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     writeJson(response, 200, { missions: await context.state.listMissions() });
     return;
   }
+  const missionBrokerMatch = /^\/missions\/([^/]+)\/broker$/.exec(url.pathname);
+  if (missionBrokerMatch !== null) {
+    const missionId = decodeURIComponent(missionBrokerMatch[1]!);
+    if (request.method === 'GET') { writeJson(response, 200, await context.missionBroker.get(missionId)); return; }
+    if (request.method === 'POST') {
+      const body = await readJsonBody(request);
+      writeJson(response, 200, await context.missionBroker.bindHermesSession({
+        missionId,
+        hermesSessionId: stringField(body, 'hermesSessionId'),
+        worktreePath: stringField(body, 'worktreePath'),
+        branch: stringField(body, 'branch'),
+      }));
+      return;
+    }
+  }
+  const checkpointMatch = /^\/missions\/([^/]+)\/checkpoints$/.exec(url.pathname);
+  if (checkpointMatch !== null && request.method === 'POST') {
+    const missionId = decodeURIComponent(checkpointMatch[1]!);
+    const body = await readJsonBody(request);
+    writeJson(response, 200, await context.missionBroker.recordCheckpoint({
+      checkpointId: stringField(body, 'checkpointId'), missionId, missionVersion: integerField(body, 'missionVersion'),
+      state: missionStateField(body, 'state'), currentPhase: stringField(body, 'currentPhase'), summary: stringField(body, 'summary'),
+      evidenceRefs: stringArrayField(body, 'evidenceRefs'), blockers: stringArrayField(body, 'blockers'),
+      hermesAssessment: stringField(body, 'hermesAssessment'), proposedNextAction: stringField(body, 'proposedNextAction'),
+      decisionRequired: booleanField(body, 'decisionRequired'), createdAt: stringField(body, 'createdAt'),
+    }));
+    return;
+  }
+  const directiveMatch = /^\/missions\/([^/]+)\/directives$/.exec(url.pathname);
+  if (directiveMatch !== null && request.method === 'POST') {
+    const missionId = decodeURIComponent(directiveMatch[1]!);
+    const body = await readJsonBody(request);
+    writeJson(response, 200, await context.missionBroker.acceptDirective({
+      missionId, expectedVersion: integerField(body, 'expectedVersion'), directiveId: stringField(body, 'directiveId'),
+      directiveSequence: integerField(body, 'directiveSequence'), decision: supervisorDecisionField(body, 'decision'),
+      instruction: stringField(body, 'instruction'), authorizedScope: stringArrayField(body, 'authorizedScope'),
+      doNot: stringArrayField(body, 'doNot'), successCriteria: stringArrayField(body, 'successCriteria'),
+    }));
+    return;
+  }
+  const completeMatch = /^\/missions\/([^/]+)\/complete$/.exec(url.pathname);
+  if (completeMatch !== null && request.method === 'POST') {
+    const missionId = decodeURIComponent(completeMatch[1]!);
+    const body = await readJsonBody(request);
+    writeJson(response, 200, await context.missionBroker.markCompleted(
+      missionId, stringField(body, 'hermesSessionId'), integerField(body, 'expectedVersion'),
+    ));
+    return;
+  }
+
   if (request.method === 'GET' && url.pathname === '/permissions') {
     writeJson(response, 200, {
       ...(await context.capabilities.permissionSnapshot()),
@@ -530,6 +602,37 @@ async function writeFetchResponse(response: ServerResponse, fetchResponse: Respo
     if (!response.hasHeader(key)) response.setHeader(key, value);
   }
   response.end(Buffer.from(await fetchResponse.arrayBuffer()));
+}
+
+function integerField(record: Record<string, unknown> | null, name: string): number {
+  const value = record?.[name];
+  if (!Number.isInteger(value)) throw new RuntimeError('INVALID_REQUEST', `${name} must be an integer`);
+  return Number(value);
+}
+
+function booleanField(record: Record<string, unknown> | null, name: string): boolean {
+  const value = record?.[name];
+  if (typeof value !== 'boolean') throw new RuntimeError('INVALID_REQUEST', `${name} must be boolean`);
+  return value;
+}
+
+function stringArrayField(record: Record<string, unknown> | null, name: string): readonly string[] {
+  const value = record?.[name];
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) throw new RuntimeError('INVALID_REQUEST', `${name} must be a string array`);
+  return value;
+}
+
+function missionStateField(record: Record<string, unknown> | null, name: string): MissionState {
+  const value = record?.[name];
+  if (value === 'PLANNED' || value === 'RUNNING' || value === 'WAITING_APPROVAL' || value === 'WAITING_SUPERVISOR'
+    || value === 'PAUSED' || value === 'COMPLETED' || value === 'FAILED' || value === 'CANCELLED') return value;
+  throw new RuntimeError('INVALID_REQUEST', `${name} must be a mission state`);
+}
+
+function supervisorDecisionField(record: Record<string, unknown> | null, name: string): SupervisorDecision {
+  const value = record?.[name];
+  if (value === 'CONTINUE' || value === 'REVISE' || value === 'PAUSE' || value === 'COMPLETE') return value;
+  throw new RuntimeError('INVALID_REQUEST', `${name} must be a supervisor decision`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
