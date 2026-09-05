@@ -101,6 +101,21 @@ describe('standard governed Hermes MCP adapter', () => {
     for (const capabilityId of ['runtime.status', 'mission.get', 'project.git_status', 'file.read']) expect(audit.some((event) => event.capabilityId === capabilityId && event.result === 'SUCCESS')).toBe(true);
   });
 
+  it('fails closed on secret-like project paths and high-confidence secret content', async () => {
+    const f = await fixture();
+    const envSecret = 'sk-abcdefghijklmnopqrstuvwxyz1234567890';
+    await writeFile(path.join(f.projectRoot, '.env'), `OPENAI_API_KEY=${envSecret}\n`);
+    const blockedPath = await call(f, 'project_file_read', { targetPath: path.join(f.projectRoot, '.env') });
+    expect(blockedPath).toMatchObject({ result: { isError: true, structuredContent: { code: 'CAPABILITY_DENIED' } } });
+    expect(JSON.stringify(blockedPath)).not.toContain(envSecret);
+
+    const privateKeyMarker = '-----BEGIN PRIVATE KEY-----';
+    await writeFile(path.join(f.projectRoot, 'ordinary-notes.txt'), `${privateKeyMarker}\nnot-a-real-key\n-----END PRIVATE KEY-----\n`);
+    const blockedContent = await call(f, 'project_file_read', { targetPath: path.join(f.projectRoot, 'ordinary-notes.txt') });
+    expect(blockedContent).toMatchObject({ result: { isError: true, structuredContent: { code: 'CAPABILITY_DENIED' } } });
+    expect(JSON.stringify(blockedContent)).not.toContain(privateKeyMarker);
+  });
+
   it('runs only the declared project test script through a prepared governed mission action', async () => {
     const f = await fixture();
     const task = await call(f, 'mission_task_create', { title: 'Validate disposable fixture' });

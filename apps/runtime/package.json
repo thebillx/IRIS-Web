@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx src/main.ts",
     "runtime": "tsx src/control.ts",
+    "v2-acceptance": "tsx src/v2-acceptance.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.build.json"

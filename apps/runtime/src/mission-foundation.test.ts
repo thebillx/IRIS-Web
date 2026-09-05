@@ -127,6 +127,79 @@ describe('V2 mission execution foundation', () => {
     await expect(readFile(targetPath, 'utf8')).resolves.toBe('mission-result');
   });
 
+  it('allows only one concurrent claim of the same prepared mission action', async () => {
+    const f = await fixture();
+    const prepared = await preparedMission(f);
+    const targetPath = path.join(f.projectRoot, 'concurrent-mission.txt');
+    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId };
+    const operation = {
+      capabilityId: 'file.write' as const, clientId: f.session.clientId, sessionId: f.session.id,
+      projectId: f.project.id, targetPath, content: 'claimed-once', mission: association,
+    };
+
+    const attempts = await Promise.allSettled([
+      f.service.execute(operation),
+      f.service.execute(operation),
+    ]);
+    const fulfilled = attempts.filter((attempt) => attempt.status === 'fulfilled');
+    const rejected = attempts.filter((attempt) => attempt.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(fulfilled[0]).toMatchObject({ status: 'fulfilled', value: { status: 'executed' } });
+    expect(rejected[0]).toMatchObject({ status: 'rejected', reason: { code: 'CAPABILITY_DENIED' } });
+    await expect(readFile(targetPath, 'utf8')).resolves.toBe('claimed-once');
+
+    const mission = await f.state.getMission(prepared.mission.id);
+    expect(mission.timeline.filter((event) => event.kind === 'ACTION_STARTED')).toHaveLength(1);
+    expect(mission.timeline.filter((event) => event.kind === 'ACTION_SUCCEEDED')).toHaveLength(1);
+    const events = await f.audit.recent(100);
+    expect(events.filter((event) => event.capabilityId === 'file.write' && event.result === 'SUCCESS')).toHaveLength(1);
+  });
+
+  it('creates at most one approval for concurrent attempts to claim the same mission action', async () => {
+    const f = await fixture();
+    await f.settings.setMode('ASK_EVERY_TIME');
+    const prepared = await preparedMission(f);
+    const targetPath = path.join(f.projectRoot, 'concurrent-owner-required.txt');
+    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId };
+    const operation = {
+      capabilityId: 'file.write' as const, clientId: f.session.clientId, sessionId: f.session.id,
+      projectId: f.project.id, targetPath, content: 'owner-required-once', mission: association,
+    };
+
+    const attempts = await Promise.allSettled([
+      f.service.execute(operation),
+      f.service.execute(operation),
+    ]);
+    const fulfilled = attempts.filter((attempt) => attempt.status === 'fulfilled');
+    const rejected = attempts.filter((attempt) => attempt.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(fulfilled[0]).toMatchObject({ status: 'fulfilled', value: { status: 'owner_required' } });
+    expect(rejected[0]).toMatchObject({ status: 'rejected', reason: { code: 'CAPABILITY_DENIED' } });
+    expect(f.service.listPendingApprovals()).toHaveLength(1);
+    const mission = await f.state.getMission(prepared.mission.id);
+    expect(mission.timeline.filter((event) => event.kind === 'APPROVAL_REQUIRED')).toHaveLength(1);
+  });
+
+  it('rejects a stale mission approval if the exact action is no longer approval-eligible', async () => {
+    const f = await fixture();
+    await f.settings.setMode('ASK_EVERY_TIME');
+    const prepared = await preparedMission(f);
+    const targetPath = path.join(f.projectRoot, 'stale-approval.txt');
+    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId };
+    const pending = await f.service.execute({
+      capabilityId: 'file.write', clientId: f.session.clientId, sessionId: f.session.id,
+      projectId: f.project.id, targetPath, content: 'must-not-run', mission: association,
+    });
+    if (pending.status !== 'owner_required') throw new Error('Expected pending owner approval');
+
+    await f.state.markMissionActionDenied(association, 'Action invalidated before owner approval');
+    await expect(f.service.resolveApproval(pending.approval.id, 'ALLOW_ONCE')).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    await expect(readFile(targetPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.service.listPendingApprovals()).toHaveLength(0);
+  });
+
   it('associates owner approval with the originating action and resumes that exact action once', async () => {
     const f = await fixture();
     await f.settings.setMode('ASK_EVERY_TIME');

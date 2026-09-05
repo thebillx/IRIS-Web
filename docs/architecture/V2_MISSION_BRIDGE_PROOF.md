@@ -28,9 +28,11 @@ The resume adapter uses an exact `--resume <hermesSessionId>` plus the bound `--
 
 ## Standard governed MCP facade
 
-The Hermes facade speaks MCP protocol `2025-11-25` and implements `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. The V2 Loop Engineer profile exposes bounded runtime/mission/Git/file reads plus mission task/action preparation and exact `project_file_write`. It exposes no direct shell, delete, or unrestricted Git command. Every local capability still enters `CapabilityService`; the MCP facade is translation only.
+The Hermes facade speaks MCP protocol `2025-11-25` and implements `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. The V2 Loop Engineer profile exposes bounded runtime/mission/Git/file reads, declared project-test execution, mission task/action preparation, and exact `project_file_write`. It exposes no direct shell, delete, arbitrary command, or unrestricted Git capability. Every local capability still enters `CapabilityService`; the MCP facade is translation only.
 
-`project_git_status` verifies the broker mapping, foundation mission, registered worktree, live session, and current project, then calls the existing `CapabilityService` using the LOW / PROJECT / read-only `project.git_status` capability. Git is inspected by IRIS with a bounded `/usr/bin/git status --porcelain=v1 --branch` process; Hermes never receives direct Git execution authority. Prepared `project_file_write` preserves the existing IRIS permission/approval path and exact mission/task/action association.
+Each `/hermes-mcp/<missionId>` endpoint is protected by a mission-scoped HMAC bearer credential derived from the private runtime owner secret; knowing a mission UUID is not sufficient to invoke the bridge. Hermes file reads additionally fail closed for secret-like project paths and high-confidence credential/private-key content, so the bounded read profile does not become a general project-secret export path.
+
+`project_git_status` verifies the broker mapping, foundation mission, registered worktree, live session, and current project, then calls the existing `CapabilityService` using the LOW / PROJECT / read-only `project.git_status` capability. Git is inspected by IRIS with a bounded `/usr/bin/git status --porcelain=v1 --branch` process; Hermes never receives direct Git execution authority. Prepared `project_file_write` preserves the existing IRIS permission/approval path and exact mission/task/action association. Initial mission-action execution is serialized and only a `PLANNED` action may be claimed, preventing concurrent duplicate approvals or execution for the same action identity.
 
 ## Pull-based supervisor transport
 
@@ -42,4 +44,13 @@ The durable broker, exact-session adapter, standard MCP handshake/tool contract,
 
 The broker then accepted a second versioned `COMPLETE` directive and resumed the same Hermes session. Hermes returned a structured completion receipt with `missionComplete=true`, and the broker durably transitioned the mission to `COMPLETED` without replay or session substitution.
 
+## Daily-use acceptance loop
+
+The V2 acceptance harness reuses the same authority chain against disposable project bytes. `project_test_run` can execute only the registered project's declared test script through `CapabilityService`; it accepts no arbitrary command. The acceptance loop proves an initial governed test failure, one inherited-MCP leaf analysis, one owner-approval-gated exact file write, a fresh governed passing test, a durable supervisor checkpoint, a versioned `COMPLETE` directive, same-session completion, daemon restart recovery, and no replay.
+
+Operational continuation after an approval is explicitly non-replayable: evidence that an exact action already executed is authoritative, so Hermes must not invoke that mutation again. Validation after a correction is represented by a newly prepared `project.test.run` action rather than by a direct shell command or mere file readback.
+
+Normal supervisor transfer remains pull-based: `AWAITING_SUPERVISOR` is durably discoverable through the ChatGPT-facing IRIS tools, so no manual checkpoint copy/paste or unsupported unsolicited ChatGPT message injection is required.
+
 `V2_0_ARCHITECTURAL_LOOP_PROVEN=YES`
+`V2_0_ACCEPTANCE_MISSION=PASS`

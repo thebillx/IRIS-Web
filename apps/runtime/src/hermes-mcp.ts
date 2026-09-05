@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { RuntimeError } from '@iris/domain';
 import type { CapabilityService } from './capability-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
@@ -111,10 +112,12 @@ async function executeTool(
   if (name === 'project_file_read') {
     const targetPath = requiredString(args, 'targetPath', 4096);
     onlyArguments(args, ['targetPath'], name);
-    return outcomeResult(await capabilities.execute({
+    assertHermesSafeReadPath(targetPath);
+    const outcome = await capabilities.execute({
       capabilityId: 'file.read', clientId: mission.clientId, sessionId: mission.sessionId,
       projectId: mission.projectId ?? undefined, targetPath,
-    }));
+    });
+    return hermesReadOutcome(outcome);
   }
   if (name === 'mission_task_create') {
     const title = requiredString(args, 'title', 240);
@@ -148,6 +151,44 @@ async function executeTool(
     }));
   }
   throw new RuntimeError('CAPABILITY_DENIED', 'Hermes tool is not implemented');
+}
+
+const HERMES_BLOCKED_READ_SEGMENTS = new Set(['.git', '.ssh', '.gnupg', '.aws', '.azure', '.kube']);
+const HERMES_BLOCKED_READ_BASENAMES = new Set([
+  '.env', '.npmrc', '.pypirc', '.netrc', '.git-credentials',
+  'credentials', 'credentials.json', 'secrets.json', 'secret.json', 'auth.json',
+  'service-account.json', 'service_account.json',
+]);
+
+function assertHermesSafeReadPath(targetPath: string): void {
+  const normalized = path.resolve(targetPath);
+  const segments = normalized.split(path.sep).filter(Boolean).map((segment) => segment.toLowerCase());
+  const basename = segments.at(-1) ?? '';
+  if (segments.some((segment) => HERMES_BLOCKED_READ_SEGMENTS.has(segment))
+    || HERMES_BLOCKED_READ_BASENAMES.has(basename)
+    || basename.startsWith('.env.')
+    || /^(?:id_rsa|id_dsa|id_ecdsa|id_ed25519)(?:\.pub)?$/i.test(basename)
+    || /\.(?:pem|key|p12|pfx|jks|keystore)$/i.test(basename)) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Hermes governed read refuses secret-like project paths');
+  }
+}
+
+function hermesReadOutcome(outcome: Awaited<ReturnType<CapabilityService['execute']>>) {
+  if (outcome.status !== 'executed') return outcomeResult(outcome);
+  if (!isRecord(outcome.value) || typeof outcome.value.targetPath !== 'string' || typeof outcome.value.content !== 'string') {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Hermes governed read returned an invalid bounded result');
+  }
+  assertHermesSafeReadPath(outcome.value.targetPath);
+  if (containsHighConfidenceSecret(outcome.value.content)) {
+    return toolError('CAPABILITY_DENIED', 'Hermes governed read refuses secret-like project content');
+  }
+  return toolResult(outcome.value);
+}
+
+function containsHighConfidenceSecret(content: string): boolean {
+  return /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/.test(content)
+    || /(?:^|\n)\s*(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENROUTER_API_KEY|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN|DATABASE_URL|PRIVATE_KEY|CLIENT_SECRET|PASSWORD)\s*=\s*["']?[^\s"'#]{8,}/i.test(content)
+    || /\b(?:sk-[A-Za-z0-9_-]{20,}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b/.test(content);
 }
 
 function outcomeResult(outcome: Awaited<ReturnType<CapabilityService['execute']>>) {
@@ -190,7 +231,7 @@ function missionTaskCreateTool() {
 }
 function missionActionPrepareTool() {
   return {
-    name: 'mission_action_prepare', description: 'Prepare one exact governed file.write action identity. Preparation does not execute the mutation or satisfy owner approval.',
+    name: 'mission_action_prepare', description: 'Prepare one exact governed mission action identity for the bounded V2 execution profile. Preparation does not execute the action or satisfy owner approval.',
     inputSchema: {
       type: 'object', required: ['taskId', 'capabilityId', 'summary'], additionalProperties: false,
       properties: { taskId: { type: 'string' }, capabilityId: { enum: ['file.write', 'project.test.run'] }, summary: { type: 'string', maxLength: 400 } },

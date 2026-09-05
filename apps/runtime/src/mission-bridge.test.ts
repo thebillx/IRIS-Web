@@ -132,6 +132,26 @@ describe('durable V2 mission broker', () => {
     expect(repairCalls[0]!.args.join(' ')).toContain('Do NOT call tools');
     expect(repairCalls[0]!.args.join(' ')).toContain('--max-turns 2');
 
+    const continuationCalls: { args: readonly string[]; cwd: string }[] = [];
+    const continuationRunner: HermesCommandRunner = {
+      run: async (args, cwd) => {
+        continuationCalls.push({ args, cwd });
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ currentPhase: 'post-approval-validation', summary: 'continued within existing directive', evidenceRefs: ['approval:resolved', 'subagent:completed'], blockers: [], hermesAssessment: 'ordinary continuation stayed governed', proposedNextAction: 'supervisor review', decisionRequired: true, missionComplete: false }),
+          stderr: `↻ Resumed session ${accepted.hermesSessionId} "proof"\nsession_id: ${accepted.hermesSessionId}\n`,
+        };
+      },
+    };
+    const continued = await new HermesSessionResumeAdapter(continuationRunner).continueAfterOperationalEvent(accepted, 'exact owner approval resolved once; asynchronous leaf result persisted');
+    expect(continued).toMatchObject({ decisionRequired: true, missionComplete: false });
+    expect(continuationCalls).toHaveLength(1);
+    expect(continuationCalls[0]!.args).toContain(accepted.hermesSessionId);
+    expect(continuationCalls[0]!.args.join(' ')).toContain('NOT a new supervisor directive');
+    expect(continuationCalls[0]!.args.join(' ')).toContain('do NOT replay or retry that action');
+    expect(continuationCalls[0]!.args.join(' ')).toContain('prepare a NEW project.test.run mission action');
+    expect(continuationCalls[0]!.args.join(' ')).toContain('--max-turns 10');
+
     const staleRunner: HermesCommandRunner = { run: async () => ({ exitCode: 1, stdout: '', stderr: `Session not found: ${accepted.hermesSessionId}\n` }) };
     await expect(new HermesSessionResumeAdapter(staleRunner).resumeExact(accepted, latest)).rejects.toMatchObject({ code: 'MISSION_NOT_FOUND' });
   });

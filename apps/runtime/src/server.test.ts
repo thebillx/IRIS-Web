@@ -73,6 +73,36 @@ describe('runtime listener safety', () => {
     expect(rejected.status).toBe(403);
   });
 
+  it('rejects Hermes mission MCP requests without the mission-scoped bridge credential', async () => {
+    const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
+    handle = await startRuntimeServer({
+      identity,
+      state: {} as RuntimeState,
+      capabilities: {} as CapabilityService,
+      missionBroker: {} as MissionBrokerService,
+      health: () => ({
+        status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: identity.runtimeId, instanceId: identity.instanceId,
+        pid: identity.pid, uptimeMs: 1, authority: 'owned', connectedClients: 0, connectedSessions: 0,
+        agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '',
+      }),
+      doctor: async () => ({ status: 'pass', checks: [] }),
+      isShuttingDown: () => false,
+      controlSecret: 'test-control-secret-that-is-not-public',
+      ownerAccessSecret,
+      requestShutdown: () => undefined,
+    }, 0);
+    const missionId = randomUUID();
+    const init = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    } as const;
+    expect((await fetch(`${handle.apiUrl}/hermes-mcp/${missionId}`, init)).status).toBe(403);
+    expect((await fetch(`${handle.apiUrl}/hermes-mcp/${missionId}`, {
+      ...init, headers: { ...init.headers, authorization: 'Bearer wrong-mission-token' },
+    })).status).toBe(403);
+  });
+
   it('returns only a product-safe agent execution failure payload', async () => {
     const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
     const sensitiveDiagnostic = 'provider failed api_key=secret internal_path=/private/example';

@@ -259,8 +259,34 @@ export class RuntimeState {
     }
     const { action } = findMissionAction(mission, association);
     if (action.capabilityId !== capabilityId) throw new RuntimeError('CAPABILITY_DENIED', 'Mission action capability does not match the governed operation');
-    if (action.state !== 'PLANNED' && action.state !== 'OWNER_APPROVAL_REQUIRED') {
-      throw new RuntimeError('CAPABILITY_DENIED', 'Mission action is not eligible for execution');
+    if (action.state !== 'PLANNED') {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Mission action is not eligible for initial execution');
+    }
+  }
+
+  public async validateMissionApprovalAssociation(
+    association: MissionExecutionAssociation,
+    capabilityId: CapabilityId,
+    clientIdInput: string,
+    sessionIdInput: string,
+    approvalIdInput: string,
+  ): Promise<void> {
+    const clientId = normalizeClientId(clientIdInput);
+    const sessionId = normalizeUuidIdentity(sessionIdInput, 'sessionId');
+    const approvalId = normalizeUuidIdentity(approvalIdInput, 'approvalId');
+    const session = this.getSessionForClient(sessionId, clientId);
+    const mission = await this.getMission(association.missionId);
+    assertMissionControlIdentity(mission, clientId, sessionId);
+    if (mission.projectId !== session.currentProjectId) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Mission project no longer matches the live session project');
+    }
+    if (mission.state === 'COMPLETED' || mission.state === 'FAILED' || mission.state === 'CANCELLED') {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Mission is no longer eligible for approved action execution');
+    }
+    const { action } = findMissionAction(mission, association);
+    if (action.capabilityId !== capabilityId) throw new RuntimeError('CAPABILITY_DENIED', 'Mission action capability does not match the approved operation');
+    if (action.state !== 'OWNER_APPROVAL_REQUIRED' || action.approvalId !== approvalId) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Mission approval is stale or does not match the exact pending action');
     }
   }
 

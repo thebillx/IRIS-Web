@@ -62,13 +62,22 @@ export class HermesSessionResumeAdapter {
     if (directive.missionId !== mapping.missionId || directive.directiveId !== mapping.lastDirectiveId) {
       throw new RuntimeError('INVALID_REQUEST', 'Hermes resume requires the latest accepted directive for this mission');
     }
-    return this.runExact(mapping, resumePrompt(mapping, directive), 8);
+    return this.runExact(mapping, resumePrompt(mapping, directive), 32);
   }
 
   public async repairCheckpointReceipt(mapping: MissionBrokerSnapshot, evidenceSummary: string): Promise<HermesCheckpointReceipt> {
     if (mapping.state === 'COMPLETED') throw new RuntimeError('INVALID_REQUEST', 'Completed mission cannot be resumed');
     const evidence = boundedString(evidenceSummary, 'repairEvidence', 2000);
     return this.runExact(mapping, repairPrompt(mapping, evidence), 2);
+  }
+
+  public async continueAfterOperationalEvent(mapping: MissionBrokerSnapshot, evidenceSummary: string): Promise<HermesCheckpointReceipt> {
+    if (mapping.state === 'COMPLETED') throw new RuntimeError('INVALID_REQUEST', 'Completed mission cannot be resumed');
+    if (mapping.lastDirectiveId === null || mapping.directives.length === 0) {
+      throw new RuntimeError('INVALID_REQUEST', 'Operational continuation requires an accepted supervisor directive');
+    }
+    const evidence = boundedString(evidenceSummary, 'operationalEvidence', 2000);
+    return this.runExact(mapping, operationalContinuationPrompt(mapping, evidence), 10);
   }
 
   private async runExact(mapping: MissionBrokerSnapshot, prompt: string, maxTurns: number): Promise<HermesCheckpointReceipt> {
@@ -108,8 +117,8 @@ function resumePrompt(mapping: MissionBrokerSnapshot, directive: SupervisorDirec
     'You are resuming the exact Hermes Loop Engineer session bound to one IRIS mission.',
     'IRIS remains execution authority. The supervisor directive is orchestration input only and grants no local permission.',
     `Directive JSON: ${JSON.stringify(directivePayload)}`,
-    'For this proof, use the configured read-only MCP tool project_git_status when the directive asks for project Git status.',
-    'Do not run git or shell directly. Do not mutate files. Do not create a new session.',
+    'Use only the configured mission-bound IRIS MCP tools for owner-project reads, tests, and mutations authorized by the directive. IRIS CapabilityService remains the sole execution and permission authority.',
+    'Do not use native terminal, shell, git, or file mutation tools against the mission project. A supervisor directive never substitutes for IRIS owner approval. Do not create a new session.',
     'Return ONLY one JSON object with keys currentPhase, summary, evidenceRefs, blockers, hermesAssessment, proposedNextAction, decisionRequired, missionComplete.',
     'The receipt MUST match this JSON shape exactly: {"currentPhase":"...","summary":"...","evidenceRefs":[],"blockers":[],"hermesAssessment":"...","proposedNextAction":"...","decisionRequired":true,"missionComplete":false}.',
     'decisionRequired and missionComplete MUST be JSON booleans true or false, never strings or descriptive text.',
@@ -128,6 +137,26 @@ function repairPrompt(mapping: MissionBrokerSnapshot, evidenceSummary: string): 
     'The receipt MUST match this JSON shape exactly: {"currentPhase":"...","summary":"...","evidenceRefs":[],"blockers":[],"hermesAssessment":"...","proposedNextAction":"...","decisionRequired":true,"missionComplete":false}.',
     'decisionRequired and missionComplete MUST be JSON booleans true or false, never strings or descriptive text.',
     'This is a checkpoint repair turn, so missionComplete must remain false unless a COMPLETE supervisor directive was already accepted.',
+  ].join('\n');
+}
+
+function operationalContinuationPrompt(mapping: MissionBrokerSnapshot, evidenceSummary: string): string {
+  return [
+    'Continue the exact already-bound Hermes Loop Engineer mission after an operational event such as IRIS owner approval or asynchronous subagent completion.',
+    `Mission ID: ${mapping.missionId}`,
+    `Mission version: ${mapping.missionVersion}`,
+    `Latest accepted supervisor directive ID: ${mapping.lastDirectiveId ?? 'none'}`,
+    `Bounded operational evidence: ${evidenceSummary}`,
+    'This is NOT a new supervisor directive and grants no new scope or local permission. Continue only within the latest accepted supervisor directive already present in this exact session.',
+    'Use only the configured mission-bound IRIS MCP tools for project reads, tests, and mutations. IRIS CapabilityService remains the sole execution and permission authority.',
+    'Do not use native terminal, shell, git, or file mutation tools against the mission project. Do not create or substitute a Hermes session.',
+    'If the bounded evidence says an exact governed action was executed-once or already succeeded, do NOT replay or retry that action. Treat the durable IRIS action/result ledger as authoritative completion evidence.',
+    'Before opening the supervisor gate after a correction, prepare a NEW project.test.run mission action and run project_test_run. A successful final checkpoint requires that fresh governed validation to report passed=true.',
+    'Recover ordinary failures autonomously where possible using only the mission-bound IRIS tools, then return a supervisor checkpoint after the required fresh validation.',
+    'Return ONLY one JSON object with keys currentPhase, summary, evidenceRefs, blockers, hermesAssessment, proposedNextAction, decisionRequired, missionComplete.',
+    'The receipt MUST match this JSON shape exactly: {"currentPhase":"...","summary":"...","evidenceRefs":[],"blockers":[],"hermesAssessment":"...","proposedNextAction":"...","decisionRequired":true,"missionComplete":false}.',
+    'decisionRequired and missionComplete MUST be JSON booleans true or false, never strings or descriptive text.',
+    'missionComplete must remain false unless the latest accepted supervisor directive decision is COMPLETE.',
   ].join('\n');
 }
 

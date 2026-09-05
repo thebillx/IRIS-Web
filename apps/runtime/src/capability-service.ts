@@ -57,6 +57,7 @@ interface PendingApprovalInternal {
 
 export class CapabilityService {
   private readonly pending = new Map<string, PendingApprovalInternal>();
+  private missionActionTail: Promise<void> = Promise.resolve();
 
   public constructor(
     private readonly state: RuntimeState,
@@ -78,7 +79,17 @@ export class CapabilityService {
     return [...this.pending.values()].map((entry) => entry.view);
   }
 
-  public async execute(operation: CapabilityOperation): Promise<CapabilityOutcome> {
+  public execute(operation: CapabilityOperation): Promise<CapabilityOutcome> {
+    if (operation.mission === undefined) return this.executeGoverned(operation);
+    const result = this.missionActionTail.then(
+      () => this.executeGoverned(operation),
+      () => this.executeGoverned(operation),
+    );
+    this.missionActionTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async executeGoverned(operation: CapabilityOperation): Promise<CapabilityOutcome> {
     const association = operation.mission;
     if (association !== undefined) {
       if (!isMissionExecutableOperation(operation)) throw new RuntimeError('CAPABILITY_DENIED', 'Mission action association is not supported for this capability');
@@ -108,7 +119,19 @@ export class CapabilityService {
     return this.executeAndAudit(operation, decision);
   }
 
-  public async resolveApproval(id: string, choice: OwnerApprovalChoice): Promise<CapabilityOutcome> {
+  public resolveApproval(id: string, choice: OwnerApprovalChoice): Promise<CapabilityOutcome> {
+    this.pruneExpiredApprovals();
+    const pending = this.pending.get(id);
+    if (pending?.operation.mission === undefined) return this.resolveApprovalGoverned(id, choice);
+    const result = this.missionActionTail.then(
+      () => this.resolveApprovalGoverned(id, choice),
+      () => this.resolveApprovalGoverned(id, choice),
+    );
+    this.missionActionTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async resolveApprovalGoverned(id: string, choice: OwnerApprovalChoice): Promise<CapabilityOutcome> {
     const pending = this.claimPendingApproval(id);
 
     if (choice === 'DENY') {
@@ -121,6 +144,19 @@ export class CapabilityService {
       await this.audit.append(denied, 'DENIED');
       if (pending.operation.mission !== undefined) await this.state.markMissionActionDenied(pending.operation.mission, denied.reason);
       return { status: 'denied', reason: denied.reason };
+    }
+
+    if (pending.operation.mission !== undefined) {
+      if (pending.view.clientId === null || pending.view.sessionId === null) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Mission approval lost its originating client/session identity');
+      }
+      await this.state.validateMissionApprovalAssociation(
+        pending.operation.mission,
+        pending.operation.capabilityId,
+        pending.view.clientId,
+        pending.view.sessionId,
+        pending.view.id,
+      );
     }
 
     const reevaluated = await this.policy.evaluate(requestForOperation(pending.operation));

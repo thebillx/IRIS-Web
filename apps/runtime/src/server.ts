@@ -1,4 +1,4 @@
-import { timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { RuntimeError, type AgentRole, type DoctorReport, type MissionState, type PermissionMode, type RuntimeHealth, type RuntimeIdentity, type SupervisorDecision } from '@iris/domain';
 import { handleMcpRequest } from './mcp.js';
@@ -11,6 +11,14 @@ export const LOOPBACK_ADDRESS = '127.0.0.1' as const;
 export const CLIENT_ID_HEADER = 'x-iris-client-id' as const;
 export const SESSION_ID_HEADER = 'x-iris-session-id' as const;
 const MAX_BODY_BYTES = 64 * 1024;
+const HERMES_MISSION_TOKEN_CONTEXT = 'iris-hermes-mcp-v2';
+
+export function hermesMissionAccessToken(ownerAccessSecret: string, missionId: string): string {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(missionId)) {
+    throw new RuntimeError('INVALID_REQUEST', 'Mission identity is invalid');
+  }
+  return createHmac('sha256', ownerAccessSecret).update(`${HERMES_MISSION_TOKEN_CONTEXT}:${missionId}`).digest('base64url');
+}
 
 export interface RuntimeServerContext {
   readonly identity: RuntimeIdentity;
@@ -116,6 +124,8 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
 
   const hermesMcpMatch = /^\/hermes-mcp\/([^/]+)$/.exec(url.pathname);
   if (hermesMcpMatch !== null) {
+    const missionId = decodeURIComponent(hermesMcpMatch[1]!);
+    authorizeHermesMissionAccess(request, context.ownerAccessSecret, missionId);
     if (request.method === 'POST') requireJsonContentType(request);
     const body = request.method === 'POST' ? await readBody(request) : '';
     const headers = new Headers();
@@ -124,7 +134,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     if (body.length > 0) init.body = body;
     const bridgeResponse = await handleHermesMcpRequest(
       new Request(`http://127.0.0.1${url.pathname}`, init),
-      decodeURIComponent(hermesMcpMatch[1]!),
+      missionId,
       context.state,
       context.missionBroker,
       context.capabilities,
@@ -529,6 +539,15 @@ async function writeCapabilityOutcome(response: ServerResponse, outcome: Capabil
     return;
   }
   writeJson(response, 403, { error: { code: 'CAPABILITY_DENIED', message: outcome.reason } });
+}
+
+function authorizeHermesMissionAccess(request: IncomingMessage, ownerAccessSecret: string, missionId: string): void {
+  const authorization = request.headers.authorization;
+  const supplied = typeof authorization === 'string' && authorization.startsWith('Bearer ')
+    ? authorization.slice('Bearer '.length)
+    : '';
+  const expected = hermesMissionAccessToken(ownerAccessSecret, missionId);
+  if (!secretsEqual(supplied, expected)) throw new RuntimeError('CONTROL_DENIED', 'Mission-scoped Hermes bridge credential is required');
 }
 
 function authorizeOwnerAccess(request: IncomingMessage, secret: string): void {
