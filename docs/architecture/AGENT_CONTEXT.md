@@ -1,6 +1,6 @@
 # Agent context foundation
 
-IRIS V1.3 is agent-ready without implementing a full multi-model orchestrator.
+IRIS V1.3 is agent-ready without implementing a full multi-model orchestrator. ChatGPT is the primary conversational UX; the IRIS connector/plugin bridges ChatGPT to the authoritative local daemon, which remains responsible for session/project identity, permission decisions, approvals, execution, and audit.
 
 ## Identity contract
 
@@ -42,7 +42,7 @@ Permission audit records include `agentId` in addition to client/session/project
 
 ## Current executor boundary
 
-The session execution seam remains the provider-neutral `AgentExecutor` contract. Runtime construction deterministically selects either the deterministic `local-development-executor` or one OpenAI-backed `production-provider-executor`; session identity, replay protection, execution state, and authoritative history stay in `RuntimeState` rather than moving into provider code.
+The session execution seam remains the provider-neutral `AgentExecutor` contract. It is an optional standalone/background execution capability, not a dependency of the primary ChatGPT-driven workflow. Runtime construction deterministically selects either the deterministic `local-development-executor` or one OpenAI-backed `production-provider-executor`; session identity, replay protection, execution state, and authoritative history stay in `RuntimeState` rather than moving into provider code.
 
 The production executor sends only the current bounded instruction plus a minimal agent-role/project-selected instruction. It does not send the project name, repository contents, filesystem paths, session/client IDs, permission state, MCP state, audit history, secrets, or other sessions. Provider output is reduced to bounded text before it returns through the existing executor result contract.
 

@@ -1,10 +1,12 @@
 # Web UI
 
-The primary interface is a small React/Vite application in a standard browser. It is a client of the authoritative local daemon, never a runtime or permission authority itself.
+The React/Vite localhost application is IRIS's local control-and-visibility surface. ChatGPT is the primary conversational UX through the IRIS connector/plugin bridge. The Web app remains a client of the authoritative local daemon, never a runtime or permission authority itself.
 
 ## Daily workspace
 
-The main surface is product-oriented rather than a runtime console. It shows:
+The main surface is product-oriented rather than a runtime console. For V1.3 its primary responsibility is control and visibility around ChatGPT-driven local work. The existing conversation composer may be retained for standalone/diagnostic validation, but it is secondary and does not create a second conversational authority.
+
+It shows:
 
 - the Active Project for the selected session, with a deliberate empty state when none is selected;
 - the current browser client's existing daemon sessions;

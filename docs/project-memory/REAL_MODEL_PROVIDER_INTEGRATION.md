@@ -6,6 +6,8 @@ Baseline: `d4a7716f5d515db0074aa14fbedc4a4f7f92f605` (`feat(agent): add session 
 
 IRIS keeps the existing authoritative session/execution path and adds exactly one real production provider behind `AgentExecutor`: OpenAI Responses API.
 
+V1.3 product realignment: this executor is preserved as `OPTIONAL_STANDALONE_EXECUTOR=YES` for standalone/background/future automation use. `PRIMARY_CHATGPT_WORKFLOW_DEPENDENCY=NO`; normal daily use is ChatGPT → IRIS connector/plugin → authoritative local daemon. The latest operational real-provider proof failed safely because the authoritative runtime environment did not expose the required local OpenAI configuration, so `REAL_PROVIDER_SMOKE=FAILED_SAFE`, `PRODUCTION_MODEL_CONNECTED=NO`, and `STANDALONE_REAL_MODEL_USABLE=BLOCKED`. This does not block the ChatGPT-driven V1.3 workflow.
+
 Canonical behavior:
 
 - Executor selection is explicit and deterministic through `IRIS_AGENT_EXECUTOR=development|openai`; unset remains the local development executor.

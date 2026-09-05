@@ -46,6 +46,17 @@ Base runtime checkpoint: `e84a870` (`feat(runtime): establish local daemon found
 
 ## Canonical V1.3 behavior
 
+Primary product workflow:
+
+`ChatGPT → IRIS connector/plugin → authoritative local daemon → live session/project → permission decision → governed local capability → structured result → ChatGPT`
+
+The localhost Web app is `CONTROL_AND_VISIBILITY`; its conversation UI is optional/secondary. The standalone `AgentExecutor` is optional for standalone/background execution and is not a dependency of the ChatGPT-driven daily workflow.
+
+- `PRIMARY_UX=ChatGPT`
+- `LOCAL_WEB_ROLE=ControlAndVisibility`
+- `LOCAL_DAEMON_ROLE=ExecutionAuthority`
+- `PLUGIN_ROLE=ChatGPTToLocalBridge`
+- `STANDALONE_EXECUTOR_ROLE=Optional`
 - `FULL_LOCAL_OWNER_MODE=PASS`
 - `PROJECT_SCOPED_AUTO_APPROVAL=PASS` for implemented LOW/MODERATE runtime capabilities
 - `NO_BLOCKING_ROUTINE_APPROVAL_MODAL=PASS`
