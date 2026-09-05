@@ -23,12 +23,46 @@ describe('local MCP transport and permission boundary', () => {
     const listed = await handleMcpRequest(rpc('tools/list', 2), fixture.service);
     const listedBody = await listed.json() as { result: { tools: Array<{ name: string }> } };
     expect(listedBody.result.tools.map((tool) => tool.name)).toEqual([
-      'runtime_status', 'list_projects', 'file_read', 'file_write', 'file_delete', 'directory_create', 'directory_delete',
+      'runtime_status', 'list_projects', 'mission_list', 'mission_get', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_supervisor_gate_set', 'file_read', 'file_write', 'file_delete', 'directory_create', 'directory_delete',
     ]);
 
     const status = await handleMcpRequest(rpc('tools/call', 3, { name: 'runtime_status', arguments: {} }, true, 'runtime_status'), fixture.service);
     expect(await status.json()).toMatchObject({ result: { isError: false, structuredContent: { status: 'ready' } } });
     expect((await fixture.audit.recent(10)).some((event) => event.capabilityId === 'runtime.status' && event.result === 'SUCCESS')).toBe(true);
+  });
+
+  it('exposes Hermes-consumable mission contracts while keeping governed execution in CapabilityService', async () => {
+    const fixture = await serviceFixture();
+    const create = await handleMcpRequest(rpc('tools/call', 10, {
+      name: 'mission_create', arguments: { title: 'Hermes bounded mission' },
+    }, true, 'mission_create', fixture.session.clientId, fixture.session.id), fixture.service);
+    const createdBody = await create.json() as { result: { structuredContent: { id: string } } };
+    const missionId = createdBody.result.structuredContent.id;
+
+    const task = await handleMcpRequest(rpc('tools/call', 11, {
+      name: 'mission_task_create', arguments: { missionId, title: 'Write governed evidence' },
+    }, true, 'mission_task_create', fixture.session.clientId, fixture.session.id), fixture.service);
+    const taskBody = await task.json() as { result: { structuredContent: { tasks: Array<{ id: string }> } } };
+    const taskId = taskBody.result.structuredContent.tasks[0]!.id;
+
+    const prepared = await handleMcpRequest(rpc('tools/call', 12, {
+      name: 'mission_action_prepare', arguments: { missionId, taskId, capabilityId: 'file.write', summary: 'Write one bounded file' },
+    }, true, 'mission_action_prepare', fixture.session.clientId, fixture.session.id), fixture.service);
+    const preparedBody = await prepared.json() as { result: { structuredContent: { tasks: Array<{ actions: Array<{ id: string }> }> } } };
+    const actionId = preparedBody.result.structuredContent.tasks[0]!.actions[0]!.id;
+
+    const targetPath = path.join(fixture.projectRoot, 'hermes-mission.txt');
+    const executed = await handleMcpRequest(rpc('tools/call', 13, {
+      name: 'file_write', arguments: { projectId: fixture.project.id, targetPath, content: 'mission-evidence', missionId, taskId, actionId },
+    }, true, 'file_write', fixture.session.clientId, fixture.session.id), fixture.service);
+    expect(await executed.json()).toMatchObject({ result: { isError: false, structuredContent: { targetPath, bytes: 16 } } });
+
+    const readMission = await handleMcpRequest(rpc('tools/call', 14, {
+      name: 'mission_get', arguments: { missionId },
+    }, true, 'mission_get'), fixture.service);
+    const missionBody = await readMission.json() as { result: { structuredContent: { tasks: Array<{ actions: Array<{ state: string; result: { evidence: unknown[] } }> }> } } };
+    expect(missionBody.result.structuredContent.tasks[0]!.actions[0]).toMatchObject({ state: 'SUCCEEDED', result: { evidence: [expect.objectContaining({ kind: 'CAPABILITY_RESULT' })] } });
+    await expect(readFile(targetPath, 'utf8')).resolves.toBe('mission-evidence');
   });
 
   it('cannot bypass session/project policy for file mutation', async () => {

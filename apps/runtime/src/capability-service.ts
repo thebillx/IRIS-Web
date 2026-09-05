@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { AgentRole, PermissionDecisionRecord, PendingApprovalView, PermissionMode, ProjectReference, RuntimeHealth } from '@iris/domain';
+import type { AgentRole, CapabilityId, MissionExecutionAssociation, MissionState, MissionTaskState, PermissionDecisionRecord, PendingApprovalView, PermissionMode, ProjectReference, RuntimeHealth, SupervisorGateState } from '@iris/domain';
 import { RuntimeError } from '@iris/domain';
 import { PermissionAuditStore } from './audit.js';
 import { capabilityDefinition } from './capability-registry.js';
@@ -12,9 +12,17 @@ const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_PENDING_APPROVALS = 100;
 const APPROVAL_TTL_MS = 15 * 60_000;
 
-export type CapabilityOperation =
+type CapabilityOperationCore =
   | { readonly capabilityId: 'runtime.status'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
+  | { readonly capabilityId: 'mission.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
+  | { readonly capabilityId: 'mission.get'; readonly missionId: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
+  | { readonly capabilityId: 'mission.create'; readonly clientId: string; readonly sessionId: string; readonly title: string }
+  | { readonly capabilityId: 'mission.state.set'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly state: MissionState }
+  | { readonly capabilityId: 'mission.task.create'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly title: string }
+  | { readonly capabilityId: 'mission.task.state.set'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly taskId: string; readonly state: MissionTaskState }
+  | { readonly capabilityId: 'mission.action.prepare'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly taskId: string; readonly actionCapabilityId: CapabilityId; readonly summary: string }
+  | { readonly capabilityId: 'mission.supervisor_gate.set'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly state: SupervisorGateState; readonly reason: string | null }
   | { readonly capabilityId: 'session.create'; readonly clientId?: string | undefined; readonly agentId?: string | undefined; readonly agentRole?: AgentRole | undefined }
   | { readonly capabilityId: 'session.delete'; readonly clientId: string; readonly sessionId: string }
   | { readonly capabilityId: 'session.current_project.set'; readonly clientId: string; readonly sessionId: string; readonly projectId: string | null }
@@ -27,6 +35,8 @@ export type CapabilityOperation =
   | { readonly capabilityId: 'directory.create'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string }
   | { readonly capabilityId: 'directory.delete'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string }
   | { readonly capabilityId: 'policy.mode.set'; readonly mode: PermissionMode; readonly clientId?: string | undefined; readonly sessionId?: string | undefined };
+
+export type CapabilityOperation = CapabilityOperationCore & { readonly mission?: MissionExecutionAssociation | undefined };
 
 export type OwnerApprovalChoice = 'ALLOW_ONCE' | 'ALWAYS_ALLOW_PROJECT' | 'DENY';
 
@@ -65,14 +75,27 @@ export class CapabilityService {
   }
 
   public async execute(operation: CapabilityOperation): Promise<CapabilityOutcome> {
+    const association = operation.mission;
+    if (association !== undefined) {
+      if (!isMissionExecutableOperation(operation)) throw new RuntimeError('CAPABILITY_DENIED', 'Mission action association is not supported for this capability');
+      await this.state.validateMissionActionAssociation(association, operation.capabilityId, operation.clientId, operation.sessionId);
+    }
+
     const policyRequest = requestForOperation(operation);
     const decision = await this.policy.evaluate(policyRequest);
     if (decision.decision === 'DENY') {
       await this.audit.append(decision, 'DENIED');
+      if (association !== undefined) await this.state.markMissionActionDenied(association, 'Governed capability was denied by policy');
       return { status: 'denied', reason: decision.reason };
     }
     if (decision.decision === 'OWNER_REQUIRED') {
       const approval = this.queueApproval(operation, decision);
+      try {
+        if (association !== undefined) await this.state.markMissionActionApprovalRequired(association, approval.id);
+      } catch (error) {
+        this.pending.delete(approval.id);
+        throw error;
+      }
       await this.audit.append(decision, 'PENDING');
       return { status: 'owner_required', approval };
     }
@@ -92,6 +115,7 @@ export class CapabilityService {
         reason: 'Owner denied the pending exact action',
       };
       await this.audit.append(denied, 'DENIED');
+      if (pending.operation.mission !== undefined) await this.state.markMissionActionDenied(pending.operation.mission, denied.reason);
       return { status: 'denied', reason: denied.reason };
     }
 
@@ -107,6 +131,7 @@ export class CapabilityService {
         reason: 'Pending action changed or became ineligible before owner approval was applied',
       };
       await this.audit.append(denied, 'DENIED');
+      if (pending.operation.mission !== undefined) await this.state.markMissionActionDenied(pending.operation.mission, denied.reason);
       return { status: 'denied', reason: denied.reason };
     }
 
@@ -160,14 +185,19 @@ export class CapabilityService {
   }
 
   private async executeAndAudit(operation: CapabilityOperation, decision: PermissionDecisionRecord): Promise<CapabilityOutcome> {
+    const association = operation.mission;
+    if (association !== undefined) await this.state.markMissionActionStarted(association);
+    let value: unknown;
     try {
-      const value = await this.executeAuthorized(operation, decision);
-      await this.audit.append(decision, 'SUCCESS');
-      return { status: 'executed', value };
+      value = await this.executeAuthorized(operation, decision);
     } catch (error) {
       await this.audit.append(decision, 'FAILED');
+      if (association !== undefined) await this.state.markMissionActionFailed(association);
       throw error;
     }
+    await this.audit.append(decision, 'SUCCESS');
+    if (association !== undefined) await this.state.markMissionActionSucceeded(association, operation.capabilityId, value);
+    return { status: 'executed', value };
   }
 
   private async executeAuthorized(operation: CapabilityOperation, decision: PermissionDecisionRecord): Promise<unknown> {
@@ -176,6 +206,17 @@ export class CapabilityService {
       projects: await this.state.listProjects(),
       defaultProjectId: await this.state.getDefaultProjectId(),
     };
+    if (operation.capabilityId === 'mission.list') return { missions: await this.state.listMissions() };
+    if (operation.capabilityId === 'mission.get') return this.state.getMission(operation.missionId);
+    if (operation.capabilityId === 'mission.create') return this.state.createMission(operation.clientId, operation.sessionId, operation.title);
+    if (operation.capabilityId === 'mission.state.set') return this.state.setMissionState(operation.missionId, operation.clientId, operation.sessionId, operation.state);
+    if (operation.capabilityId === 'mission.task.create') return this.state.createMissionTask(operation.missionId, operation.clientId, operation.sessionId, operation.title);
+    if (operation.capabilityId === 'mission.task.state.set') return this.state.setMissionTaskState(operation.missionId, operation.taskId, operation.clientId, operation.sessionId, operation.state);
+    if (operation.capabilityId === 'mission.action.prepare') {
+      if (!missionExecutionCapability(operation.actionCapabilityId)) throw new RuntimeError('CAPABILITY_DENIED', 'Mission action capability is not exposed for governed mission execution');
+      return this.state.prepareMissionAction(operation.missionId, operation.taskId, operation.clientId, operation.sessionId, operation.actionCapabilityId, operation.summary);
+    }
+    if (operation.capabilityId === 'mission.supervisor_gate.set') return this.state.setMissionSupervisorGate(operation.missionId, operation.clientId, operation.sessionId, operation.state, operation.reason);
     if (operation.capabilityId === 'session.create') return this.state.createSession(operation.clientId, operation.agentId, operation.agentRole);
     if (operation.capabilityId === 'session.delete') {
       this.state.deleteSession(operation.sessionId, operation.clientId);
@@ -254,37 +295,68 @@ export class CapabilityService {
 }
 
 function requestForOperation(operation: CapabilityOperation): PolicyRequest {
-  if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list') {
-    return { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
+  let request: PolicyRequest;
+  if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
+  } else if (operation.capabilityId === 'mission.get') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId };
+  } else if (operation.capabilityId === 'mission.create') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
+  } else if (operation.capabilityId === 'mission.state.set' || operation.capabilityId === 'mission.task.create'
+    || operation.capabilityId === 'mission.task.state.set' || operation.capabilityId === 'mission.action.prepare'
+    || operation.capabilityId === 'mission.supervisor_gate.set') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId,
+      ...('taskId' in operation ? { taskId: operation.taskId } : {}) };
+  } else if (operation.capabilityId === 'project.register') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, targetPath: operation.rootPath };
+  } else if (operation.capabilityId === 'project.default.set') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
+  } else if (operation.capabilityId === 'policy.mode.set') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
+  } else if (operation.capabilityId === 'session.create') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, agentId: operation.agentId };
+  } else if (operation.capabilityId === 'session.delete') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
+  } else if (operation.capabilityId === 'session.current_project.set') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
+  } else if (operation.capabilityId === 'session.instruction.submit') {
+    request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
+  } else {
+    request = {
+      capabilityId: operation.capabilityId,
+      clientId: operation.clientId,
+      sessionId: operation.sessionId,
+      projectId: operation.projectId,
+      targetPath: operation.targetPath,
+    };
   }
-  if (operation.capabilityId === 'project.register') {
-    return { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, targetPath: operation.rootPath };
-  }
-  if (operation.capabilityId === 'project.default.set') {
-    return { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
-  }
-  if (operation.capabilityId === 'policy.mode.set') {
-    return { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
-  }
-  if (operation.capabilityId === 'session.create') return { capabilityId: operation.capabilityId, clientId: operation.clientId, agentId: operation.agentId };
-  if (operation.capabilityId === 'session.delete') return { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
-  if (operation.capabilityId === 'session.current_project.set') {
-    return { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
-  }
-  if (operation.capabilityId === 'session.instruction.submit') {
-    return { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
-  }
-  return {
-    capabilityId: operation.capabilityId,
-    clientId: operation.clientId,
-    sessionId: operation.sessionId,
-    projectId: operation.projectId,
-    targetPath: operation.targetPath,
+  return operation.mission === undefined ? request : {
+    ...request,
+    missionId: operation.mission.missionId,
+    taskId: operation.mission.taskId,
+    actionId: operation.mission.actionId,
   };
 }
 
+function isMissionExecutableOperation(operation: CapabilityOperation): operation is CapabilityOperation & { readonly clientId: string; readonly sessionId: string; readonly mission: MissionExecutionAssociation } {
+  return operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete'
+    || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
+}
+
+function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'file.read' | 'file.write' | 'file.delete' | 'directory.create' | 'directory.delete' {
+  return capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete'
+    || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
+}
+
 function describeOperation(operation: CapabilityOperation): string {
-  if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list') return operation.capabilityId;
+  if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') return operation.capabilityId;
+  if (operation.capabilityId === 'mission.get') return `mission.get missionId=${operation.missionId}`;
+  if (operation.capabilityId === 'mission.create') return `mission.create sessionId=${operation.sessionId} title=${JSON.stringify(operation.title)}`;
+  if (operation.capabilityId === 'mission.state.set') return `mission.state.set missionId=${operation.missionId} state=${operation.state}`;
+  if (operation.capabilityId === 'mission.task.create') return `mission.task.create missionId=${operation.missionId} title=${JSON.stringify(operation.title)}`;
+  if (operation.capabilityId === 'mission.task.state.set') return `mission.task.state.set missionId=${operation.missionId} taskId=${operation.taskId} state=${operation.state}`;
+  if (operation.capabilityId === 'mission.action.prepare') return `mission.action.prepare missionId=${operation.missionId} taskId=${operation.taskId} capability=${operation.actionCapabilityId} summary=${JSON.stringify(operation.summary)}`;
+  if (operation.capabilityId === 'mission.supervisor_gate.set') return `mission.supervisor_gate.set missionId=${operation.missionId} state=${operation.state}`;
   if (operation.capabilityId === 'file.write') {
     const bytes = Buffer.byteLength(operation.content, 'utf8');
     const digest = createHash('sha256').update(operation.content).digest('hex');

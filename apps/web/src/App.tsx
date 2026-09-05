@@ -35,6 +35,28 @@ export type Session = {
   executionState: SessionExecutionState;
   interactions: SessionInteraction[];
 };
+type MissionActionResult = {
+  status: 'SUCCEEDED' | 'OWNER_REQUIRED' | 'DENIED' | 'FAILED';
+  summary: string;
+  approvalId: string | null;
+  completedAt: string | null;
+  evidence: Array<{ id: string; kind: string; label: string; summary: string; reference: string | null; data: Record<string, string | number | boolean | null> }>;
+};
+type MissionAction = { id: string; capabilityId: string; summary: string; state: string; createdAt: string; updatedAt: string; approvalId: string | null; result: MissionActionResult | null };
+type MissionTask = { id: string; title: string; state: string; createdAt: string; updatedAt: string; actions: MissionAction[] };
+type Mission = {
+  id: string;
+  title: string;
+  state: string;
+  clientId: string;
+  sessionId: string;
+  projectId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  supervisorGate: { state: string; reason: string | null; updatedAt: string };
+  tasks: MissionTask[];
+  timeline: Array<{ id: string; timestamp: string; kind: string; taskId: string | null; actionId: string | null; message: string }>;
+};
 type PermissionMode = 'ASK_EVERY_TIME' | 'AUTO_APPROVE_LOW_RISK' | 'AUTO_APPROVE_PROJECT_SCOPED' | 'FULL_LOCAL_OWNER';
 type RiskClass = 'LOW' | 'MODERATE' | 'HIGH' | 'SYSTEM';
 type PolicyDecision = 'ALLOW_AUTO' | 'ALLOW_ONCE' | 'DENY' | 'OWNER_REQUIRED';
@@ -81,6 +103,7 @@ export function App(): ReactElement {
   const [projects, setProjects] = useState<Project[]>([]);
   const [defaultProjectId, setDefaultProjectId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [missions, setMissions] = useState<Mission[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState(readSelectedSessionId);
   const [permissions, setPermissions] = useState<PermissionSnapshot | null>(null);
   const [selectedApproval, setSelectedApproval] = useState<PendingApproval | null>(null);
@@ -100,24 +123,28 @@ export function App(): ReactElement {
         setProjects([]);
         setDefaultProjectId(null);
         setSessions([]);
+        setMissions([]);
         setPermissions(null);
         setError('Owner access is locked. Open the IRIS_OWNER_URL printed by pnpm dev.');
         return;
       }
-      const [projectsResponse, sessionsResponse, permissionsResponse] = await Promise.all([
+      const [projectsResponse, sessionsResponse, missionsResponse, permissionsResponse] = await Promise.all([
         authorizedFetch(ownerAccessToken, '/projects'),
         authorizedFetch(ownerAccessToken, '/sessions', { headers: { 'x-iris-client-id': clientId } }),
+        authorizedFetch(ownerAccessToken, '/missions'),
         authorizedFetch(ownerAccessToken, '/permissions'),
       ]);
-      if (!projectsResponse.ok || !sessionsResponse.ok || !permissionsResponse.ok) {
+      if (!projectsResponse.ok || !sessionsResponse.ok || !missionsResponse.ok || !permissionsResponse.ok) {
         throw new Error('Owner access was rejected by the runtime');
       }
       const projectBody = await projectsResponse.json() as { projects: Project[]; defaultProjectId: string | null };
       const sessionBody = await sessionsResponse.json() as { sessions: Session[] };
+      const missionBody = await missionsResponse.json() as { missions: Mission[] };
       const nextSelectedSessionId = reconcileSelectedSessionId(readSelectedSessionId(), sessionBody.sessions);
       setProjects(projectBody.projects);
       setDefaultProjectId(projectBody.defaultProjectId);
       setSessions(sessionBody.sessions);
+      setMissions(missionBody.missions);
       setSelectedSessionId(nextSelectedSessionId);
       persistSelectedSessionId(nextSelectedSessionId);
       setPermissions(await permissionsResponse.json() as PermissionSnapshot);
@@ -342,6 +369,7 @@ export function App(): ReactElement {
         defaultProject={defaultProject}
         activeProject={activeProject}
         sessions={sessions}
+        missions={missions}
         selectedSession={selectedSession}
         sessionActivity={currentSessionActivity}
         pendingApprovalCount={visibleApprovals.length}
@@ -376,6 +404,7 @@ export function RuntimePage(props: {
   defaultProject: Project | null;
   activeProject: Project | null;
   sessions: Session[];
+  missions: Mission[];
   selectedSession: Session | null;
   sessionActivity: AuditEvent[];
   pendingApprovalCount: number;
@@ -469,6 +498,8 @@ export function RuntimePage(props: {
             </>}
         </section>
 
+        <MissionControl missions={props.missions} projects={props.projects} />
+
         <section className="projects-card"><div className="section-title-row"><div><p className="section-label">Projects</p><h2>Registered locally</h2></div></div>
           {props.projects.length === 0 ? <div className="empty-state"><p>No registered projects.</p><span>Register an existing local folder. IRIS never scans your filesystem implicitly.</span></div> : <ul className="project-list">{props.projects.map((project) => <li key={project.id}><div><strong>{project.name}</strong><code>{project.rootPath}</code></div>{project.id === props.defaultProject?.id ? <span>Default</span> : null}</li>)}</ul>}
           <div className="project-register"><label>Name<input value={props.name} onChange={(event) => props.setName(event.target.value)} /></label><label>Absolute path<input value={props.rootPath} onChange={(event) => props.setRootPath(event.target.value)} /></label><button onClick={props.onRegisterProject}>Register project</button></div>
@@ -482,6 +513,33 @@ export function RuntimePage(props: {
       </div>
     </div>
   </>;
+}
+
+function MissionControl(props: { missions: Mission[]; projects: Project[] }): ReactElement {
+  return <section className="mission-control" aria-labelledby="mission-control-heading">
+    <div className="section-title-row"><div><p className="section-label">Mission Control</p><h2 id="mission-control-heading">Hermes execution ledger</h2></div><span className="mission-count">{props.missions.length} mission{props.missions.length === 1 ? '' : 's'}</span></div>
+    <p className="mission-help">Hermes owns orchestration. IRIS records governed action state, evidence, approvals, and supervisor-gate representation. Supervisor transport is not connected here.</p>
+    {props.missions.length === 0
+      ? <div className="empty-state"><p>No missions recorded yet.</p><span>Mission records appear when an orchestrator registers work through the governed IRIS mission tools.</span></div>
+      : <div className="mission-list">{props.missions.map((mission) => {
+        const project = mission.projectId === null ? null : props.projects.find((candidate) => candidate.id === mission.projectId) ?? null;
+        const actionCount = mission.tasks.reduce((total, task) => total + task.actions.length, 0);
+        return <details key={mission.id} className="mission-item">
+          <summary><span><strong>{mission.title}</strong><small>{project?.name ?? 'No project'} · {mission.tasks.length} tasks · {actionCount} actions</small></span><span className="mission-state">{mission.state}</span></summary>
+          <div className="mission-meta"><div><span>Supervisor gate</span><strong>{mission.supervisorGate.state}</strong></div><div><span>Updated</span><strong>{formatSessionTime(mission.updatedAt)}</strong></div></div>
+          {mission.supervisorGate.reason !== null ? <p className="mission-gate-reason">{mission.supervisorGate.reason}</p> : null}
+          <div className="mission-tasks">{mission.tasks.map((task) => <article key={task.id}>
+            <header><strong>{task.title}</strong><span>{task.state}</span></header>
+            {task.actions.length === 0 ? <p>No governed actions prepared.</p> : <ul>{task.actions.map((action) => <li key={action.id}>
+              <div><strong>{humanCapability(action.capabilityId)}</strong><span>{action.summary}</span></div>
+              <div className="mission-action-status"><span>{action.state}</span>{action.approvalId !== null ? <small>Approval associated</small> : null}</div>
+              {action.result !== null ? <p>{action.result.summary}{action.result.evidence.length > 0 ? ` · ${action.result.evidence.length} evidence item${action.result.evidence.length === 1 ? '' : 's'}` : ''}</p> : null}
+            </li>)}</ul>}
+          </article>)}</div>
+          <details className="mission-timeline"><summary>Recent timeline</summary><ol>{mission.timeline.slice(-8).reverse().map((event) => <li key={event.id}><time dateTime={event.timestamp}>{formatSessionTime(event.timestamp)}</time><span>{event.message}</span></li>)}</ol></details>
+        </details>;
+      })}</div>}
+  </section>;
 }
 
 function PermissionsPage(props: { permissions: PermissionSnapshot | null; onRequestMode(mode: PermissionMode): void }): ReactElement {

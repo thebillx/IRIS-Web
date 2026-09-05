@@ -48,6 +48,7 @@ describe('agent interaction conversation execution', () => {
       calls.push({ url, method, clientId: headers.get('x-iris-client-id') });
       if (url === '/health') return jsonResponse(health);
       if (url === '/projects') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/missions') return jsonResponse({ missions: [] });
       if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
       if (url === '/sessions' && method === 'GET') return jsonResponse({ sessions: [session] });
       if (url === '/sessions/session-a/instructions' && method === 'POST') {
@@ -92,6 +93,7 @@ describe('agent interaction conversation execution', () => {
       const method = init.method ?? 'GET';
       if (url === '/health') return Promise.resolve(jsonResponse(health));
       if (url === '/projects') return Promise.resolve(jsonResponse({ projects: [projectA, projectB], defaultProjectId: projectA.id }));
+      if (url === '/missions') return jsonResponse({ missions: [] });
       if (url === '/permissions') return Promise.resolve(jsonResponse(permissionSnapshot([])));
       if (url === '/sessions' && method === 'GET') return Promise.resolve(jsonResponse({ sessions: [sessionA, sessionB] }));
       if (url === '/sessions/session-a/instructions' && method === 'POST') {
@@ -157,6 +159,7 @@ describe('agent interaction conversation execution', () => {
       const method = init.method ?? 'GET';
       if (url === '/health') return jsonResponse(health);
       if (url === '/projects') return jsonResponse({ projects: [projectA, projectB], defaultProjectId: projectA.id });
+      if (url === '/missions') return jsonResponse({ missions: [] });
       if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
       if (url === '/sessions' && method === 'GET') return jsonResponse({ sessions: [sessionA, sessionB] });
       if (url === '/sessions/session-a/instructions' && method === 'POST') {

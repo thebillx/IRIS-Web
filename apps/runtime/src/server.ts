@@ -150,6 +150,10 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     });
     return;
   }
+  if (request.method === 'GET' && url.pathname === '/missions') {
+    writeJson(response, 200, { missions: await context.state.listMissions() });
+    return;
+  }
   if (request.method === 'GET' && url.pathname === '/permissions') {
     writeJson(response, 200, {
       ...(await context.capabilities.permissionSnapshot()),

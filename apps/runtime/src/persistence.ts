@@ -122,7 +122,7 @@ export async function readOwnerAccessSecret(dataRoot: string): Promise<string | 
 }
 
 export class FoundationStateStore {
-  public constructor(private readonly dataRoot: string) {}
+  public constructor(public readonly dataRoot: string) {}
 
   public async read(): Promise<FoundationStateDocument> {
     const filename = path.join(this.dataRoot, STATE_FILE);

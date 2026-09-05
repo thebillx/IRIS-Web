@@ -18,6 +18,9 @@ export interface PolicyRequest {
   readonly clientId?: string | null | undefined;
   readonly sessionId?: string | null | undefined;
   readonly agentId?: string | null | undefined;
+  readonly missionId?: string | null | undefined;
+  readonly taskId?: string | null | undefined;
+  readonly actionId?: string | null | undefined;
   readonly projectId?: string | null | undefined;
   readonly targetPath?: string | null | undefined;
 }
@@ -272,6 +275,9 @@ function record(
     clientId: input.clientId?.trim() || null,
     sessionId: input.sessionId?.trim() || null,
     agentId: input.agentId?.trim() || null,
+    missionId: input.missionId?.trim() || null,
+    taskId: input.taskId?.trim() || null,
+    actionId: input.actionId?.trim() || null,
     capabilityId: input.capabilityId,
     riskClass,
     projectId,

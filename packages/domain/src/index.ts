@@ -47,6 +47,96 @@ export interface RuntimeSessionSnapshot extends RuntimeSession {
   readonly interactions: readonly SessionInteractionEvent[];
 }
 
+export type MissionState = 'PLANNED' | 'RUNNING' | 'WAITING_APPROVAL' | 'WAITING_SUPERVISOR' | 'PAUSED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+export type MissionTaskState = 'PENDING' | 'RUNNING' | 'BLOCKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+export type MissionActionState = 'PLANNED' | 'RUNNING' | 'OWNER_APPROVAL_REQUIRED' | 'SUCCEEDED' | 'DENIED' | 'FAILED' | 'CANCELLED';
+export type SupervisorGateState = 'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'DENIED';
+export type MissionEvidenceKind = 'CAPABILITY_RESULT' | 'AUDIT' | 'ARTIFACT' | 'OBSERVATION';
+export type MissionTimelineKind =
+  | 'MISSION_CREATED'
+  | 'MISSION_STATE_CHANGED'
+  | 'TASK_CREATED'
+  | 'TASK_STATE_CHANGED'
+  | 'ACTION_PREPARED'
+  | 'ACTION_STARTED'
+  | 'APPROVAL_REQUIRED'
+  | 'ACTION_SUCCEEDED'
+  | 'ACTION_DENIED'
+  | 'ACTION_FAILED'
+  | 'SUPERVISOR_GATE_CHANGED';
+
+export interface MissionExecutionAssociation {
+  readonly missionId: string;
+  readonly taskId: string;
+  readonly actionId: string;
+}
+
+export interface MissionEvidence {
+  readonly id: string;
+  readonly kind: MissionEvidenceKind;
+  readonly label: string;
+  readonly summary: string;
+  readonly reference: string | null;
+  readonly data: Readonly<Record<string, string | number | boolean | null>>;
+}
+
+export interface MissionActionResult {
+  readonly status: 'SUCCEEDED' | 'OWNER_REQUIRED' | 'DENIED' | 'FAILED';
+  readonly summary: string;
+  readonly approvalId: string | null;
+  readonly completedAt: string | null;
+  readonly evidence: readonly MissionEvidence[];
+}
+
+export interface MissionAction {
+  readonly id: string;
+  readonly capabilityId: CapabilityId;
+  readonly summary: string;
+  readonly state: MissionActionState;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly approvalId: string | null;
+  readonly result: MissionActionResult | null;
+}
+
+export interface MissionTask {
+  readonly id: string;
+  readonly title: string;
+  readonly state: MissionTaskState;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly actions: readonly MissionAction[];
+}
+
+export interface SupervisorGate {
+  readonly state: SupervisorGateState;
+  readonly reason: string | null;
+  readonly updatedAt: string;
+}
+
+export interface MissionTimelineEvent {
+  readonly id: string;
+  readonly timestamp: string;
+  readonly kind: MissionTimelineKind;
+  readonly taskId: string | null;
+  readonly actionId: string | null;
+  readonly message: string;
+}
+
+export interface MissionSnapshot {
+  readonly id: string;
+  readonly title: string;
+  readonly state: MissionState;
+  readonly clientId: string;
+  readonly sessionId: string;
+  readonly projectId: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly supervisorGate: SupervisorGate;
+  readonly tasks: readonly MissionTask[];
+  readonly timeline: readonly MissionTimelineEvent[];
+}
+
 export interface RuntimeClientState {
   readonly clientId: string;
   readonly connected: boolean;
@@ -94,6 +184,14 @@ export type PolicyDecision = 'ALLOW_AUTO' | 'ALLOW_ONCE' | 'DENY' | 'OWNER_REQUI
 export type CapabilityId =
   | 'runtime.status'
   | 'project.list'
+  | 'mission.list'
+  | 'mission.get'
+  | 'mission.create'
+  | 'mission.state.set'
+  | 'mission.task.create'
+  | 'mission.task.state.set'
+  | 'mission.action.prepare'
+  | 'mission.supervisor_gate.set'
   | 'session.create'
   | 'session.delete'
   | 'session.current_project.set'
@@ -129,6 +227,9 @@ export interface PermissionDecisionRecord {
   readonly clientId: string | null;
   readonly sessionId: string | null;
   readonly agentId: string | null;
+  readonly missionId?: string | null;
+  readonly taskId?: string | null;
+  readonly actionId?: string | null;
   readonly capabilityId: CapabilityId | string;
   readonly riskClass: RiskClass;
   readonly projectId: string | null;
@@ -161,6 +262,7 @@ export type RuntimeFailureCode =
   | 'PROJECT_NOT_FOUND'
   | 'SESSION_NOT_FOUND'
   | 'SESSION_BUSY'
+  | 'MISSION_NOT_FOUND'
   | 'AGENT_EXECUTION_FAILED'
   | 'RUNTIME_NOT_RUNNING'
   | 'RUNTIME_SHUTTING_DOWN'

@@ -56,13 +56,14 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB]): string {
+function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB], missions: Parameters<typeof RuntimePage>[0]['missions'] = []): string {
   return renderToStaticMarkup(createElement(RuntimePage, {
     health,
     projects: [projectA, projectB],
     defaultProject: projectA,
     activeProject: selectedSession?.currentProjectId === projectA.id ? projectA : selectedSession?.currentProjectId === projectB.id ? projectB : null,
     sessions,
+    missions,
     selectedSession,
     sessionActivity: [],
     pendingApprovalCount: 0,
@@ -134,6 +135,7 @@ describe('daily workspace session experience', () => {
 
       if (url === '/health') return jsonResponse(health);
       if (url === '/projects' && method === 'GET') return jsonResponse({ projects: [projectA, projectB], defaultProjectId: projectA.id });
+      if (url === '/missions') return jsonResponse({ missions: [] });
       if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
       if (url === '/sessions' && method === 'GET') return jsonResponse({ sessions: [...runtimeSessions] });
       if (url === '/sessions' && method === 'POST') {
@@ -183,6 +185,7 @@ describe('daily workspace session experience', () => {
       if (url === '/health') return jsonResponse({ ...health, instanceId: 'restarted-instance', connectedSessions: 0 });
       if (url === '/projects' && method === 'GET') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
       if (url === '/sessions' && method === 'GET') return jsonResponse({ sessions: [] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
       if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
       throw new Error(`Unexpected request: ${method} ${url}`);
     }));
@@ -209,6 +212,7 @@ describe('daily workspace session experience', () => {
       if (url === '/health') return jsonResponse(health);
       if (url === '/projects' && method === 'GET') return jsonResponse({ projects: [projectA, projectB], defaultProjectId: projectA.id });
       if (url === '/sessions' && method === 'GET') return jsonResponse({ sessions: [sessionA, sessionB] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
       if (url === '/permissions') return jsonResponse(permissionSnapshot([approvalA, approvalB]));
       throw new Error(`Unexpected request: ${method} ${url}`);
     }));
@@ -242,6 +246,35 @@ describe('daily workspace session experience', () => {
     expect(approvalBelongsToSessionContext(otherSessionApproval, 'web-client', sessionA.id)).toBe(false);
     expect(approvalBelongsToSessionContext(browserClientApproval, 'web-client', sessionA.id)).toBe(true);
     expect(approvalBelongsToSessionContext(otherClientApproval, 'web-client', sessionA.id)).toBe(false);
+  });
+
+  it('renders mission control state, approval association, evidence count, and recent timeline read-only', () => {
+    const mission: Parameters<typeof RuntimePage>[0]['missions'][number] = {
+      id: '11111111-1111-4111-8111-111111111111', title: 'Hermes mission', state: 'WAITING_APPROVAL',
+      clientId: 'web-client', sessionId: sessionA.id, projectId: projectA.id,
+      createdAt: '2026-09-05T06:00:00.000Z', updatedAt: '2026-09-05T06:10:00.000Z',
+      supervisorGate: { state: 'PENDING', reason: 'Await supervisor directive', updatedAt: '2026-09-05T06:09:00.000Z' },
+      tasks: [{
+        id: '22222222-2222-4222-8222-222222222222', title: 'Governed write', state: 'BLOCKED',
+        createdAt: '2026-09-05T06:01:00.000Z', updatedAt: '2026-09-05T06:08:00.000Z',
+        actions: [{
+          id: '33333333-3333-4333-8333-333333333333', capabilityId: 'file.write', summary: 'Write bounded artifact',
+          state: 'OWNER_APPROVAL_REQUIRED', createdAt: '2026-09-05T06:02:00.000Z', updatedAt: '2026-09-05T06:08:00.000Z',
+          approvalId: '44444444-4444-4444-8444-444444444444',
+          result: { status: 'OWNER_REQUIRED', summary: 'Owner approval required', approvalId: '44444444-4444-4444-8444-444444444444', completedAt: null, evidence: [{ id: '55555555-5555-4555-8555-555555555555', kind: 'OBSERVATION', label: 'scope', summary: 'Bounded observation', reference: null, data: {} }] },
+        }],
+      }],
+      timeline: [{ id: '66666666-6666-4666-8666-666666666666', timestamp: '2026-09-05T06:08:00.000Z', kind: 'APPROVAL_REQUIRED', taskId: '22222222-2222-4222-8222-222222222222', actionId: '33333333-3333-4333-8333-333333333333', message: 'Owner approval is required before the governed action can execute' }],
+    };
+    const markup = renderWorkspace(sessionA, [sessionA], [mission]);
+    expect(markup).toContain('Mission Control');
+    expect(markup).toContain('Hermes execution ledger');
+    expect(markup).toContain('Hermes mission');
+    expect(markup).toContain('WAITING_APPROVAL');
+    expect(markup).toContain('PENDING');
+    expect(markup).toContain('Approval associated');
+    expect(markup).toContain('1 evidence item');
+    expect(markup).toContain('Owner approval is required before the governed action can execute');
   });
 
   it('shows intentional empty states when there is no session or active project', () => {
