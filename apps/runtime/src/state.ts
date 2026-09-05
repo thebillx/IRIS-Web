@@ -690,7 +690,7 @@ function missionEvidence(capabilityId: CapabilityId, value: unknown): readonly M
   const data: Record<string, string | number | boolean | null> = {};
   let reference: string | null = null;
   if (typeof record.targetPath === 'string') reference = record.targetPath.slice(0, 2_048);
-  for (const key of ['bytes', 'created', 'deleted'] as const) {
+  for (const key of ['bytes', 'created', 'deleted', 'passed', 'exitCode', 'timedOut', 'outputTruncated'] as const) {
     const item = record[key];
     if (typeof item === 'number' && Number.isFinite(item)) data[key] = item;
     if (typeof item === 'boolean') data[key] = item;

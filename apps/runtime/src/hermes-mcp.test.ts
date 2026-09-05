@@ -23,6 +23,7 @@ async function fixture() {
   const projectRoot = path.join(sourceRoot, 'proof-worktree'); await mkdir(projectRoot);
   await execFileAsync('/usr/bin/git', ['init', '-b', 'proof'], { cwd: projectRoot });
   await writeFile(path.join(projectRoot, 'untracked.txt'), 'read-only proof\n');
+  await writeFile(path.join(projectRoot, 'package.json'), JSON.stringify({ private: true, scripts: { test: "node -e \"console.log('hermes-governed-test-pass')\"" } }));
   const state = new RuntimeState(new FoundationStateStore(dataRoot));
   const project = await state.registerProject('Hermes Proof', projectRoot);
   const session = state.createSession('hermes-client', 'hermes-loop-engineer', 'implementer');
@@ -82,7 +83,7 @@ describe('standard governed Hermes MCP adapter', () => {
     const listed = await handleHermesMcpRequest(rpc('tools/list'), f.mission.id, f.state, f.broker, f.capabilities);
     const listBody = await listed.json() as { result: { tools: { name: string }[] } };
     expect(listBody.result.tools.map((tool) => tool.name)).toEqual([
-      'runtime_status', 'mission_get', 'project_git_status', 'project_file_read',
+      'runtime_status', 'mission_get', 'project_git_status', 'project_file_read', 'project_test_run',
       'mission_task_create', 'mission_action_prepare', 'project_file_write',
     ]);
     expect(JSON.stringify(listBody)).not.toContain('file_delete');
@@ -94,10 +95,25 @@ describe('standard governed Hermes MCP adapter', () => {
     const f = await fixture();
     expect(await call(f, 'runtime_status')).toMatchObject({ result: { isError: false, structuredContent: { status: 'ready', authority: 'owned' } } });
     expect(await call(f, 'mission_get')).toMatchObject({ result: { isError: false, structuredContent: { id: f.mission.id, title: 'Hermes MCP proof' } } });
-    expect(await call(f, 'project_git_status')).toMatchObject({ result: { isError: false, structuredContent: { branch: 'proof', clean: false, untrackedChanges: 1 } } });
+    expect(await call(f, 'project_git_status')).toMatchObject({ result: { isError: false, structuredContent: { branch: 'proof', clean: false, untrackedChanges: 2 } } });
     expect(await call(f, 'project_file_read', { targetPath: path.join(f.projectRoot, 'untracked.txt') })).toMatchObject({ result: { isError: false, structuredContent: { content: 'read-only proof\n' } } });
     const audit = await f.audit.recent(40);
     for (const capabilityId of ['runtime.status', 'mission.get', 'project.git_status', 'file.read']) expect(audit.some((event) => event.capabilityId === capabilityId && event.result === 'SUCCESS')).toBe(true);
+  });
+
+  it('runs only the declared project test script through a prepared governed mission action', async () => {
+    const f = await fixture();
+    const task = await call(f, 'mission_task_create', { title: 'Validate disposable fixture' });
+    const taskId = asMission(task.result.structuredContent).tasks.at(-1)!.id;
+    const prepared = await call(f, 'mission_action_prepare', { taskId, capabilityId: 'project.test.run', summary: 'Run declared fixture tests' });
+    const { actionId } = taskAndAction(asMission(prepared.result.structuredContent));
+    const result = await call(f, 'project_test_run', { taskId, actionId });
+    expect(result).toMatchObject({ result: { isError: false, structuredContent: { passed: true, exitCode: 0, timedOut: false } } });
+    expect(JSON.stringify(result)).toContain('hermes-governed-test-pass');
+    const mission = await f.state.getMission(f.mission.id);
+    const action = mission.tasks.at(-1)!.actions.at(-1)!;
+    expect(action).toMatchObject({ capabilityId: 'project.test.run', state: 'SUCCEEDED', result: { status: 'SUCCEEDED' } });
+    expect(action.result?.evidence.at(-1)?.data).toMatchObject({ passed: true, exitCode: 0, timedOut: false });
   });
 
   it('requires prepared mission identity and owner approval, then executes the exact file.write once', async () => {

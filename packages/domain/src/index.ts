@@ -230,6 +230,7 @@ export type CapabilityId =
   | 'runtime.status'
   | 'project.list'
   | 'project.git_status'
+  | 'project.test.run'
   | 'mission.list'
   | 'mission.get'
   | 'mission.create'

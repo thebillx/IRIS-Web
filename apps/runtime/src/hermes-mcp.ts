@@ -13,7 +13,7 @@ interface JsonRpcRequest {
 }
 
 const TOOLS = [
-  runtimeStatusTool(), missionGetTool(), projectGitStatusTool(), projectFileReadTool(),
+  runtimeStatusTool(), missionGetTool(), projectGitStatusTool(), projectFileReadTool(), projectTestRunTool(),
   missionTaskCreateTool(), missionActionPrepareTool(), projectFileWriteTool(),
 ] as const;
 
@@ -99,6 +99,15 @@ async function executeTool(
     requireNoArguments(args, name);
     return outcomeResult(await capabilities.execute({ capabilityId: 'project.git_status', clientId: mission.clientId, sessionId: mission.sessionId, projectId: mission.projectId ?? undefined }));
   }
+  if (name === 'project_test_run') {
+    const taskId = requiredString(args, 'taskId', 200);
+    const actionId = requiredString(args, 'actionId', 200);
+    onlyArguments(args, ['taskId', 'actionId'], name);
+    return outcomeResult(await capabilities.execute({
+      capabilityId: 'project.test.run', clientId: mission.clientId, sessionId: mission.sessionId,
+      projectId: mission.projectId ?? undefined, mission: { missionId: mission.id, taskId, actionId },
+    }));
+  }
   if (name === 'project_file_read') {
     const targetPath = requiredString(args, 'targetPath', 4096);
     onlyArguments(args, ['targetPath'], name);
@@ -120,10 +129,10 @@ async function executeTool(
     const capabilityId = requiredString(args, 'capabilityId', 200);
     const summary = requiredString(args, 'summary', 400);
     onlyArguments(args, ['taskId', 'capabilityId', 'summary'], name);
-    if (capabilityId !== 'file.write') throw new RuntimeError('CAPABILITY_DENIED', 'This V2 phase exposes only file.write mission actions');
+    if (capabilityId !== 'file.write' && capabilityId !== 'project.test.run') throw new RuntimeError('CAPABILITY_DENIED', 'This V2 profile exposes only file.write and project.test.run mission actions');
     return outcomeResult(await capabilities.execute({
       capabilityId: 'mission.action.prepare', clientId: mission.clientId, sessionId: mission.sessionId,
-      missionId: mission.id, taskId, actionCapabilityId: 'file.write', summary,
+      missionId: mission.id, taskId, actionCapabilityId: capabilityId, summary,
     }));
   }
   if (name === 'project_file_write') {
@@ -158,6 +167,13 @@ function missionGetTool() {
 function projectGitStatusTool() {
   return { name: 'project_git_status', description: 'Read the branch and clean/dirty state of the mission-bound registered worktree through IRIS governance.', inputSchema: emptySchema(), annotations: { readOnlyHint: true } } as const;
 }
+function projectTestRunTool() {
+  return {
+    name: 'project_test_run', description: 'Run only the mission-bound project declared test script through IRIS governed execution. No arbitrary command is accepted.',
+    inputSchema: { type: 'object', required: ['taskId', 'actionId'], additionalProperties: false, properties: { taskId: { type: 'string' }, actionId: { type: 'string' } } },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  } as const;
+}
 function projectFileReadTool() {
   return {
     name: 'project_file_read', description: 'Read one bounded regular file from the mission-bound project through IRIS path and permission governance.',
@@ -177,7 +193,7 @@ function missionActionPrepareTool() {
     name: 'mission_action_prepare', description: 'Prepare one exact governed file.write action identity. Preparation does not execute the mutation or satisfy owner approval.',
     inputSchema: {
       type: 'object', required: ['taskId', 'capabilityId', 'summary'], additionalProperties: false,
-      properties: { taskId: { type: 'string' }, capabilityId: { const: 'file.write' }, summary: { type: 'string', maxLength: 400 } },
+      properties: { taskId: { type: 'string' }, capabilityId: { enum: ['file.write', 'project.test.run'] }, summary: { type: 'string', maxLength: 400 } },
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   } as const;
