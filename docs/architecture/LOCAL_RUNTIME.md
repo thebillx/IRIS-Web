@@ -35,6 +35,8 @@ Session-scoped state: session identity, logical `agentId`/agent role attribution
 
 Client-scoped state: explicit `clientId`, connected/disconnected state, and last-seen time. Session read/update/delete routes require the matching client identity, so one client cannot silently operate another client's session. Multiple agent sessions may coexist on one daemon; agent identity is attribution rather than a separate authority boundary. Client and session state are in memory; unnecessary transient state is not persisted.
 
+The Web client may list only sessions owned by its stable browser `clientId`. A browser refresh or reconnect to the same daemon can therefore resume an existing authoritative session without creating another one. The selected session ID stored in browser session storage is only a UI preference: it is accepted only when that session still exists in the daemon's client-scoped list. A daemon restart intentionally drops transient sessions and pending approvals; the Web client clears any stale selection and reloads the persisted project registry/default project instead of recreating session authority from browser state.
+
 ## Endpoint discovery
 
 The default preferred API port is `43110`. The daemon binds `127.0.0.1` only. The actual API and MCP URLs are printed at startup and persisted in machine-local endpoint metadata so clients can discover a safe fallback port.

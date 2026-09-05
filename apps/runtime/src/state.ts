@@ -16,6 +16,11 @@ export class RuntimeState {
     return [...this.sessions.values()];
   }
 
+  public listSessionsForClient(clientIdInput: string): readonly RuntimeSession[] {
+    const clientId = normalizeClientId(clientIdInput);
+    return [...this.sessions.values()].filter((session) => session.clientId === clientId);
+  }
+
   public listClients(): readonly RuntimeClientState[] {
     return [...this.clients.values()];
   }

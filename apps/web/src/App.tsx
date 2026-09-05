@@ -14,7 +14,7 @@ type Health = {
 };
 
 type Project = { id: string; name: string; rootPath: string };
-type Session = { id: string; clientId: string; agentId: string; agentRole: string; currentProjectId: string | null };
+export type Session = { id: string; clientId: string; agentId: string; agentRole: string; createdAt: string; currentProjectId: string | null };
 type PermissionMode = 'ASK_EVERY_TIME' | 'AUTO_APPROVE_LOW_RISK' | 'AUTO_APPROVE_PROJECT_SCOPED' | 'FULL_LOCAL_OWNER';
 type RiskClass = 'LOW' | 'MODERATE' | 'HIGH' | 'SYSTEM';
 type PolicyDecision = 'ALLOW_AUTO' | 'ALLOW_ONCE' | 'DENY' | 'OWNER_REQUIRED';
@@ -51,6 +51,7 @@ type ApprovalChoice = 'ALLOW_ONCE' | 'ALWAYS_ALLOW_PROJECT' | 'DENY';
 
 const WEB_CLIENT_ID_KEY = 'iris.web.clientId';
 const WEB_OWNER_TOKEN_KEY = 'iris.web.ownerToken';
+const WEB_SELECTED_SESSION_KEY = 'iris.web.selectedSessionId';
 
 export function App(): ReactElement {
   const [clientId] = useState(webClientId);
@@ -58,7 +59,9 @@ export function App(): ReactElement {
   const [view, setView] = useState<View>('runtime');
   const [health, setHealth] = useState<Health | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [session, setSession] = useState<Session | null>(null);
+  const [defaultProjectId, setDefaultProjectId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState(readSelectedSessionId);
   const [permissions, setPermissions] = useState<PermissionSnapshot | null>(null);
   const [selectedApproval, setSelectedApproval] = useState<PendingApproval | null>(null);
   const [name, setName] = useState('');
@@ -73,30 +76,52 @@ export function App(): ReactElement {
       setHealth(await healthResponse.json() as Health);
       if (ownerAccessToken.length === 0) {
         setProjects([]);
+        setDefaultProjectId(null);
+        setSessions([]);
         setPermissions(null);
         setError('Owner access is locked. Open the IRIS_OWNER_URL printed by pnpm dev.');
         return;
       }
-      const [projectsResponse, permissionsResponse] = await Promise.all([
+      const [projectsResponse, sessionsResponse, permissionsResponse] = await Promise.all([
         authorizedFetch(ownerAccessToken, '/projects'),
+        authorizedFetch(ownerAccessToken, '/sessions', { headers: { 'x-iris-client-id': clientId } }),
         authorizedFetch(ownerAccessToken, '/permissions'),
       ]);
-      if (!projectsResponse.ok || !permissionsResponse.ok) throw new Error('Owner access was rejected by the runtime');
-      const projectBody = await projectsResponse.json() as { projects: Project[] };
+      if (!projectsResponse.ok || !sessionsResponse.ok || !permissionsResponse.ok) {
+        throw new Error('Owner access was rejected by the runtime');
+      }
+      const projectBody = await projectsResponse.json() as { projects: Project[]; defaultProjectId: string | null };
+      const sessionBody = await sessionsResponse.json() as { sessions: Session[] };
+      const nextSelectedSessionId = reconcileSelectedSessionId(readSelectedSessionId(), sessionBody.sessions);
       setProjects(projectBody.projects);
+      setDefaultProjectId(projectBody.defaultProjectId);
+      setSessions(sessionBody.sessions);
+      setSelectedSessionId(nextSelectedSessionId);
+      persistSelectedSessionId(nextSelectedSessionId);
       setPermissions(await permissionsResponse.json() as PermissionSnapshot);
       setError('');
     } catch (cause) {
       setHealth(null);
       setError(cause instanceof Error ? cause.message : 'Runtime unavailable');
     }
-  }, [ownerAccessToken]);
+  }, [clientId, ownerAccessToken]);
 
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 3_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  const selectedSession = sessions.find((candidate) => candidate.id === selectedSessionId) ?? null;
+  const visibleApprovals = (permissions?.pendingApprovals ?? []).filter((approval) =>
+    approvalBelongsToSessionContext(approval, clientId, selectedSessionId),
+  );
+
+  useEffect(() => {
+    if (selectedApproval !== null && !approvalBelongsToSessionContext(selectedApproval, clientId, selectedSessionId)) {
+      setSelectedApproval(null);
+    }
+  }, [clientId, selectedApproval, selectedSessionId]);
 
   const createSession = async () => {
     const response = await authorizedFetch(ownerAccessToken, '/sessions', {
@@ -109,7 +134,10 @@ export function App(): ReactElement {
       return;
     }
     if (!response.ok) throw new Error(await responseMessage(response, 'Could not create session'));
-    setSession(await response.json() as Session);
+    const created = await response.json() as Session;
+    persistSelectedSessionId(created.id);
+    setSelectedSessionId(created.id);
+    setNotice('New session created and selected.');
     await refresh();
   };
 
@@ -131,10 +159,10 @@ export function App(): ReactElement {
   };
 
   const selectProject = async (projectId: string) => {
-    if (session === null) return;
-    const response = await authorizedFetch(ownerAccessToken, `/sessions/${encodeURIComponent(session.id)}/current-project`, {
+    if (selectedSession === null) return;
+    const response = await authorizedFetch(ownerAccessToken, `/sessions/${encodeURIComponent(selectedSession.id)}/current-project`, {
       method: 'PUT',
-      headers: { 'content-type': 'application/json', 'x-iris-client-id': session.clientId },
+      headers: { 'content-type': 'application/json', 'x-iris-client-id': selectedSession.clientId },
       body: JSON.stringify({ projectId: projectId || null }),
     });
     if (response.status === 409) {
@@ -144,7 +172,8 @@ export function App(): ReactElement {
       return;
     }
     if (!response.ok) throw new Error(await responseMessage(response, 'Could not update current project'));
-    setSession(await response.json() as Session);
+    const updated = await response.json() as Session;
+    setSessions((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
     await refresh();
   };
 
@@ -153,7 +182,7 @@ export function App(): ReactElement {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        ...(session === null ? {} : { 'x-iris-client-id': session.clientId, 'x-iris-session-id': session.id }),
+        ...(selectedSession === null ? {} : { 'x-iris-client-id': selectedSession.clientId, 'x-iris-session-id': selectedSession.id }),
       },
       body: JSON.stringify({ mode }),
     });
@@ -168,20 +197,33 @@ export function App(): ReactElement {
   };
 
   const resolveApproval = async (approval: PendingApproval, decision: ApprovalChoice) => {
+    if (!approvalBelongsToSessionContext(approval, clientId, selectedSessionId)) {
+      throw new Error('Switch to the session that owns this approval before resolving it.');
+    }
     const response = await authorizedFetch(ownerAccessToken, `/approvals/${encodeURIComponent(approval.id)}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision }),
     });
     const denialApplied = decision === 'DENY' && await isAppliedOwnerDenial(response);
     if (!response.ok && !denialApplied) throw new Error(await responseMessage(response, 'Could not resolve approval'));
-    if (!denialApplied
-      && response.ok
-      && approval.clientId === clientId
-      && (approval.capabilityId === 'session.create' || approval.capabilityId === 'session.current_project.set')) {
-      setSession(await response.json() as Session);
+    if (!denialApplied && response.ok && approval.clientId === clientId && approval.capabilityId === 'session.create') {
+      const created = await response.json() as Session;
+      persistSelectedSessionId(created.id);
+      setSelectedSessionId(created.id);
+    } else if (!denialApplied && response.ok && approval.clientId === clientId && approval.capabilityId === 'session.current_project.set') {
+      const updated = await response.json() as Session;
+      setSessions((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
     }
     setSelectedApproval(null);
     setNotice(decision === 'DENY' ? 'Action denied. Nothing was executed.' : 'Owner decision applied to the exact pending action.');
     await refresh();
+  };
+
+  const selectSession = (sessionId: string) => {
+    if (!sessions.some((candidate) => candidate.id === sessionId)) return;
+    setSelectedApproval(null);
+    persistSelectedSessionId(sessionId);
+    setSelectedSessionId(sessionId);
+    setNotice('Session resumed.');
   };
 
   const run = (operation: () => Promise<void>) => {
@@ -189,32 +231,58 @@ export function App(): ReactElement {
     void operation().catch((cause) => setError(cause instanceof Error ? cause.message : 'Operation failed'));
   };
 
+  const activeProject = selectedSession?.currentProjectId === null || selectedSession === null
+    ? null
+    : projects.find((project) => project.id === selectedSession.currentProjectId) ?? null;
+  const defaultProject = defaultProjectId === null ? null : projects.find((project) => project.id === defaultProjectId) ?? null;
+  const currentSessionActivity = selectedSession === null
+    ? []
+    : (permissions?.recentDecisions ?? []).filter((event) => event.sessionId === selectedSession.id).slice(0, 5);
+  const productStatus = health === null
+    ? 'Disconnected'
+    : visibleApprovals.length > 0
+      ? 'Approval required'
+      : health.status === 'ready' ? 'Ready' : 'Working';
+
   return <div className="app-frame">
     <header className="web-header">
       <div className="brand-lockup">
         <span className="brand-mark" aria-hidden="true">I</span>
-        <div><strong>IRIS</strong><small>Local Runtime</small></div>
+        <div><strong>IRIS</strong><small>Local Workspace</small></div>
       </div>
       <nav aria-label="IRIS sections">
-        <button className={view === 'runtime' ? 'is-active' : ''} onClick={() => setView('runtime')}>Runtime</button>
+        <button className={view === 'runtime' ? 'is-active' : ''} onClick={() => setView('runtime')}>Workspace</button>
         <button className={view === 'permissions' ? 'is-active' : ''} onClick={() => setView('permissions')}>Settings · Permissions</button>
         <button className={view === 'approvals' ? 'is-active' : ''} onClick={() => setView('approvals')}>
-          Approval Center{permissions?.pendingApprovals.length ? ` (${permissions.pendingApprovals.length})` : ''}
+          Approval Center{visibleApprovals.length > 0 ? ` (${visibleApprovals.length})` : ''}
         </button>
       </nav>
-      <span className={`header-status ${health ? 'is-online' : ''}`}>{health ? 'Local daemon online' : 'Runtime unavailable'}</span>
+      <span className={`header-status ${health ? 'is-online' : ''}`}>{productStatus}</span>
     </header>
 
     <main>
       {error && <p className="error" role="alert">{error}</p>}
       {notice && <p className="notice" role="status">{notice}</p>}
       {view === 'runtime' && <RuntimePage
-        health={health} projects={projects} session={session} name={name} rootPath={rootPath}
-        setName={setName} setRootPath={setRootPath} onCreateSession={() => run(createSession)}
-        onRegisterProject={() => run(registerProject)} onSelectProject={(projectId) => run(() => selectProject(projectId))}
+        health={health}
+        projects={projects}
+        defaultProject={defaultProject}
+        activeProject={activeProject}
+        sessions={sessions}
+        selectedSession={selectedSession}
+        sessionActivity={currentSessionActivity}
+        pendingApprovalCount={visibleApprovals.length}
+        name={name}
+        rootPath={rootPath}
+        setName={setName}
+        setRootPath={setRootPath}
+        onCreateSession={() => run(createSession)}
+        onSelectSession={selectSession}
+        onRegisterProject={() => run(registerProject)}
+        onSelectProject={(projectId) => run(() => selectProject(projectId))}
       />}
       {view === 'permissions' && <PermissionsPage permissions={permissions} onRequestMode={(mode) => run(() => requestMode(mode))} />}
-      {view === 'approvals' && <ApprovalCenter permissions={permissions} onReview={setSelectedApproval} />}
+      {view === 'approvals' && <ApprovalCenter approvals={visibleApprovals} selectedSession={selectedSession} onReview={setSelectedApproval} />}
     </main>
 
     <ApprovalReview
@@ -225,26 +293,81 @@ export function App(): ReactElement {
   </div>;
 }
 
-function RuntimePage(props: {
-  health: Health | null; projects: Project[]; session: Session | null; name: string; rootPath: string;
-  setName(value: string): void; setRootPath(value: string): void; onCreateSession(): void; onRegisterProject(): void; onSelectProject(projectId: string): void;
+export function RuntimePage(props: {
+  health: Health | null;
+  projects: Project[];
+  defaultProject: Project | null;
+  activeProject: Project | null;
+  sessions: Session[];
+  selectedSession: Session | null;
+  sessionActivity: AuditEvent[];
+  pendingApprovalCount: number;
+  name: string;
+  rootPath: string;
+  setName(value: string): void;
+  setRootPath(value: string): void;
+  onCreateSession(): void;
+  onSelectSession(sessionId: string): void;
+  onRegisterProject(): void;
+  onSelectProject(projectId: string): void;
 }): ReactElement {
+  const sessionState = props.health === null
+    ? 'Disconnected'
+    : props.pendingApprovalCount > 0 ? 'Approval required' : 'Ready';
+
   return <>
-    <div className="page-heading"><div><p className="eyebrow">Machine-local authority</p><h1>IRIS Local Runtime</h1></div></div>
-    <p className={`status ${props.health ? 'status--connected' : 'status--unavailable'}`}><span />{props.health ? props.health.status : 'unavailable'}</p>
-    {props.health && <section><h2>Runtime</h2><dl>
-      <dt>Runtime</dt><dd>{props.health.runtimeId}</dd><dt>Instance</dt><dd>{props.health.instanceId}</dd><dt>PID</dt><dd>{props.health.pid}</dd>
-      <dt>Uptime</dt><dd>{Math.floor(props.health.uptimeMs / 1000)}s</dd><dt>Authority</dt><dd>{props.health.authority}</dd>
-      <dt>API</dt><dd>{props.health.apiUrl}</dd><dt>MCP</dt><dd>{props.health.mcpUrl}</dd><dt>Sessions</dt><dd>{props.health.connectedSessions}</dd>
-    </dl></section>}
-    <section><h2>Session</h2>{props.session === null
-      ? <button onClick={props.onCreateSession}>Create Web session</button>
-      : <><p>Session <code>{props.session.id}</code></p><p>Agent <code>{props.session.agentId}</code> · {props.session.agentRole}</p><label>Current project<select value={props.session.currentProjectId ?? ''} onChange={(event) => props.onSelectProject(event.target.value)}><option value="">None</option>{props.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label></>}</section>
-    <section><h2>Projects</h2>{props.projects.length === 0 ? <p>No registered projects.</p> : <ul>{props.projects.map((project) => <li key={project.id}><strong>{project.name}</strong><br/><code>{project.rootPath}</code></li>)}</ul>}
-      <label>Name<input value={props.name} onChange={(event) => props.setName(event.target.value)} /></label>
-      <label>Absolute path<input value={props.rootPath} onChange={(event) => props.setRootPath(event.target.value)} /></label>
-      <button onClick={props.onRegisterProject}>Register project</button>
-    </section>
+    <div className="page-heading"><div><p className="eyebrow">Daily workspace</p><h1>IRIS</h1><p>One local daemon, your projects, and resumable browser sessions.</p></div></div>
+    <div className="workspace-grid">
+      <aside className="workspace-rail">
+        <section className="active-project-card" aria-labelledby="active-project-heading">
+          <p className="section-label">Active Project</p>
+          <h2 id="active-project-heading">{props.activeProject?.name ?? 'No active project'}</h2>
+          {props.activeProject === null
+            ? <p>{props.selectedSession === null ? 'Create or resume a session to choose a project.' : 'This session is not attached to a project yet.'}</p>
+            : <><code className="project-path">{props.activeProject.rootPath}</code><span className="project-status">Available locally</span></>}
+          {props.defaultProject !== null && props.defaultProject.id !== props.activeProject?.id
+            ? <p className="muted">Machine default: <strong>{props.defaultProject.name}</strong></p>
+            : null}
+        </section>
+
+        <section className="sessions-card" aria-labelledby="sessions-heading">
+          <div className="section-title-row"><div><p className="section-label">Sessions</p><h2 id="sessions-heading">Your sessions</h2></div><button onClick={props.onCreateSession}>+ New</button></div>
+          {props.sessions.length === 0
+            ? <div className="empty-state"><p>No sessions yet.</p><span>Start one to work with a project. Sessions live in the local daemon and resume across browser refreshes while that daemon is running.</span></div>
+            : <div className="session-list">{props.sessions.map((session, index) => {
+              const selected = session.id === props.selectedSession?.id;
+              const project = session.currentProjectId === null ? null : props.projects.find((candidate) => candidate.id === session.currentProjectId) ?? null;
+              return <button key={session.id} className={`session-row ${selected ? 'is-selected' : ''}`} onClick={() => props.onSelectSession(session.id)} aria-pressed={selected}>
+                <span><strong>Session {index + 1}</strong><small>{session.agentRole} · {project?.name ?? 'No project'}</small></span>
+                <span className="session-action">{selected ? 'Current' : 'Resume'}</span>
+              </button>;
+            })}</div>}
+        </section>
+      </aside>
+
+      <div className="workspace-main">
+        <section className="current-session-card" aria-labelledby="current-session-heading">
+          <div className="section-title-row"><div><p className="section-label">Current Session</p><h2 id="current-session-heading">{props.selectedSession === null ? 'Nothing selected' : 'Session workspace'}</h2></div><span className={`session-state ${sessionState === 'Ready' ? 'is-ready' : ''}`}>{sessionState}</span></div>
+          {props.selectedSession === null
+            ? <div className="empty-state prominent"><p>Create a session or resume one from the list.</p><button onClick={props.onCreateSession}>Create session</button></div>
+            : <>
+              <div className="session-summary"><div><span>Role</span><strong>{props.selectedSession.agentRole}</strong></div><div><span>Agent</span><strong>{humanAgentName(props.selectedSession.agentId)}</strong></div><div><span>Started</span><strong><time dateTime={props.selectedSession.createdAt}>{formatSessionTime(props.selectedSession.createdAt)}</time></strong></div></div>
+              <label>Active project<select value={props.selectedSession.currentProjectId ?? ''} onChange={(event) => props.onSelectProject(event.target.value)}><option value="">No active project</option>{props.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+              <div className="session-activity"><h3>Recent activity</h3>{props.sessionActivity.length === 0 ? <p>No recorded activity in this session yet.</p> : <ul>{props.sessionActivity.map((event) => <li key={event.id}><strong>{humanCapability(event.capabilityId)}</strong><span>{event.result.toLowerCase()}</span></li>)}</ul>}</div>
+            </>}
+        </section>
+
+        <section className="projects-card"><div className="section-title-row"><div><p className="section-label">Projects</p><h2>Registered locally</h2></div></div>
+          {props.projects.length === 0 ? <div className="empty-state"><p>No registered projects.</p><span>Register an existing local folder. IRIS never scans your filesystem implicitly.</span></div> : <ul className="project-list">{props.projects.map((project) => <li key={project.id}><div><strong>{project.name}</strong><code>{project.rootPath}</code></div>{project.id === props.defaultProject?.id ? <span>Default</span> : null}</li>)}</ul>}
+          <div className="project-register"><label>Name<input value={props.name} onChange={(event) => props.setName(event.target.value)} /></label><label>Absolute path<input value={props.rootPath} onChange={(event) => props.setRootPath(event.target.value)} /></label><button onClick={props.onRegisterProject}>Register project</button></div>
+        </section>
+
+        {props.health && <details className="runtime-details"><summary>Runtime details</summary><dl>
+          <dt>Status</dt><dd>{props.health.status}</dd><dt>Uptime</dt><dd>{Math.floor(props.health.uptimeMs / 1000)}s</dd><dt>Authority</dt><dd>{props.health.authority}</dd>
+          <dt>API</dt><dd>{props.health.apiUrl}</dd><dt>MCP</dt><dd>{props.health.mcpUrl}</dd><dt>Daemon sessions</dt><dd>{props.health.connectedSessions}</dd>
+        </dl></details>}
+      </div>
+    </div>
   </>;
 }
 
@@ -265,12 +388,11 @@ function PermissionsPage(props: { permissions: PermissionSnapshot | null; onRequ
   </>;
 }
 
-function ApprovalCenter(props: { permissions: PermissionSnapshot | null; onReview(approval: PendingApproval): void }): ReactElement {
-  const approvals = props.permissions?.pendingApprovals ?? [];
+function ApprovalCenter(props: { approvals: PendingApproval[]; selectedSession: Session | null; onReview(approval: PendingApproval): void }): ReactElement {
   return <>
-    <div className="page-heading"><div><p className="eyebrow">Owner decisions</p><h1>Approval Center</h1><p>Only genuine trust or authority expansion appears here. Auto-approved project work never blocks on this screen.</p></div></div>
-    <section>{approvals.length === 0 ? <p>No pending owner decisions.</p> : <div className="approval-list">{approvals.map((approval) => <article key={approval.id} className="approval-row">
-      <div><strong>{approval.capabilityId}</strong><span className={`risk risk-${approval.riskClass.toLowerCase()}`}>{approval.riskClass}</span><p>{approval.reason}</p><code>{approval.target ?? 'No filesystem target'}</code></div>
+    <div className="page-heading"><div><p className="eyebrow">Owner decisions</p><h1>Approval Center</h1><p>{props.selectedSession === null ? 'Showing machine or browser-client decisions that are not tied to another session.' : 'Showing decisions for the current session plus machine-level decisions for this browser client.'}</p></div></div>
+    <section>{props.approvals.length === 0 ? <p>No pending owner decisions in this session context.</p> : <div className="approval-list">{props.approvals.map((approval) => <article key={approval.id} className="approval-row">
+      <div><strong>{humanCapability(approval.capabilityId)}</strong><span className={`risk risk-${approval.riskClass.toLowerCase()}`}>{approval.riskClass}</span><p>{approval.reason}</p><code>{approval.target ?? 'No filesystem target'}</code></div>
       <button onClick={() => props.onReview(approval)}>Review exact action</button>
     </article>)}</div>}</section>
   </>;
@@ -318,6 +440,51 @@ function AuditTable(props: { events: AuditEvent[] }): ReactElement {
   return <div className="audit-list">{props.events.map((event) => <article key={event.id}><div><strong>{event.capabilityId}</strong><span>{event.decision} · {event.result}</span></div><code>{event.target ?? 'no target'}</code></article>)}</div>;
 }
 
+export function reconcileSelectedSessionId(preferredSessionId: string | null, sessions: readonly Session[]): string | null {
+  if (preferredSessionId !== null && sessions.some((session) => session.id === preferredSessionId)) return preferredSessionId;
+  return sessions[0]?.id ?? null;
+}
+
+export function approvalBelongsToSessionContext(
+  approval: PendingApproval,
+  clientId: string,
+  selectedSessionId: string | null,
+): boolean {
+  if (approval.sessionId !== null) {
+    return selectedSessionId !== null
+      && approval.sessionId === selectedSessionId
+      && (approval.clientId === null || approval.clientId === clientId);
+  }
+  return approval.clientId === null || approval.clientId === clientId;
+}
+
+function readSelectedSessionId(): string | null {
+  const value = window.sessionStorage.getItem(WEB_SELECTED_SESSION_KEY);
+  return value !== null && value.length > 0 && value.length <= 200 && !value.includes('\0') ? value : null;
+}
+
+function persistSelectedSessionId(sessionId: string | null): void {
+  if (sessionId === null) {
+    window.sessionStorage.removeItem(WEB_SELECTED_SESSION_KEY);
+    return;
+  }
+  window.sessionStorage.setItem(WEB_SELECTED_SESSION_KEY, sessionId);
+}
+
+function humanAgentName(agentId: string): string {
+  return agentId === 'owner-web' ? 'Owner Web' : agentId;
+}
+
+function formatSessionTime(createdAt: string): string {
+  const timestamp = Date.parse(createdAt);
+  if (!Number.isFinite(timestamp)) return 'Unknown';
+  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function humanCapability(capabilityId: string): string {
+  return capabilityId.split('.').map((part) => part.replaceAll('_', ' ')).join(' · ');
+}
+
 function readOwnerAccessToken(): string {
   const hash = new URLSearchParams(window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash);
   const supplied = hash.get('owner');
@@ -336,9 +503,16 @@ function authorizedFetch(token: string, input: RequestInfo | URL, init: RequestI
   return fetch(input, { ...init, headers });
 }
 
-function webClientId(): string {
+export function webClientId(): string {
   const existing = window.sessionStorage.getItem(WEB_CLIENT_ID_KEY);
-  if (existing !== null) return existing;
+  if (existing !== null) {
+    const normalized = existing.trim();
+    if (normalized.length > 0 && normalized.length <= 200 && !normalized.includes('\0')) {
+      if (normalized !== existing) window.sessionStorage.setItem(WEB_CLIENT_ID_KEY, normalized);
+      return normalized;
+    }
+    window.sessionStorage.removeItem(WEB_CLIENT_ID_KEY);
+  }
   const created = crypto.randomUUID();
   window.sessionStorage.setItem(WEB_CLIENT_ID_KEY, created);
   return created;

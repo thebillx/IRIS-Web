@@ -9,6 +9,16 @@
     "typecheck": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.json && vite build"
   },
-  "dependencies": { "@vitejs/plugin-react": "^5.0.2", "vite": "^7.1.4", "react": "^19.1.1", "react-dom": "^19.1.1" },
-  "devDependencies": { "@types/react": "^19.1.12", "@types/react-dom": "^19.1.9", "vitest": "^3.2.4" }
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.0.2",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "vite": "^7.1.4"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "jsdom": "^30.0.1",
+    "vitest": "^3.2.4"
+  }
 }

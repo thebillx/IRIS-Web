@@ -40,6 +40,16 @@ describe('runtime machine, client, and session state', () => {
     expect(state.listClients()).toHaveLength(roles.length);
   });
 
+  it('lists only sessions owned by the requesting client so reconnect can resume without cross-client leakage', async () => {
+    const state = new RuntimeState(new FoundationStateStore(await temp('iris-state-data-')));
+    const first = state.createSession('client-a', 'owner-web', 'owner');
+    const second = state.createSession('client-a', 'owner-web', 'owner');
+    state.createSession('client-b', 'other-web', 'owner');
+
+    expect(state.listSessionsForClient('client-a').map((session) => session.id)).toEqual([first.id, second.id]);
+    expect(state.listSessionsForClient('client-b')).toHaveLength(1);
+  });
+
   it('prevents one client from operating another client session', async () => {
     const state = new RuntimeState(new FoundationStateStore(await temp('iris-state-data-')));
     const session = state.createSession('client-a');

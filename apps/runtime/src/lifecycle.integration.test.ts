@@ -157,6 +157,18 @@ describe('runtime lifecycle integration', () => {
     const sessionB = await json<{ id: string; currentProjectId: string | null }>(`${first.endpoint.apiUrl}/sessions`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientId: 'client-b' }),
     });
+    const clientASessions = await json<{ sessions: Array<{ id: string }> }>(`${first.endpoint.apiUrl}/sessions`, {
+      headers: { 'x-iris-client-id': 'client-a' },
+    });
+    expect(clientASessions.sessions.map((session) => session.id)).toEqual([sessionA.id]);
+
+    const reattachedWithSessions = await startRuntime({ dataRoot, preferredPort: 0, startupDeadlineMs: 15_000 });
+    expect(reattachedWithSessions.endpoint?.instanceId).toBe(firstInstanceId);
+    const clientASessionsAfterReconnect = await json<{ sessions: Array<{ id: string }> }>(`${first.endpoint.apiUrl}/sessions`, {
+      headers: { 'x-iris-client-id': 'client-a' },
+    });
+    expect(clientASessionsAfterReconnect.sessions.map((session) => session.id)).toEqual([sessionA.id]);
+
     const updatedA = await json<{ currentProjectId: string | null }>(`${first.endpoint.apiUrl}/sessions/${sessionA.id}/current-project`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', 'x-iris-client-id': 'client-a' },
@@ -206,6 +218,10 @@ describe('runtime lifecycle integration', () => {
     const persisted = await json<{ projects: Array<{ id: string }>; defaultProjectId: string | null }>(`${second.endpoint.apiUrl}/projects`);
     expect(persisted.projects.map((project) => project.id)).toEqual([projectA.id, projectB.id]);
     expect(persisted.defaultProjectId).toBe(projectA.id);
+    const restartedSessions = await json<{ sessions: Array<{ id: string }> }>(`${second.endpoint.apiUrl}/sessions`, {
+      headers: { 'x-iris-client-id': 'client-a' },
+    });
+    expect(restartedSessions.sessions).toEqual([]);
     await stopRuntime(dataRoot, 15_000);
   }, 45_000);
 });

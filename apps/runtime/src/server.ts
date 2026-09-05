@@ -207,6 +207,11 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     }));
     return;
   }
+  if (request.method === 'GET' && url.pathname === '/sessions') {
+    const clientId = requiredClientId(request);
+    writeJson(response, 200, { sessions: context.state.listSessionsForClient(clientId) });
+    return;
+  }
   if (request.method === 'POST' && url.pathname === '/sessions') {
     const body = await readJsonBody(request, true);
     await writeCapabilityOutcome(response, await context.capabilities.execute({

@@ -55,6 +55,8 @@ describe('capability execution and owner approval', () => {
     if (pending.status !== 'owner_required') return;
     expect(pending.approval.exactAction).toContain('sha256=');
     expect(pending.approval.exactAction).not.toContain(content);
+    expect(pending.approval.clientId).toBe(fixture.session.clientId);
+    expect(pending.approval.sessionId).toBe(fixture.session.id);
     await expect(access(target)).rejects.toMatchObject({ code: 'ENOENT' });
 
     const approved = await fixture.service.resolveApproval(pending.approval.id, 'ALLOW_ONCE');
