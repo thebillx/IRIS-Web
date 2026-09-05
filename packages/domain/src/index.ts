@@ -19,7 +19,7 @@ export interface ProjectReference {
 }
 
 export type AgentRole = 'owner' | 'planner' | 'implementer' | 'reviewer' | 'security' | 'explorer' | 'other';
-export type AgentExecutorType = 'local-development-executor' | 'existing-provider' | 'other';
+export type AgentExecutorType = 'local-development-executor' | 'production-provider-executor' | 'other';
 
 export interface RuntimeSession {
   readonly id: string;

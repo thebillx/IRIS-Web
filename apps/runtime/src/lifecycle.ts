@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { IRIS_VERSION, RuntimeError, type RuntimeHealth, type RuntimeIdentity } from '@iris/domain';
+import { AGENT_EXECUTOR_ENV, OPENAI_API_KEY_ENV, OPENAI_MODEL_ENV } from './agent-executor.js';
 import { AUTHORITY_RECOVERY_IN_PROGRESS, probeRuntimeAuthority } from './authority.js';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { readEndpoint, readRuntimeControl, type EndpointDocument, type RuntimeControlDocument } from './persistence.js';
@@ -195,6 +196,14 @@ export function runtimeChildEnvironment(dataRoot: string, preferredPort?: number
   for (const name of ['HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE'] as const) {
     const value = source[name];
     if (value !== undefined && value.length > 0) environment[name] = value;
+  }
+  const executorSelection = source[AGENT_EXECUTOR_ENV];
+  if (executorSelection !== undefined && executorSelection.length > 0) environment[AGENT_EXECUTOR_ENV] = executorSelection;
+  if (executorSelection?.trim() === 'openai') {
+    for (const name of [OPENAI_API_KEY_ENV, OPENAI_MODEL_ENV] as const) {
+      const value = source[name];
+      if (value !== undefined && value.length > 0) environment[name] = value;
+    }
   }
   return environment;
 }

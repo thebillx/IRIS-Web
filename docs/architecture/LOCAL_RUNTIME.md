@@ -37,6 +37,12 @@ Client-scoped state: explicit `clientId`, connected/disconnected state, and last
 
 The Web client may list only sessions owned by its stable browser `clientId`. A browser refresh or reconnect to the same daemon can therefore resume an existing authoritative session, including its bounded interaction history and execution state, without creating another session or replaying completed work. The selected session ID stored in browser session storage is only a UI preference: it is accepted only when that session still exists in the daemon's client-scoped list. A daemon restart intentionally drops transient sessions, interaction history, execution state, and pending approvals; the Web client clears any stale selection and reloads the persisted project registry/default project instead of recreating session authority or replaying execution from browser state.
 
+## Model executor configuration
+
+Agent execution selection is daemon-owned and explicit. `IRIS_AGENT_EXECUTOR` is either `development` (or unset, which keeps the local deterministic executor) or `openai`. OpenAI production execution additionally requires daemon-local `OPENAI_API_KEY` and `IRIS_OPENAI_MODEL`. The lifecycle child environment forwards only those named provider variables in addition to the existing bounded runtime environment; unrelated inherited tokens and `NODE_OPTIONS` remain excluded.
+
+Selecting `openai` never falls back to the development executor when configuration, network access, authentication, provider response shape, or timeout handling fails. Runtime health reports `agentExecutorType=production-provider-executor` for the selected production path, while `productionModelConnected` remains false until a real production request has completed successfully with a valid bounded response.
+
 ## Endpoint discovery
 
 The default preferred API port is `43110`. The daemon binds `127.0.0.1` only. The actual API and MCP URLs are printed at startup and persisted in machine-local endpoint metadata so clients can discover a safe fallback port.

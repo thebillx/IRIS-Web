@@ -18,4 +18,6 @@ Session current-project state is isolated in memory and read/update/delete route
 
 Permission audit remains local and records metadata only; it does not record file contents, API keys, passwords, tokens, control credentials, or secret values. Permission settings are explicitly initialized to the owner-authorized development mode and missing/corrupt settings after initialization fail closed.
 
+Production model access is daemon-only. The OpenAI credential is accepted only from the explicitly allowlisted local child environment and is never written into repository state, runtime health, approval text, authoritative conversation history, or Web state. The provider receives only the current bounded instruction plus minimal role/project-selected context; project names, filesystem paths, repository contents, permissions/audit state, MCP state, other sessions, and credentials are excluded. Provider/network/timeout/malformed-response diagnostics cross the existing executor failure sanitization boundary before they can reach normal product APIs or history.
+
 The same macOS-account process boundary remains a deliberate V1.3 trust assumption: IRIS does not claim to isolate mutually hostile processes already running as the same OS user. Stronger per-process local authentication is future hardening, not an implicit V1.3 guarantee.

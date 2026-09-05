@@ -38,13 +38,23 @@ describe('runtime lifecycle integration', () => {
     const environment = runtimeChildEnvironment('/private/tmp/iris-runtime-test', 43110, {
       PATH: '/opt/homebrew/bin:/usr/bin:/bin', HOME: '/Users/test', TMPDIR: '/private/tmp', LANG: 'en_US.UTF-8',
       NODE_OPTIONS: '--require /tmp/untrusted.js', CLOUD_TOKEN: 'secret-value',
+      IRIS_AGENT_EXECUTOR: 'openai', OPENAI_API_KEY: 'openai-test-secret', IRIS_OPENAI_MODEL: 'gpt-test-model',
     });
     expect(environment).toMatchObject({
       PATH: '/opt/homebrew/bin:/usr/bin:/bin', HOME: '/Users/test', TMPDIR: '/private/tmp', LANG: 'en_US.UTF-8',
       IRIS_RUNTIME_DATA_ROOT: '/private/tmp/iris-runtime-test', IRIS_RUNTIME_PORT: '43110',
+      IRIS_AGENT_EXECUTOR: 'openai', OPENAI_API_KEY: 'openai-test-secret', IRIS_OPENAI_MODEL: 'gpt-test-model',
     });
     expect(environment.NODE_OPTIONS).toBeUndefined();
     expect(environment.CLOUD_TOKEN).toBeUndefined();
+
+    const developmentEnvironment = runtimeChildEnvironment('/private/tmp/iris-runtime-test', 43110, {
+      PATH: '/opt/homebrew/bin:/usr/bin:/bin',
+      IRIS_AGENT_EXECUTOR: 'development', OPENAI_API_KEY: 'must-not-reach-child', IRIS_OPENAI_MODEL: 'must-not-reach-child',
+    });
+    expect(developmentEnvironment.IRIS_AGENT_EXECUTOR).toBe('development');
+    expect(developmentEnvironment.OPENAI_API_KEY).toBeUndefined();
+    expect(developmentEnvironment.IRIS_OPENAI_MODEL).toBeUndefined();
   });
 
   it('recovers a matching stale schema-v1 authority and endpoint that predates runtime control metadata', async () => {

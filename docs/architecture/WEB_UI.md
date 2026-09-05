@@ -22,7 +22,7 @@ Sessions remain intentionally daemon-memory state, including their bounded inter
 
 Approval Center remains the only permission surface. Pending approvals are filtered to the selected session plus machine/browser-client decisions not tied to another session, and switching sessions closes any open approval from the previous context before it can be resolved accidentally. When an instruction itself is owner-required, the originating session shows an approval-required state but the exact decision is still made in Approval Center.
 
-The current executor is explicitly reported by runtime metadata as `local-development-executor` with no production model connected. The Web labels that development seam instead of presenting it as a production AI provider.
+Runtime metadata reports either `local-development-executor` or `production-provider-executor`. The Web remains provider-neutral: it never receives provider credentials, endpoint protocol, request IDs, or authentication details. `productionModelConnected` reflects a successfully completed real production request, not merely the presence of local configuration.
 
 During `pnpm dev`, the root dev coordinator starts or attaches to the authoritative runtime first, reads its actual loopback URL, and then starts Vite with a same-origin proxy to that runtime. No developer-specific absolute path is required.
 

@@ -42,9 +42,11 @@ Permission audit records include `agentId` in addition to client/session/project
 
 ## Current executor boundary
 
-The current session execution seam is implemented by a deterministic `local-development-executor`. It proves session-bound instruction → runtime execution → session output without a cloud runtime dependency, and runtime health explicitly reports that no production model is connected. The session/UI contracts do not depend on this temporary executor's response format.
+The session execution seam remains the provider-neutral `AgentExecutor` contract. Runtime construction deterministically selects either the deterministic `local-development-executor` or one OpenAI-backed `production-provider-executor`; session identity, replay protection, execution state, and authoritative history stay in `RuntimeState` rather than moving into provider code.
 
-IRIS still does not implement an Agent Manager, planner queue, model router, delegation scheduler, or sub-agent lifecycle service. Those remain separate orchestration work and must not bypass daemon authority or capability policy.
+The production executor sends only the current bounded instruction plus a minimal agent-role/project-selected instruction. It does not send the project name, repository contents, filesystem paths, session/client IDs, permission state, MCP state, audit history, secrets, or other sessions. Provider output is reduced to bounded text before it returns through the existing executor result contract.
+
+IRIS still does not implement an Agent Manager, planner queue, model router, provider fallback, delegation scheduler, tool-calling loop, or sub-agent lifecycle service. Those remain separate orchestration work and must not bypass daemon authority or capability policy.
 
 `AGENT_MANAGER_FOUNDATION=PASS`
 

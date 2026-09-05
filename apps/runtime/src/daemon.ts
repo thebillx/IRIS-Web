@@ -3,6 +3,7 @@ import { IRIS_PLATFORM, IRIS_VERSION, RuntimeError, type DoctorReport, type Runt
 import { acquireRuntimeAuthority, probeRuntimeAuthority } from './authority.js';
 import { ensureRuntimeDataRoot, resolveRuntimeDataRoot, resolveSourceRoot, RUNTIME_DATA_ENV, runtimeDataRootWritable } from './data-root.js';
 import { PermissionAuditStore } from './audit.js';
+import { createAgentExecutorFromEnvironment } from './agent-executor.js';
 import { CapabilityService } from './capability-service.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
@@ -64,7 +65,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
 
   try {
     const store = new FoundationStateStore(dataRoot);
-    const state = new RuntimeState(store);
+    const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env));
     const permissionSettings = new PermissionSettingsStore(dataRoot);
     await permissionSettings.initialize();
     const sourceRoot = await resolveSourceRoot();

@@ -9,7 +9,7 @@ type Health = {
   authority: string;
   connectedClients: number;
   connectedSessions: number;
-  agentExecutorType: 'local-development-executor' | 'existing-provider' | 'other';
+  agentExecutorType: 'local-development-executor' | 'production-provider-executor' | 'other';
   productionModelConnected: boolean;
   apiUrl: string;
   mcpUrl: string;
