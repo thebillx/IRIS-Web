@@ -28,8 +28,9 @@ export class MissionLedgerStore {
     if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
     try {
       const parsed = JSON.parse(inspected.content) as unknown;
-      if (!isMissionLedgerDocument(parsed)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Mission ledger is invalid');
-      return parsed;
+      const normalized = normalizeMissionLedgerDocument(parsed);
+      if (normalized === null) throw new RuntimeError('PERSISTENCE_FAILURE', 'Mission ledger is invalid');
+      return normalized;
     } catch (error) {
       if (error instanceof RuntimeError) throw error;
       throw new RuntimeError('PERSISTENCE_FAILURE', 'Mission ledger is invalid JSON', { cause: error });
@@ -60,6 +61,30 @@ async function writeJsonAtomic(filename: string, value: unknown): Promise<void> 
   }
 }
 
+function normalizeMissionLedgerDocument(value: unknown): MissionLedgerDocument | null {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.missions) || value.missions.length > MAX_MISSIONS) return null;
+  const missions: MissionSnapshot[] = [];
+  for (const candidate of value.missions) {
+    if (!isRecord(candidate)) return null;
+    const orchestratorFields = [candidate.orchestratorMode, candidate.orchestratorVersion, candidate.lastOrchestratorHandoff, candidate.orchestratorHandoffIds];
+    const legacyOrchestratorRecord = orchestratorFields.every((field) => field === undefined);
+    if (!legacyOrchestratorRecord && orchestratorFields.some((field) => field === undefined)) return null;
+    const normalized: MissionSnapshot = legacyOrchestratorRecord
+      ? {
+          ...(candidate as unknown as MissionSnapshot),
+          orchestratorMode: 'HERMES',
+          orchestratorVersion: 1,
+          lastOrchestratorHandoff: null,
+          orchestratorHandoffIds: [],
+        }
+      : candidate as unknown as MissionSnapshot;
+    if (!isMissionSnapshot(normalized)) return null;
+    missions.push(normalized);
+  }
+  if (new Set(missions.map((mission) => mission.id)).size !== missions.length) return null;
+  return { schemaVersion: 1, missions };
+}
+
 function isMissionLedgerDocument(value: unknown): value is MissionLedgerDocument {
   if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.missions) || value.missions.length > MAX_MISSIONS) return false;
   if (!value.missions.every(isMissionSnapshot)) return false;
@@ -72,6 +97,9 @@ function isMissionSnapshot(value: unknown): value is MissionSnapshot {
     || !isUuid(value.id)
     || !boundedText(value.title, 240)
     || !missionState(value.state)
+    || !orchestratorMode(value.orchestratorMode)
+    || !positiveVersion(value.orchestratorVersion)
+    || !orchestratorHandoffHistory(value.lastOrchestratorHandoff, value.orchestratorHandoffIds)
     || !boundedIdentity(value.clientId)
     || !boundedIdentity(value.sessionId)
     || (value.projectId !== null && !isUuid(value.projectId))
@@ -159,6 +187,30 @@ function isTimelineEvent(value: unknown): boolean {
     && boundedText(value.message, 500);
 }
 
+function orchestratorMode(value: unknown): boolean {
+  return value === 'HERMES' || value === 'CHATGPT';
+}
+
+function positiveVersion(value: unknown): boolean {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
+function isOrchestratorHandoff(value: unknown): value is NonNullable<MissionSnapshot['lastOrchestratorHandoff']> {
+  return isRecord(value)
+    && isUuid(value.handoffId)
+    && positiveVersion(value.expectedVersion)
+    && orchestratorMode(value.from)
+    && orchestratorMode(value.to)
+    && value.from !== value.to
+    && timestamp(value.completedAt);
+}
+
+function orchestratorHandoffHistory(last: unknown, ids: unknown): boolean {
+  if (!Array.isArray(ids) || ids.length > 64 || !ids.every(isUuid) || new Set(ids).size !== ids.length) return false;
+  if (last === null) return true;
+  return isOrchestratorHandoff(last) && ids.includes(last.handoffId);
+}
+
 function missionState(value: unknown): boolean {
   return value === 'PLANNED' || value === 'RUNNING' || value === 'WAITING_APPROVAL' || value === 'WAITING_SUPERVISOR'
     || value === 'PAUSED' || value === 'COMPLETED' || value === 'FAILED' || value === 'CANCELLED';
@@ -176,7 +228,7 @@ function actionState(value: unknown): boolean {
 function timelineKind(value: unknown): boolean {
   return value === 'MISSION_CREATED' || value === 'MISSION_STATE_CHANGED' || value === 'TASK_CREATED' || value === 'TASK_STATE_CHANGED'
     || value === 'ACTION_PREPARED' || value === 'ACTION_STARTED' || value === 'APPROVAL_REQUIRED' || value === 'ACTION_SUCCEEDED'
-    || value === 'ACTION_DENIED' || value === 'ACTION_FAILED' || value === 'SUPERVISOR_GATE_CHANGED';
+    || value === 'ACTION_DENIED' || value === 'ACTION_FAILED' || value === 'SUPERVISOR_GATE_CHANGED' || value === 'ORCHESTRATOR_MODE_CHANGED';
 }
 
 function timestamp(value: unknown): boolean {

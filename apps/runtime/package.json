@@ -7,6 +7,7 @@
     "dev": "tsx src/main.ts",
     "runtime": "tsx src/control.ts",
     "v2-acceptance": "tsx src/v2-acceptance.ts",
+    "v2-orchestrator-acceptance": "tsx src/v2-orchestrator-acceptance.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.build.json"

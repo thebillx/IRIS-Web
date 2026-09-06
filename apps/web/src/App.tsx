@@ -70,10 +70,15 @@ type MissionBroker = {
   directives: MissionBrokerDirective[];
   updatedAt: string;
 };
+type OrchestratorMode = 'HERMES' | 'CHATGPT';
 type Mission = {
   id: string;
   title: string;
   state: string;
+  orchestratorMode: OrchestratorMode;
+  orchestratorVersion: number;
+  lastOrchestratorHandoff: { handoffId: string; expectedVersion: number; from: OrchestratorMode; to: OrchestratorMode; completedAt: string } | null;
+  orchestratorHandoff: { safe: boolean; reason: string };
   clientId: string;
   sessionId: string;
   projectId: string | null;
@@ -300,6 +305,18 @@ export function App(): ReactElement {
     }
   };
 
+  const requestMissionOrchestrator = async (mission: Mission, targetMode: OrchestratorMode) => {
+    if (mission.orchestratorMode === targetMode) return;
+    const response = await authorizedFetch(ownerAccessToken, `/missions/${encodeURIComponent(mission.id)}/orchestrator`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ targetMode, expectedVersion: mission.orchestratorVersion, handoffId: crypto.randomUUID() }),
+    });
+    if (!response.ok) throw new Error(await responseMessage(response, mission.orchestratorHandoff.reason || 'Could not change mission orchestrator'));
+    setNotice(`Mission orchestrator changed to ${targetMode === 'HERMES' ? 'Hermes Loop Engineer' : 'ChatGPT Direct'}.`);
+    await refresh();
+  };
+
   const requestMode = async (mode: PermissionMode) => {
     const response = await authorizedFetch(ownerAccessToken, '/permissions/mode', {
       method: 'POST',
@@ -412,6 +429,7 @@ export function App(): ReactElement {
         onSelectSession={selectSession}
         onRegisterProject={() => run(registerProject)}
         onSelectProject={(projectId) => run(() => selectProject(projectId))}
+        onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
       />}
       {view === 'permissions' && <PermissionsPage permissions={permissions} onRequestMode={(mode) => run(() => requestMode(mode))} />}
       {view === 'approvals' && <ApprovalCenter approvals={visibleApprovals} selectedSession={selectedSession} onReview={setSelectedApproval} />}
@@ -447,6 +465,7 @@ export function RuntimePage(props: {
   onSelectSession(sessionId: string): void;
   onRegisterProject(): void;
   onSelectProject(projectId: string): void;
+  onRequestMissionOrchestrator(mission: Mission, targetMode: OrchestratorMode): void;
 }): ReactElement {
   const sessionState = props.health === null
     ? 'Disconnected'
@@ -525,7 +544,7 @@ export function RuntimePage(props: {
             </>}
         </section>
 
-        <MissionControl missions={props.missions} projects={props.projects} />
+        <MissionControl missions={props.missions} projects={props.projects} onRequestOrchestrator={props.onRequestMissionOrchestrator} />
 
         <section className="projects-card"><div className="section-title-row"><div><p className="section-label">Projects</p><h2>Registered locally</h2></div></div>
           {props.projects.length === 0 ? <div className="empty-state"><p>No registered projects.</p><span>Register an existing local folder. IRIS never scans your filesystem implicitly.</span></div> : <ul className="project-list">{props.projects.map((project) => <li key={project.id}><div><strong>{project.name}</strong><code>{project.rootPath}</code></div>{project.id === props.defaultProject?.id ? <span>Default</span> : null}</li>)}</ul>}
@@ -542,10 +561,10 @@ export function RuntimePage(props: {
   </>;
 }
 
-function MissionControl(props: { missions: Mission[]; projects: Project[] }): ReactElement {
+function MissionControl(props: { missions: Mission[]; projects: Project[]; onRequestOrchestrator(mission: Mission, targetMode: OrchestratorMode): void }): ReactElement {
   return <section className="mission-control" aria-labelledby="mission-control-heading">
-    <div className="section-title-row"><div><p className="section-label">Mission Control</p><h2 id="mission-control-heading">Hermes execution ledger</h2></div><span className="mission-count">{props.missions.length} mission{props.missions.length === 1 ? '' : 's'}</span></div>
-    <p className="mission-help">Hermes owns orchestration. IRIS records governed action state, durable supervisor checkpoints/directives, evidence, and approvals. This view never grants execution authority.</p>
+    <div className="section-title-row"><div><p className="section-label">Mission Control</p><h2 id="mission-control-heading">Mission execution ledger</h2></div><span className="mission-count">{props.missions.length} mission{props.missions.length === 1 ? '' : 's'}</span></div>
+    <p className="mission-help">The daemon records the single operational orchestrator, governed action state, durable supervisor checkpoints/directives, evidence, and approvals. IRIS remains execution and permission authority in every mode.</p>
     {props.missions.length === 0
       ? <div className="empty-state"><p>No missions recorded yet.</p><span>Mission records appear when an orchestrator registers work through the governed IRIS mission tools.</span></div>
       : <div className="mission-list">{props.missions.map((mission) => {
@@ -556,6 +575,21 @@ function MissionControl(props: { missions: Mission[]; projects: Project[] }): Re
         return <details key={mission.id} className="mission-item">
           <summary><span><strong>{mission.title}</strong><small>{project?.name ?? 'No project'} · {mission.tasks.length} tasks · {actionCount} actions</small></span><span className="mission-state">{mission.state}</span></summary>
           <div className="mission-meta"><div><span>Supervisor gate</span><strong>{mission.supervisorGate.state}</strong></div><div><span>Updated</span><strong>{formatSessionTime(mission.updatedAt)}</strong></div></div>
+          <div className="mission-orchestrator-control">
+            <label>Orchestrator Mode<select
+              aria-label={`Orchestrator Mode for ${mission.title}`}
+              value={mission.orchestratorMode}
+              disabled={!mission.orchestratorHandoff.safe || mission.state === 'COMPLETED'}
+              onChange={(event) => props.onRequestOrchestrator(mission, event.target.value as OrchestratorMode)}
+            >
+              <option value="HERMES">Hermes Loop Engineer</option>
+              <option value="CHATGPT">ChatGPT Direct</option>
+            </select></label>
+            <p><strong>Current orchestrator:</strong> {mission.orchestratorMode === 'HERMES' ? 'Hermes Loop Engineer' : 'ChatGPT Direct'} · version {mission.orchestratorVersion}</p>
+            <p className={mission.orchestratorHandoff.safe ? 'mission-handoff-safe' : 'mission-handoff-blocked'}>
+              <strong>{mission.orchestratorHandoff.safe ? 'Handoff safe' : 'Handoff blocked'}:</strong> {mission.orchestratorHandoff.reason}
+            </p>
+          </div>
           {mission.broker !== null ? <div className="mission-meta broker-meta">
             <div><span>Broker state</span><strong>{mission.broker.state}</strong></div>
             <div><span>Mission version</span><strong>{mission.broker.missionVersion}</strong></div>

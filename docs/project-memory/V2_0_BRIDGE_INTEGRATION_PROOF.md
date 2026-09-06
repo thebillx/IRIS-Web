@@ -38,6 +38,16 @@ A later live mission (`e4a4d94f-9460-4033-ac9b-39f23bd915e7`) bound parent Herme
 `LIVE_HERMES_REASONING_LOOP=PASS`
 `V2_0_ARCHITECTURAL_LOOP_PROVEN=YES`
 
+## Selectable orchestrator stabilization
+
+V2.0 missions now persist `orchestratorMode=HERMES|CHATGPT`, defaulting to `HERMES`, with a versioned/idempotent safe-handoff record in the durable mission ledger. Existing records missing the field migrate on read as HERMES; invalid explicit values fail closed. The daemon is the source of truth and Mission Control renders its current mode plus handoff-safe/blocked reason.
+
+HERMES mode preserves the existing exact-session Loop Engineer/subagent path. CHATGPT mode uses the standard IRIS MCP mission/task/action contracts directly and still routes every local read, declared project test, and mutation through `CapabilityService`, permission policy, approval binding, audit, and result evidence. Transport code stamps the operational source so Hermes execution is rejected in CHATGPT mode and ChatGPT operational mutation is rejected in HERMES mode. Supervisor reads/directives and the explicit handoff operation remain control-plane operations and do not grant execution permission.
+
+Safe handoff rejects running actions, pending owner approvals, unsafe mission states, and active/uncheckpointed Hermes continuation. Broker quiescence is revalidated under the broker mutation queue through the mission switch, so concurrent directive/checkpoint changes cannot race a handoff. HERMES→CHATGPT requires durable quiescence and disables the Hermes MCP immediately; CHATGPT→HERMES requires explicit exact Hermes binding and never chooses `latest`. Duplicate identical handoff IDs are idempotent only for the latest identical transition; all accepted IDs remain in a bounded durable fail-closed history so older IDs cannot be replayed. Governed action start revalidates the durable orchestrator after permission evaluation, preventing a pre-handoff decision from executing after the handoff. Restart preserves one mode, completed actions remain non-replayable, and legacy migration is accepted only when the orchestrator fields are all absent; partial/malformed explicit metadata fails closed.
+
+The repository-owned `pnpm --filter @iris/runtime v2-orchestrator-acceptance` proves a CHATGPT-direct disposable mission with governed read, owner-approved failing test, owner-approved file correction, fresh passing governed test, completion/restart/no-replay, plus both bounded handoff directions and double-orchestration rejection.
+
 ## Reproducible V2.0 daily-use acceptance
 
 The repository-owned acceptance command `pnpm --filter @iris/runtime v2-acceptance` drives a disposable project through the real daemon and mission-bound `/hermes-mcp/<missionId>` endpoint; it does not create another permission engine, mission store, protocol authority, or orchestrator. Acceptance setup registers its project/session and permission mode through the owner-authenticated daemon API, establishes the `project.test.run` project override through the real CapabilityService owner-approval path, and fails closed if either the Hermes parent or child uses native project shell/Git/file tools instead of the mission-bound MCP profile.

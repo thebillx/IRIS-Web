@@ -173,6 +173,14 @@ describe('standard governed Hermes MCP adapter', () => {
     expect((mission.tasks.at(-1)!.actions.at(-1)!)).toMatchObject({ state: 'DENIED', approvalId: approval.id });
   });
 
+  it('disables all Hermes operational tools immediately after a safe handoff to CHATGPT', async () => {
+    const f = await fixture();
+    const handed = await f.broker.changeOrchestrator({ missionId: f.mission.id, targetMode: 'CHATGPT', expectedVersion: 1, handoffId: crypto.randomUUID() });
+    expect(handed.orchestratorMode).toBe('CHATGPT');
+    const result = await call(f, 'runtime_status');
+    expect(result).toMatchObject({ result: { isError: true, structuredContent: { code: 'CAPABILITY_DENIED' } } });
+  });
+
   it('does not expose or accept unprepared or unsupported mutation tools', async () => {
     const f = await fixture();
     const response = await handleHermesMcpRequest(rpc('tools/call', { name: 'file_delete', arguments: { targetPath: '/tmp/nope' } }), f.mission.id, f.state, f.broker, f.capabilities);

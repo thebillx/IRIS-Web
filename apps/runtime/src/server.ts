@@ -186,8 +186,24 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     const brokerRecords = await context.missionBroker.list();
     const brokerByMission = new Map(brokerRecords.map((record) => [record.missionId, record]));
     writeJson(response, 200, {
-      missions: (await context.state.listMissions()).map((mission) => ({ ...mission, broker: brokerByMission.get(mission.id) ?? null })),
+      missions: await Promise.all((await context.state.listMissions()).map(async (mission) => ({
+        ...mission,
+        broker: brokerByMission.get(mission.id) ?? null,
+        orchestratorHandoff: await context.missionBroker.orchestratorHandoffStatus(mission.id),
+      }))),
     });
+    return;
+  }
+  const orchestratorMatch = /^\/missions\/([^/]+)\/orchestrator$/.exec(url.pathname);
+  if (orchestratorMatch !== null && request.method === 'POST') {
+    const missionId = decodeURIComponent(orchestratorMatch[1]!);
+    const body = await readJsonBody(request);
+    writeJson(response, 200, await context.missionBroker.changeOrchestrator({
+      missionId,
+      targetMode: orchestratorModeField(body, 'targetMode'),
+      expectedVersion: integerField(body, 'expectedVersion'),
+      handoffId: stringField(body, 'handoffId'),
+    }));
     return;
   }
   const missionBrokerMatch = /^\/missions\/([^/]+)\/broker$/.exec(url.pathname);
@@ -514,6 +530,12 @@ function nullableStringField(body: Record<string, unknown> | null, name: string)
   if (value === null) return null;
   if (typeof value !== 'string') throw new RuntimeError('INVALID_REQUEST', `${name} must be a string or null`);
   return value;
+}
+
+function orchestratorModeField(body: Record<string, unknown> | null, name: string): 'HERMES' | 'CHATGPT' {
+  const value = body?.[name];
+  if (value === 'HERMES' || value === 'CHATGPT') return value;
+  throw new RuntimeError('INVALID_REQUEST', `${name} is not a supported orchestrator mode`);
 }
 
 function permissionModeField(body: Record<string, unknown> | null, name: string): PermissionMode {

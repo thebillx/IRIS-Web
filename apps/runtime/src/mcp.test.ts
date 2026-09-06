@@ -25,7 +25,7 @@ describe('local MCP transport and permission boundary', () => {
     const listed = await handleMcpRequest(rpc('tools/list', 2), fixture.service);
     const listedBody = await listed.json() as { result: { tools: Array<{ name: string }> } };
     expect(listedBody.result.tools.map((tool) => tool.name)).toEqual([
-      'runtime_status', 'list_projects', 'mission_list', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_supervisor_gate_set', 'file_read', 'file_write', 'file_delete', 'directory_create', 'directory_delete',
+      'runtime_status', 'list_projects', 'mission_list', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_supervisor_gate_set', 'project_test_run', 'file_read', 'file_write', 'file_delete', 'directory_create', 'directory_delete',
     ]);
 
     const status = await handleMcpRequest(rpc('tools/call', 3, { name: 'runtime_status', arguments: {} }, true, 'runtime_status'), fixture.service);
@@ -33,30 +33,30 @@ describe('local MCP transport and permission boundary', () => {
     expect((await fixture.audit.recent(10)).some((event) => event.capabilityId === 'runtime.status' && event.result === 'SUCCESS')).toBe(true);
   });
 
-  it('exposes Hermes-consumable mission contracts while keeping governed execution in CapabilityService', async () => {
+  it('exposes ChatGPT-direct mission contracts while keeping governed execution in CapabilityService', async () => {
     const fixture = await serviceFixture();
     const create = await handleMcpRequest(rpc('tools/call', 10, {
-      name: 'mission_create', arguments: { title: 'Hermes bounded mission' },
+      name: 'mission_create', arguments: { title: 'ChatGPT bounded mission', orchestratorMode: 'CHATGPT' },
     }, true, 'mission_create', fixture.session.clientId, fixture.session.id), fixture.service);
     const createdBody = await create.json() as { result: { structuredContent: { id: string } } };
     const missionId = createdBody.result.structuredContent.id;
 
     const task = await handleMcpRequest(rpc('tools/call', 11, {
       name: 'mission_task_create', arguments: { missionId, title: 'Write governed evidence' },
-    }, true, 'mission_task_create', fixture.session.clientId, fixture.session.id), fixture.service);
+    }, true, 'mission_task_create', fixture.session.clientId, fixture.session.id), fixture.service, fixture.state, fixture.broker);
     const taskBody = await task.json() as { result: { structuredContent: { tasks: Array<{ id: string }> } } };
     const taskId = taskBody.result.structuredContent.tasks[0]!.id;
 
     const prepared = await handleMcpRequest(rpc('tools/call', 12, {
       name: 'mission_action_prepare', arguments: { missionId, taskId, capabilityId: 'file.write', summary: 'Write one bounded file' },
-    }, true, 'mission_action_prepare', fixture.session.clientId, fixture.session.id), fixture.service);
+    }, true, 'mission_action_prepare', fixture.session.clientId, fixture.session.id), fixture.service, fixture.state, fixture.broker);
     const preparedBody = await prepared.json() as { result: { structuredContent: { tasks: Array<{ actions: Array<{ id: string }> }> } } };
     const actionId = preparedBody.result.structuredContent.tasks[0]!.actions[0]!.id;
 
     const targetPath = path.join(fixture.projectRoot, 'hermes-mission.txt');
     const executed = await handleMcpRequest(rpc('tools/call', 13, {
       name: 'file_write', arguments: { projectId: fixture.project.id, targetPath, content: 'mission-evidence', missionId, taskId, actionId },
-    }, true, 'file_write', fixture.session.clientId, fixture.session.id), fixture.service);
+    }, true, 'file_write', fixture.session.clientId, fixture.session.id), fixture.service, fixture.state, fixture.broker);
     expect(await executed.json()).toMatchObject({ result: { isError: false, structuredContent: { targetPath, bytes: 16 } } });
 
     const readMission = await handleMcpRequest(rpc('tools/call', 14, {
@@ -65,6 +65,26 @@ describe('local MCP transport and permission boundary', () => {
     const missionBody = await readMission.json() as { result: { structuredContent: { tasks: Array<{ actions: Array<{ state: string; result: { evidence: unknown[] } }> }> } } };
     expect(missionBody.result.structuredContent.tasks[0]!.actions[0]).toMatchObject({ state: 'SUCCEEDED', result: { evidence: [expect.objectContaining({ kind: 'CAPABILITY_RESULT' })] } });
     await expect(readFile(targetPath, 'utf8')).resolves.toBe('mission-evidence');
+  });
+
+  it('rejects ChatGPT operational mission mutation while HERMES is active and allows safe supervisor handoff', async () => {
+    const fixture = await serviceFixture();
+    const mission = await fixture.state.createMission(fixture.session.clientId, fixture.session.id, 'Hermes-owned mission');
+    const rejected = await handleMcpRequest(rpc('tools/call', 15, {
+      name: 'mission_task_create', arguments: { missionId: mission.id, title: 'Must not run from ChatGPT transport' },
+    }, true, 'mission_task_create', fixture.session.clientId, fixture.session.id), fixture.service, fixture.state, fixture.broker);
+    expect(await rejected.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'INVALID_REQUEST' } } });
+    expect((await fixture.state.getMission(mission.id)).tasks).toHaveLength(0);
+
+    const handoffId = randomUUID();
+    const handed = await handleMcpRequest(rpc('tools/call', 16, {
+      name: 'mission_orchestrator_handoff', arguments: { missionId: mission.id, targetMode: 'CHATGPT', expectedVersion: 1, handoffId },
+    }, true, 'mission_orchestrator_handoff'), fixture.service, fixture.state, fixture.broker);
+    expect(await handed.json()).toMatchObject({ result: { isError: false, structuredContent: { orchestratorMode: 'CHATGPT', orchestratorVersion: 2 } } });
+    const task = await handleMcpRequest(rpc('tools/call', 17, {
+      name: 'mission_task_create', arguments: { missionId: mission.id, title: 'Now ChatGPT may orchestrate' },
+    }, true, 'mission_task_create', fixture.session.clientId, fixture.session.id), fixture.service, fixture.state, fixture.broker);
+    expect(await task.json()).toMatchObject({ result: { isError: false, structuredContent: { tasks: [{ title: 'Now ChatGPT may orchestrate' }] } } });
   });
 
   it('exposes pull-based supervisor checkpoint state and versioned directives without changing permission authority', async () => {

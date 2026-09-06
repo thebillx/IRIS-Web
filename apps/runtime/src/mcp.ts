@@ -1,4 +1,4 @@
-import type { MissionCheckpoint, MissionExecutionAssociation, MissionState, MissionTaskState, MissionTimelineEvent, SupervisorDecision, SupervisorDirective, SupervisorGateState } from '@iris/domain';
+import type { MissionCheckpoint, MissionExecutionAssociation, MissionState, MissionTaskState, MissionTimelineEvent, OrchestratorMode, SupervisorDecision, SupervisorDirective, SupervisorGateState } from '@iris/domain';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import type { RuntimeState } from './state.js';
@@ -119,24 +119,59 @@ async function executeTool(
       successCriteria: requiredStringArray(args, 'successCriteria'),
     });
   }
+  if (name === 'mission_orchestrator_handoff') {
+    const supervisor = requireBrokerContext(state, broker);
+    return supervisor.broker.changeOrchestrator({
+      missionId: requiredString(args, 'missionId'),
+      targetMode: orchestratorMode(args, 'targetMode'),
+      expectedVersion: requiredPositiveInteger(args, 'expectedVersion'),
+      handoffId: requiredBoundedString(args, 'handoffId', 200),
+    });
+  }
 
   const requiredClient = requiredHeader(request, CLIENT_ID_HEADER);
   const requiredSession = requiredHeader(request, SESSION_ID_HEADER);
-  if (name === 'mission_create') return capabilities.execute({ capabilityId: 'mission.create', clientId: requiredClient, sessionId: requiredSession, title: requiredString(args, 'title') });
-  if (name === 'mission_state_set') return capabilities.execute({ capabilityId: 'mission.state.set', clientId: requiredClient, sessionId: requiredSession,
-    missionId: requiredString(args, 'missionId'), state: missionState(args, 'state') });
-  if (name === 'mission_task_create') return capabilities.execute({ capabilityId: 'mission.task.create', clientId: requiredClient, sessionId: requiredSession,
-    missionId: requiredString(args, 'missionId'), title: requiredString(args, 'title') });
-  if (name === 'mission_task_state_set') return capabilities.execute({ capabilityId: 'mission.task.state.set', clientId: requiredClient, sessionId: requiredSession,
-    missionId: requiredString(args, 'missionId'), taskId: requiredString(args, 'taskId'), state: missionTaskState(args, 'state') });
-  if (name === 'mission_action_prepare') return capabilities.execute({ capabilityId: 'mission.action.prepare', clientId: requiredClient, sessionId: requiredSession,
-    missionId: requiredString(args, 'missionId'), taskId: requiredString(args, 'taskId'), actionCapabilityId: missionActionCapability(args, 'capabilityId'), summary: requiredString(args, 'summary') });
-  if (name === 'mission_supervisor_gate_set') return capabilities.execute({ capabilityId: 'mission.supervisor_gate.set', clientId: requiredClient, sessionId: requiredSession,
-    missionId: requiredString(args, 'missionId'), state: supervisorGateState(args, 'state'), reason: optionalNullableString(args, 'reason') });
+  if (name === 'mission_create') return capabilities.execute({
+    capabilityId: 'mission.create', clientId: requiredClient, sessionId: requiredSession,
+    title: requiredString(args, 'title'), orchestratorMode: optionalOrchestratorMode(args, 'orchestratorMode') ?? 'HERMES',
+  });
+  if (name === 'mission_state_set') {
+    const missionId = requiredString(args, 'missionId');
+    await assertChatGptOperationalMission(state, missionId);
+    return capabilities.execute({ capabilityId: 'mission.state.set', clientId: requiredClient, sessionId: requiredSession, missionId, state: missionState(args, 'state') });
+  }
+  if (name === 'mission_task_create') {
+    const missionId = requiredString(args, 'missionId');
+    await assertChatGptOperationalMission(state, missionId);
+    return capabilities.execute({ capabilityId: 'mission.task.create', clientId: requiredClient, sessionId: requiredSession, missionId, title: requiredString(args, 'title') });
+  }
+  if (name === 'mission_task_state_set') {
+    const missionId = requiredString(args, 'missionId');
+    await assertChatGptOperationalMission(state, missionId);
+    return capabilities.execute({ capabilityId: 'mission.task.state.set', clientId: requiredClient, sessionId: requiredSession, missionId, taskId: requiredString(args, 'taskId'), state: missionTaskState(args, 'state') });
+  }
+  if (name === 'mission_action_prepare') {
+    const missionId = requiredString(args, 'missionId');
+    await assertChatGptOperationalMission(state, missionId);
+    return capabilities.execute({ capabilityId: 'mission.action.prepare', clientId: requiredClient, sessionId: requiredSession,
+      missionId, taskId: requiredString(args, 'taskId'), actionCapabilityId: missionActionCapability(args, 'capabilityId'), summary: requiredString(args, 'summary') });
+  }
+  if (name === 'mission_supervisor_gate_set') {
+    const missionId = requiredString(args, 'missionId');
+    await assertChatGptOperationalMission(state, missionId);
+    return capabilities.execute({ capabilityId: 'mission.supervisor_gate.set', clientId: requiredClient, sessionId: requiredSession,
+      missionId, state: supervisorGateState(args, 'state'), reason: optionalNullableString(args, 'reason') });
+  }
 
   const projectId = optionalString(args, 'projectId');
+  if (name === 'project_test_run') {
+    const mission = requiredMissionAssociation(args, 'CHATGPT');
+    await assertChatGptOperationalMission(state, mission.missionId);
+    return capabilities.execute({ capabilityId: 'project.test.run', clientId: requiredClient, sessionId: requiredSession, projectId, mission });
+  }
   const targetPath = requiredString(args, 'targetPath');
-  const mission = optionalMissionAssociation(args);
+  const mission = optionalMissionAssociation(args, 'CHATGPT');
+  if (mission !== undefined) await assertChatGptOperationalMission(state, mission.missionId);
   if (name === 'file_read') return capabilities.execute({ capabilityId: 'file.read', clientId: requiredClient, sessionId: requiredSession, projectId, targetPath, mission });
   if (name === 'file_write') return capabilities.execute({ capabilityId: 'file.write', clientId: requiredClient, sessionId: requiredSession, projectId, targetPath, content: requiredString(args, 'content'), mission });
   if (name === 'file_delete') return capabilities.execute({ capabilityId: 'file.delete', clientId: requiredClient, sessionId: requiredSession, projectId, targetPath, mission });
@@ -164,13 +199,15 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'mission_get', description: 'Read one durable mission with tasks, governed actions, evidence, supervisor-gate representation, timeline, and broker checkpoint state when available.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
     { name: 'mission_events', description: 'Read a bounded merged mission timeline containing governed mission events, supervisor checkpoints, and accepted directives.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
     { name: 'mission_directive', description: 'Submit one versioned supervisor directive to the durable mission broker. A directive is orchestration input only and never satisfies IRIS permission approval.', inputSchema: { type: 'object', required: ['missionId','expectedVersion','directiveId','directiveSequence','decision','instruction','authorizedScope','doNot','successCriteria'], properties: { missionId: { type: 'string' }, expectedVersion: { type: 'integer', minimum: 1 }, directiveId: { type: 'string' }, directiveSequence: { type: 'integer', minimum: 1 }, decision: { enum: ['CONTINUE','REVISE','PAUSE','COMPLETE'] }, instruction: { type: 'string', maxLength: 4000 }, authorizedScope: { type: 'array', items: { type: 'string' }, maxItems: 24 }, doNot: { type: 'array', items: { type: 'string' }, maxItems: 24 }, successCriteria: { type: 'array', items: { type: 'string' }, maxItems: 24 } }, additionalProperties: false } },
-    { name: 'mission_create', description: 'Register mission identity for the live client/session. Hermes remains orchestration authority.', inputSchema: { type: 'object', required: ['title'], properties: { title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
+    { name: 'mission_orchestrator_handoff', description: 'Perform one versioned safe operational-orchestrator handoff. This changes orchestration ownership only and never grants local execution permission.', inputSchema: { type: 'object', required: ['missionId','targetMode','expectedVersion','handoffId'], properties: { missionId: { type: 'string' }, targetMode: { enum: ['HERMES','CHATGPT'] }, expectedVersion: { type: 'integer', minimum: 1 }, handoffId: { type: 'string' } }, additionalProperties: false } },
+    { name: 'mission_create', description: 'Register mission identity for the live client/session. New missions default to HERMES unless CHATGPT direct orchestration is explicitly selected.', inputSchema: { type: 'object', required: ['title'], properties: { title: { type: 'string', maxLength: 240 }, orchestratorMode: { enum: ['HERMES','CHATGPT'] } }, additionalProperties: false } },
     { name: 'mission_state_set', description: 'Record orchestration-owned mission state; this does not grant execution authority.', inputSchema: { type: 'object', required: ['missionId', 'state'], properties: { missionId: { type: 'string' }, state: { enum: ['PLANNED','RUNNING','WAITING_APPROVAL','WAITING_SUPERVISOR','PAUSED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
     { name: 'mission_task_create', description: 'Register a task identity inside a mission.', inputSchema: { type: 'object', required: ['missionId','title'], properties: { missionId: { type: 'string' }, title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
     { name: 'mission_task_state_set', description: 'Record orchestration-owned task state.', inputSchema: { type: 'object', required: ['missionId','taskId','state'], properties: { missionId: { type: 'string' }, taskId: { type: 'string' }, state: { enum: ['PENDING','RUNNING','BLOCKED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
-    { name: 'mission_action_prepare', description: 'Prepare one governed IRIS execution action. Preparation never executes the capability.', inputSchema: { type: 'object', required: ['missionId','taskId','capabilityId','summary'], properties: { missionId: { type: 'string' }, taskId: { type: 'string' }, capabilityId: { enum: ['file.read','file.write','file.delete','directory.create','directory.delete'] }, summary: { type: 'string', maxLength: 400 } }, additionalProperties: false } },
-    { name: 'mission_supervisor_gate_set', description: 'Record supervisor-gate state only. The gate never overrides IRIS permission policy.', inputSchema: { type: 'object', required: ['missionId','state'], properties: { missionId: { type: 'string' }, state: { enum: ['NOT_REQUIRED','PENDING','APPROVED','DENIED'] }, reason: { type: ['string','null'], maxLength: 500 } }, additionalProperties: false } },
-    { name: 'file_read', description: 'Read one bounded regular file from the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
+    { name: 'mission_action_prepare', description: 'Prepare one governed IRIS execution action for a CHATGPT-orchestrated mission. Preparation never executes the capability.', inputSchema: { type: 'object', required: ['missionId','taskId','capabilityId','summary'], properties: { missionId: { type: 'string' }, taskId: { type: 'string' }, capabilityId: { enum: ['file.read','file.write','file.delete','directory.create','directory.delete','project.test.run'] }, summary: { type: 'string', maxLength: 400 } }, additionalProperties: false } },
+    { name: 'mission_supervisor_gate_set', description: 'Record supervisor-gate state only for the active CHATGPT operational orchestrator. The gate never overrides IRIS permission policy.', inputSchema: { type: 'object', required: ['missionId','state'], properties: { missionId: { type: 'string' }, state: { enum: ['NOT_REQUIRED','PENDING','APPROVED','DENIED'] }, reason: { type: ['string','null'], maxLength: 500 } }, additionalProperties: false } },
+    { name: 'project_test_run', description: 'Run only the registered project declared test script for one prepared CHATGPT mission action through CapabilityService.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId'], properties: { missionId: { type: 'string' }, taskId: { type: 'string' }, actionId: { type: 'string' }, projectId: { type: 'string' } }, additionalProperties: false } },
+    { name: 'file_read', description: 'Read one bounded regular file from the live session project; may bind to a prepared CHATGPT mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
     { name: 'file_write', description: 'Create or replace one bounded regular file in the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath', 'content'], properties: { ...projectProperties, content: { type: 'string' } }, additionalProperties: false } },
     { name: 'file_delete', description: 'Delete one regular file in the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
     { name: 'directory_create', description: 'Create one directory whose parent already exists inside the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
@@ -278,13 +315,24 @@ function optionalString(record: Record<string, unknown>, name: string): string |
   return value;
 }
 
-function optionalMissionAssociation(args: Record<string, unknown>): MissionExecutionAssociation | undefined {
+function optionalMissionAssociation(args: Record<string, unknown>, source: OrchestratorMode): MissionExecutionAssociation | undefined {
   const values = [args.missionId, args.taskId, args.actionId];
   if (values.every((value) => value === undefined)) return undefined;
   if (!values.every((value) => typeof value === 'string' && value.length > 0)) {
     throw new Error('missionId, taskId, and actionId must be supplied together');
   }
-  return { missionId: String(args.missionId), taskId: String(args.taskId), actionId: String(args.actionId) };
+  return { missionId: String(args.missionId), taskId: String(args.taskId), actionId: String(args.actionId), orchestratorMode: source };
+}
+
+function requiredMissionAssociation(args: Record<string, unknown>, source: OrchestratorMode): MissionExecutionAssociation {
+  const association = optionalMissionAssociation(args, source);
+  if (association === undefined) throw new Error('missionId, taskId, and actionId are required');
+  return association;
+}
+
+async function assertChatGptOperationalMission(state: RuntimeState | undefined, missionId: string): Promise<void> {
+  if (state === undefined) throw new Error('Mission state is unavailable');
+  await state.assertMissionOrchestrator(missionId, 'CHATGPT');
 }
 
 function missionState(record: Record<string, unknown>, name: string): MissionState {
@@ -306,10 +354,21 @@ function supervisorGateState(record: Record<string, unknown>, name: string): Sup
   throw new Error(`${name} is not a supported supervisor gate state`);
 }
 
-function missionActionCapability(record: Record<string, unknown>, name: string): 'file.read' | 'file.write' | 'file.delete' | 'directory.create' | 'directory.delete' {
+function missionActionCapability(record: Record<string, unknown>, name: string): 'file.read' | 'file.write' | 'file.delete' | 'directory.create' | 'directory.delete' | 'project.test.run' {
   const value = record[name];
-  if (value === 'file.read' || value === 'file.write' || value === 'file.delete' || value === 'directory.create' || value === 'directory.delete') return value;
+  if (value === 'file.read' || value === 'file.write' || value === 'file.delete' || value === 'directory.create' || value === 'directory.delete' || value === 'project.test.run') return value;
   throw new Error(`${name} is not a supported governed mission capability`);
+}
+
+function orchestratorMode(record: Record<string, unknown>, name: string): OrchestratorMode {
+  const value = record[name];
+  if (value === 'HERMES' || value === 'CHATGPT') return value;
+  throw new Error(`${name} is not a supported orchestrator mode`);
+}
+
+function optionalOrchestratorMode(record: Record<string, unknown>, name: string): OrchestratorMode | undefined {
+  if (record[name] === undefined) return undefined;
+  return orchestratorMode(record, name);
 }
 
 function optionalNullableString(record: Record<string, unknown>, name: string): string | null {

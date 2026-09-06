@@ -9,6 +9,7 @@ import {
   type MissionEvidence,
   type MissionSnapshot,
   type MissionState,
+  type OrchestratorMode,
   type MissionTaskState,
   type ProjectReference,
   type SupervisorGateState,
@@ -86,8 +87,8 @@ export class RuntimeState {
     const session: RuntimeSessionSnapshot = {
       id: mission.sessionId,
       clientId: mission.clientId,
-      agentId: 'hermes-loop-engineer',
-      agentRole: 'implementer',
+      agentId: mission.orchestratorMode === 'HERMES' ? 'hermes-loop-engineer' : 'chatgpt-direct-orchestrator',
+      agentRole: mission.orchestratorMode === 'HERMES' ? 'implementer' : 'owner',
       createdAt: now,
       currentProjectId: mission.projectId,
       executionState: 'READY',
@@ -99,7 +100,7 @@ export class RuntimeState {
     return session;
   }
 
-  public createMission(clientIdInput: string, sessionIdInput: string, titleInput: string): Promise<MissionSnapshot> {
+  public createMission(clientIdInput: string, sessionIdInput: string, titleInput: string, orchestratorMode: OrchestratorMode = 'HERMES'): Promise<MissionSnapshot> {
     const clientId = normalizeClientId(clientIdInput);
     const sessionId = normalizeUuidIdentity(sessionIdInput, 'sessionId');
     const title = normalizeMissionText(titleInput, 'mission title', 240);
@@ -112,6 +113,10 @@ export class RuntimeState {
         id: randomUUID(),
         title,
         state: 'PLANNED',
+        orchestratorMode,
+        orchestratorVersion: 1,
+        lastOrchestratorHandoff: null,
+        orchestratorHandoffIds: [],
         clientId,
         sessionId,
         projectId: session.currentProjectId,
@@ -243,6 +248,67 @@ export class RuntimeState {
     }));
   }
 
+  public changeMissionOrchestrator(
+    missionIdInput: string,
+    targetMode: OrchestratorMode,
+    expectedVersionInput: number,
+    handoffIdInput: string,
+    externalHandoffSafe: boolean,
+  ): Promise<MissionSnapshot> {
+    const missionId = normalizeUuidIdentity(missionIdInput, 'missionId');
+    const handoffId = normalizeUuidIdentity(handoffIdInput, 'handoffId');
+    if (!Number.isInteger(expectedVersionInput) || expectedVersionInput <= 0) throw new RuntimeError('INVALID_REQUEST', 'expectedVersion is invalid');
+    if (targetMode !== 'HERMES' && targetMode !== 'CHATGPT') throw new RuntimeError('INVALID_REQUEST', 'orchestratorMode is invalid');
+    return this.serializeMissionMutation(async () => {
+      const document = await this.missionStore.read();
+      const index = document.missions.findIndex((mission) => mission.id === missionId);
+      if (index < 0) throw new RuntimeError('MISSION_NOT_FOUND', 'Mission was not found');
+      const mission = document.missions[index]!;
+      const duplicate = mission.lastOrchestratorHandoff;
+      if (mission.orchestratorHandoffIds.includes(handoffId)) {
+        if (duplicate?.handoffId === handoffId && duplicate.expectedVersion === expectedVersionInput && duplicate.from !== duplicate.to && duplicate.to === targetMode) return mission;
+        throw new RuntimeError('INVALID_REQUEST', 'handoffId was already used by this mission');
+      }
+      if (mission.orchestratorVersion !== expectedVersionInput) throw new RuntimeError('INVALID_REQUEST', 'Orchestrator handoff expectedVersion is stale');
+      if (mission.orchestratorHandoffIds.length >= 64) throw new RuntimeError('CAPABILITY_DENIED', 'Mission orchestrator handoff history capacity has been reached');
+      if (mission.orchestratorMode === targetMode) throw new RuntimeError('INVALID_REQUEST', 'Mission already uses the requested orchestrator mode');
+      const handoff = missionHandoffSafety(mission, externalHandoffSafe);
+      if (!handoff.safe) throw new RuntimeError('CAPABILITY_DENIED', handoff.reason);
+      const now = new Date().toISOString();
+      const updated: MissionSnapshot = {
+        ...mission,
+        orchestratorMode: targetMode,
+        orchestratorVersion: mission.orchestratorVersion + 1,
+        lastOrchestratorHandoff: {
+          handoffId,
+          expectedVersion: expectedVersionInput,
+          from: mission.orchestratorMode,
+          to: targetMode,
+          completedAt: now,
+        },
+        orchestratorHandoffIds: [...mission.orchestratorHandoffIds, handoffId],
+        updatedAt: now,
+        timeline: appendMissionEvent(mission.timeline, missionEvent('ORCHESTRATOR_MODE_CHANGED', `Operational orchestrator changed from ${mission.orchestratorMode} to ${targetMode}`, null, null, now)),
+      };
+      const missions = [...document.missions];
+      missions[index] = updated;
+      await this.missionStore.write({ schemaVersion: 1, missions });
+      return updated;
+    });
+  }
+
+  public missionHandoffSafety(mission: MissionSnapshot, externalHandoffSafe = true): { safe: boolean; reason: string } {
+    return missionHandoffSafety(mission, externalHandoffSafe);
+  }
+
+  public async assertMissionOrchestrator(missionIdInput: string, expectedMode: OrchestratorMode): Promise<MissionSnapshot> {
+    const mission = await this.getMission(missionIdInput);
+    if (mission.orchestratorMode !== expectedMode) {
+      throw new RuntimeError('CAPABILITY_DENIED', `Mission operational orchestrator is ${mission.orchestratorMode}, not ${expectedMode}`);
+    }
+    return mission;
+  }
+
   public async validateMissionActionAssociation(
     association: MissionExecutionAssociation,
     capabilityId: CapabilityId,
@@ -254,6 +320,9 @@ export class RuntimeState {
     const session = this.getSessionForClient(sessionId, clientId);
     const mission = await this.getMission(association.missionId);
     assertMissionControlIdentity(mission, clientId, sessionId);
+    if (mission.orchestratorMode !== association.orchestratorMode) {
+      throw new RuntimeError('CAPABILITY_DENIED', `Mission operational orchestrator is ${mission.orchestratorMode}, not ${association.orchestratorMode}`);
+    }
     if (mission.projectId !== session.currentProjectId) {
       throw new RuntimeError('CAPABILITY_DENIED', 'Mission project no longer matches the live session project');
     }
@@ -277,6 +346,9 @@ export class RuntimeState {
     const session = this.getSessionForClient(sessionId, clientId);
     const mission = await this.getMission(association.missionId);
     assertMissionControlIdentity(mission, clientId, sessionId);
+    if (mission.orchestratorMode !== association.orchestratorMode) {
+      throw new RuntimeError('CAPABILITY_DENIED', `Mission operational orchestrator is ${mission.orchestratorMode}, not ${association.orchestratorMode}`);
+    }
     if (mission.projectId !== session.currentProjectId) {
       throw new RuntimeError('CAPABILITY_DENIED', 'Mission project no longer matches the live session project');
     }
@@ -291,14 +363,22 @@ export class RuntimeState {
   }
 
   public markMissionActionStarted(association: MissionExecutionAssociation): Promise<void> {
-    return this.updateMissionAction(association, (mission, task, action, now) => ({
-      mission: {
-        ...mission,
-        updatedAt: now,
-        timeline: appendMissionEvent(mission.timeline, missionEvent('ACTION_STARTED', `Governed action started: ${action.capabilityId}`, task.id, action.id, now)),
-      },
-      action: { ...action, state: 'RUNNING', updatedAt: now },
-    }));
+    return this.updateMissionAction(association, (mission, task, action, now) => {
+      if (mission.orchestratorMode !== association.orchestratorMode) {
+        throw new RuntimeError('CAPABILITY_DENIED', `Mission operational orchestrator is ${mission.orchestratorMode}, not ${association.orchestratorMode}`);
+      }
+      if (action.state !== 'PLANNED' && action.state !== 'OWNER_APPROVAL_REQUIRED') {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Mission action is not eligible to start');
+      }
+      return {
+        mission: {
+          ...mission,
+          updatedAt: now,
+          timeline: appendMissionEvent(mission.timeline, missionEvent('ACTION_STARTED', `Governed action started: ${action.capabilityId}`, task.id, action.id, now)),
+        },
+        action: { ...action, state: 'RUNNING', updatedAt: now },
+      };
+    });
   }
 
   public markMissionActionApprovalRequired(association: MissionExecutionAssociation, approvalId: string): Promise<void> {
@@ -654,6 +734,20 @@ function appendInteraction(session: RuntimeSessionSnapshot, event: SessionIntera
   };
 }
 
+function missionHandoffSafety(mission: MissionSnapshot, externalHandoffSafe: boolean): { safe: boolean; reason: string } {
+  if (!externalHandoffSafe) return { safe: false, reason: 'Mission has an active or uncheckpointed orchestrator continuation' };
+  if (mission.tasks.some((task) => task.actions.some((action) => action.state === 'RUNNING'))) {
+    return { safe: false, reason: 'Mission has a governed action currently running' };
+  }
+  if (mission.tasks.some((task) => task.actions.some((action) => action.state === 'OWNER_APPROVAL_REQUIRED'))) {
+    return { safe: false, reason: 'Mission has a governed action waiting for owner approval' };
+  }
+  if (mission.state !== 'PLANNED' && mission.state !== 'PAUSED' && mission.state !== 'WAITING_SUPERVISOR' && mission.state !== 'COMPLETED') {
+    return { safe: false, reason: `Mission state ${mission.state} is not safe for orchestrator handoff` };
+  }
+  return { safe: true, reason: mission.state === 'COMPLETED' ? 'Completed mission mode is informational only' : 'Mission is checkpointed or inactive and safe for handoff' };
+}
+
 function normalizeMissionText(value: string, label: string, max: number): string {
   const normalized = value.trim();
   if (normalized.length === 0 || normalized.length > max || normalized.includes('\0')) {
@@ -671,10 +765,14 @@ function normalizeUuidIdentity(value: string, label: string): string {
 }
 
 function normalizeMissionAssociation(value: MissionExecutionAssociation): MissionExecutionAssociation {
+  if (value.orchestratorMode !== 'HERMES' && value.orchestratorMode !== 'CHATGPT') {
+    throw new RuntimeError('INVALID_REQUEST', 'Mission action orchestratorMode is invalid');
+  }
   return {
     missionId: normalizeUuidIdentity(value.missionId, 'missionId'),
     taskId: normalizeUuidIdentity(value.taskId, 'taskId'),
     actionId: normalizeUuidIdentity(value.actionId, 'actionId'),
+    orchestratorMode: value.orchestratorMode,
   };
 }
 

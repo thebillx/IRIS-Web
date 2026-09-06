@@ -69,8 +69,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     const store = new FoundationStateStore(dataRoot);
     const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env));
     const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
-    for (const record of await missionBroker.list()) {
-      if (record.state === 'ACTIVE' || record.state === 'AWAITING_SUPERVISOR') await state.rehydrateBrokerMissionSession(record.missionId);
+    const brokerByMission = new Map((await missionBroker.list()).map((record) => [record.missionId, record]));
+    for (const mission of await state.listMissions()) {
+      const brokerRecord = brokerByMission.get(mission.id);
+      const terminal = mission.state === 'COMPLETED' || mission.state === 'FAILED' || mission.state === 'CANCELLED'
+        || brokerRecord?.state === 'COMPLETED';
+      if (!terminal) await state.rehydrateBrokerMissionSession(mission.id);
     }
     const permissionSettings = new PermissionSettingsStore(dataRoot);
     await permissionSettings.initialize();

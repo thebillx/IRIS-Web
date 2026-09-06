@@ -47,6 +47,7 @@ export interface RuntimeSessionSnapshot extends RuntimeSession {
   readonly interactions: readonly SessionInteractionEvent[];
 }
 
+export type OrchestratorMode = 'HERMES' | 'CHATGPT';
 export type MissionState = 'PLANNED' | 'RUNNING' | 'WAITING_APPROVAL' | 'WAITING_SUPERVISOR' | 'PAUSED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type MissionTaskState = 'PENDING' | 'RUNNING' | 'BLOCKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type MissionActionState = 'PLANNED' | 'RUNNING' | 'OWNER_APPROVAL_REQUIRED' | 'SUCCEEDED' | 'DENIED' | 'FAILED' | 'CANCELLED';
@@ -65,12 +66,22 @@ export type MissionTimelineKind =
   | 'ACTION_SUCCEEDED'
   | 'ACTION_DENIED'
   | 'ACTION_FAILED'
-  | 'SUPERVISOR_GATE_CHANGED';
+  | 'SUPERVISOR_GATE_CHANGED'
+  | 'ORCHESTRATOR_MODE_CHANGED';
 
 export interface MissionExecutionAssociation {
   readonly missionId: string;
   readonly taskId: string;
   readonly actionId: string;
+  readonly orchestratorMode: OrchestratorMode;
+}
+
+export interface MissionOrchestratorHandoff {
+  readonly handoffId: string;
+  readonly expectedVersion: number;
+  readonly from: OrchestratorMode;
+  readonly to: OrchestratorMode;
+  readonly completedAt: string;
 }
 
 export interface MissionEvidence {
@@ -129,6 +140,10 @@ export interface MissionSnapshot {
   readonly id: string;
   readonly title: string;
   readonly state: MissionState;
+  readonly orchestratorMode: OrchestratorMode;
+  readonly orchestratorVersion: number;
+  readonly lastOrchestratorHandoff: MissionOrchestratorHandoff | null;
+  readonly orchestratorHandoffIds: readonly string[];
   readonly clientId: string;
   readonly sessionId: string;
   readonly projectId: string | null;

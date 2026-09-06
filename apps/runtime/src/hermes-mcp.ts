@@ -72,6 +72,7 @@ async function resolveMissionContext(missionId: string, state: RuntimeState, bro
   const mapping = await broker.get(missionId);
   if (mapping.state === 'COMPLETED') throw new RuntimeError('CAPABILITY_DENIED', 'Completed mission cannot execute additional Hermes tools');
   const mission = await state.getMission(missionId);
+  if (mission.orchestratorMode !== 'HERMES') throw new RuntimeError('CAPABILITY_DENIED', 'Hermes tools are inactive because this mission is orchestrated by ChatGPT');
   if (mission.projectId === null) throw new RuntimeError('CAPABILITY_DENIED', 'Mission has no bound project');
   const project = (await state.listProjects()).find((candidate) => candidate.id === mission.projectId);
   if (project === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Mission project is no longer registered');
@@ -106,7 +107,7 @@ async function executeTool(
     onlyArguments(args, ['taskId', 'actionId'], name);
     return outcomeResult(await capabilities.execute({
       capabilityId: 'project.test.run', clientId: mission.clientId, sessionId: mission.sessionId,
-      projectId: mission.projectId ?? undefined, mission: { missionId: mission.id, taskId, actionId },
+      projectId: mission.projectId ?? undefined, mission: { missionId: mission.id, taskId, actionId, orchestratorMode: 'HERMES' },
     }));
   }
   if (name === 'project_file_read') {
@@ -147,7 +148,7 @@ async function executeTool(
     return outcomeResult(await capabilities.execute({
       capabilityId: 'file.write', clientId: mission.clientId, sessionId: mission.sessionId,
       projectId: mission.projectId ?? undefined, targetPath, content,
-      mission: { missionId: mission.id, taskId, actionId },
+      mission: { missionId: mission.id, taskId, actionId, orchestratorMode: 'HERMES' },
     }));
   }
   throw new RuntimeError('CAPABILITY_DENIED', 'Hermes tool is not implemented');

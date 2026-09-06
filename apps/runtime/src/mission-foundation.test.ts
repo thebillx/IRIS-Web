@@ -103,7 +103,7 @@ describe('V2 mission execution foundation', () => {
     const f = await fixture();
     const prepared = await preparedMission(f);
     const targetPath = path.join(f.projectRoot, 'mission.txt');
-    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId };
+    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId, orchestratorMode: 'HERMES' as const };
 
     const outcome = await f.service.execute({
       capabilityId: 'file.write', clientId: f.session.clientId, sessionId: f.session.id,
@@ -131,7 +131,7 @@ describe('V2 mission execution foundation', () => {
     const f = await fixture();
     const prepared = await preparedMission(f);
     const targetPath = path.join(f.projectRoot, 'concurrent-mission.txt');
-    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId };
+    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId, orchestratorMode: 'HERMES' as const };
     const operation = {
       capabilityId: 'file.write' as const, clientId: f.session.clientId, sessionId: f.session.id,
       projectId: f.project.id, targetPath, content: 'claimed-once', mission: association,
@@ -161,7 +161,7 @@ describe('V2 mission execution foundation', () => {
     await f.settings.setMode('ASK_EVERY_TIME');
     const prepared = await preparedMission(f);
     const targetPath = path.join(f.projectRoot, 'concurrent-owner-required.txt');
-    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId };
+    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId, orchestratorMode: 'HERMES' as const };
     const operation = {
       capabilityId: 'file.write' as const, clientId: f.session.clientId, sessionId: f.session.id,
       projectId: f.project.id, targetPath, content: 'owner-required-once', mission: association,
@@ -187,7 +187,7 @@ describe('V2 mission execution foundation', () => {
     await f.settings.setMode('ASK_EVERY_TIME');
     const prepared = await preparedMission(f);
     const targetPath = path.join(f.projectRoot, 'stale-approval.txt');
-    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId };
+    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId, orchestratorMode: 'HERMES' as const };
     const pending = await f.service.execute({
       capabilityId: 'file.write', clientId: f.session.clientId, sessionId: f.session.id,
       projectId: f.project.id, targetPath, content: 'must-not-run', mission: association,
@@ -205,7 +205,7 @@ describe('V2 mission execution foundation', () => {
     await f.settings.setMode('ASK_EVERY_TIME');
     const prepared = await preparedMission(f);
     const targetPath = path.join(f.projectRoot, 'approved.txt');
-    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId };
+    const association = { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId, orchestratorMode: 'HERMES' as const };
 
     const pending = await f.service.execute({
       capabilityId: 'file.write', clientId: f.session.clientId, sessionId: f.session.id,
@@ -235,7 +235,7 @@ describe('V2 mission execution foundation', () => {
     const outcome = await f.service.execute({
       capabilityId: 'file.write', clientId: f.session.clientId, sessionId: f.session.id, projectId: f.project.id,
       targetPath: path.join(f.projectRoot, 'still-governed.txt'), content: 'blocked-until-owner',
-      mission: { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId },
+      mission: { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId, orchestratorMode: 'HERMES' },
     });
     expect(outcome.status).toBe('owner_required');
   });
@@ -251,7 +251,7 @@ describe('V2 mission execution foundation', () => {
     await expect(f.service.execute({
       capabilityId: 'file.write', clientId: f.session.clientId, sessionId: f.session.id, projectId: otherProject.id,
       targetPath: path.join(otherProject.rootPath, 'redirect.txt'), content: 'must-not-run',
-      mission: { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId },
+      mission: { missionId: prepared.mission.id, taskId: prepared.taskId, actionId: prepared.actionId, orchestratorMode: 'HERMES' },
     })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
   });
 });

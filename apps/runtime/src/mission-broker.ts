@@ -6,6 +6,7 @@ import {
   type MissionBrokerSnapshot,
   type MissionBrokerState,
   type MissionCheckpoint,
+  type OrchestratorMode,
   type SupervisorDecision,
   type SupervisorDirective,
 } from '@iris/domain';
@@ -32,6 +33,13 @@ export interface BindHermesSessionInput {
 
 export interface RebindHermesSessionInput extends BindHermesSessionInput {
   readonly expectedVersion: number;
+}
+
+export interface OrchestratorHandoffInput {
+  readonly missionId: string;
+  readonly targetMode: OrchestratorMode;
+  readonly expectedVersion: number;
+  readonly handoffId: string;
 }
 
 export interface SupervisorDirectiveInput {
@@ -92,10 +100,35 @@ export class MissionBrokerService {
     return record;
   }
 
+  public async orchestratorHandoffStatus(missionIdInput: string): Promise<{ safe: boolean; reason: string }> {
+    const mission = await this.state.getMission(missionIdInput);
+    const record = (await this.list()).find((candidate) => candidate.missionId === mission.id) ?? null;
+    return this.state.missionHandoffSafety(mission, brokerHandoffSafe(mission.orchestratorMode, mission.state, record));
+  }
+
+  public async changeOrchestrator(input: OrchestratorHandoffInput) {
+    const missionId = uuid(input.missionId, 'missionId');
+    const targetMode = orchestratorMode(input.targetMode);
+    const expectedVersion = version(input.expectedVersion, 'expectedVersion');
+    const handoffId = uuid(input.handoffId, 'handoffId');
+    return this.serializeBrokerAccess(async (document) => {
+      const mission = await this.state.getMission(missionId);
+      const record = document.records.find((candidate) => candidate.missionId === mission.id) ?? null;
+      return this.state.changeMissionOrchestrator(
+        mission.id,
+        targetMode,
+        expectedVersion,
+        handoffId,
+        brokerHandoffSafe(mission.orchestratorMode, mission.state, record),
+      );
+    });
+  }
+
   public bindHermesSession(input: BindHermesSessionInput): Promise<MissionBrokerSnapshot> {
     const normalized = normalizeBinding(input);
     return this.mutate(async (document) => {
-      await this.state.getMission(normalized.missionId);
+      const mission = await this.state.getMission(normalized.missionId);
+      if (mission.orchestratorMode !== 'HERMES') throw new RuntimeError('CAPABILITY_DENIED', 'Hermes session binding requires HERMES orchestrator mode');
       const existing = document.records.find((record) => record.missionId === normalized.missionId);
       if (existing !== undefined) {
         if (sameBinding(existing, normalized)) return { document, result: existing };
@@ -216,12 +249,17 @@ export class MissionBrokerService {
   private async mutate(
     operation: (document: MissionBrokerDocument) => Promise<{ document: MissionBrokerDocument; result: MissionBrokerSnapshot }>,
   ): Promise<MissionBrokerSnapshot> {
-    let result!: MissionBrokerSnapshot;
-    const queued = this.mutationTail.then(async () => {
-      const current = await this.store.read();
+    return this.serializeBrokerAccess(async (current) => {
       const next = await operation(current);
       if (next.document !== current) await this.store.write(next.document);
-      result = next.result;
+      return next.result;
+    });
+  }
+
+  private async serializeBrokerAccess<T>(operation: (document: MissionBrokerDocument) => Promise<T>): Promise<T> {
+    let result!: T;
+    const queued = this.mutationTail.then(async () => {
+      result = await operation(await this.store.read());
     });
     this.mutationTail = queued.then(() => undefined, () => undefined);
     await queued;
@@ -375,6 +413,23 @@ function text(value: string, name: string, max: number): string {
 
 function timestamp(value: string, name: string): string {
   if (!isTimestamp(value)) throw new RuntimeError('INVALID_REQUEST', `${name} must be a valid timestamp`);
+  return value;
+}
+
+function brokerHandoffSafe(
+  currentMode: OrchestratorMode,
+  missionStateValue: string,
+  record: MissionBrokerSnapshot | null,
+): boolean {
+  if (currentMode !== 'HERMES' || record === null) return true;
+  if (missionStateValue === 'COMPLETED') return true;
+  if (record.state === 'AWAITING_SUPERVISOR' && record.lastCheckpointId !== null) return true;
+  if (missionStateValue === 'PLANNED') return record.directives.length === 0 && record.checkpoints.length === 0;
+  return false;
+}
+
+function orchestratorMode(value: OrchestratorMode): OrchestratorMode {
+  if (value !== 'HERMES' && value !== 'CHATGPT') throw new RuntimeError('INVALID_REQUEST', 'orchestratorMode is invalid');
   return value;
 }
 

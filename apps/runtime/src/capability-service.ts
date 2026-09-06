@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { AgentRole, CapabilityId, MissionExecutionAssociation, MissionState, MissionTaskState, PermissionDecisionRecord, PendingApprovalView, PermissionMode, ProjectReference, RuntimeHealth, SupervisorGateState } from '@iris/domain';
+import type { AgentRole, CapabilityId, MissionExecutionAssociation, MissionState, MissionTaskState, OrchestratorMode, PermissionDecisionRecord, PendingApprovalView, PermissionMode, ProjectReference, RuntimeHealth, SupervisorGateState } from '@iris/domain';
 import { RuntimeError } from '@iris/domain';
 import { PermissionAuditStore } from './audit.js';
 import { capabilityDefinition } from './capability-registry.js';
@@ -21,7 +21,7 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'project.test.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'mission.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'mission.get'; readonly missionId: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
-  | { readonly capabilityId: 'mission.create'; readonly clientId: string; readonly sessionId: string; readonly title: string }
+  | { readonly capabilityId: 'mission.create'; readonly clientId: string; readonly sessionId: string; readonly title: string; readonly orchestratorMode?: OrchestratorMode | undefined }
   | { readonly capabilityId: 'mission.state.set'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly state: MissionState }
   | { readonly capabilityId: 'mission.task.create'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly title: string }
   | { readonly capabilityId: 'mission.task.state.set'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly taskId: string; readonly state: MissionTaskState }
@@ -256,7 +256,7 @@ export class CapabilityService {
     }
     if (operation.capabilityId === 'mission.list') return { missions: await this.state.listMissions() };
     if (operation.capabilityId === 'mission.get') return this.state.getMission(operation.missionId);
-    if (operation.capabilityId === 'mission.create') return this.state.createMission(operation.clientId, operation.sessionId, operation.title);
+    if (operation.capabilityId === 'mission.create') return this.state.createMission(operation.clientId, operation.sessionId, operation.title, operation.orchestratorMode ?? 'HERMES');
     if (operation.capabilityId === 'mission.state.set') return this.state.setMissionState(operation.missionId, operation.clientId, operation.sessionId, operation.state);
     if (operation.capabilityId === 'mission.task.create') return this.state.createMissionTask(operation.missionId, operation.clientId, operation.sessionId, operation.title);
     if (operation.capabilityId === 'mission.task.state.set') return this.state.setMissionTaskState(operation.missionId, operation.taskId, operation.clientId, operation.sessionId, operation.state);

@@ -79,6 +79,7 @@ function renderWorkspace(selectedSession: Session | null, sessions: Session[] = 
     onSelectSession: () => undefined,
     onRegisterProject: () => undefined,
     onSelectProject: () => undefined,
+    onRequestMissionOrchestrator: () => undefined,
   }));
 }
 
@@ -251,6 +252,8 @@ describe('daily workspace session experience', () => {
   it('renders mission control state, approval association, evidence count, and recent timeline read-only', () => {
     const mission: Parameters<typeof RuntimePage>[0]['missions'][number] = {
       id: '11111111-1111-4111-8111-111111111111', title: 'Hermes mission', state: 'WAITING_APPROVAL',
+      orchestratorMode: 'HERMES', orchestratorVersion: 1, lastOrchestratorHandoff: null,
+      orchestratorHandoff: { safe: false, reason: 'Mission has a governed action waiting for owner approval' },
       clientId: 'web-client', sessionId: sessionA.id, projectId: projectA.id,
       createdAt: '2026-09-05T06:00:00.000Z', updatedAt: '2026-09-05T06:10:00.000Z',
       supervisorGate: { state: 'PENDING', reason: 'Await supervisor directive', updatedAt: '2026-09-05T06:09:00.000Z' },
@@ -286,7 +289,11 @@ describe('daily workspace session experience', () => {
     };
     const markup = renderWorkspace(sessionA, [sessionA], [mission]);
     expect(markup).toContain('Mission Control');
-    expect(markup).toContain('Hermes execution ledger');
+    expect(markup).toContain('Mission execution ledger');
+    expect(markup).toContain('Orchestrator Mode');
+    expect(markup).toContain('Hermes Loop Engineer');
+    expect(markup).toContain('Handoff blocked');
+    expect(markup).toContain('Mission has a governed action waiting for owner approval');
     expect(markup).toContain('Hermes mission');
     expect(markup).toContain('WAITING_APPROVAL');
     expect(markup).toContain('PENDING');
@@ -298,6 +305,50 @@ describe('daily workspace session experience', () => {
     expect(markup).toContain('delegation:deleg_2fbc0e4a');
     expect(markup).toContain('Last supervisor directive:');
     expect(markup).toContain('Owner approval is required before the governed action can execute');
+  });
+
+  it('changes orchestrator through the daemon API and reflects daemon truth after refresh', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    let mode: 'HERMES' | 'CHATGPT' = 'HERMES';
+    let version = 1;
+    const handoffBodies: Record<string, unknown>[] = [];
+    const mission = () => ({
+      id: '11111111-1111-4111-8111-111111111111', title: 'Selectable mission', state: 'WAITING_SUPERVISOR',
+      orchestratorMode: mode, orchestratorVersion: version, lastOrchestratorHandoff: null,
+      orchestratorHandoff: { safe: true, reason: 'Mission is checkpointed or inactive and safe for handoff' },
+      clientId: 'web-client', sessionId: sessionA.id, projectId: projectA.id,
+      createdAt: '2026-09-05T06:00:00.000Z', updatedAt: '2026-09-05T06:01:00.000Z',
+      supervisorGate: { state: 'PENDING', reason: null, updatedAt: '2026-09-05T06:01:00.000Z' }, tasks: [], timeline: [], broker: null,
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = String(input); const method = init.method ?? 'GET';
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA] });
+      if (url === '/missions' && method === 'GET') return jsonResponse({ missions: [mission()] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/missions/${mission().id}/orchestrator` && method === 'POST') {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        handoffBodies.push(body);
+        expect(body.targetMode).toBe('CHATGPT');
+        expect(body.expectedVersion).toBe(1);
+        expect(typeof body.handoffId).toBe('string');
+        mode = 'CHATGPT'; version = 2;
+        return jsonResponse(mission());
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    }));
+    await mountApp(); await settleApp();
+    const select = document.querySelector('select[aria-label="Orchestrator Mode for Selectable mission"]');
+    if (!(select instanceof HTMLSelectElement)) throw new Error('Orchestrator selector not found');
+    expect(select.value).toBe('HERMES');
+    await act(async () => { select.value = 'CHATGPT'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    await settleApp();
+    expect(handoffBodies).toHaveLength(1);
+    expect((document.querySelector('select[aria-label="Orchestrator Mode for Selectable mission"]') as HTMLSelectElement).value).toBe('CHATGPT');
+    expect(document.body.textContent).toContain('Current orchestrator: ChatGPT Direct · version 2');
   });
 
   it('shows intentional empty states when there is no session or active project', () => {
