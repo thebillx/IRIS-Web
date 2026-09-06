@@ -73,6 +73,56 @@ describe('runtime listener safety', () => {
     expect(rejected.status).toBe(403);
   });
 
+  it('publishes only OAuth discovery metadata without owner access', async () => {
+    const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
+    const controlSecret = 'test-control-secret-that-is-not-public';
+    handle = await startRuntimeServer({
+      identity,
+      state: {} as RuntimeState,
+      capabilities: {} as CapabilityService,
+      missionBroker: {} as MissionBrokerService,
+      health: () => ({
+        status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: identity.runtimeId, instanceId: identity.instanceId,
+        pid: identity.pid, uptimeMs: 1, authority: 'owned', connectedClients: 0, connectedSessions: 0,
+        agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '',
+      }),
+      doctor: async () => ({ status: 'pass', checks: [] }),
+      isShuttingDown: () => false,
+      controlSecret,
+      ownerAccessSecret,
+      requestShutdown: () => undefined,
+    }, 0);
+
+    const protectedResourceResponse = await fetch(`${handle.apiUrl}/.well-known/oauth-protected-resource/mcp`);
+    expect(protectedResourceResponse.status).toBe(200);
+    const protectedResource = await protectedResourceResponse.json();
+    expect(protectedResource).toMatchObject({
+      resource: `${handle.apiUrl}/mcp`,
+      authorization_servers: [handle.apiUrl],
+    });
+
+    const authorizationServerResponse = await fetch(`${handle.apiUrl}/.well-known/oauth-authorization-server`);
+    expect(authorizationServerResponse.status).toBe(200);
+    expect(await authorizationServerResponse.json()).toMatchObject({
+      issuer: handle.apiUrl,
+      authorization_endpoint: `${handle.apiUrl}/authorize`,
+      token_endpoint: `${handle.apiUrl}/token`,
+      registration_endpoint: `${handle.apiUrl}/register`,
+    });
+
+    const publicMetadata = `${await (await fetch(`${handle.apiUrl}/.well-known/oauth-protected-resource/mcp`)).text()}${await (await fetch(`${handle.apiUrl}/.well-known/oauth-authorization-server`)).text()}`;
+    expect(publicMetadata).not.toContain(ownerAccessSecret);
+    expect(publicMetadata).not.toContain(controlSecret);
+
+    expect((await fetch(`${handle.apiUrl}/mcp`)).status).toBe(403);
+    expect((await fetch(`${handle.apiUrl}/projects`)).status).toBe(403);
+    expect((await fetch(`${handle.apiUrl}/missions`)).status).toBe(403);
+    expect((await fetch(`${handle.apiUrl}/capabilities/file/read`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetPath: 'README.md' }),
+    })).status).toBe(403);
+    expect((await fetch(`${handle.apiUrl}/readyz`)).status).toBe(403);
+  });
+
   it('rejects Hermes mission MCP requests without the mission-scoped bridge credential', async () => {
     const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
     handle = await startRuntimeServer({

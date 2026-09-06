@@ -110,6 +110,29 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   }
 
   const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+  const runtimeOrigin = `http://${request.headers.host!}`;
+  if (request.method === 'GET' && url.pathname === '/.well-known/oauth-protected-resource/mcp') {
+    writeJson(response, 200, {
+      authorization_servers: [runtimeOrigin],
+      resource: `${runtimeOrigin}/mcp`,
+      scopes_supported: ['read', 'write'],
+    });
+    return;
+  }
+  if (request.method === 'GET' && url.pathname === '/.well-known/oauth-authorization-server') {
+    writeJson(response, 200, {
+      authorization_endpoint: `${runtimeOrigin}/authorize`,
+      code_challenge_methods_supported: ['S256'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
+      issuer: runtimeOrigin,
+      jwks_uri: `${runtimeOrigin}/jwks`,
+      registration_endpoint: `${runtimeOrigin}/register`,
+      response_types_supported: ['code'],
+      token_endpoint: `${runtimeOrigin}/token`,
+      token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
+    });
+    return;
+  }
   if (request.method === 'POST' && url.pathname === '/control/stop') {
     requireJsonContentType(request);
     const body = await readJsonBody(request);
