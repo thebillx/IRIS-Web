@@ -3,7 +3,9 @@ import type { CapabilityDefinition, CapabilityId } from '@iris/domain';
 const DEFINITIONS: readonly CapabilityDefinition[] = [
   { id: 'runtime.status', title: 'Read runtime status', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },
   { id: 'project.list', title: 'List registered projects', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },
+  { id: 'project.info', title: 'Read registered project metadata', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
   { id: 'project.git_status', title: 'Read project Git status', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
+  { id: 'project.search', title: 'Search registered project text', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
   { id: 'project.test.run', title: 'Run declared project test script', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'mission.list', title: 'List mission execution records', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },
   { id: 'mission.get', title: 'Read mission execution record', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },

@@ -244,7 +244,9 @@ export type PolicyDecision = 'ALLOW_AUTO' | 'ALLOW_ONCE' | 'DENY' | 'OWNER_REQUI
 export type CapabilityId =
   | 'runtime.status'
   | 'project.list'
+  | 'project.info'
   | 'project.git_status'
+  | 'project.search'
   | 'project.test.run'
   | 'mission.list'
   | 'mission.get'

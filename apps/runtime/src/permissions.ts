@@ -161,6 +161,19 @@ export class PermissionPolicyEngine {
 
     const sessionId = input.sessionId?.trim() ?? '';
     const clientId = input.clientId?.trim() ?? '';
+    if (sessionId.length === 0 && sessionlessProjectRead(definition.id)) {
+      if (clientId.length === 0) return { valid: false, reason: 'Project read requires client identity', projectId: null, target: normalizedDisplayTarget(input.targetPath) };
+      const projectId = input.projectId?.trim() ?? '';
+      if (projectId.length === 0) return { valid: false, reason: 'Project read requires an explicit registered projectId', projectId: null, target: normalizedDisplayTarget(input.targetPath) };
+      const project = await projectById(this.state, projectId);
+      if (project === null) return { valid: false, reason: 'Requested project is not registered', projectId, target: normalizedDisplayTarget(input.targetPath) };
+      const targetKind = projectTargetKind(definition.id);
+      if (targetKind === null) return { valid: true, reason: 'Explicit registered project scope is valid', projectId, target: project.rootPath };
+      const requested = input.targetPath?.trim() ?? '';
+      const target = requested.length === 0 || requested.includes('\0') ? null : path.isAbsolute(requested) ? requested : path.resolve(project.rootPath, requested);
+      const inspected = await inspectProjectTarget(project.rootPath, target, targetKind);
+      return { valid: inspected.valid, reason: inspected.reason, projectId, target: inspected.target };
+    }
     if (sessionId.length === 0 || clientId.length === 0) {
       return { valid: false, reason: 'Project capability requires live client and session identity', projectId: null, target: normalizedDisplayTarget(input.targetPath) };
     }
@@ -230,6 +243,13 @@ export class PermissionPolicyEngine {
       ? { valid: false, reason: 'Requested default project is not registered', projectId, target: null }
       : { valid: true, reason: 'Requested default project is registered', projectId, target: project.rootPath };
   }
+}
+
+function sessionlessProjectRead(capabilityId: CapabilityId): boolean {
+  return capabilityId === 'project.info'
+    || capabilityId === 'project.git_status'
+    || capabilityId === 'project.search'
+    || capabilityId === 'file.read';
 }
 
 function projectTargetKind(capabilityId: CapabilityId): Exclude<ProjectTargetKind, 'project-root'> | null {

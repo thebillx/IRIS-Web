@@ -222,7 +222,7 @@ describe('runtime lifecycle integration', () => {
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
     expect(mcp.result.tools.map((tool) => tool.name)).toEqual([
-      'runtime_status', 'list_projects', 'mission_list', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_supervisor_gate_set', 'project_test_run', 'file_read', 'file_write', 'file_delete', 'directory_create', 'directory_delete',
+      'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_supervisor_gate_set', 'project_test_run', 'file_read', 'file_write', 'file_delete', 'directory_create', 'directory_delete',
     ]);
 
     const stopped = await stopRuntime(dataRoot, 15_000);

@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { RuntimeError, type AgentRole, type DoctorReport, type MissionState, type PermissionMode, type RuntimeHealth, type RuntimeIdentity, type SupervisorDecision } from '@iris/domain';
-import { handleMcpRequest } from './mcp.js';
+import { handleMcpProRequest, handleMcpRequest } from './mcp.js';
 import type { CapabilityOutcome, CapabilityService, OwnerApprovalChoice } from './capability-service.js';
 import type { RuntimeState } from './state.js';
 import type { MissionBrokerService } from './mission-broker.js';
@@ -119,6 +119,13 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     });
     return;
   }
+  if (request.method === 'GET' && (
+    url.pathname === '/.well-known/oauth-protected-resource'
+    || url.pathname === '/.well-known/oauth-protected-resource/mcp-pro'
+  )) {
+    writeEmptyNotFound(response);
+    return;
+  }
   if (request.method === 'GET' && url.pathname === '/.well-known/oauth-authorization-server') {
     writeJson(response, 200, {
       authorization_endpoint: `${runtimeOrigin}/authorize`,
@@ -168,9 +175,16 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
 
   const publicObservation = request.method === 'GET'
     && (url.pathname === '/health' || url.pathname === '/status' || url.pathname === '/doctor');
-  if (!publicObservation) authorizeOwnerAccess(request, context.ownerAccessSecret);
+  const ownerMcp = url.pathname === '/mcp' || url.pathname === '/mcp-pro';
+  if (ownerMcp && !ownerAccessAllowed(request, context.ownerAccessSecret)) {
+    writeJson(response, 401, { error: { code: 'CONTROL_DENIED', message: 'Owner access credential is required' } }, {
+      'www-authenticate': 'Bearer',
+    });
+    return;
+  }
+  if (!publicObservation && !ownerMcp) authorizeOwnerAccess(request, context.ownerAccessSecret);
 
-  if ((request.method === 'POST' || request.method === 'PUT') && url.pathname !== '/mcp') requireJsonContentType(request);
+  if ((request.method === 'POST' || request.method === 'PUT') && !ownerMcp) requireJsonContentType(request);
 
   if (url.pathname === '/mcp') {
     if (request.method === 'POST') requireJsonContentType(request);
@@ -182,6 +196,17 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     const init: RequestInit = { method: request.method ?? 'GET', headers };
     if (body.length > 0) init.body = body;
     const mcpResponse = await handleMcpRequest(new Request('http://127.0.0.1/mcp', init), context.capabilities, context.state, context.missionBroker);
+    await writeFetchResponse(response, mcpResponse);
+    return;
+  }
+  if (url.pathname === '/mcp-pro') {
+    if (request.method === 'POST') requireJsonContentType(request);
+    const body = request.method === 'POST' ? await readBody(request) : '';
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(request.headers)) if (typeof value === 'string') headers.set(name, value);
+    const init: RequestInit = { method: request.method ?? 'GET', headers };
+    if (body.length > 0) init.body = body;
+    const mcpResponse = await handleMcpProRequest(new Request('http://127.0.0.1/mcp-pro', init), context.capabilities);
     await writeFetchResponse(response, mcpResponse);
     return;
   }
@@ -596,11 +621,15 @@ function authorizeHermesMissionAccess(request: IncomingMessage, ownerAccessSecre
 }
 
 function authorizeOwnerAccess(request: IncomingMessage, secret: string): void {
+  if (!ownerAccessAllowed(request, secret)) throw new RuntimeError('CONTROL_DENIED', 'Owner access credential is required');
+}
+
+function ownerAccessAllowed(request: IncomingMessage, secret: string): boolean {
   const authorization = request.headers.authorization;
   const supplied = typeof authorization === 'string' && authorization.startsWith('Bearer ')
     ? authorization.slice('Bearer '.length)
     : '';
-  if (!secretsEqual(supplied, secret)) throw new RuntimeError('CONTROL_DENIED', 'Owner access credential is required');
+  return secretsEqual(supplied, secret);
 }
 
 function authorizeRuntimeControl(request: IncomingMessage, body: Record<string, unknown> | null, context: RuntimeServerContext): void {
@@ -620,12 +649,18 @@ function secretsEqual(left: string, right: string): boolean {
   return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
 }
 
-function writeJson(response: ServerResponse, status: number, value: unknown): void {
+function writeJson(response: ServerResponse, status: number, value: unknown, headers: Record<string, string> = {}): void {
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     ...securityHeaders(),
+    ...headers,
   });
   response.end(JSON.stringify(value));
+}
+
+function writeEmptyNotFound(response: ServerResponse): void {
+  response.writeHead(404, securityHeaders());
+  response.end();
 }
 
 function writeJsonThen(response: ServerResponse, status: number, value: unknown, after: () => void): void {

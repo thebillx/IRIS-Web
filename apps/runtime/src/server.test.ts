@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -99,7 +100,17 @@ describe('runtime listener safety', () => {
     expect(protectedResource).toMatchObject({
       resource: `${handle.apiUrl}/mcp`,
       authorization_servers: [handle.apiUrl],
+      scopes_supported: ['read', 'write'],
     });
+
+    for (const path of [
+      '/.well-known/oauth-protected-resource',
+      '/.well-known/oauth-protected-resource/mcp-pro',
+    ]) {
+      const response = await fetch(`${handle.apiUrl}${path}`);
+      expect(response.status).toBe(404);
+      expect(new Uint8Array(await response.arrayBuffer())).toHaveLength(0);
+    }
 
     const authorizationServerResponse = await fetch(`${handle.apiUrl}/.well-known/oauth-authorization-server`);
     expect(authorizationServerResponse.status).toBe(200);
@@ -114,13 +125,109 @@ describe('runtime listener safety', () => {
     expect(publicMetadata).not.toContain(ownerAccessSecret);
     expect(publicMetadata).not.toContain(controlSecret);
 
-    expect((await fetch(`${handle.apiUrl}/mcp`)).status).toBe(403);
+    const unauthenticatedMcp = await fetch(`${handle.apiUrl}/mcp`);
+    expect(unauthenticatedMcp.status).toBe(401);
+    expect(unauthenticatedMcp.headers.get('www-authenticate')).toBe('Bearer');
+    const unauthenticatedMcpPro = await fetch(`${handle.apiUrl}/mcp-pro`);
+    expect(unauthenticatedMcpPro.status).toBe(401);
+    expect(unauthenticatedMcpPro.headers.get('www-authenticate')).toBe('Bearer');
     expect((await fetch(`${handle.apiUrl}/projects`)).status).toBe(403);
     expect((await fetch(`${handle.apiUrl}/missions`)).status).toBe(403);
     expect((await fetch(`${handle.apiUrl}/capabilities/file/read`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetPath: 'README.md' }),
     })).status).toBe(403);
     expect((await fetch(`${handle.apiUrl}/readyz`)).status).toBe(403);
+  });
+
+  it('scopes bearer challenges to MCP owner authentication and preserves post-auth denials', async () => {
+    const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
+    const capabilities = {
+      execute: async () => ({ status: 'denied', reason: 'Policy denied the requested capability' }),
+    } as unknown as CapabilityService;
+    handle = await startRuntimeServer({
+      identity,
+      state: {} as RuntimeState,
+      capabilities,
+      missionBroker: {} as MissionBrokerService,
+      health: () => ({
+        status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: identity.runtimeId, instanceId: identity.instanceId,
+        pid: identity.pid, uptimeMs: 1, authority: 'owned', connectedClients: 0, connectedSessions: 0,
+        agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '',
+      }),
+      doctor: async () => ({ status: 'pass', checks: [] }),
+      isShuttingDown: () => false,
+      controlSecret: 'test-control-secret-that-is-not-public',
+      ownerAccessSecret,
+      requestShutdown: () => undefined,
+    }, 0);
+
+    const request = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'server/discover' }),
+    } as const;
+    const unauthenticated = await fetch(`${handle.apiUrl}/mcp`, request);
+    expect(unauthenticated.status).toBe(401);
+    expect(unauthenticated.headers.get('www-authenticate')).toBe('Bearer');
+
+    const invalid = await fetch(`${handle.apiUrl}/mcp`, {
+      ...request, headers: { ...request.headers, authorization: 'Bearer invalid-owner-secret' },
+    });
+    expect(invalid.status).toBe(401);
+    expect(invalid.headers.get('www-authenticate')).toBe('Bearer');
+
+    const discovered = await fetch(`${handle.apiUrl}/mcp`, {
+      ...request, headers: { ...request.headers, authorization: `Bearer ${ownerAccessSecret}` },
+    });
+    expect(discovered.status).toBe(200);
+    expect(await discovered.json()).toMatchObject({ result: { protocolVersion: '2026-07-28' } });
+
+    const proUnauthenticated = await fetch(`${handle.apiUrl}/mcp-pro`, request);
+    expect(proUnauthenticated.status).toBe(401);
+    const proDiscovered = await fetch(`${handle.apiUrl}/mcp-pro`, {
+      ...request, headers: { ...request.headers, authorization: `Bearer ${ownerAccessSecret}` },
+    });
+    expect(proDiscovered.status).toBe(200);
+    expect(await proDiscovered.json()).toMatchObject({ result: { resultType: 'complete', supportedVersions: ['2026-07-28'], capabilities: { tools: {} } } });
+    const proListed = await fetch(`${handle.apiUrl}/mcp-pro`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json', authorization: `Bearer ${ownerAccessSecret}`,
+        'MCP-Protocol-Version': '2026-07-28', 'x-iris-client-id': 'chatgpt-pro',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
+    });
+    expect(proListed.status).toBe(200);
+    expect((await proListed.json() as { result: { tools: Array<{ name: string }> } }).result.tools.map((tool) => tool.name)).toEqual([
+      'list_projects', 'project_info', 'git_status', 'file_read', 'search',
+    ]);
+
+    const policyDenied = await fetch(`${handle.apiUrl}/capabilities/file/read`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${ownerAccessSecret}`,
+        'x-iris-client-id': 'client-a',
+        'x-iris-session-id': 'session-a',
+      },
+      body: JSON.stringify({ targetPath: '/tmp/denied' }),
+    });
+    expect(policyDenied.status).toBe(403);
+    expect(policyDenied.headers.get('www-authenticate')).toBeNull();
+
+    const invalidHostStatus = await requestStatus(handle.port, '/mcp', {
+      authorization: `Bearer ${ownerAccessSecret}`,
+      host: 'example.test',
+    });
+    expect(invalidHostStatus).toBe(403);
+    const invalidOrigin = await fetch(`${handle.apiUrl}/mcp`, {
+      ...request, headers: { ...request.headers, authorization: `Bearer ${ownerAccessSecret}`, origin: 'https://example.test' },
+    });
+    expect(invalidOrigin.status).toBe(403);
+    const crossSite = await fetch(`${handle.apiUrl}/mcp`, {
+      ...request, headers: { ...request.headers, authorization: `Bearer ${ownerAccessSecret}`, 'sec-fetch-site': 'cross-site' },
+    });
+    expect(crossSite.status).toBe(403);
   });
 
   it('rejects Hermes mission MCP requests without the mission-scoped bridge credential', async () => {
@@ -246,3 +353,14 @@ describe('runtime listener safety', () => {
     expect(shutdownRequested).toBe(true);
   });
 });
+
+function requestStatus(port: number, pathname: string, headers: Record<string, string>): Promise<number | undefined> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ host: LOOPBACK_ADDRESS, port, path: pathname, headers }, (response) => {
+      response.resume();
+      response.once('end', () => resolve(response.statusCode));
+    });
+    request.once('error', reject);
+    request.end();
+  });
+}

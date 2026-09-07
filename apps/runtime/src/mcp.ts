@@ -1,4 +1,4 @@
-import type { MissionCheckpoint, MissionExecutionAssociation, MissionState, MissionTaskState, MissionTimelineEvent, OrchestratorMode, SupervisorDecision, SupervisorDirective, SupervisorGateState } from '@iris/domain';
+import { RuntimeError, type MissionCheckpoint, type MissionExecutionAssociation, type MissionState, type MissionTaskState, type MissionTimelineEvent, type OrchestratorMode, type SupervisorDecision, type SupervisorDirective, type SupervisorGateState } from '@iris/domain';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import type { RuntimeState } from './state.js';
@@ -20,6 +20,20 @@ export async function handleMcpRequest(
   state?: RuntimeState,
   broker?: MissionBrokerService,
 ): Promise<Response> {
+  return handleMcpTransportRequest(request, capabilities, state, broker, 'full');
+}
+
+export async function handleMcpProRequest(request: Request, capabilities: CapabilityService): Promise<Response> {
+  return handleMcpTransportRequest(request, capabilities, undefined, undefined, 'pro');
+}
+
+async function handleMcpTransportRequest(
+  request: Request,
+  capabilities: CapabilityService,
+  state: RuntimeState | undefined,
+  broker: MissionBrokerService | undefined,
+  profile: 'full' | 'pro',
+): Promise<Response> {
   if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405, { allow: 'POST' });
 
   let rpc: JsonRpcRequest;
@@ -31,11 +45,20 @@ export async function handleMcpRequest(
   if (rpc.jsonrpc !== '2.0' || typeof rpc.method !== 'string') return jsonRpcError(rpc.id ?? null, -32600, 'Invalid Request', 400);
 
   if (rpc.method === 'server/discover') {
-    return jsonRpcResult(rpc.id ?? null, {
-      protocolVersion: MCP_PROTOCOL_VERSION,
-      serverInfo: { name: 'iris-local-runtime', version: '0.0.0' },
-      capabilities: { tools: {} },
-    });
+    return jsonRpcResult(rpc.id ?? null, profile === 'pro'
+      ? {
+        resultType: 'complete',
+        supportedVersions: [MCP_PROTOCOL_VERSION],
+        capabilities: { tools: {} },
+        _meta: {
+          'io.modelcontextprotocol/serverInfo': { name: 'IRIS Pro Read Only', version: '0.0.0' },
+        },
+      }
+      : {
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        serverInfo: { name: 'iris-local-runtime', version: '0.0.0' },
+        capabilities: { tools: {} },
+      });
   }
 
   if (request.headers.get('MCP-Protocol-Version') !== MCP_PROTOCOL_VERSION) {
@@ -45,7 +68,7 @@ export async function handleMcpRequest(
   if (methodHeader !== null && methodHeader !== rpc.method) return jsonRpcError(rpc.id ?? null, -32600, 'Mcp-Method does not match JSON-RPC method', 400);
 
   if (rpc.method === 'ping') return jsonRpcResult(rpc.id ?? null, {});
-  if (rpc.method === 'tools/list') return jsonRpcResult(rpc.id ?? null, { tools: toolDefinitions() });
+  if (rpc.method === 'tools/list') return jsonRpcResult(rpc.id ?? null, { tools: profile === 'pro' ? proToolDefinitions() : toolDefinitions() });
 
   if (rpc.method === 'tools/call') {
     const params = isRecord(rpc.params) ? rpc.params : null;
@@ -56,15 +79,52 @@ export async function handleMcpRequest(
     if (toolHeader !== null && toolHeader !== params.name) return jsonRpcError(rpc.id ?? null, -32600, 'Mcp-Name does not match tool name', 400);
 
     try {
-      const result = await executeTool(params.name, args, request, capabilities, state, broker);
+      const result = profile === 'pro'
+        ? await executeProTool(params.name, args, request, capabilities)
+        : await executeTool(params.name, args, request, capabilities, state, broker);
       return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
     } catch (error) {
-      return jsonRpcResult(rpc.id ?? null, toolError('INVALID_REQUEST', error instanceof Error ? error.message : 'Tool call failed'));
+      return jsonRpcResult(rpc.id ?? null, toolError(error instanceof RuntimeError ? error.code : 'INVALID_REQUEST', error instanceof Error ? error.message : 'Tool call failed'));
     }
   }
 
   if (rpc.id === undefined) return new Response(null, { status: 202 });
   return jsonRpcError(rpc.id, -32601, 'Method not found', 404);
+}
+
+const PRO_TOOL_NAMES = ['list_projects', 'project_info', 'git_status', 'file_read', 'search'] as const;
+
+async function executeProTool(
+  name: string,
+  args: Record<string, unknown>,
+  request: Request,
+  capabilities: CapabilityService,
+): Promise<CapabilityOutcome> {
+  const clientId = requiredHeader(request, CLIENT_ID_HEADER);
+  if (!PRO_TOOL_NAMES.some((toolName) => toolName === name)) throw new Error(`Unknown tool: ${name}`);
+  if (name === 'list_projects') return capabilities.execute({ capabilityId: 'project.list', clientId });
+  const projectId = requiredString(args, 'projectId');
+  if (name === 'project_info') return capabilities.execute({ capabilityId: 'project.info', clientId, projectId });
+  if (name === 'git_status') return capabilities.execute({ capabilityId: 'project.git_status', clientId, projectId });
+  if (name === 'file_read') return capabilities.execute({
+    capabilityId: 'file.read', clientId, projectId, targetPath: requiredString(args, 'targetPath'),
+  });
+  if (name === 'search') return capabilities.execute({
+    capabilityId: 'project.search', clientId, projectId, query: requiredBoundedString(args, 'query', 500),
+  });
+  throw new Error(`Unknown tool: ${name}`);
+}
+
+function proToolDefinitions(): readonly Record<string, unknown>[] {
+  const projectId = { projectId: { type: 'string', description: 'Explicit registered project UUID returned by list_projects.' } };
+  const definitions: Record<(typeof PRO_TOOL_NAMES)[number], Record<string, unknown>> = {
+    list_projects: { name: 'list_projects', description: 'List registered IRIS projects.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+    project_info: { name: 'project_info', description: 'Read bounded metadata for an explicitly selected registered project.', inputSchema: { type: 'object', required: ['projectId'], properties: projectId, additionalProperties: false } },
+    git_status: { name: 'git_status', description: 'Inspect Git status for an explicitly selected registered project.', inputSchema: { type: 'object', required: ['projectId'], properties: projectId, additionalProperties: false } },
+    file_read: { name: 'file_read', description: 'Read a contained file from an explicitly selected registered project.', inputSchema: { type: 'object', required: ['projectId', 'targetPath'], properties: { ...projectId, targetPath: { type: 'string' } }, additionalProperties: false } },
+    search: { name: 'search', description: 'Search text in an explicitly selected registered project.', inputSchema: { type: 'object', required: ['projectId', 'query'], properties: { ...projectId, query: { type: 'string', minLength: 1, maxLength: 500 } }, additionalProperties: false } },
+  };
+  return PRO_TOOL_NAMES.map((name) => definitions[name]);
 }
 
 async function executeTool(
@@ -79,7 +139,45 @@ async function executeTool(
   const sessionId = optionalHeader(request, SESSION_ID_HEADER);
   if (name === 'runtime_status') return capabilities.execute({ capabilityId: 'runtime.status', clientId, sessionId });
   if (name === 'list_projects') return capabilities.execute({ capabilityId: 'project.list', clientId, sessionId });
+  if (name === 'project_info') return capabilities.execute({
+    capabilityId: 'project.info', clientId: requiredHeader(request, CLIENT_ID_HEADER), projectId: requiredString(args, 'projectId'),
+  });
+  if (name === 'git_status') return capabilities.execute({
+    capabilityId: 'project.git_status', clientId: requiredHeader(request, CLIENT_ID_HEADER), projectId: requiredString(args, 'projectId'),
+  });
+  if (name === 'search') return capabilities.execute({
+    capabilityId: 'project.search', clientId: requiredHeader(request, CLIENT_ID_HEADER), projectId: requiredString(args, 'projectId'), query: requiredBoundedString(args, 'query', 500),
+  });
+  if (name === 'file_read' && args.sessionId === undefined && optionalHeader(request, SESSION_ID_HEADER) === undefined) return capabilities.execute({
+    capabilityId: 'file.read', clientId: requiredHeader(request, CLIENT_ID_HEADER), projectId: requiredString(args, 'projectId'), targetPath: requiredString(args, 'targetPath'),
+  });
   if (name === 'mission_list') return capabilities.execute({ capabilityId: 'mission.list', clientId, sessionId });
+  if (name === 'session_open') {
+    const outcome = await capabilities.execute({
+      capabilityId: 'session.create',
+      clientId: requiredHeader(request, CLIENT_ID_HEADER),
+      agentId: 'chatgpt',
+      agentRole: 'owner',
+    });
+    if (outcome.status !== 'executed') return outcome;
+    const session = asRecord(outcome.value);
+    return { ...session, sessionId: session.id };
+  }
+  if (name === 'session_get') {
+    const identity = resolveSessionIdentity(args, request, state);
+    return identity.session;
+  }
+  if (name === 'session_close') {
+    const identity = resolveSessionIdentity(args, request, state);
+    return capabilities.execute({ capabilityId: 'session.delete', clientId: identity.clientId, sessionId: identity.sessionId });
+  }
+  if (name === 'workspace_select') {
+    const identity = resolveSessionIdentity(args, request, state);
+    return capabilities.execute({
+      capabilityId: 'session.current_project.set', clientId: identity.clientId, sessionId: identity.sessionId,
+      projectId: requiredString(args, 'projectId'),
+    });
+  }
   if (name === 'mission_list_waiting_supervisor') {
     const supervisor = requireBrokerContext(state, broker);
     const records = await supervisor.broker.listWaitingSupervisor();
@@ -129,8 +227,9 @@ async function executeTool(
     });
   }
 
-  const requiredClient = requiredHeader(request, CLIENT_ID_HEADER);
-  const requiredSession = requiredHeader(request, SESSION_ID_HEADER);
+  const identity = resolveSessionIdentity(args, request, state);
+  const requiredClient = identity.clientId;
+  const requiredSession = identity.sessionId;
   if (name === 'mission_create') return capabilities.execute({
     capabilityId: 'mission.create', clientId: requiredClient, sessionId: requiredSession,
     title: requiredString(args, 'title'), orchestratorMode: optionalOrchestratorMode(args, 'orchestratorMode') ?? 'HERMES',
@@ -181,38 +280,67 @@ async function executeTool(
 }
 
 function toolDefinitions(): readonly Record<string, unknown>[] {
+  const sessionProperty = { sessionId: { type: 'string', description: 'IRIS runtime session UUID returned by session_open. May be omitted only by compatible clients that send x-iris-session-id.' } };
   const associationProperties = {
     missionId: { type: 'string', description: 'Prepared mission identity. missionId/taskId/actionId must be supplied together.' },
     taskId: { type: 'string', description: 'Prepared task identity. missionId/taskId/actionId must be supplied together.' },
     actionId: { type: 'string', description: 'Prepared action identity. missionId/taskId/actionId must be supplied together.' },
   };
   const projectProperties = {
+    ...sessionProperty,
     projectId: { type: 'string', description: 'Optional expected project id; must match the live session project.' },
     targetPath: { type: 'string', description: 'Absolute path physically contained by the live session project.' },
     ...associationProperties,
   };
+  const explicitProjectProperty = { projectId: { type: 'string', description: 'Explicit registered project UUID returned by list_projects.' } };
   return [
     { name: 'runtime_status', description: 'Read the local IRIS runtime status.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-    { name: 'list_projects', description: 'List explicitly registered local projects.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+    { name: 'list_projects', description: 'List registered IRIS projects. Read-only and does not require an IRIS session.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+    { name: 'project_info', description: 'Read bounded metadata for an explicitly selected registered project. Read-only and sessionless.', inputSchema: { type: 'object', required: ['projectId'], properties: explicitProjectProperty, additionalProperties: false } },
+    { name: 'git_status', description: 'Inspect Git status for an explicitly selected registered project. Read-only and sessionless.', inputSchema: { type: 'object', required: ['projectId'], properties: explicitProjectProperty, additionalProperties: false } },
+    { name: 'search', description: 'Search text in an explicitly selected registered project. Read-only and sessionless.', inputSchema: { type: 'object', required: ['projectId', 'query'], properties: { ...explicitProjectProperty, query: { type: 'string', minLength: 1, maxLength: 500 } }, additionalProperties: false } },
     { name: 'mission_list', description: 'List durable mission execution records visible to the local owner.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+    { name: 'session_open', description: 'Open a new IRIS runtime session for this MCP client. Call once per logical ChatGPT conversation before session-bound project or execution operations.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+    { name: 'session_get', description: 'Read the owned IRIS runtime session and its current project.', inputSchema: { type: 'object', properties: sessionProperty, additionalProperties: false } },
+    { name: 'session_close', description: 'Close the owned IRIS runtime session when the logical conversation no longer needs it.', inputSchema: { type: 'object', properties: sessionProperty, additionalProperties: false } },
+    { name: 'workspace_select', description: 'Select one registered project as the current workspace for this IRIS session only.', inputSchema: { type: 'object', required: ['projectId'], properties: { ...sessionProperty, projectId: { type: 'string', description: 'Registered project ID returned by list_projects.' } }, additionalProperties: false } },
     { name: 'mission_list_waiting_supervisor', description: 'List broker-bound missions durably waiting for supervisor review. This is read-only supervisor transport and grants no execution permission.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
     { name: 'mission_get', description: 'Read one durable mission with tasks, governed actions, evidence, supervisor-gate representation, timeline, and broker checkpoint state when available.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
     { name: 'mission_events', description: 'Read a bounded merged mission timeline containing governed mission events, supervisor checkpoints, and accepted directives.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
     { name: 'mission_directive', description: 'Submit one versioned supervisor directive to the durable mission broker. A directive is orchestration input only and never satisfies IRIS permission approval.', inputSchema: { type: 'object', required: ['missionId','expectedVersion','directiveId','directiveSequence','decision','instruction','authorizedScope','doNot','successCriteria'], properties: { missionId: { type: 'string' }, expectedVersion: { type: 'integer', minimum: 1 }, directiveId: { type: 'string' }, directiveSequence: { type: 'integer', minimum: 1 }, decision: { enum: ['CONTINUE','REVISE','PAUSE','COMPLETE'] }, instruction: { type: 'string', maxLength: 4000 }, authorizedScope: { type: 'array', items: { type: 'string' }, maxItems: 24 }, doNot: { type: 'array', items: { type: 'string' }, maxItems: 24 }, successCriteria: { type: 'array', items: { type: 'string' }, maxItems: 24 } }, additionalProperties: false } },
     { name: 'mission_orchestrator_handoff', description: 'Perform one versioned safe operational-orchestrator handoff. This changes orchestration ownership only and never grants local execution permission.', inputSchema: { type: 'object', required: ['missionId','targetMode','expectedVersion','handoffId'], properties: { missionId: { type: 'string' }, targetMode: { enum: ['HERMES','CHATGPT'] }, expectedVersion: { type: 'integer', minimum: 1 }, handoffId: { type: 'string' } }, additionalProperties: false } },
-    { name: 'mission_create', description: 'Register mission identity for the live client/session. New missions default to HERMES unless CHATGPT direct orchestration is explicitly selected.', inputSchema: { type: 'object', required: ['title'], properties: { title: { type: 'string', maxLength: 240 }, orchestratorMode: { enum: ['HERMES','CHATGPT'] } }, additionalProperties: false } },
-    { name: 'mission_state_set', description: 'Record orchestration-owned mission state; this does not grant execution authority.', inputSchema: { type: 'object', required: ['missionId', 'state'], properties: { missionId: { type: 'string' }, state: { enum: ['PLANNED','RUNNING','WAITING_APPROVAL','WAITING_SUPERVISOR','PAUSED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
-    { name: 'mission_task_create', description: 'Register a task identity inside a mission.', inputSchema: { type: 'object', required: ['missionId','title'], properties: { missionId: { type: 'string' }, title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
-    { name: 'mission_task_state_set', description: 'Record orchestration-owned task state.', inputSchema: { type: 'object', required: ['missionId','taskId','state'], properties: { missionId: { type: 'string' }, taskId: { type: 'string' }, state: { enum: ['PENDING','RUNNING','BLOCKED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
-    { name: 'mission_action_prepare', description: 'Prepare one governed IRIS execution action for a CHATGPT-orchestrated mission. Preparation never executes the capability.', inputSchema: { type: 'object', required: ['missionId','taskId','capabilityId','summary'], properties: { missionId: { type: 'string' }, taskId: { type: 'string' }, capabilityId: { enum: ['file.read','file.write','file.delete','directory.create','directory.delete','project.test.run'] }, summary: { type: 'string', maxLength: 400 } }, additionalProperties: false } },
-    { name: 'mission_supervisor_gate_set', description: 'Record supervisor-gate state only for the active CHATGPT operational orchestrator. The gate never overrides IRIS permission policy.', inputSchema: { type: 'object', required: ['missionId','state'], properties: { missionId: { type: 'string' }, state: { enum: ['NOT_REQUIRED','PENDING','APPROVED','DENIED'] }, reason: { type: ['string','null'], maxLength: 500 } }, additionalProperties: false } },
-    { name: 'project_test_run', description: 'Run only the registered project declared test script for one prepared CHATGPT mission action through CapabilityService.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId'], properties: { missionId: { type: 'string' }, taskId: { type: 'string' }, actionId: { type: 'string' }, projectId: { type: 'string' } }, additionalProperties: false } },
-    { name: 'file_read', description: 'Read one bounded regular file from the live session project; may bind to a prepared CHATGPT mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
+    { name: 'mission_create', description: 'Register mission identity for the live client/session. New missions default to HERMES unless CHATGPT direct orchestration is explicitly selected.', inputSchema: { type: 'object', required: ['title'], properties: { ...sessionProperty, title: { type: 'string', maxLength: 240 }, orchestratorMode: { enum: ['HERMES','CHATGPT'] } }, additionalProperties: false } },
+    { name: 'mission_state_set', description: 'Record orchestration-owned mission state; this does not grant execution authority.', inputSchema: { type: 'object', required: ['missionId', 'state'], properties: { ...sessionProperty, missionId: { type: 'string' }, state: { enum: ['PLANNED','RUNNING','WAITING_APPROVAL','WAITING_SUPERVISOR','PAUSED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
+    { name: 'mission_task_create', description: 'Register a task identity inside a mission.', inputSchema: { type: 'object', required: ['missionId','title'], properties: { ...sessionProperty, missionId: { type: 'string' }, title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
+    { name: 'mission_task_state_set', description: 'Record orchestration-owned task state.', inputSchema: { type: 'object', required: ['missionId','taskId','state'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, state: { enum: ['PENDING','RUNNING','BLOCKED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
+    { name: 'mission_action_prepare', description: 'Prepare one governed IRIS execution action for a CHATGPT-orchestrated mission. Preparation never executes the capability.', inputSchema: { type: 'object', required: ['missionId','taskId','capabilityId','summary'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, capabilityId: { enum: ['file.read','file.write','file.delete','directory.create','directory.delete','project.test.run'] }, summary: { type: 'string', maxLength: 400 } }, additionalProperties: false } },
+    { name: 'mission_supervisor_gate_set', description: 'Record supervisor-gate state only for the active CHATGPT operational orchestrator. The gate never overrides IRIS permission policy.', inputSchema: { type: 'object', required: ['missionId','state'], properties: { ...sessionProperty, missionId: { type: 'string' }, state: { enum: ['NOT_REQUIRED','PENDING','APPROVED','DENIED'] }, reason: { type: ['string','null'], maxLength: 500 } }, additionalProperties: false } },
+    { name: 'project_test_run', description: 'Run only the registered project declared test script for one prepared CHATGPT mission action through CapabilityService.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, actionId: { type: 'string' }, projectId: { type: 'string' } }, additionalProperties: false } },
+    { name: 'file_read', description: 'Read a file from an explicitly selected registered project by projectId. Read-only compatibility path does not require an IRIS session; Full Mode may use a live session.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
     { name: 'file_write', description: 'Create or replace one bounded regular file in the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath', 'content'], properties: { ...projectProperties, content: { type: 'string' } }, additionalProperties: false } },
     { name: 'file_delete', description: 'Delete one regular file in the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
     { name: 'directory_create', description: 'Create one directory whose parent already exists inside the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
     { name: 'directory_delete', description: 'Remove one empty directory inside the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
   ];
+}
+
+function resolveSessionIdentity(
+  args: Record<string, unknown>,
+  request: Request,
+  state: RuntimeState | undefined,
+): { clientId: string; sessionId: string; session: ReturnType<RuntimeState['getSessionForClient']> } {
+  const clientId = requiredHeader(request, CLIENT_ID_HEADER);
+  const argumentSessionId = optionalString(args, 'sessionId');
+  const headerSessionId = optionalHeader(request, SESSION_ID_HEADER);
+  if (argumentSessionId !== undefined && headerSessionId !== undefined && argumentSessionId !== headerSessionId) {
+    throw new RuntimeError('CONTROL_DENIED', 'sessionId argument does not match x-iris-session-id');
+  }
+  const sessionId = argumentSessionId ?? headerSessionId;
+  if (sessionId === undefined) {
+    throw new RuntimeError('INVALID_REQUEST', 'IRIS session is required; call session_open first and pass its sessionId.');
+  }
+  if (state === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session validation is unavailable');
+  return { clientId, sessionId, session: state.getSessionForClient(sessionId, clientId) };
 }
 
 function requireBrokerContext(state: RuntimeState | undefined, broker: MissionBrokerService | undefined): { state: RuntimeState; broker: MissionBrokerService } {

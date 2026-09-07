@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import path from 'node:path';
 import type { AgentRole, CapabilityId, MissionExecutionAssociation, MissionState, MissionTaskState, OrchestratorMode, PermissionDecisionRecord, PendingApprovalView, PermissionMode, ProjectReference, RuntimeHealth, SupervisorGateState } from '@iris/domain';
 import { RuntimeError } from '@iris/domain';
 import { PermissionAuditStore } from './audit.js';
@@ -7,6 +8,7 @@ import { PermissionPolicyEngine, type PolicyRequest } from './permissions.js';
 import { inspectProjectTarget } from './project-path.js';
 import { secureProjectFileRead, secureProjectFileWrite, secureProjectMutation } from './macos-safety.js';
 import { inspectProjectGitStatus } from './git-status.js';
+import { searchProjectText } from './project-search.js';
 import { runDeclaredProjectTest } from './project-test.js';
 import type { RuntimeState } from './state.js';
 
@@ -17,7 +19,9 @@ const APPROVAL_TTL_MS = 15 * 60_000;
 type CapabilityOperationCore =
   | { readonly capabilityId: 'runtime.status'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
-  | { readonly capabilityId: 'project.git_status'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
+  | { readonly capabilityId: 'project.info'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string }
+  | { readonly capabilityId: 'project.git_status'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId?: string | undefined }
+  | { readonly capabilityId: 'project.search'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string; readonly query: string }
   | { readonly capabilityId: 'project.test.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'mission.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'mission.get'; readonly missionId: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
@@ -33,7 +37,7 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'session.instruction.submit'; readonly clientId: string; readonly sessionId: string; readonly submissionId: string; readonly instruction: string }
   | { readonly capabilityId: 'project.register'; readonly name: string; readonly rootPath: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.default.set'; readonly projectId: string | null; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
-  | { readonly capabilityId: 'file.read'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string }
+  | { readonly capabilityId: 'file.read'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId?: string | undefined; readonly targetPath: string }
   | { readonly capabilityId: 'file.write'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string; readonly content: string }
   | { readonly capabilityId: 'file.delete'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string }
   | { readonly capabilityId: 'directory.create'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string }
@@ -246,9 +250,17 @@ export class CapabilityService {
       projects: await this.state.listProjects(),
       defaultProjectId: await this.state.getDefaultProjectId(),
     };
+    if (operation.capabilityId === 'project.info') {
+      const project = await this.authorizedProject(operation);
+      return { id: project.id, name: project.name, rootPath: project.rootPath, isDefault: project.id === await this.state.getDefaultProjectId() };
+    }
     if (operation.capabilityId === 'project.git_status') {
       const project = await this.authorizedProject(operation);
       return inspectProjectGitStatus(project.rootPath);
+    }
+    if (operation.capabilityId === 'project.search') {
+      const project = await this.authorizedProject(operation);
+      return searchProjectText(project.rootPath, operation.query);
     }
     if (operation.capabilityId === 'project.test.run') {
       const project = await this.authorizedProject(operation);
@@ -320,7 +332,15 @@ export class CapabilityService {
     throw new RuntimeError('CAPABILITY_DENIED', 'Capability execution is not implemented');
   }
 
-  private async authorizedProject(operation: Extract<CapabilityOperation, { clientId: string; sessionId: string }>): Promise<ProjectReference> {
+  private async authorizedProject(operation: { readonly capabilityId: CapabilityId; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId?: string | undefined }): Promise<ProjectReference> {
+    if (operation.sessionId === undefined) {
+      if (operation.projectId === undefined || !sessionlessProjectRead(operation.capabilityId)) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Sessionless project reads require an explicit registered projectId');
+      }
+      const project = (await this.state.listProjects()).find((entry) => entry.id === operation.projectId);
+      if (project === undefined) throw new RuntimeError('PROJECT_NOT_FOUND', 'Requested project is not registered');
+      return project;
+    }
     const session = this.state.getSessionForClient(operation.sessionId, operation.clientId);
     if (session.currentProjectId === null) throw new RuntimeError('CAPABILITY_DENIED', 'Session has no current project');
     if ('projectId' in operation && operation.projectId !== undefined && operation.projectId !== session.currentProjectId) {
@@ -336,17 +356,22 @@ export class CapabilityService {
     targetPath: string,
     kind: 'file-read' | 'file-write' | 'file-delete' | 'directory-create' | 'directory-delete',
   ): Promise<string> {
-    const inspected = await inspectProjectTarget(project.rootPath, targetPath, kind);
+    const resolvedTarget = path.isAbsolute(targetPath) ? targetPath : path.resolve(project.rootPath, targetPath);
+    const inspected = await inspectProjectTarget(project.rootPath, resolvedTarget, kind);
     if (!inspected.valid || inspected.target === null) throw new RuntimeError('CAPABILITY_DENIED', inspected.reason);
     return inspected.target;
   }
+}
+
+function sessionlessProjectRead(capabilityId: CapabilityId): boolean {
+  return capabilityId === 'project.info' || capabilityId === 'project.git_status' || capabilityId === 'project.search' || capabilityId === 'file.read';
 }
 
 function requestForOperation(operation: CapabilityOperation): PolicyRequest {
   let request: PolicyRequest;
   if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
-  } else if (operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.test.run') {
+  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'project.test.run') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'mission.get') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId };
@@ -400,7 +425,9 @@ function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is
 
 function describeOperation(operation: CapabilityOperation): string {
   if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') return operation.capabilityId;
-  if (operation.capabilityId === 'project.git_status') return `project.git_status projectId=${operation.projectId ?? 'session-current'}`;
+  if (operation.capabilityId === 'project.info') return `project.info projectId=${operation.projectId}`;
+  if (operation.capabilityId === 'project.git_status') return `project.git_status projectId=${operation.projectId}`;
+  if (operation.capabilityId === 'project.search') return `project.search projectId=${operation.projectId} queryLength=${operation.query.length}`;
   if (operation.capabilityId === 'project.test.run') return `project.test.run projectId=${operation.projectId ?? 'session-current'} declared-script=test`;
   if (operation.capabilityId === 'mission.get') return `mission.get missionId=${operation.missionId}`;
   if (operation.capabilityId === 'mission.create') return `mission.create sessionId=${operation.sessionId} title=${JSON.stringify(operation.title)}`;
