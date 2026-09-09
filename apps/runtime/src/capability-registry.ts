@@ -26,14 +26,14 @@ const DEFINITIONS: readonly CapabilityDefinition[] = [
   { id: 'file.delete', title: 'Delete project file', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'directory.create', title: 'Create project directory', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'directory.delete', title: 'Remove empty project directory', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
-  { id: 'project.command.run', title: 'Run approved project command', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: false },
-  { id: 'git.local', title: 'Local project Git operation', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: false },
+  { id: 'project.command.run', title: 'Run declared project validation script', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
+  { id: 'git.local', title: 'Bounded local project Git operation', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'runtime.lifecycle', title: 'Local runtime lifecycle', riskClass: 'MODERATE', requiredScope: 'RUNTIME_DATA', mutation: true, implemented: true },
   { id: 'web.lifecycle', title: 'Local Web development lifecycle', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: false },
   { id: 'package.project', title: 'Project package-manager operation', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: false },
   { id: 'policy.mode.set', title: 'Change machine permission mode', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: true },
   { id: 'credential.mutate', title: 'Create or change credentials', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: false },
-  { id: 'remote.publish', title: 'Publish or mutate a remote repository/account', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: false },
+  { id: 'remote.publish', title: 'Push current feature branch to configured origin', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: true },
   { id: 'system.sudo', title: 'System privilege escalation', riskClass: 'SYSTEM', requiredScope: 'OWNER', mutation: true, implemented: false },
 ] as const;
 

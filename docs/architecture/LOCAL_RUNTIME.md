@@ -47,6 +47,13 @@ Selecting `openai` never falls back to the development executor when configurati
 
 The default preferred API port is `43110`. The daemon binds `127.0.0.1` only. The actual API and MCP URLs are printed at startup and persisted in machine-local endpoint metadata so clients can discover a safe fallback port.
 
+The long-lived runtime and tunnel-client processes are coordinated by the IRIS
+supervisor. Its process records are separate from the runtime authority record;
+stopping a stack first verifies the supervisor-owned identity of each child and
+uses the runtime's instance-bound control request for the daemon itself. See
+`RUNTIME_SUPERVISOR.md` for persistent credentials, connector bindings, layered
+readiness, bounded recovery, and the user LaunchAgent.
+
 ## Failure taxonomy
 
 The runtime uses machine-readable codes including `AUTHORITY_HELD`, `AUTHORITY_INDETERMINATE`, `AUTHORITY_CHANGED`, `CONTROL_DENIED`, `STALE_AUTHORITY`, `PORT_UNAVAILABLE`, `INVALID_PROJECT_PATH`, `PROJECT_NOT_FOUND`, `SESSION_NOT_FOUND`, `SESSION_BUSY`, `AGENT_EXECUTION_FAILED`, `RUNTIME_NOT_RUNNING`, `RUNTIME_SHUTTING_DOWN`, `PERSISTENCE_FAILURE`, and `INVALID_REQUEST`.

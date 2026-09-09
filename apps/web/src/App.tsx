@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
+import { V21MissionLifecyclePanel, type V21MissionLifecycle } from './mission-control-v21.js';
 
 type Health = {
   status: string;
@@ -88,6 +89,7 @@ type Mission = {
   tasks: MissionTask[];
   timeline: Array<{ id: string; timestamp: string; kind: string; taskId: string | null; actionId: string | null; message: string }>;
   broker: MissionBroker | null;
+  lifecycle?: V21MissionLifecycle | null;
 };
 type PermissionMode = 'ASK_EVERY_TIME' | 'AUTO_APPROVE_LOW_RISK' | 'AUTO_APPROVE_PROJECT_SCOPED' | 'FULL_LOCAL_OWNER';
 type RiskClass = 'LOW' | 'MODERATE' | 'HIGH' | 'SYSTEM';
@@ -122,6 +124,7 @@ type PermissionSnapshot = {
 };
 type View = 'runtime' | 'permissions' | 'approvals';
 type ApprovalChoice = 'ALLOW_ONCE' | 'ALWAYS_ALLOW_PROJECT' | 'DENY';
+type MissionLifecycleAction = 'resume' | 'cancel';
 
 const WEB_CLIENT_ID_KEY = 'iris.web.clientId';
 const WEB_OWNER_TOKEN_KEY = 'iris.web.ownerToken';
@@ -317,6 +320,19 @@ export function App(): ReactElement {
     await refresh();
   };
 
+  const requestMissionLifecycleAction = async (mission: Mission, action: MissionLifecycleAction) => {
+    const lifecycle = mission.lifecycle;
+    if (lifecycle === undefined || lifecycle === null) return;
+    const response = await authorizedFetch(ownerAccessToken, `/missions/${encodeURIComponent(mission.id)}/lifecycle/${action}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: lifecycle.revision, requestId: crypto.randomUUID() }),
+    });
+    if (!response.ok) throw new Error(await responseMessage(response, `Could not ${action} mission lifecycle`));
+    setNotice(action === 'resume' ? 'Mission resume was accepted by the durable lifecycle.' : 'Mission cancellation was accepted by the durable lifecycle.');
+    await refresh();
+  };
+
   const requestMode = async (mode: PermissionMode) => {
     const response = await authorizedFetch(ownerAccessToken, '/permissions/mode', {
       method: 'POST',
@@ -430,6 +446,7 @@ export function App(): ReactElement {
         onRegisterProject={() => run(registerProject)}
         onSelectProject={(projectId) => run(() => selectProject(projectId))}
         onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
+        onRequestMissionLifecycleAction={(mission, action) => run(() => requestMissionLifecycleAction(mission, action))}
       />}
       {view === 'permissions' && <PermissionsPage permissions={permissions} onRequestMode={(mode) => run(() => requestMode(mode))} />}
       {view === 'approvals' && <ApprovalCenter approvals={visibleApprovals} selectedSession={selectedSession} onReview={setSelectedApproval} />}
@@ -466,6 +483,7 @@ export function RuntimePage(props: {
   onRegisterProject(): void;
   onSelectProject(projectId: string): void;
   onRequestMissionOrchestrator(mission: Mission, targetMode: OrchestratorMode): void;
+  onRequestMissionLifecycleAction?(mission: Mission, action: MissionLifecycleAction): void;
 }): ReactElement {
   const sessionState = props.health === null
     ? 'Disconnected'
@@ -544,7 +562,7 @@ export function RuntimePage(props: {
             </>}
         </section>
 
-        <MissionControl missions={props.missions} projects={props.projects} onRequestOrchestrator={props.onRequestMissionOrchestrator} />
+        <MissionControl missions={props.missions} projects={props.projects} onRequestOrchestrator={props.onRequestMissionOrchestrator} {...(props.onRequestMissionLifecycleAction === undefined ? {} : { onRequestLifecycleAction: props.onRequestMissionLifecycleAction })} />
 
         <section className="projects-card"><div className="section-title-row"><div><p className="section-label">Projects</p><h2>Registered locally</h2></div></div>
           {props.projects.length === 0 ? <div className="empty-state"><p>No registered projects.</p><span>Register an existing local folder. IRIS never scans your filesystem implicitly.</span></div> : <ul className="project-list">{props.projects.map((project) => <li key={project.id}><div><strong>{project.name}</strong><code>{project.rootPath}</code></div>{project.id === props.defaultProject?.id ? <span>Default</span> : null}</li>)}</ul>}
@@ -561,7 +579,12 @@ export function RuntimePage(props: {
   </>;
 }
 
-function MissionControl(props: { missions: Mission[]; projects: Project[]; onRequestOrchestrator(mission: Mission, targetMode: OrchestratorMode): void }): ReactElement {
+function MissionControl(props: {
+  missions: Mission[];
+  projects: Project[];
+  onRequestOrchestrator(mission: Mission, targetMode: OrchestratorMode): void;
+  onRequestLifecycleAction?(mission: Mission, action: MissionLifecycleAction): void;
+}): ReactElement {
   return <section className="mission-control" aria-labelledby="mission-control-heading">
     <div className="section-title-row"><div><p className="section-label">Mission Control</p><h2 id="mission-control-heading">Mission execution ledger</h2></div><span className="mission-count">{props.missions.length} mission{props.missions.length === 1 ? '' : 's'}</span></div>
     <p className="mission-help">The daemon records the single operational orchestrator, governed action state, durable supervisor checkpoints/directives, evidence, and approvals. IRIS remains execution and permission authority in every mode.</p>
@@ -606,6 +629,12 @@ function MissionControl(props: { missions: Mission[]; projects: Project[]; onReq
             <p><strong>Proposed next action:</strong> {latestCheckpoint.proposedNextAction}</p>
           </section> : null}
           {latestDirective !== null ? <p className="mission-last-directive"><strong>Last supervisor directive:</strong> #{latestDirective.directiveSequence} {latestDirective.decision} · {latestDirective.instruction}</p> : null}
+          <V21MissionLifecyclePanel
+            lifecycle={mission.lifecycle ?? null}
+            missionTitle={mission.title}
+            onResume={() => props.onRequestLifecycleAction?.(mission, 'resume')}
+            onCancel={() => props.onRequestLifecycleAction?.(mission, 'cancel')}
+          />
           <div className="mission-tasks">{mission.tasks.map((task) => <article key={task.id}>
             <header><strong>{task.title}</strong><span>{task.state}</span></header>
             {task.actions.length === 0 ? <p>No governed actions prepared.</p> : <ul>{task.actions.map((action) => <li key={action.id}>

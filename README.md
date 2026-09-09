@@ -20,3 +20,12 @@ pnpm dev
 The web app defaults to `http://127.0.0.1:5173`; its development server proxies `/health` to the runtime on port `43110`. The combined `pnpm dev` command configures that port automatically. When the runtime is launched separately without `IRIS_PORT`, it selects an available loopback port.
 
 Validation commands are `pnpm test`, `pnpm lint`, `pnpm typecheck`, and `pnpm build`.
+
+## Supervised local stack
+
+The supported daily control surface is `pnpm iris up`, `pnpm iris status`,
+`pnpm iris doctor`, `pnpm iris restart`, and `pnpm iris down`. The first run on
+an existing tunnel-client setup requires an explicit credential migration; IRIS
+does not copy shell or legacy profile secrets automatically. See
+[`docs/architecture/RUNTIME_SUPERVISOR.md`](docs/architecture/RUNTIME_SUPERVISOR.md)
+for the credential, connector, readiness, recovery, and LaunchAgent model.

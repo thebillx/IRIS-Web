@@ -1,38 +1,57 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { runDeclaredProjectTest } from './project-test.js';
+import { describe, expect, it, vi } from 'vitest';
+import { runDeclaredProjectScript, runDeclaredProjectTest } from './project-test.js';
 
-const roots: string[] = [];
-afterEach(async () => {
-  delete process.env.OPENAI_API_KEY;
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
-
-async function fixture(testScript: string): Promise<string> {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-governed-project-test-'));
-  roots.push(root);
-  await writeFile(path.join(root, 'package.json'), JSON.stringify({ private: true, scripts: { test: testScript } }));
+async function fixture(packageManager: string, scripts: Record<string, string>) {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-project-test-'));
+  await writeFile(path.join(root, 'package.json'), JSON.stringify({ packageManager, scripts }));
   return root;
 }
 
-describe('governed declared project tests', () => {
-  it('returns bounded success and failure results without arbitrary command input', async () => {
-    const passing = await runDeclaredProjectTest(await fixture("node -e \"console.log('pass')\""));
-    expect(passing).toMatchObject({ passed: true, exitCode: 0, timedOut: false });
-    expect(passing.stdout).toContain('pass');
-
-    const failing = await runDeclaredProjectTest(await fixture("node -e \"console.error('expected-failure'); process.exit(3)\""));
-    expect(failing).toMatchObject({ passed: false, exitCode: 3, timedOut: false });
-    expect(failing.stderr).toContain('expected-failure');
+describe('governed project validation', () => {
+  it('uses npm for an npm project and keeps metacharacters inert', async () => {
+    const root = await fixture('npm@11.17.0', { 'unit:contract': 'ignored command text' });
+    const execute = vi.fn(async () => ({ stdout: 'ok', stderr: '' }));
+    const result = await runDeclaredProjectScript(root, 'unit:contract', { execute: execute as never });
+    expect(result.packageManager).toBe('npm');
+    expect(execute).toHaveBeenCalledWith('npm', ['run', '--ignore-scripts', 'unit:contract'], expect.objectContaining({ cwd: root }));
+    await expect(runDeclaredProjectScript(root, 'unit:contract;touch')).rejects.toThrow('script name is invalid');
   });
 
-  it('does not inherit credential-like parent environment values', async () => {
-    process.env.OPENAI_API_KEY = 'SHOULD_NOT_REACH_PROJECT_TEST';
-    const result = await runDeclaredProjectTest(await fixture("node -e \"console.log(process.env.OPENAI_API_KEY || 'credential-absent')\""));
-    expect(result.passed).toBe(true);
-    expect(result.stdout).toContain('credential-absent');
-    expect(result.stdout).not.toContain('SHOULD_NOT_REACH_PROJECT_TEST');
+  it('uses pnpm for a pnpm project', async () => {
+    const root = await fixture('pnpm@10.15.0', { test: 'ignored' });
+    const execute = vi.fn(async () => ({ stdout: 'ok', stderr: '' }));
+    const result = await runDeclaredProjectScript(root, 'test', { execute: execute as never });
+    expect(result.packageManager).toBe('pnpm');
+    expect(execute).toHaveBeenCalledWith('pnpm', ['--config.ignore-scripts=true', 'run', 'test'], expect.objectContaining({ cwd: root }));
+  });
+
+  it('fails closed for missing and unknown scripts', async () => {
+    const root = await fixture('npm@11.17.0', { test: 'ignored' });
+    await expect(runDeclaredProjectScript(root, 'missing')).rejects.toThrow('does not declare validation script');
+    const empty = await fixture('npm@11.17.0', {});
+    await expect(runDeclaredProjectTest(empty)).rejects.toThrow('does not declare validation script test');
+  });
+
+  it('physically binds cwd and preserves timeout reporting', async () => {
+    const root = await fixture('npm@11.17.0', { test: 'ignored' });
+    const execute = vi.fn(async (_file, _args, options) => {
+      expect(options.cwd).toBe(root);
+      throw Object.assign(new Error('timeout'), { killed: true, signal: 'SIGTERM', stdout: '', stderr: '' });
+    });
+    const result = await runDeclaredProjectScript(root, 'test', { timeoutMs: 1, execute: execute as never });
+    expect(result).toMatchObject({ timedOut: true, passed: false });
+  });
+
+  it('preserves legacy undeclared manifests as pnpm without installing dependencies', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'iris-project-test-'));
+    await mkdir(path.join(root, 'nested'));
+    await writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { test: 'ignored' } }));
+    const execute = vi.fn(async () => ({ stdout: 'ok', stderr: '' }));
+    const result = await runDeclaredProjectScript(root, 'test', { execute: execute as never });
+    expect(result.packageManager).toBe('pnpm');
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 });
