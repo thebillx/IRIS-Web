@@ -3,6 +3,7 @@ import { access, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { node24Environment, node24TsxArgs, resolveCanonicalNode } from './node24.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const artifactRoot = path.join(repoRoot, '.local-artifacts');
@@ -10,13 +11,14 @@ await mkdir(artifactRoot, { recursive: true });
 const projectRoot = await mkdtemp(path.join(artifactRoot, 'permission-smoke-project-'));
 const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-permission-smoke-data-'));
 const outsideRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-permission-smoke-outside-'));
-const environment = { ...process.env, IRIS_RUNTIME_DATA_ROOT: dataRoot };
+const node = resolveCanonicalNode();
+const environment = node24Environment(process.env, { IRIS_RUNTIME_DATA_ROOT: dataRoot });
 let dev;
 let ownerAccessToken = '';
 
 try {
   const endpoints = endpointPromise();
-  dev = spawn(process.execPath, ['scripts/dev.mjs'], {
+  dev = spawn(node.path, [path.join(repoRoot, 'scripts', 'dev.mjs')], {
     cwd: repoRoot,
     env: environment,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -208,8 +210,7 @@ async function waitForExit(child, timeoutMs) {
 }
 
 async function runtimeControl(command, env) {
-  const executable = path.join(repoRoot, 'apps', 'runtime', 'node_modules', '.bin', 'tsx');
-  const child = spawn(executable, ['src/control.ts', command], { cwd: path.join(repoRoot, 'apps', 'runtime'), env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(node.path, node24TsxArgs(path.join(repoRoot, 'apps', 'runtime', 'src', 'control.ts'), [command]), { cwd: path.join(repoRoot, 'apps', 'runtime'), env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';
   child.stdout.setEncoding('utf8');

@@ -1,10 +1,10 @@
 import { execFile } from 'node:child_process';
 import { access, mkdir, rm } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { RuntimeError } from '@iris/domain';
 import { writePrivateJsonAtomic } from './credentials.js';
+import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
 
 const execFileAsync = promisify(execFile);
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
@@ -43,7 +43,7 @@ export function renderLaunchAgent(dataRoot: string, executable: string, controlS
     '  <key>EnvironmentVariables</key>',
     '  <dict>',
     `    <key>IRIS_RUNTIME_DATA_ROOT</key><string>${xml(dataRoot)}</string>`,
-    `    <key>PATH</key><string>${xml([path.dirname(process.execPath), path.join(os.homedir(), '.local', 'bin'), '/opt/homebrew/bin', '/opt/homebrew/sbin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(path.delimiter))}</string>`,
+    `    <key>PATH</key><string>${xml(node24Path(executable))}</string>`,
     '  </dict>',
     '  <key>RunAtLoad</key><true/>',
     '  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>',
@@ -74,17 +74,29 @@ export async function writeLaunchAgent(dataRoot: string, executable: string, con
 }
 
 export async function installLaunchAgent(dataRoot: string, executable: string, controlScript: string, executableArguments: readonly string[] = []): Promise<LaunchdPaths> {
+  assertSupportedNodeVersion();
   await access(controlScript).catch(() => { throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Build IRIS before installing its LaunchAgent'); });
-  const paths = await writeLaunchAgent(dataRoot, executable, controlScript, executableArguments);
+  const paths = await writeLaunchAgent(dataRoot, canonicalNodeRuntime().path, controlScript, executableArguments);
   const domain = launchdDomain();
   const serviceTarget = `${domain}/${LAUNCH_AGENT_LABEL}`;
   try {
     await execFileAsync('launchctl', ['bootout', serviceTarget], { encoding: 'utf8', timeout: 5_000 }).catch(() => undefined);
-    await execFileAsync('launchctl', ['bootstrap', domain, paths.plist], { encoding: 'utf8', timeout: 5_000 });
+    await waitForLaunchAgent(false, 5_000);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await execFileAsync('launchctl', ['bootstrap', domain, paths.plist], { encoding: 'utf8', timeout: 5_000 });
+        await waitForLaunchAgent(true, 5_000);
+        return paths;
+      } catch (error) {
+        lastError = error;
+        await waitForLaunchAgent(false, 5_000);
+      }
+    }
+    throw lastError ?? new Error('LaunchAgent bootstrap did not complete');
   } catch (error) {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Could not install the IRIS LaunchAgent', { cause: error });
   }
-  return paths;
 }
 
 export async function uninstallLaunchAgent(dataRoot: string): Promise<void> {
@@ -97,6 +109,15 @@ export async function uninstallLaunchAgent(dataRoot: string): Promise<void> {
 export async function launchAgentLoaded(): Promise<boolean> {
   try { await execFileAsync('launchctl', ['print', `${launchdDomain()}/${LAUNCH_AGENT_LABEL}`], { encoding: 'utf8', timeout: 2_000 }); return true; }
   catch { return false; }
+}
+
+async function waitForLaunchAgent(expected: boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await launchAgentLoaded() === expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`LaunchAgent did not become ${expected ? 'loaded' : 'unloaded'} before the deadline`);
 }
 
 function launchdDomain(): string {

@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { RuntimeError } from '@iris/domain';
+import { node24Path } from './node-runtime.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_TIMEOUT_MS = 15 * 60_000;
@@ -90,7 +91,7 @@ function boundedResult(scriptName: string, packageManager: 'npm' | 'pnpm', exitC
 
 function testEnvironment(): NodeJS.ProcessEnv {
   return {
-    PATH: process.env.PATH ?? '/opt/homebrew/bin:/usr/bin:/bin',
+    PATH: node24Path(),
     HOME: process.env.HOME ?? '',
     TMPDIR: process.env.TMPDIR ?? '/tmp',
     LANG: process.env.LANG ?? 'en_US.UTF-8',

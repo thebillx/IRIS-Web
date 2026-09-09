@@ -8,6 +8,7 @@ import { probeRuntimeAuthority } from './authority.js';
 import { runtimeChildEnvironment, runtimeStatus, startRuntime, stopRuntime } from './lifecycle.js';
 import { MCP_PROTOCOL_VERSION } from './mcp.js';
 import { loadOrCreateRuntimeId, readEndpoint, readOwnerAccessSecret, readRuntimeControl, writeEndpoint, writeRuntimeControl } from './persistence.js';
+import { node24Path } from './node-runtime.js';
 
 const roots: string[] = [];
 let occupiedServer: Server | undefined;
@@ -36,12 +37,12 @@ async function json<T>(url: string, init: RequestInit = {}): Promise<T> {
 describe('runtime lifecycle integration', () => {
   it('passes only the bounded local environment required by the child runtime', () => {
     const environment = runtimeChildEnvironment('/private/tmp/iris-runtime-test', 43110, {
-      PATH: '/opt/homebrew/bin:/usr/bin:/bin', HOME: '/Users/test', TMPDIR: '/private/tmp', LANG: 'en_US.UTF-8',
+      PATH: node24Path(), HOME: '/Users/test', TMPDIR: '/private/tmp', LANG: 'en_US.UTF-8',
       NODE_OPTIONS: '--require /tmp/untrusted.js', CLOUD_TOKEN: 'secret-value',
       IRIS_AGENT_EXECUTOR: 'openai', OPENAI_API_KEY: 'openai-test-secret', IRIS_OPENAI_MODEL: 'gpt-test-model',
     });
     expect(environment).toMatchObject({
-      PATH: '/opt/homebrew/bin:/usr/bin:/bin', HOME: '/Users/test', TMPDIR: '/private/tmp', LANG: 'en_US.UTF-8',
+      PATH: node24Path(), HOME: '/Users/test', TMPDIR: '/private/tmp', LANG: 'en_US.UTF-8',
       IRIS_RUNTIME_DATA_ROOT: '/private/tmp/iris-runtime-test', IRIS_RUNTIME_PORT: '43110',
       IRIS_AGENT_EXECUTOR: 'openai', OPENAI_API_KEY: 'openai-test-secret', IRIS_OPENAI_MODEL: 'gpt-test-model',
     });
@@ -49,7 +50,7 @@ describe('runtime lifecycle integration', () => {
     expect(environment.CLOUD_TOKEN).toBeUndefined();
 
     const developmentEnvironment = runtimeChildEnvironment('/private/tmp/iris-runtime-test', 43110, {
-      PATH: '/opt/homebrew/bin:/usr/bin:/bin',
+      PATH: node24Path(),
       IRIS_AGENT_EXECUTOR: 'development', OPENAI_API_KEY: 'must-not-reach-child', IRIS_OPENAI_MODEL: 'must-not-reach-child',
     });
     expect(developmentEnvironment.IRIS_AGENT_EXECUTOR).toBe('development');

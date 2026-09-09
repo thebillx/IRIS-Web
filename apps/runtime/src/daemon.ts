@@ -17,6 +17,7 @@ import { DurableMissionLifecycleStore } from './durable-mission-store.js';
 import { DurableMissionLifecycleService } from './durable-mission-service.js';
 import { WorkerAdapterRegistry } from './durable-mission-workers.js';
 import { recoverDurableMissions } from './durable-mission-recovery.js';
+import { assertSupportedNodeVersion } from './node-runtime.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -40,6 +41,7 @@ export interface DaemonHandle {
 }
 
 export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHandle> {
+  assertSupportedNodeVersion();
   if (process.platform !== 'darwin') throw new Error('IRIS V0 local runtime is implemented for macOS only');
   const dataRoot = options.dataRoot === undefined
     ? await resolveRuntimeDataRoot()

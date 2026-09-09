@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx src/main.ts",
-    "runtime": "tsx src/control.ts",
-    "v2-acceptance": "tsx src/v2-acceptance.ts",
-    "v2-orchestrator-acceptance": "tsx src/v2-orchestrator-acceptance.ts",
+    "dev": "node ../../scripts/node24.mjs src/main.ts",
+    "runtime": "node ../../scripts/node24.mjs src/control.ts",
+    "v2-acceptance": "node ../../scripts/node24.mjs src/v2-acceptance.ts",
+    "v2-orchestrator-acceptance": "node ../../scripts/node24.mjs src/v2-orchestrator-acceptance.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.build.json"
