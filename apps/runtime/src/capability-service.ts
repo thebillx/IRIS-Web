@@ -9,7 +9,8 @@ import { inspectProjectTarget } from './project-path.js';
 import { secureProjectFileRead, secureProjectFileWrite, secureProjectMutation } from './macos-safety.js';
 import { inspectProjectGitStatus } from './git-status.js';
 import { searchProjectText } from './project-search.js';
-import { runDeclaredProjectTest } from './project-test.js';
+import { runDeclaredProjectScript, runDeclaredProjectTest } from './project-test.js';
+import { pushCurrentFeatureBranch, runProjectGitLocal, type GitLocalOperation } from './project-git.js';
 import type { RuntimeState } from './state.js';
 
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -23,6 +24,9 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'project.git_status'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'project.search'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string; readonly query: string }
   | { readonly capabilityId: 'project.test.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
+  | { readonly capabilityId: 'project.command.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly scriptName: string }
+  | { readonly capabilityId: 'git.local'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly operation: GitLocalOperation; readonly paths?: readonly string[] | undefined; readonly message?: string | undefined }
+  | { readonly capabilityId: 'remote.publish'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'mission.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'mission.get'; readonly missionId: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'mission.create'; readonly clientId: string; readonly sessionId: string; readonly title: string; readonly orchestratorMode?: OrchestratorMode | undefined }
@@ -266,6 +270,22 @@ export class CapabilityService {
       const project = await this.authorizedProject(operation);
       return runDeclaredProjectTest(project.rootPath);
     }
+    if (operation.capabilityId === 'project.command.run') {
+      const project = await this.authorizedProject(operation);
+      return runDeclaredProjectScript(project.rootPath, operation.scriptName);
+    }
+    if (operation.capabilityId === 'git.local') {
+      const project = await this.authorizedProject(operation);
+      return runProjectGitLocal(project.rootPath, {
+        operation: operation.operation,
+        ...(operation.paths === undefined ? {} : { paths: operation.paths }),
+        ...(operation.message === undefined ? {} : { message: operation.message }),
+      });
+    }
+    if (operation.capabilityId === 'remote.publish') {
+      const project = await this.authorizedProject(operation);
+      return pushCurrentFeatureBranch(project.rootPath);
+    }
     if (operation.capabilityId === 'mission.list') return { missions: await this.state.listMissions() };
     if (operation.capabilityId === 'mission.get') return this.state.getMission(operation.missionId);
     if (operation.capabilityId === 'mission.create') return this.state.createMission(operation.clientId, operation.sessionId, operation.title, operation.orchestratorMode ?? 'HERMES');
@@ -371,7 +391,7 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
   let request: PolicyRequest;
   if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
-  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'project.test.run') {
+  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'mission.get') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId };
@@ -414,12 +434,12 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
 }
 
 function isMissionExecutableOperation(operation: CapabilityOperation): operation is CapabilityOperation & { readonly clientId: string; readonly sessionId: string; readonly mission: MissionExecutionAssociation } {
-  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete'
+  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete'
     || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
 }
 
-function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'file.read' | 'file.write' | 'file.delete' | 'directory.create' | 'directory.delete' {
-  return capabilityId === 'project.test.run' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete'
+function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'project.command.run' | 'git.local' | 'remote.publish' | 'file.read' | 'file.write' | 'file.delete' | 'directory.create' | 'directory.delete' {
+  return capabilityId === 'project.test.run' || capabilityId === 'project.command.run' || capabilityId === 'git.local' || capabilityId === 'remote.publish' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete'
     || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
 }
 
@@ -429,6 +449,9 @@ function describeOperation(operation: CapabilityOperation): string {
   if (operation.capabilityId === 'project.git_status') return `project.git_status projectId=${operation.projectId}`;
   if (operation.capabilityId === 'project.search') return `project.search projectId=${operation.projectId} queryLength=${operation.query.length}`;
   if (operation.capabilityId === 'project.test.run') return `project.test.run projectId=${operation.projectId ?? 'session-current'} declared-script=test`;
+  if (operation.capabilityId === 'project.command.run') return `project.command.run projectId=${operation.projectId ?? 'session-current'} declared-script=${operation.scriptName}`;
+  if (operation.capabilityId === 'git.local') return `git.local projectId=${operation.projectId ?? 'session-current'} operation=${operation.operation} paths=${operation.paths?.length ?? 0}`;
+  if (operation.capabilityId === 'remote.publish') return `remote.publish projectId=${operation.projectId ?? 'session-current'} configured-origin-current-feature-branch`;
   if (operation.capabilityId === 'mission.get') return `mission.get missionId=${operation.missionId}`;
   if (operation.capabilityId === 'mission.create') return `mission.create sessionId=${operation.sessionId} title=${JSON.stringify(operation.title)}`;
   if (operation.capabilityId === 'mission.state.set') return `mission.state.set missionId=${operation.missionId} state=${operation.state}`;

@@ -8,9 +8,15 @@ import { CapabilityService } from './capability-service.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
 import { FoundationStateStore, loadOrCreateOwnerAccessSecret, loadOrCreateRuntimeId, removeEndpointIfInstance, removeRuntimeControlIfInstance, writeEndpoint, writeRuntimeControl } from './persistence.js';
+import { loadOrCreateTunnelServiceSecret } from './credentials.js';
+import { readConnectorRegistry } from './connector-registry.js';
 import { startRuntimeServer, type RuntimeServerHandle } from './server.js';
 import { RuntimeState } from './state.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
+import { DurableMissionLifecycleStore } from './durable-mission-store.js';
+import { DurableMissionLifecycleService } from './durable-mission-service.js';
+import { WorkerAdapterRegistry } from './durable-mission-workers.js';
+import { recoverDurableMissions } from './durable-mission-recovery.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -25,6 +31,7 @@ export interface DaemonHandle {
   readonly state: RuntimeState;
   readonly capabilities: CapabilityService;
   readonly missionBroker: MissionBrokerService;
+  readonly missionLifecycle: DurableMissionLifecycleService;
   readonly apiUrl: string;
   readonly mcpUrl: string;
   health(): RuntimeHealth;
@@ -41,6 +48,8 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
 
   const runtimeId = await loadOrCreateRuntimeId(dataRoot);
   const ownerAccessSecret = await loadOrCreateOwnerAccessSecret(dataRoot);
+  const tunnelServiceSecret = await loadOrCreateTunnelServiceSecret(dataRoot);
+  const connectorRegistry = await readConnectorRegistry(dataRoot);
   const identity: RuntimeIdentity = {
     runtimeId,
     instanceId: randomUUID(),
@@ -69,6 +78,9 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     const store = new FoundationStateStore(dataRoot);
     const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env));
     const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
+    const lifecycleStore = new DurableMissionLifecycleStore(dataRoot);
+    const lifecycleWorkers = new WorkerAdapterRegistry();
+    const missionLifecycle = new DurableMissionLifecycleService(state, lifecycleStore, lifecycleWorkers);
     const brokerByMission = new Map((await missionBroker.list()).map((record) => [record.missionId, record]));
     for (const mission of await state.listMissions()) {
       const brokerRecord = brokerByMission.get(mission.id);
@@ -76,6 +88,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         || brokerRecord?.state === 'COMPLETED';
       if (!terminal) await state.rehydrateBrokerMissionSession(mission.id);
     }
+    await recoverDurableMissions(state, lifecycleStore, lifecycleWorkers);
     const permissionSettings = new PermissionSettingsStore(dataRoot);
     await permissionSettings.initialize();
     const sourceRoot = await resolveSourceRoot();
@@ -126,11 +139,15 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         state,
         capabilities,
         missionBroker,
+        missionLifecycle,
         health,
         doctor,
         isShuttingDown: () => shuttingDown,
         controlSecret,
         ownerAccessSecret,
+        tunnelServiceSecret,
+        ...(connectorRegistry === null ? {} : { connectorDeploymentEpoch: connectorRegistry.deploymentEpoch }),
+        connectorRuntimeId: runtimeId,
         requestShutdown: () => {
           void close().catch((error: unknown) => {
             process.stderr.write(`IRIS controlled shutdown failed: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -156,6 +173,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       state,
       capabilities,
       missionBroker,
+      missionLifecycle,
       apiUrl: server.apiUrl,
       mcpUrl: server.mcpUrl,
       health,

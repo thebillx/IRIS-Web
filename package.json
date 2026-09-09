@@ -2,11 +2,13 @@
   "name": "iris",
   "version": "0.0.0",
   "private": true,
+  "bin": { "iris": "scripts/iris.mjs" },
   "packageManager": "pnpm@10.15.0",
   "engines": { "node": ">=24" },
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "runtime": "pnpm --filter @iris/runtime runtime",
+    "iris": "node scripts/iris.mjs",
     "permission-smoke": "node scripts/permission-smoke.mjs",
     "test": "pnpm --recursive --if-present test",
     "lint": "eslint .",

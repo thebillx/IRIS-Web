@@ -814,12 +814,20 @@ function missionEvidence(capabilityId: CapabilityId, value: unknown): readonly M
   const data: Record<string, string | number | boolean | null> = {};
   let reference: string | null = null;
   if (typeof record.targetPath === 'string') reference = record.targetPath.slice(0, 2_048);
-  for (const key of ['bytes', 'created', 'deleted', 'passed', 'exitCode', 'timedOut', 'outputTruncated'] as const) {
+  for (const key of ['bytes', 'created', 'deleted', 'passed', 'exitCode', 'timedOut', 'outputTruncated', 'verified'] as const) {
     const item = record[key];
     if (typeof item === 'number' && Number.isFinite(item)) data[key] = item;
     if (typeof item === 'boolean') data[key] = item;
   }
   if (capabilityId === 'file.read' && typeof record.content === 'string') data.bytes = Buffer.byteLength(record.content, 'utf8');
+  if (typeof record.operation === 'string') data.operation = record.operation.slice(0, 100);
+  if (typeof record.scriptName === 'string') data.scriptName = record.scriptName.slice(0, 100);
+  if (typeof record.packageManager === 'string') data.packageManager = record.packageManager.slice(0, 20);
+  if (typeof record.branch === 'string') data.branch = record.branch.slice(0, 255);
+  if (typeof record.remote === 'string') data.remote = record.remote.slice(0, 100);
+  if (typeof record.head === 'string') data.head = record.head.slice(0, 64);
+  if (typeof record.localHead === 'string') data.localHead = record.localHead.slice(0, 64);
+  if (typeof record.remoteHead === 'string') data.remoteHead = record.remoteHead.slice(0, 64);
   return [{
     id: randomUUID(),
     kind: 'CAPABILITY_RESULT',

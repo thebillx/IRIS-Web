@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { IRIS_VERSION, RuntimeError, type RuntimeHealth, type RuntimeIdentity } from '@iris/domain';
 import { AGENT_EXECUTOR_ENV, OPENAI_API_KEY_ENV, OPENAI_MODEL_ENV } from './agent-executor.js';
 import { AUTHORITY_RECOVERY_IN_PROGRESS, probeRuntimeAuthority } from './authority.js';
@@ -42,7 +43,10 @@ export async function runtimeStatus(dataRootInput?: string): Promise<RuntimeObse
         && control.instanceId === authority.identity.instanceId) {
         return { state: 'indeterminate', endpoint: null, health: null, reason: 'RUNTIME_STARTING' };
       }
-      return { state: 'indeterminate', endpoint: null, health: null, reason: 'Runtime control metadata exists without a matching live startup authority' };
+      if (authority.state === 'live') {
+        return { state: 'indeterminate', endpoint: null, health: null, reason: 'RUNTIME_AUTHORITY_ACTIVE' };
+      }
+      return { state: 'stale', endpoint: null, health: null, reason: 'STALE_METADATA' };
     }
     if (authority.state === 'unowned') return { state: 'stopped', endpoint: null, health: null };
     if (authority.state === 'stale') return { state: 'stale', endpoint: null, health: null, reason: 'STALE_AUTHORITY' };
@@ -64,13 +68,15 @@ export async function runtimeStatus(dataRootInput?: string): Promise<RuntimeObse
       && !pidExists(endpoint.pid)) {
       return { state: 'indeterminate', endpoint, health: null, reason: 'RUNTIME_STARTING' };
     }
-    return { state: 'indeterminate', endpoint, health: null, reason: 'Runtime control metadata does not identify the endpoint daemon' };
+    if (!pidExists(endpoint.pid) && authority.state !== 'live') return { state: 'stale', endpoint, health: null, reason: 'STALE_METADATA' };
+    return { state: 'indeterminate', endpoint, health: null, reason: pidExists(endpoint.pid) ? 'FOREIGN_PROCESS' : 'Runtime control metadata does not identify the endpoint daemon' };
   }
   if (control.runtimeId !== endpoint.runtimeId || control.instanceId !== endpoint.instanceId) {
     if (authority.state === 'live' && replacedStaleEndpointIsStarting(endpoint, authority.identity, control)) {
       return { state: 'indeterminate', endpoint, health: null, reason: 'RUNTIME_STARTING' };
     }
-    return { state: 'indeterminate', endpoint, health: null, reason: 'Runtime control metadata does not identify the endpoint daemon' };
+    if (!pidExists(endpoint.pid) && authority.state !== 'live') return { state: 'stale', endpoint, health: null, reason: 'STALE_METADATA' };
+    return { state: 'indeterminate', endpoint, health: null, reason: pidExists(endpoint.pid) ? 'FOREIGN_PROCESS' : 'Runtime control metadata does not identify the endpoint daemon' };
   }
 
   try {
@@ -87,10 +93,10 @@ export async function runtimeStatus(dataRootInput?: string): Promise<RuntimeObse
     return { state: 'running', endpoint, health: remote.health };
   } catch {
     return {
-      state: authority.state === 'stale' ? 'stale' : 'indeterminate',
+      state: authority.state === 'stale' || !pidExists(endpoint.pid) ? 'stale' : 'indeterminate',
       endpoint,
       health: null,
-      reason: 'Runtime endpoint is unreachable',
+      reason: authority.state === 'stale' || !pidExists(endpoint.pid) ? 'STALE_METADATA' : 'Runtime endpoint is unreachable',
     };
   }
 }
@@ -109,10 +115,14 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
   const sourceEntrypoint = path.resolve(import.meta.dirname, 'main.ts');
   const builtEntrypoint = path.resolve(import.meta.dirname, 'main.js');
   const sourceMode = existsSync(sourceEntrypoint);
-  const executable = sourceMode
-    ? path.resolve(import.meta.dirname, '..', 'node_modules', '.bin', 'tsx')
-    : process.execPath;
-  const args = [sourceMode ? sourceEntrypoint : builtEntrypoint];
+  const executable = process.execPath;
+  const args = sourceMode
+    ? [
+      '--require', path.resolve(import.meta.dirname, '..', 'node_modules', 'tsx', 'dist', 'preflight.cjs'),
+      '--import', pathToFileURL(path.resolve(import.meta.dirname, '..', 'node_modules', 'tsx', 'dist', 'loader.mjs')).href,
+      sourceEntrypoint,
+    ]
+    : [builtEntrypoint];
   const child = spawn(executable, args, {
     detached: true,
     stdio: 'ignore',

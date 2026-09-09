@@ -1,10 +1,13 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { RuntimeError, type AgentRole, type DoctorReport, type MissionState, type PermissionMode, type RuntimeHealth, type RuntimeIdentity, type SupervisorDecision } from '@iris/domain';
-import { handleMcpProRequest, handleMcpRequest } from './mcp.js';
+import { handleMcpProRequest, handleMcpRequest, type McpPrincipal } from './mcp.js';
+import { handleMcpV21Request } from './mcp-v21.js';
 import type { CapabilityOutcome, CapabilityService, OwnerApprovalChoice } from './capability-service.js';
 import type { RuntimeState } from './state.js';
 import type { MissionBrokerService } from './mission-broker.js';
+import type { DurableMissionLifecycleService } from './durable-mission-service.js';
+import { handleV21OwnerRoute } from './server-v21-routes.js';
 import { handleHermesMcpRequest } from './hermes-mcp.js';
 
 export const LOOPBACK_ADDRESS = '127.0.0.1' as const;
@@ -25,11 +28,15 @@ export interface RuntimeServerContext {
   readonly state: RuntimeState;
   readonly capabilities: CapabilityService;
   readonly missionBroker: MissionBrokerService;
+  readonly missionLifecycle?: DurableMissionLifecycleService;
   readonly health: () => RuntimeHealth;
   readonly doctor: () => Promise<DoctorReport>;
   readonly isShuttingDown: () => boolean;
   readonly controlSecret: string;
   readonly ownerAccessSecret: string;
+  readonly tunnelServiceSecret?: string;
+  readonly connectorDeploymentEpoch?: number;
+  readonly connectorRuntimeId?: string;
   readonly requestShutdown: () => void;
 }
 
@@ -176,7 +183,8 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   const publicObservation = request.method === 'GET'
     && (url.pathname === '/health' || url.pathname === '/status' || url.pathname === '/doctor');
   const ownerMcp = url.pathname === '/mcp' || url.pathname === '/mcp-pro';
-  if (ownerMcp && !ownerAccessAllowed(request, context.ownerAccessSecret)) {
+  const mcpPrincipal = ownerMcp ? mcpAccessPrincipal(request, context, url.pathname) : null;
+  if (ownerMcp && mcpPrincipal === null) {
     writeJson(response, 401, { error: { code: 'CONTROL_DENIED', message: 'Owner access credential is required' } }, {
       'www-authenticate': 'Bearer',
     });
@@ -195,7 +203,16 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     }
     const init: RequestInit = { method: request.method ?? 'GET', headers };
     if (body.length > 0) init.body = body;
-    const mcpResponse = await handleMcpRequest(new Request('http://127.0.0.1/mcp', init), context.capabilities, context.state, context.missionBroker);
+    const mcpResponse = context.missionLifecycle === undefined
+      ? await handleMcpRequest(new Request('http://127.0.0.1/mcp', init), context.capabilities, context.state, context.missionBroker, mcpPrincipal ?? 'owner')
+      : await handleMcpV21Request(
+        new Request('http://127.0.0.1/mcp', init),
+        context.capabilities,
+        context.state,
+        context.missionBroker,
+        context.missionLifecycle,
+        mcpPrincipal ?? 'owner',
+      );
     await writeFetchResponse(response, mcpResponse);
     return;
   }
@@ -206,7 +223,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     for (const [name, value] of Object.entries(request.headers)) if (typeof value === 'string') headers.set(name, value);
     const init: RequestInit = { method: request.method ?? 'GET', headers };
     if (body.length > 0) init.body = body;
-    const mcpResponse = await handleMcpProRequest(new Request('http://127.0.0.1/mcp-pro', init), context.capabilities);
+    const mcpResponse = await handleMcpProRequest(new Request('http://127.0.0.1/mcp-pro', init), context.capabilities, mcpPrincipal ?? 'owner');
     await writeFetchResponse(response, mcpResponse);
     return;
   }
@@ -232,14 +249,24 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   }
   if (request.method === 'GET' && url.pathname === '/missions') {
     const brokerRecords = await context.missionBroker.list();
+    const lifecycleRecords = context.missionLifecycle === undefined ? [] : await context.missionLifecycle.list();
     const brokerByMission = new Map(brokerRecords.map((record) => [record.missionId, record]));
+    const lifecycleByMission = new Map(lifecycleRecords.map((record) => [record.missionId, record]));
     writeJson(response, 200, {
       missions: await Promise.all((await context.state.listMissions()).map(async (mission) => ({
         ...mission,
         broker: brokerByMission.get(mission.id) ?? null,
+        lifecycle: lifecycleByMission.get(mission.id) ?? null,
         orchestratorHandoff: await context.missionBroker.orchestratorHandoffStatus(mission.id),
       }))),
     });
+    return;
+  }
+  const lifecycleRoute = context.missionLifecycle === undefined
+    ? null
+    : await handleV21OwnerRoute(request, url, context.missionLifecycle, readJsonBody);
+  if (lifecycleRoute !== null) {
+    writeJson(response, lifecycleRoute.status, lifecycleRoute.value);
     return;
   }
   const orchestratorMatch = /^\/missions\/([^/]+)\/orchestrator$/.exec(url.pathname);
@@ -632,6 +659,27 @@ function ownerAccessAllowed(request: IncomingMessage, secret: string): boolean {
   return secretsEqual(supplied, secret);
 }
 
+function mcpAccessPrincipal(
+  request: IncomingMessage,
+  context: RuntimeServerContext,
+  pathname: string,
+): McpPrincipal | null {
+  if (ownerAccessAllowed(request, context.ownerAccessSecret)) return 'owner';
+  if (context.tunnelServiceSecret === undefined || !ownerAccessAllowed(request, context.tunnelServiceSecret)) return null;
+  const expectedProfile = pathname === '/mcp' ? 'FULL' : 'PRO';
+  if (request.headers['x-iris-connector-profile'] !== expectedProfile) {
+    throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Tunnel connector profile does not match the MCP endpoint');
+  }
+  const epoch = request.headers['x-iris-deployment-epoch'];
+  if (context.connectorDeploymentEpoch === undefined || typeof epoch !== 'string' || Number(epoch) !== context.connectorDeploymentEpoch) {
+    throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'Tunnel connector deployment epoch is stale or missing');
+  }
+  if (context.connectorRuntimeId === undefined || request.headers['x-iris-runtime-id'] !== context.connectorRuntimeId) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Tunnel connector runtime identity is stale or missing');
+  }
+  return 'tunnel-service';
+}
+
 function authorizeRuntimeControl(request: IncomingMessage, body: Record<string, unknown> | null, context: RuntimeServerContext): void {
   const authorization = request.headers.authorization;
   const supplied = typeof authorization === 'string' && authorization.startsWith('Bearer ')
@@ -690,6 +738,8 @@ function writeError(response: ServerResponse, error: unknown): void {
       ? 403
       : runtimeError.code === 'OWNER_DECISION_REQUIRED' || runtimeError.code === 'SESSION_BUSY'
         ? 409
+        : runtimeError.code === 'CONNECTOR_BINDING_MISMATCH' || runtimeError.code === 'CONNECTOR_MANIFEST_STALE'
+          ? 409
         : runtimeError.code === 'INVALID_REQUEST' || runtimeError.code === 'INVALID_PROJECT_PATH'
           ? 400
           : runtimeError.code === 'RUNTIME_SHUTTING_DOWN'

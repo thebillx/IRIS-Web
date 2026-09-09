@@ -14,17 +14,20 @@ interface JsonRpcRequest {
   readonly params?: unknown;
 }
 
+export type McpPrincipal = 'owner' | 'tunnel-service';
+
 export async function handleMcpRequest(
   request: Request,
   capabilities: CapabilityService,
   state?: RuntimeState,
   broker?: MissionBrokerService,
+  principal: McpPrincipal = 'owner',
 ): Promise<Response> {
-  return handleMcpTransportRequest(request, capabilities, state, broker, 'full');
+  return handleMcpTransportRequest(request, capabilities, state, broker, 'full', principal);
 }
 
-export async function handleMcpProRequest(request: Request, capabilities: CapabilityService): Promise<Response> {
-  return handleMcpTransportRequest(request, capabilities, undefined, undefined, 'pro');
+export async function handleMcpProRequest(request: Request, capabilities: CapabilityService, principal: McpPrincipal = 'owner'): Promise<Response> {
+  return handleMcpTransportRequest(request, capabilities, undefined, undefined, 'pro', principal);
 }
 
 async function handleMcpTransportRequest(
@@ -33,6 +36,7 @@ async function handleMcpTransportRequest(
   state: RuntimeState | undefined,
   broker: MissionBrokerService | undefined,
   profile: 'full' | 'pro',
+  principal: McpPrincipal,
 ): Promise<Response> {
   if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405, { allow: 'POST' });
 
@@ -45,13 +49,14 @@ async function handleMcpTransportRequest(
   if (rpc.jsonrpc !== '2.0' || typeof rpc.method !== 'string') return jsonRpcError(rpc.id ?? null, -32600, 'Invalid Request', 400);
 
   if (rpc.method === 'server/discover') {
-    return jsonRpcResult(rpc.id ?? null, profile === 'pro'
+    const modernDiscovery = profile === 'pro' || principal === 'tunnel-service';
+    return jsonRpcResult(rpc.id ?? null, modernDiscovery
       ? {
         resultType: 'complete',
         supportedVersions: [MCP_PROTOCOL_VERSION],
         capabilities: { tools: {} },
         _meta: {
-          'io.modelcontextprotocol/serverInfo': { name: 'IRIS Pro Read Only', version: '0.0.0' },
+          'io.modelcontextprotocol/serverInfo': { name: profile === 'pro' ? 'IRIS Pro Read Only' : 'IRIS', version: '0.0.0' },
         },
       }
       : {
@@ -81,7 +86,7 @@ async function handleMcpTransportRequest(
     try {
       const result = profile === 'pro'
         ? await executeProTool(params.name, args, request, capabilities)
-        : await executeTool(params.name, args, request, capabilities, state, broker);
+        : await executeTool(params.name, args, request, capabilities, state, broker, principal);
       return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
     } catch (error) {
       return jsonRpcResult(rpc.id ?? null, toolError(error instanceof RuntimeError ? error.code : 'INVALID_REQUEST', error instanceof Error ? error.message : 'Tool call failed'));
@@ -92,7 +97,11 @@ async function handleMcpTransportRequest(
   return jsonRpcError(rpc.id, -32601, 'Method not found', 404);
 }
 
-const PRO_TOOL_NAMES = ['list_projects', 'project_info', 'git_status', 'file_read', 'search'] as const;
+export const PRO_TOOL_NAMES = ['list_projects', 'project_info', 'git_status', 'file_read', 'search'] as const;
+
+export function fullMcpToolDefinitions(): readonly Record<string, unknown>[] {
+  return toolDefinitions();
+}
 
 async function executeProTool(
   name: string,
@@ -134,6 +143,7 @@ async function executeTool(
   capabilities: CapabilityService,
   state?: RuntimeState,
   broker?: MissionBrokerService,
+  principal: McpPrincipal = 'owner',
 ): Promise<CapabilityOutcome | unknown> {
   const clientId = optionalHeader(request, CLIENT_ID_HEADER);
   const sessionId = optionalHeader(request, SESSION_ID_HEADER);
@@ -156,8 +166,8 @@ async function executeTool(
     const outcome = await capabilities.execute({
       capabilityId: 'session.create',
       clientId: requiredHeader(request, CLIENT_ID_HEADER),
-      agentId: 'chatgpt',
-      agentRole: 'owner',
+      agentId: principal === 'tunnel-service' ? 'iris-tunnel-service' : 'chatgpt',
+      agentRole: principal === 'tunnel-service' ? 'other' : 'owner',
     });
     if (outcome.status !== 'executed') return outcome;
     const session = asRecord(outcome.value);
@@ -268,6 +278,24 @@ async function executeTool(
     await assertChatGptOperationalMission(state, mission.missionId);
     return capabilities.execute({ capabilityId: 'project.test.run', clientId: requiredClient, sessionId: requiredSession, projectId, mission });
   }
+  if (name === 'project_validation_run') {
+    const mission = requiredMissionAssociation(args, 'CHATGPT');
+    await assertChatGptOperationalMission(state, mission.missionId);
+    return capabilities.execute({ capabilityId: 'project.command.run', clientId: requiredClient, sessionId: requiredSession, projectId,
+      scriptName: requiredBoundedString(args, 'scriptName', 100), mission });
+  }
+  if (name === 'git_local') {
+    const mission = requiredMissionAssociation(args, 'CHATGPT');
+    await assertChatGptOperationalMission(state, mission.missionId);
+    return capabilities.execute({ capabilityId: 'git.local', clientId: requiredClient, sessionId: requiredSession, projectId,
+      operation: gitLocalOperation(args, 'operation'), paths: args.paths === undefined ? undefined : requiredStringArray(args, 'paths'),
+      message: optionalString(args, 'message'), mission });
+  }
+  if (name === 'remote_publish') {
+    const mission = requiredMissionAssociation(args, 'CHATGPT');
+    await assertChatGptOperationalMission(state, mission.missionId);
+    return capabilities.execute({ capabilityId: 'remote.publish', clientId: requiredClient, sessionId: requiredSession, projectId, mission });
+  }
   const targetPath = requiredString(args, 'targetPath');
   const mission = optionalMissionAssociation(args, 'CHATGPT');
   if (mission !== undefined) await assertChatGptOperationalMission(state, mission.missionId);
@@ -313,9 +341,12 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'mission_state_set', description: 'Record orchestration-owned mission state; this does not grant execution authority.', inputSchema: { type: 'object', required: ['missionId', 'state'], properties: { ...sessionProperty, missionId: { type: 'string' }, state: { enum: ['PLANNED','RUNNING','WAITING_APPROVAL','WAITING_SUPERVISOR','PAUSED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
     { name: 'mission_task_create', description: 'Register a task identity inside a mission.', inputSchema: { type: 'object', required: ['missionId','title'], properties: { ...sessionProperty, missionId: { type: 'string' }, title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
     { name: 'mission_task_state_set', description: 'Record orchestration-owned task state.', inputSchema: { type: 'object', required: ['missionId','taskId','state'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, state: { enum: ['PENDING','RUNNING','BLOCKED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
-    { name: 'mission_action_prepare', description: 'Prepare one governed IRIS execution action for a CHATGPT-orchestrated mission. Preparation never executes the capability.', inputSchema: { type: 'object', required: ['missionId','taskId','capabilityId','summary'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, capabilityId: { enum: ['file.read','file.write','file.delete','directory.create','directory.delete','project.test.run'] }, summary: { type: 'string', maxLength: 400 } }, additionalProperties: false } },
+    { name: 'mission_action_prepare', description: 'Prepare one governed IRIS execution action for a CHATGPT-orchestrated mission. Preparation never executes the capability.', inputSchema: { type: 'object', required: ['missionId','taskId','capabilityId','summary'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, capabilityId: { enum: ['file.read','file.write','file.delete','directory.create','directory.delete','project.test.run','project.command.run','git.local','remote.publish'] }, summary: { type: 'string', maxLength: 400 } }, additionalProperties: false } },
     { name: 'mission_supervisor_gate_set', description: 'Record supervisor-gate state only for the active CHATGPT operational orchestrator. The gate never overrides IRIS permission policy.', inputSchema: { type: 'object', required: ['missionId','state'], properties: { ...sessionProperty, missionId: { type: 'string' }, state: { enum: ['NOT_REQUIRED','PENDING','APPROVED','DENIED'] }, reason: { type: ['string','null'], maxLength: 500 } }, additionalProperties: false } },
     { name: 'project_test_run', description: 'Run only the registered project declared test script for one prepared CHATGPT mission action through CapabilityService.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, actionId: { type: 'string' }, projectId: { type: 'string' } }, additionalProperties: false } },
+    { name: 'project_validation_run', description: 'Run one exact script physically declared in the selected project root package.json using its declared npm or pnpm packageManager. No shell text is accepted.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId','scriptName'], properties: { ...sessionProperty, ...associationProperties, projectId: { type: 'string' }, scriptName: { type: 'string', minLength: 1, maxLength: 100 } }, additionalProperties: false } },
+    { name: 'git_local', description: 'Run one bounded local Git operation in the selected registered project. Mutation supports only explicit-path add and a bounded non-amending commit.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId','operation'], properties: { ...sessionProperty, ...associationProperties, projectId: { type: 'string' }, operation: { enum: ['status','head','diff','diff-check','diff-name-only','add','commit'] }, paths: { type: 'array', minItems: 1, maxItems: 24, items: { type: 'string', minLength: 1, maxLength: 1000 } }, message: { type: 'string', minLength: 1, maxLength: 200 } }, additionalProperties: false } },
+    { name: 'remote_publish', description: 'Normally push the live current feature branch to its configured origin and verify local and remote HEAD. Protected/default branches and force operations are rejected.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId'], properties: { ...sessionProperty, ...associationProperties, projectId: { type: 'string' } }, additionalProperties: false } },
     { name: 'file_read', description: 'Read a file from an explicitly selected registered project by projectId. Read-only compatibility path does not require an IRIS session; Full Mode may use a live session.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
     { name: 'file_write', description: 'Create or replace one bounded regular file in the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath', 'content'], properties: { ...projectProperties, content: { type: 'string' } }, additionalProperties: false } },
     { name: 'file_delete', description: 'Delete one regular file in the live session project; may bind to a prepared mission action.', inputSchema: { type: 'object', required: ['targetPath'], properties: projectProperties, additionalProperties: false } },
@@ -482,10 +513,16 @@ function supervisorGateState(record: Record<string, unknown>, name: string): Sup
   throw new Error(`${name} is not a supported supervisor gate state`);
 }
 
-function missionActionCapability(record: Record<string, unknown>, name: string): 'file.read' | 'file.write' | 'file.delete' | 'directory.create' | 'directory.delete' | 'project.test.run' {
+function missionActionCapability(record: Record<string, unknown>, name: string): 'file.read' | 'file.write' | 'file.delete' | 'directory.create' | 'directory.delete' | 'project.test.run' | 'project.command.run' | 'git.local' | 'remote.publish' {
   const value = record[name];
-  if (value === 'file.read' || value === 'file.write' || value === 'file.delete' || value === 'directory.create' || value === 'directory.delete' || value === 'project.test.run') return value;
+  if (value === 'file.read' || value === 'file.write' || value === 'file.delete' || value === 'directory.create' || value === 'directory.delete' || value === 'project.test.run' || value === 'project.command.run' || value === 'git.local' || value === 'remote.publish') return value;
   throw new Error(`${name} is not a supported governed mission capability`);
+}
+
+function gitLocalOperation(record: Record<string, unknown>, name: string): 'status' | 'head' | 'diff' | 'diff-check' | 'diff-name-only' | 'add' | 'commit' {
+  const value = record[name];
+  if (value === 'status' || value === 'head' || value === 'diff' || value === 'diff-check' || value === 'diff-name-only' || value === 'add' || value === 'commit') return value;
+  throw new Error(`${name} is not a supported bounded Git operation`);
 }
 
 function orchestratorMode(record: Record<string, unknown>, name: string): OrchestratorMode {
