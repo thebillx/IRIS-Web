@@ -5,11 +5,13 @@ import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
 import { createSupervisor } from './supervisor.js';
 import { installLaunchAgent, launchAgentLoaded, launchdPaths, uninstallLaunchAgent } from './launchd.js';
+import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 
 const command = process.argv[2];
 const legacyRuntimeControl = process.env.IRIS_STACK_CLI !== '1';
 
 try {
+  assertSupportedNodeVersion();
   const dataRoot = await resolveRuntimeDataRoot();
   if (legacyRuntimeControl && command === 'start') {
     process.stdout.write(`${JSON.stringify(await startRuntime({ dataRoot }), null, 2)}\n`);
@@ -50,7 +52,7 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'install') {
       const runtimeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
       const tsxDirectory = path.join(runtimeDirectory, 'node_modules', 'tsx', 'dist');
-      const executable = process.execPath;
+      const executable = canonicalNodeRuntime().path;
       const script = path.join(runtimeDirectory, 'src', 'control.ts');
       const executableArguments = ['--require', path.join(tsxDirectory, 'preflight.cjs'), '--import', pathToFileURL(path.join(tsxDirectory, 'loader.mjs')).href];
       process.stdout.write(`${JSON.stringify(await installLaunchAgent(dataRoot, executable, script, executableArguments), null, 2)}\n`);

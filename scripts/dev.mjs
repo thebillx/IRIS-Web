@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import process from 'node:process';
+import { node24Environment, node24TsxArgs, resolveCanonicalNode } from './node24.mjs';
 
 const runtimeRoot = path.resolve('apps/runtime');
-const runtimeExecutable = path.resolve('apps/runtime/node_modules/.bin/tsx');
+const node = resolveCanonicalNode();
 const webExecutable = path.resolve('apps/web/node_modules/.bin/vite');
 let runtime;
 let web;
@@ -31,10 +32,10 @@ function shutdown(code = 0) {
 }
 
 async function readOwnerToken() {
-  const child = spawn(runtimeExecutable, ['src/control.ts', 'owner-token'], {
+  const child = spawn(node.path, node24TsxArgs(path.join(runtimeRoot, 'src', 'control.ts'), ['owner-token']), {
     cwd: runtimeRoot,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env },
+    env: node24Environment(),
   });
   let stdout = '';
   let stderr = '';
@@ -57,7 +58,7 @@ async function startWeb(runtimeUrl) {
   web = spawn(webExecutable, ['--host', '127.0.0.1'], {
     cwd: path.resolve('apps/web'),
     stdio: ['inherit', 'pipe', 'inherit'],
-    env: { ...process.env, IRIS_RUNTIME_URL: runtimeUrl },
+    env: node24Environment(process.env, { IRIS_RUNTIME_URL: runtimeUrl }),
   });
   web.stdout.setEncoding('utf8');
   web.stdout.on('data', (chunk) => {
@@ -74,10 +75,10 @@ async function startWeb(runtimeUrl) {
   });
 }
 
-runtime = spawn(runtimeExecutable, ['src/main.ts'], {
+runtime = spawn(node.path, node24TsxArgs(path.join(runtimeRoot, 'src', 'main.ts')), {
   cwd: runtimeRoot,
   stdio: ['inherit', 'pipe', 'inherit'],
-  env: { ...process.env },
+  env: node24Environment(),
 });
 
 let buffer = '';

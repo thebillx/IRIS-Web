@@ -6,14 +6,14 @@
   "packageManager": "pnpm@10.15.0",
   "engines": { "node": ">=24" },
   "scripts": {
-    "dev": "node scripts/dev.mjs",
-    "runtime": "pnpm --filter @iris/runtime runtime",
-    "iris": "node scripts/iris.mjs",
-    "permission-smoke": "node scripts/permission-smoke.mjs",
-    "test": "pnpm --recursive --if-present test",
-    "lint": "eslint .",
-    "typecheck": "pnpm --recursive --if-present typecheck",
-    "build": "pnpm --recursive --if-present build"
+    "dev": "node scripts/node24.mjs scripts/dev.mjs",
+    "runtime": "node scripts/node24.mjs --pnpm --filter @iris/runtime runtime",
+    "iris": "node scripts/node24.mjs scripts/iris.mjs",
+    "permission-smoke": "node scripts/node24.mjs scripts/permission-smoke.mjs",
+    "test": "node scripts/node24.mjs --pnpm --recursive --if-present test",
+    "lint": "node scripts/node24.mjs --bin eslint .",
+    "typecheck": "node scripts/node24.mjs --pnpm --recursive --if-present typecheck",
+    "build": "node scripts/node24.mjs --pnpm --recursive --if-present build"
   },
   "devDependencies": {
     "@eslint/js": "^9.35.0",

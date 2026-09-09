@@ -12,6 +12,7 @@ import { observeProcessStart } from './macos-safety.js';
 import { loadOrCreateRuntimeId, readEndpoint, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
 import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
+import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 
 const execFileAsync = promisify(execFile);
 const SUPERVISOR_DIRECTORY = 'supervisor';
@@ -116,6 +117,7 @@ export interface LocalReadinessResult {
 }
 
 export async function createSupervisor(options: SupervisorOptions = {}): Promise<Supervisor> {
+  assertSupportedNodeVersion();
   const dataRoot = options.dataRoot === undefined
     ? await resolveRuntimeDataRoot()
     : await resolveRuntimeDataRoot({ ...process.env, IRIS_RUNTIME_DATA_ROOT: options.dataRoot });
@@ -151,7 +153,9 @@ export class Supervisor {
     try {
       const observed = await runtimeStatus(this.dataRoot);
       let runtimeReplaced = false;
-      if (observed.state === 'running' && !registryChanged) {
+      const runtimeNodeChanged = observed.state === 'running' && state.runtime !== null
+        && !sameExecutablePath(state.runtime.executable, canonicalNodeRuntime().path);
+      if (observed.state === 'running' && !registryChanged && !runtimeNodeChanged) {
         if (state.runtime === null) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'A running IRIS runtime is not owned by this supervisor; use explicit runtime adoption or stop it through its existing owner');
         assertRuntimeOwnership(state.runtime, observed);
         await assertOwnedRuntimeProcess(state.runtime);
@@ -752,7 +756,7 @@ async function spawnManaged(
 ): Promise<OwnedProcess> {
   const logFilename = path.join(logDirectory, component === 'web' ? 'supervisor.log' : `${component}.log`);
   const output = openSync(logFilename, 'a', 0o600);
-  const environment: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin', HOME: process.env.HOME ?? os.homedir(), ...extraEnvironment };
+  const environment = node24Environment({ HOME: process.env.HOME ?? os.homedir(), TMPDIR: process.env.TMPDIR ?? '/tmp', LANG: process.env.LANG ?? 'en_US.UTF-8' }, extraEnvironment);
   const child = spawn(executable, [...args], { cwd, env: environment, detached: true, stdio: ['ignore', output, output] });
   closeSync(output);
   const pid = child.pid;
@@ -793,7 +797,7 @@ async function inspectProcess(record: OwnedProcess): Promise<'running' | 'stoppe
   const command = await commandForPid(record.pid);
   if (command === null) return 'ambiguous';
   const markerMatches = record.component === 'runtime'
-    ? commandIncludesPath(command, record.marker)
+    ? commandIncludesPath(command, record.marker) && commandIncludesPath(command, record.executable)
     : record.component === 'tunnel-full' || record.component === 'tunnel-pro'
       ? commandIncludesPath(command, record.executable)
     : commandIncludesMarker(command, record.marker);
@@ -905,11 +909,13 @@ async function waitForEndpoint(url: string, timeoutMs: number, message: string):
 }
 
 async function runtimeRecordFromObserved(endpoint: NonNullable<RuntimeObservedStatus['endpoint']>, sourceRoot: string): Promise<OwnedProcess> {
+  const executable = await executableForPid(endpoint.pid);
+  if (executable === null) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Runtime executable identity could not be verified');
   return {
     component: 'runtime',
     pid: endpoint.pid,
     startedAt: endpoint.startedAt,
-    executable: process.execPath,
+    executable,
     profilePath: null,
     tunnelId: null,
     marker: sourceRoot,
@@ -917,6 +923,12 @@ async function runtimeRecordFromObserved(endpoint: NonNullable<RuntimeObservedSt
     runtimeId: endpoint.runtimeId,
     instanceId: endpoint.instanceId,
   };
+}
+
+async function executableForPid(pid: number): Promise<string | null> {
+  const command = await commandForPid(pid);
+  const first = command?.split(/\s+/)[0];
+  return first !== undefined && path.isAbsolute(first) ? path.resolve(first) : null;
 }
 
 function emptyState(supervisorId: string): SupervisorStateDocument {
@@ -1015,6 +1027,13 @@ function assertRuntimeOwnership(record: OwnedProcess, observed: RuntimeObservedS
 function sameOwnedRuntime(left: OwnedProcess, right: OwnedProcess): boolean {
   return left.pid === right.pid && left.startedAt === right.startedAt
     && left.runtimeId === right.runtimeId && left.instanceId === right.instanceId;
+}
+
+function sameExecutablePath(left: string, right: string): boolean {
+  const normalized = (value: string): string => {
+    try { return realpathSync(value); } catch { return path.resolve(value); }
+  };
+  return normalized(left) === normalized(right);
 }
 
 function matchesRecordedRuntime(record: OwnedProcess, endpoint: NonNullable<RuntimeObservedStatus['endpoint']>): boolean {

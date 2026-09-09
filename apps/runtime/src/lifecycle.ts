@@ -7,6 +7,7 @@ import { AGENT_EXECUTOR_ENV, OPENAI_API_KEY_ENV, OPENAI_MODEL_ENV } from './agen
 import { AUTHORITY_RECOVERY_IN_PROGRESS, probeRuntimeAuthority } from './authority.js';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { readEndpoint, readRuntimeControl, type EndpointDocument, type RuntimeControlDocument } from './persistence.js';
+import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
 
 export interface RuntimeObservedStatus {
   readonly state: 'running' | 'stopped' | 'stale' | 'indeterminate';
@@ -22,6 +23,7 @@ export interface StartRuntimeOptions {
 }
 
 export async function runtimeStatus(dataRootInput?: string): Promise<RuntimeObservedStatus> {
+  assertSupportedNodeVersion();
   const dataRoot = await canonicalDataRoot(dataRootInput);
   let endpoint: EndpointDocument | null;
   try {
@@ -102,6 +104,7 @@ export async function runtimeStatus(dataRootInput?: string): Promise<RuntimeObse
 }
 
 export async function startRuntime(options: StartRuntimeOptions = {}): Promise<RuntimeObservedStatus> {
+  assertSupportedNodeVersion();
   const dataRoot = await canonicalDataRoot(options.dataRoot);
   const existing = await runtimeStatus(dataRoot);
   if (existing.state === 'running') return existing;
@@ -115,7 +118,7 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
   const sourceEntrypoint = path.resolve(import.meta.dirname, 'main.ts');
   const builtEntrypoint = path.resolve(import.meta.dirname, 'main.js');
   const sourceMode = existsSync(sourceEntrypoint);
-  const executable = process.execPath;
+  const executable = canonicalNodeRuntime().path;
   const args = sourceMode
     ? [
       '--require', path.resolve(import.meta.dirname, '..', 'node_modules', 'tsx', 'dist', 'preflight.cjs'),
@@ -137,6 +140,7 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
 }
 
 export async function stopRuntime(dataRootInput?: string, shutdownDeadlineMs = 10_000): Promise<RuntimeObservedStatus> {
+  assertSupportedNodeVersion();
   const dataRoot = await canonicalDataRoot(dataRootInput);
   const current = await runtimeStatus(dataRoot);
   if (current.state === 'stopped') return current;
@@ -199,7 +203,7 @@ export const STOP_COMPLETE_CONTRACT = 'target_pid_gone+target_descriptor_absent+
 
 export function runtimeChildEnvironment(dataRoot: string, preferredPort?: number, source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
-    PATH: source.PATH ?? '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    PATH: node24Path(),
     [RUNTIME_DATA_ENV]: dataRoot,
     ...(preferredPort === undefined ? {} : { IRIS_RUNTIME_PORT: String(preferredPort) }),
   };

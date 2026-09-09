@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { RuntimeError } from '@iris/domain';
+import { node24Path } from './node-runtime.js';
 
 const execFileAsync = promisify(execFile);
 const TIMEOUT_MS = 120_000;
@@ -77,7 +78,7 @@ function validatePaths(projectRoot: string, supplied: readonly string[] | undefi
 async function git(projectRoot: string, args: readonly string[], timeout = TIMEOUT_MS) {
   try {
     return await execFileAsync('git', [...args], { cwd: projectRoot, encoding: 'utf8', timeout, maxBuffer: MAX_BUFFER,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '', LANG: process.env.LANG ?? 'en_US.UTF-8', GIT_TERMINAL_PROMPT: '0' } });
+      env: { PATH: node24Path(), HOME: process.env.HOME ?? '', LANG: process.env.LANG ?? 'en_US.UTF-8', GIT_TERMINAL_PROMPT: '0' } });
   } catch (error) {
     const candidate = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
     throw new RuntimeError('CAPABILITY_DENIED', `Bounded Git operation failed: ${String(candidate.stderr ?? candidate.message).slice(-MAX_OUTPUT)}`, { cause: error });

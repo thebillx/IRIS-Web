@@ -350,7 +350,8 @@ export type RuntimeFailureCode =
   | 'SUPERVISOR_BUSY'
   | 'PROCESS_OWNERSHIP_AMBIGUOUS'
   | 'RECOVERY_EXHAUSTED'
-  | 'E2E_PROBE_UNAVAILABLE';
+  | 'E2E_PROBE_UNAVAILABLE'
+  | 'NODE_VERSION_UNSUPPORTED';
 
 export class RuntimeError extends Error {
   public constructor(
