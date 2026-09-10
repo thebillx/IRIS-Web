@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { RuntimeError, type MissionSnapshot } from '@iris/domain';
+import { RuntimeError, type MissionRebindAuditEvent, type MissionSnapshot } from '@iris/domain';
 import { capabilityDefinition } from './capability-registry.js';
 import { inspectPrivateRegularFile } from './private-fs.js';
 
@@ -78,8 +78,14 @@ function normalizeMissionLedgerDocument(value: unknown): MissionLedgerDocument |
           orchestratorHandoffIds: [],
         }
       : candidate as unknown as MissionSnapshot;
-    if (!isMissionSnapshot(normalized)) return null;
-    missions.push(normalized);
+    const withBinding = {
+      ...normalized,
+      ownerClientId: typeof candidate.ownerClientId === 'string' ? candidate.ownerClientId : candidate.clientId,
+      bindingRevision: candidate.bindingRevision === undefined ? 1 : candidate.bindingRevision,
+      rebindAudit: candidate.rebindAudit === undefined ? [] : candidate.rebindAudit,
+    } as MissionSnapshot;
+    if (!isMissionSnapshot(withBinding)) return null;
+    missions.push(withBinding);
   }
   if (new Set(missions.map((mission) => mission.id)).size !== missions.length) return null;
   return { schemaVersion: 1, missions };
@@ -102,6 +108,11 @@ function isMissionSnapshot(value: unknown): value is MissionSnapshot {
     || !orchestratorHandoffHistory(value.lastOrchestratorHandoff, value.orchestratorHandoffIds)
     || !boundedIdentity(value.clientId)
     || !boundedIdentity(value.sessionId)
+    || !boundedIdentity(value.ownerClientId)
+    || !positiveVersion(value.bindingRevision)
+    || !Array.isArray(value.rebindAudit)
+    || value.rebindAudit.length > 64
+    || !value.rebindAudit.every(isRebindAuditEvent)
     || (value.projectId !== null && !isUuid(value.projectId))
     || !timestamp(value.createdAt)
     || !timestamp(value.updatedAt)
@@ -187,6 +198,22 @@ function isTimelineEvent(value: unknown): boolean {
     && boundedText(value.message, 500);
 }
 
+function isRebindAuditEvent(value: unknown): value is MissionRebindAuditEvent {
+  return isRecord(value)
+    && isUuid(value.id)
+    && isUuid(value.missionId)
+    && boundedIdentity(value.oldClientId)
+    && boundedIdentity(value.oldSessionId)
+    && boundedIdentity(value.newClientId)
+    && boundedIdentity(value.newSessionId)
+    && value.principal === 'owner'
+    && isUuid(value.projectId)
+    && timestamp(value.timestamp)
+    && boundedText(value.reason, 500)
+    && positiveVersion(value.bindingRevision)
+    && value.result === 'SUCCESS';
+}
+
 function orchestratorMode(value: unknown): boolean {
   return value === 'HERMES' || value === 'CHATGPT';
 }
@@ -228,7 +255,8 @@ function actionState(value: unknown): boolean {
 function timelineKind(value: unknown): boolean {
   return value === 'MISSION_CREATED' || value === 'MISSION_STATE_CHANGED' || value === 'TASK_CREATED' || value === 'TASK_STATE_CHANGED'
     || value === 'ACTION_PREPARED' || value === 'ACTION_STARTED' || value === 'APPROVAL_REQUIRED' || value === 'ACTION_SUCCEEDED'
-    || value === 'ACTION_DENIED' || value === 'ACTION_FAILED' || value === 'SUPERVISOR_GATE_CHANGED' || value === 'ORCHESTRATOR_MODE_CHANGED';
+    || value === 'ACTION_DENIED' || value === 'ACTION_FAILED' || value === 'SUPERVISOR_GATE_CHANGED' || value === 'ORCHESTRATOR_MODE_CHANGED'
+    || value === 'MISSION_SESSION_REBOUND';
 }
 
 function timestamp(value: unknown): boolean {

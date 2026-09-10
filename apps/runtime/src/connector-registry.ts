@@ -4,8 +4,9 @@ import { realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { RuntimeError } from '@iris/domain';
-import { fullMcpToolNames } from './mcp-v21.js';
-import { PRO_TOOL_NAMES } from './mcp.js';
+import { catalogIdentity } from './mcp-catalog.js';
+import { PRO_TOOL_NAMES, proMcpToolDefinitions } from './mcp.js';
+import { fullMcpToolDefinitionsV21, fullMcpToolNames } from './mcp-v21.js';
 import { inspectPrivateRegularFile } from './private-fs.js';
 import { writePrivateJsonAtomic } from './credentials.js';
 
@@ -24,6 +25,7 @@ export interface ConnectorBinding {
   readonly mcpPath: '/mcp' | '/mcp-pro';
   readonly expectedToolNames: readonly string[];
   readonly catalogFingerprint: string;
+  readonly catalogHash: string;
   readonly healthPort: number;
   readonly managedProfilePath: string;
   readonly runtimeId: string | null;
@@ -43,6 +45,12 @@ export interface ConnectorRegistryReconciliation {
   readonly previousDeploymentEpoch: number;
 }
 
+export interface ConnectorRegistryInspection {
+  readonly registry: ConnectorRegistryDocument;
+  readonly changed: boolean;
+  readonly staleConnectorIds: readonly string[];
+}
+
 interface RawConnectorBinding {
   readonly connectorId: string;
   readonly label: 'IRIS FULL' | 'IRIS PRO';
@@ -53,6 +61,7 @@ interface RawConnectorBinding {
   readonly mcpPath: '/mcp' | '/mcp-pro';
   readonly expectedToolNames?: unknown;
   readonly catalogFingerprint?: unknown;
+  readonly catalogHash?: unknown;
   readonly healthPort: number;
   readonly managedProfilePath: string;
   readonly runtimeId?: string | null;
@@ -83,6 +92,11 @@ export async function readConnectorRegistry(dataRoot: string): Promise<Connector
   return parsed?.registry ?? null;
 }
 
+export async function inspectConnectorRegistry(dataRoot: string): Promise<ConnectorRegistryInspection | null> {
+  const parsed = await readParsedRegistry(dataRoot);
+  return parsed === null ? null : { registry: parsed.registry, changed: parsed.changed, staleConnectorIds: parsed.staleConnectorIds };
+}
+
 export async function reconcileConnectorRegistry(dataRoot: string): Promise<ConnectorRegistryReconciliation | null> {
   const parsed = await readParsedRegistry(dataRoot);
   if (parsed === null) return null;
@@ -103,7 +117,7 @@ export async function reconcileConnectorRegistry(dataRoot: string): Promise<Conn
   return { registry, changed: true, previousDeploymentEpoch };
 }
 
-async function readParsedRegistry(dataRoot: string): Promise<{ readonly registry: ConnectorRegistryDocument; readonly changed: boolean } | null> {
+async function readParsedRegistry(dataRoot: string): Promise<{ readonly registry: ConnectorRegistryDocument; readonly changed: boolean; readonly staleConnectorIds: readonly string[] } | null> {
   const inspected = await inspectPrivateRegularFile(connectorRegistryPath(dataRoot), 'IRIS connector registry');
   if (inspected.state === 'missing') return null;
   if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
@@ -139,13 +153,13 @@ export function createConnectorRegistry(dataRoot: string, seed: ConnectorSeed, d
     connectors: [
       {
         connectorId: 'iris-full', label: 'IRIS FULL', mode: 'FULL', tunnelId: seed.fullTunnelId,
-        runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', expectedToolNames: fullMcpToolNames(), catalogFingerprint: catalogFingerprint(fullMcpToolNames()),
+        runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', expectedToolNames: fullMcpToolNames(), catalogFingerprint: catalogFingerprint(fullMcpToolNames()), catalogHash: catalogIdentity('FULL', fullMcpToolDefinitionsV21()).catalogHash,
         healthPort: seed.fullHealthPort ?? 8080, managedProfilePath: path.join(dataRoot, 'tunnel-profiles', 'iris-full.yaml'),
         runtimeId: null, deploymentEpoch,
       },
       {
         connectorId: 'iris-pro', label: 'IRIS PRO', mode: 'PRO', tunnelId: seed.proTunnelId,
-        runtime: 'iris-local-runtime', mcpProfile: 'READ_ONLY', mcpPath: '/mcp-pro', expectedToolNames: [...PRO_TOOL_NAMES], catalogFingerprint: catalogFingerprint(PRO_TOOL_NAMES),
+        runtime: 'iris-local-runtime', mcpProfile: 'READ_ONLY', mcpPath: '/mcp-pro', expectedToolNames: [...PRO_TOOL_NAMES], catalogFingerprint: catalogFingerprint(PRO_TOOL_NAMES), catalogHash: catalogIdentity('PRO', proMcpToolDefinitions()).catalogHash,
         healthPort: seed.proHealthPort ?? 8081, managedProfilePath: path.join(dataRoot, 'tunnel-profiles', 'iris-pro.yaml'),
         runtimeId: null, deploymentEpoch,
       },
@@ -239,7 +253,7 @@ function validateTunnelId(value: string, name: string): void {
   if (!TUNNEL_ID_PATTERN.test(value)) throw new RuntimeError('INVALID_REQUEST', `${name} is not a valid tunnel ID`);
 }
 
-function normalizeRegistry(value: unknown, dataRoot: string): { readonly registry: ConnectorRegistryDocument; readonly changed: boolean } {
+function normalizeRegistry(value: unknown, dataRoot: string): { readonly registry: ConnectorRegistryDocument; readonly changed: boolean; readonly staleConnectorIds: readonly string[] } {
   if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2) || !isPositiveSafeInteger(value.deploymentEpoch)
     || typeof value.updatedAt !== 'string' || !Array.isArray(value.connectors) || value.connectors.length !== 2) {
     throw new Error('invalid registry schema');
@@ -270,9 +284,12 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
   }
   const fullTools = fullMcpToolNames();
   const proTools = [...PRO_TOOL_NAMES];
-  const currentTools = new Map([['iris-full', fullTools], ['iris-pro', proTools]]);
+  const currentTools = new Map([
+    ['iris-full', { names: fullTools, hash: catalogIdentity('FULL', fullMcpToolDefinitionsV21()).catalogHash }],
+    ['iris-pro', { names: proTools, hash: catalogIdentity('PRO', proMcpToolDefinitions()).catalogHash }],
+  ]);
   const connectors = rawConnectors.map((candidate) => {
-    const tools = currentTools.get(candidate.connectorId)!;
+    const current = currentTools.get(candidate.connectorId)!;
     return {
       connectorId: candidate.connectorId,
       label: candidate.label,
@@ -281,8 +298,9 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
       runtime: candidate.runtime,
       mcpProfile: candidate.mcpProfile,
       mcpPath: candidate.mcpPath,
-      expectedToolNames: tools,
-      catalogFingerprint: catalogFingerprint(tools),
+      expectedToolNames: current.names,
+      catalogFingerprint: catalogFingerprint(current.names),
+      catalogHash: current.hash,
       healthPort: candidate.healthPort,
       managedProfilePath: candidate.managedProfilePath,
       runtimeId: candidate.runtimeId ?? null,
@@ -295,15 +313,16 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
     updatedAt: value.updatedAt,
     connectors,
   };
-  const changed = value.schemaVersion !== 2 || rawConnectors.some((candidate) => {
+  const staleConnectorIds = rawConnectors.filter((candidate) => {
     const current = registry.connectors.find((connector) => connector.connectorId === candidate.connectorId)!;
     return !Array.isArray(candidate.expectedToolNames)
       || candidate.expectedToolNames.length !== current.expectedToolNames.length
       || candidate.expectedToolNames.some((name, index) => name !== current.expectedToolNames[index])
       || candidate.catalogFingerprint !== current.catalogFingerprint
+      || candidate.catalogHash !== current.catalogHash
       || candidate.deploymentEpoch !== deploymentEpoch;
-  });
-  return { registry, changed };
+  }).map((candidate) => candidate.connectorId);
+  return { registry, changed: value.schemaVersion !== 2 || staleConnectorIds.length > 0, staleConnectorIds };
 }
 
 function isRawConnector(value: unknown): value is RawConnectorBinding {

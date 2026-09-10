@@ -18,6 +18,7 @@ import { DurableMissionLifecycleService } from './durable-mission-service.js';
 import { WorkerAdapterRegistry } from './durable-mission-workers.js';
 import { recoverDurableMissions } from './durable-mission-recovery.js';
 import { assertSupportedNodeVersion } from './node-runtime.js';
+import { ProjectValidationJobManager } from './project-test.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -115,7 +116,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       mcpUrl: server?.mcpUrl ?? '',
     });
 
-    const capabilities = new CapabilityService(state, permissionPolicy, permissionAudit, health);
+    const capabilities = new CapabilityService(state, permissionPolicy, permissionAudit, health, new ProjectValidationJobManager(dataRoot));
 
     const doctor = async (): Promise<DoctorReport> => {
       const probe = await probeRuntimeAuthority(dataRoot);
@@ -150,6 +151,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         tunnelServiceSecret,
         ...(connectorRegistry === null ? {} : { connectorDeploymentEpoch: connectorRegistry.deploymentEpoch }),
         connectorRuntimeId: runtimeId,
+        catalogRuntimeContext: {
+          runtimeId,
+          instanceId: identity.instanceId,
+          runtimeVersion: identity.version,
+          deploymentEpoch: connectorRegistry?.deploymentEpoch ?? null,
+        },
         requestShutdown: () => {
           void close().catch((error: unknown) => {
             process.stderr.write(`IRIS controlled shutdown failed: ${error instanceof Error ? error.message : String(error)}\n`);
