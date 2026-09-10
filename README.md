@@ -29,3 +29,6 @@ an existing tunnel-client setup requires an explicit credential migration; IRIS
 does not copy shell or legacy profile secrets automatically. See
 [`docs/architecture/RUNTIME_SUPERVISOR.md`](docs/architecture/RUNTIME_SUPERVISOR.md)
 for the credential, connector, readiness, recovery, and LaunchAgent model.
+V2.3 catalog activation and cross-session durable mission continuation are
+documented in
+[`docs/architecture/V2_3_MCP_ACTIVATION_AND_MISSION_REBIND.md`](docs/architecture/V2_3_MCP_ACTIVATION_AND_MISSION_REBIND.md).

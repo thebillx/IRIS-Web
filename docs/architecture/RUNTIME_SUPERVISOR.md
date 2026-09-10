@@ -85,7 +85,14 @@ capabilities. IRIS PRO remains exactly `list_projects`, `project_info`,
 The status codes include `LOCAL_MCP_AUTH_FAILED`,
 `TUNNEL_SERVICE_CREDENTIAL_MISMATCH`, `CONNECTOR_BINDING_MISMATCH`,
 `CONNECTOR_MANIFEST_STALE`, `PROCESS_OWNERSHIP_AMBIGUOUS`, and
-`E2E_PROBE_UNAVAILABLE`. `iris doctor` reports the failed layer and an action.
+`MCP_CATALOG_STALE`, and `E2E_PROBE_UNAVAILABLE`. `iris doctor` reports the
+failed layer and an action.
+
+The V2.3 catalog operator surface is `iris catalog status` and
+`iris catalog reload`. Local L1 requires authenticated FULL and PRO discovery
+whose ordered tool schemas match the canonical source catalog. See
+[`V2_3_MCP_ACTIVATION_AND_MISSION_REBIND.md`](V2_3_MCP_ACTIVATION_AND_MISSION_REBIND.md)
+for catalog hashes, stale connector diagnosis, and durable mission rebind.
 
 ## Recovery and launchd
 

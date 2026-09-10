@@ -77,6 +77,9 @@ describe('V2.1 live server integration', () => {
       isShuttingDown: () => false,
       controlSecret: 'v21-control-secret-that-is-private',
       ownerAccessSecret,
+      catalogRuntimeContext: {
+        runtimeId: 'catalog-runtime-id', instanceId: 'catalog-instance-id', runtimeVersion: '0.0.0', deploymentEpoch: 9,
+      },
       requestShutdown: () => undefined,
     }, 0);
 
@@ -87,8 +90,23 @@ describe('V2.1 live server integration', () => {
     expect(fullMcp.status).toBe(200);
     const fullBody = await fullMcp.json() as { result: { tools: Array<{ name: string }> } };
     expect(fullBody.result.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
-      'mission_start', 'mission_checkpoint', 'mission_resume', 'mission_cancel', 'mission_complete', 'mission_evidence',
+      'mission_start', 'mission_checkpoint', 'mission_resume', 'mission_rebind', 'mission_cancel', 'mission_complete', 'mission_evidence',
     ]));
+
+    const catalogIdentity = await fetch(`${handle.apiUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        ...ownerHeaders(ownerAccessSecret), 'content-type': 'application/json',
+        'MCP-Protocol-Version': MCP_PROTOCOL_VERSION, 'Mcp-Method': 'tools/call', 'Mcp-Name': 'catalog_identity',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'catalog_identity', arguments: {} } }),
+    });
+    expect(await catalogIdentity.json()).toMatchObject({
+      result: {
+        isError: false,
+        structuredContent: { profile: 'FULL', toolCount: fullBody.result.tools.length, runtimeId: 'catalog-runtime-id', instanceId: 'catalog-instance-id', deploymentEpoch: 9 },
+      },
+    });
 
     const proMcp = await rpc(handle.apiUrl, '/mcp-pro', ownerAccessSecret, 'tools/list', 2);
     expect(proMcp.status).toBe(200);

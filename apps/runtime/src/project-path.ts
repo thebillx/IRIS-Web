@@ -1,7 +1,7 @@
 import { lstat, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 
-export type ProjectTargetKind = 'file-read' | 'file-write' | 'file-delete' | 'directory-create' | 'directory-delete' | 'project-root';
+export type ProjectTargetKind = 'file-read' | 'file-write' | 'file-edit' | 'file-delete' | 'directory-create' | 'directory-delete' | 'project-root';
 
 export interface ProjectTargetInspection {
   readonly valid: boolean;
@@ -60,7 +60,7 @@ export async function inspectProjectTarget(
       if (metadata.isSymbolicLink()) return invalid('Symlink components are not eligible for project capability execution');
       if (!final && !metadata.isDirectory()) return invalid('A project target parent component is not a directory');
       if (final) {
-        if (kind === 'file-read' || kind === 'file-write' || kind === 'file-delete') {
+        if (kind === 'file-read' || kind === 'file-write' || kind === 'file-edit' || kind === 'file-delete') {
           if (!metadata.isFile()) return invalid('Target must be a regular file');
           if (metadata.nlink !== 1) return invalid('Hard-linked files are outside the safe project capability model');
         }
