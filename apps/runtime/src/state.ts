@@ -7,6 +7,7 @@ import {
   type CapabilityId,
   type MissionExecutionAssociation,
   type MissionEvidence,
+  type MissionRebindAuditEvent,
   type MissionSnapshot,
   type MissionState,
   type OrchestratorMode,
@@ -25,6 +26,15 @@ import { inspectRegistrationRoot } from './project-path.js';
 const MAX_INSTRUCTION_CHARS = 8_000;
 const MAX_INTERACTION_EVENTS = 200;
 const MAX_EXECUTOR_OUTPUT_CHARS = 12_000;
+
+export interface MissionRebindInput {
+  readonly missionId: string;
+  readonly clientId: string;
+  readonly sessionId: string;
+  readonly projectId: string;
+  readonly expectedBindingRevision: number;
+  readonly reason: string;
+}
 
 export class RuntimeState {
   private readonly sessions = new Map<string, RuntimeSessionSnapshot>();
@@ -66,6 +76,67 @@ export class RuntimeState {
     const mission = (await this.listMissions()).find((candidate) => candidate.id === missionId);
     if (mission === undefined) throw new RuntimeError('MISSION_NOT_FOUND', 'Mission was not found');
     return mission;
+  }
+
+  public rebindMissionSession(input: MissionRebindInput): Promise<MissionSnapshot> {
+    const missionId = normalizeUuidIdentity(input.missionId, 'missionId');
+    const clientId = normalizeClientId(input.clientId);
+    const sessionId = normalizeUuidIdentity(input.sessionId, 'sessionId');
+    const projectId = normalizeUuidIdentity(input.projectId, 'projectId');
+    const reason = normalizeMissionText(input.reason, 'reason', 500);
+    if (!Number.isSafeInteger(input.expectedBindingRevision) || input.expectedBindingRevision <= 0) {
+      throw new RuntimeError('INVALID_REQUEST', 'expectedBindingRevision is invalid');
+    }
+    const session = this.getSessionForClient(sessionId, clientId);
+    if (session.currentProjectId !== projectId) throw new RuntimeError('CAPABILITY_DENIED', 'Rebind session is not selected on the mission project');
+    return this.serializeMissionMutation(async () => {
+      const currentSession = this.getSessionForClient(sessionId, clientId);
+      if (currentSession.currentProjectId !== projectId) throw new RuntimeError('CAPABILITY_DENIED', 'Rebind session is not selected on the mission project');
+      const document = await this.missionStore.read();
+      const index = document.missions.findIndex((mission) => mission.id === missionId);
+      if (index < 0) throw new RuntimeError('MISSION_NOT_FOUND', 'Mission was not found');
+      const mission = document.missions[index]!;
+      if (mission.projectId !== projectId) throw new RuntimeError('CAPABILITY_DENIED', 'Rebind project does not match the durable mission project');
+      if (mission.state === 'COMPLETED' || mission.state === 'FAILED' || mission.state === 'CANCELLED') {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Terminal missions cannot be rebound');
+      }
+      if (mission.bindingRevision !== input.expectedBindingRevision) {
+        throw new RuntimeError('INVALID_REQUEST', 'Mission binding revision is stale');
+      }
+      if (mission.clientId === clientId && mission.sessionId === sessionId) return mission;
+      if (this.activeSubmissions.has(mission.sessionId) || mission.tasks.some((task) => task.actions.some((action) => action.state === 'RUNNING' || action.state === 'OWNER_APPROVAL_REQUIRED'))) {
+        throw new RuntimeError('SESSION_BUSY', 'Mission has active mutation authority and cannot be rebound yet');
+      }
+      const now = new Date().toISOString();
+      const bindingRevision = mission.bindingRevision + 1;
+      const audit: MissionRebindAuditEvent = {
+        id: randomUUID(),
+        missionId: mission.id,
+        oldClientId: mission.clientId,
+        oldSessionId: mission.sessionId,
+        newClientId: clientId,
+        newSessionId: sessionId,
+        principal: 'owner',
+        projectId,
+        timestamp: now,
+        reason,
+        bindingRevision,
+        result: 'SUCCESS',
+      };
+      const updated: MissionSnapshot = {
+        ...mission,
+        clientId,
+        sessionId,
+        bindingRevision,
+        rebindAudit: [...mission.rebindAudit, audit].slice(-64),
+        updatedAt: now,
+        timeline: appendMissionEvent(mission.timeline, missionEvent('MISSION_SESSION_REBOUND', 'Durable mission session rebound by the authenticated owner', null, null, now)),
+      };
+      const missions = [...document.missions];
+      missions[index] = updated;
+      await this.missionStore.write({ schemaVersion: 1, missions });
+      return updated;
+    });
   }
 
   public async rehydrateBrokerMissionSession(missionIdInput: string): Promise<RuntimeSessionSnapshot> {
@@ -117,6 +188,9 @@ export class RuntimeState {
         orchestratorVersion: 1,
         lastOrchestratorHandoff: null,
         orchestratorHandoffIds: [],
+        ownerClientId: clientId,
+        bindingRevision: 1,
+        rebindAudit: [],
         clientId,
         sessionId,
         projectId: session.currentProjectId,

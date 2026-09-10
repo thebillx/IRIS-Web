@@ -6,10 +6,10 @@ import { PermissionAuditStore } from './audit.js';
 import { capabilityDefinition } from './capability-registry.js';
 import { PermissionPolicyEngine, type PolicyRequest } from './permissions.js';
 import { inspectProjectTarget } from './project-path.js';
-import { secureProjectFileRead, secureProjectFileWrite, secureProjectMutation } from './macos-safety.js';
+import { secureProjectFileEdit, secureProjectFileRead, secureProjectFileWrite, secureProjectMutation } from './macos-safety.js';
 import { inspectProjectGitStatus } from './git-status.js';
 import { searchProjectText } from './project-search.js';
-import { runDeclaredProjectScript, runDeclaredProjectTest } from './project-test.js';
+import { discoverDeclaredProjectValidation, ProjectValidationJobManager, runDeclaredProjectScript, runDeclaredProjectTest } from './project-test.js';
 import { pushCurrentFeatureBranch, runProjectGitLocal, type GitLocalOperation } from './project-git.js';
 import type { RuntimeState } from './state.js';
 
@@ -25,6 +25,9 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'project.search'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string; readonly query: string }
   | { readonly capabilityId: 'project.test.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'project.command.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly scriptName: string }
+  | { readonly capabilityId: 'project.validation.discover'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string }
+  | { readonly capabilityId: 'project.validation.start'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly scriptName: string; readonly requestId: string }
+  | { readonly capabilityId: 'project.validation.job.read'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string; readonly jobId: string; readonly view: 'status' | 'logs' | 'result' }
   | { readonly capabilityId: 'git.local'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly operation: GitLocalOperation; readonly paths?: readonly string[] | undefined; readonly message?: string | undefined }
   | { readonly capabilityId: 'remote.publish'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'mission.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
@@ -43,6 +46,7 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'project.default.set'; readonly projectId: string | null; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'file.read'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId?: string | undefined; readonly targetPath: string }
   | { readonly capabilityId: 'file.write'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string; readonly content: string }
+  | { readonly capabilityId: 'file.edit'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string; readonly find: string; readonly replace: string; readonly expectedSha256: string; readonly dryRun?: boolean | undefined }
   | { readonly capabilityId: 'file.delete'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string }
   | { readonly capabilityId: 'directory.create'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string }
   | { readonly capabilityId: 'directory.delete'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly targetPath: string }
@@ -72,6 +76,7 @@ export class CapabilityService {
     private readonly policy: PermissionPolicyEngine,
     private readonly audit: PermissionAuditStore,
     private readonly health: () => RuntimeHealth,
+    private readonly validationJobs: ProjectValidationJobManager = new ProjectValidationJobManager(),
   ) {}
 
   public permissionSnapshot() {
@@ -274,6 +279,18 @@ export class CapabilityService {
       const project = await this.authorizedProject(operation);
       return runDeclaredProjectScript(project.rootPath, operation.scriptName);
     }
+    if (operation.capabilityId === 'project.validation.discover') {
+      const project = await this.authorizedProject(operation);
+      return discoverDeclaredProjectValidation(project.rootPath);
+    }
+    if (operation.capabilityId === 'project.validation.start') {
+      const project = await this.authorizedProject(operation);
+      return this.validationJobs.start(project.rootPath, operation.scriptName, operation.requestId);
+    }
+    if (operation.capabilityId === 'project.validation.job.read') {
+      const project = await this.authorizedProject(operation);
+      return this.validationJobs.read(operation.jobId, operation.view, project.rootPath);
+    }
     if (operation.capabilityId === 'git.local') {
       const project = await this.authorizedProject(operation);
       return runProjectGitLocal(project.rootPath, {
@@ -334,6 +351,23 @@ export class CapabilityService {
       if (written !== bytes) throw new RuntimeError('CAPABILITY_DENIED', 'Protected project write byte count did not match the approved exact action');
       return { targetPath: target, bytes };
     }
+    if (operation.capabilityId === 'file.edit') {
+      if (Buffer.byteLength(operation.find, 'utf8') === 0 || Buffer.byteLength(operation.find, 'utf8') > MAX_FILE_BYTES
+        || Buffer.byteLength(operation.replace, 'utf8') > MAX_FILE_BYTES
+        || !/^[0-9a-f]{64}$/i.test(operation.expectedSha256)) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'File edit requires bounded UTF-8 text and a SHA-256 precondition');
+      }
+      const target = await this.revalidateTarget(project, operation.targetPath, 'file-edit');
+      try {
+        const result = await secureProjectFileEdit(project.rootPath, target, operation.find, operation.replace, operation.expectedSha256, operation.dryRun ?? false);
+        return { targetPath: target, ...result, summary: result.changed ? 'One exact text occurrence is ready or was replaced' : 'The exact edit produced no byte change' };
+      } catch (error) {
+        if (error instanceof RuntimeError && /precondition/i.test(error.message)) {
+          throw new RuntimeError('PRECONDITION_FAILED', error.message, { cause: error });
+        }
+        throw error;
+      }
+    }
     if (operation.capabilityId === 'file.delete') {
       const target = await this.revalidateTarget(project, operation.targetPath, 'file-delete');
       const result = await secureProjectMutation('unlink', project.rootPath, target);
@@ -374,7 +408,7 @@ export class CapabilityService {
   private async revalidateTarget(
     project: ProjectReference,
     targetPath: string,
-    kind: 'file-read' | 'file-write' | 'file-delete' | 'directory-create' | 'directory-delete',
+    kind: 'file-read' | 'file-write' | 'file-edit' | 'file-delete' | 'directory-create' | 'directory-delete',
   ): Promise<string> {
     const resolvedTarget = path.isAbsolute(targetPath) ? targetPath : path.resolve(project.rootPath, targetPath);
     const inspected = await inspectProjectTarget(project.rootPath, resolvedTarget, kind);
@@ -384,14 +418,15 @@ export class CapabilityService {
 }
 
 function sessionlessProjectRead(capabilityId: CapabilityId): boolean {
-  return capabilityId === 'project.info' || capabilityId === 'project.git_status' || capabilityId === 'project.search' || capabilityId === 'file.read';
+  return capabilityId === 'project.info' || capabilityId === 'project.git_status' || capabilityId === 'project.search'
+    || capabilityId === 'project.validation.discover' || capabilityId === 'project.validation.job.read' || capabilityId === 'file.read';
 }
 
 function requestForOperation(operation: CapabilityOperation): PolicyRequest {
   let request: PolicyRequest;
   if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
-  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish') {
+  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.discover' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'project.validation.job.read' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'mission.get') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId };
@@ -434,13 +469,13 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
 }
 
 function isMissionExecutableOperation(operation: CapabilityOperation): operation is CapabilityOperation & { readonly clientId: string; readonly sessionId: string; readonly mission: MissionExecutionAssociation } {
-  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete'
-    || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
+  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete'
+    || operation.capabilityId === 'file.edit' || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
 }
 
-function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'project.command.run' | 'git.local' | 'remote.publish' | 'file.read' | 'file.write' | 'file.delete' | 'directory.create' | 'directory.delete' {
-  return capabilityId === 'project.test.run' || capabilityId === 'project.command.run' || capabilityId === 'git.local' || capabilityId === 'remote.publish' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete'
-    || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
+function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'project.command.run' | 'project.validation.start' | 'git.local' | 'remote.publish' | 'file.read' | 'file.write' | 'file.edit' | 'file.delete' | 'directory.create' | 'directory.delete' {
+  return capabilityId === 'project.test.run' || capabilityId === 'project.command.run' || capabilityId === 'project.validation.start' || capabilityId === 'git.local' || capabilityId === 'remote.publish' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete'
+    || capabilityId === 'file.edit' || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
 }
 
 function describeOperation(operation: CapabilityOperation): string {
@@ -450,6 +485,9 @@ function describeOperation(operation: CapabilityOperation): string {
   if (operation.capabilityId === 'project.search') return `project.search projectId=${operation.projectId} queryLength=${operation.query.length}`;
   if (operation.capabilityId === 'project.test.run') return `project.test.run projectId=${operation.projectId ?? 'session-current'} declared-script=test`;
   if (operation.capabilityId === 'project.command.run') return `project.command.run projectId=${operation.projectId ?? 'session-current'} declared-script=${operation.scriptName}`;
+  if (operation.capabilityId === 'project.validation.discover') return `project.validation.discover projectId=${operation.projectId}`;
+  if (operation.capabilityId === 'project.validation.start') return `project.validation.start projectId=${operation.projectId ?? 'session-current'} declared-script=${operation.scriptName} requestId=${operation.requestId}`;
+  if (operation.capabilityId === 'project.validation.job.read') return `project.validation.job.read projectId=${operation.projectId} jobId=${operation.jobId} view=${operation.view}`;
   if (operation.capabilityId === 'git.local') return `git.local projectId=${operation.projectId ?? 'session-current'} operation=${operation.operation} paths=${operation.paths?.length ?? 0}`;
   if (operation.capabilityId === 'remote.publish') return `remote.publish projectId=${operation.projectId ?? 'session-current'} configured-origin-current-feature-branch`;
   if (operation.capabilityId === 'mission.get') return `mission.get missionId=${operation.missionId}`;
@@ -463,6 +501,11 @@ function describeOperation(operation: CapabilityOperation): string {
     const bytes = Buffer.byteLength(operation.content, 'utf8');
     const digest = createHash('sha256').update(operation.content).digest('hex');
     return `file.write target=${operation.targetPath} bytes=${bytes} sha256=${digest}`;
+  }
+  if (operation.capabilityId === 'file.edit') {
+    const findDigest = createHash('sha256').update(operation.find).digest('hex');
+    const replaceDigest = createHash('sha256').update(operation.replace).digest('hex');
+    return `file.edit target=${operation.targetPath} findSha256=${findDigest} replaceSha256=${replaceDigest} expectedSha256=${operation.expectedSha256} dryRun=${operation.dryRun === true}`;
   }
   if (operation.capabilityId === 'file.read' || operation.capabilityId === 'file.delete'
     || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete') {

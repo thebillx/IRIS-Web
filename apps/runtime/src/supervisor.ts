@@ -5,10 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { RuntimeError, type RuntimeFailureCode } from '@iris/domain';
-import { bindConnectorRuntime, readConnectorRegistry, reconcileConnectorRegistry, seedFromLegacyProfiles, type ConnectorBinding, type ConnectorRegistryDocument } from './connector-registry.js';
+import { bindConnectorRuntime, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry, seedFromLegacyProfiles, type ConnectorBinding, type ConnectorRegistryDocument } from './connector-registry.js';
 import { credentialPaths, inspectCredentialStatus, loadOrCreateTunnelServiceSecret, readTunnelServiceSecret, rotateTunnelServiceSecret, type CredentialStatus } from './credentials.js';
 import { ensureRuntimeDataRoot, resolveRuntimeDataRoot, resolveSourceRoot } from './data-root.js';
+import { catalogIdentity, catalogToolNames, type McpCatalogIdentity } from './mcp-catalog.js';
 import { observeProcessStart } from './macos-safety.js';
+import { proMcpToolDefinitions } from './mcp.js';
+import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
 import { loadOrCreateRuntimeId, readEndpoint, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
 import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
@@ -114,6 +117,29 @@ interface SupervisorOperationLock {
 export interface LocalReadinessResult {
   readonly status: LayerStatus;
   readonly connectors: readonly ConnectorStatus[];
+  readonly catalogs: readonly CatalogProfileStatus[];
+}
+
+export type CatalogActivationState = 'ACTIVE' | 'STALE_RUNTIME' | 'STALE_CONNECTOR' | 'MISMATCH' | 'UNKNOWN';
+
+export interface CatalogProfileStatus {
+  readonly profile: 'FULL' | 'PRO';
+  readonly source: McpCatalogIdentity;
+  readonly live: McpCatalogIdentity | null;
+  readonly liveToolCount: number | null;
+  readonly connectorCatalogHash: string;
+  readonly connectorEpoch: number;
+  readonly state: CatalogActivationState;
+}
+
+export interface SupervisorCatalogStatus {
+  readonly state: CatalogActivationState;
+  readonly full: CatalogProfileStatus;
+  readonly pro: CatalogProfileStatus;
+  readonly runtimeId: string | null;
+  readonly instanceId: string | null;
+  readonly deploymentEpoch: number;
+  readonly recommendedAction: string;
 }
 
 export async function createSupervisor(options: SupervisorOptions = {}): Promise<Supervisor> {
@@ -153,9 +179,20 @@ export class Supervisor {
     try {
       const observed = await runtimeStatus(this.dataRoot);
       let runtimeReplaced = false;
+      let runtimeCatalogStale = false;
       const runtimeNodeChanged = observed.state === 'running' && state.runtime !== null
         && !sameExecutablePath(state.runtime.executable, canonicalNodeRuntime().path);
       if (observed.state === 'running' && !registryChanged && !runtimeNodeChanged) {
+        if (state.runtime === null) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'A running IRIS runtime is not owned by this supervisor; use explicit runtime adoption or stop it through its existing owner');
+        assertRuntimeOwnership(state.runtime, observed);
+        await assertOwnedRuntimeProcess(state.runtime);
+        const serviceSecret = await readTunnelServiceSecret(this.dataRoot);
+        if (serviceSecret !== null && observed.endpoint !== null) {
+          const catalogProbe = await probeLocalRuntime(observed.endpoint.apiUrl, serviceSecret, boundRegistry);
+          runtimeCatalogStale = catalogProbe.catalogs.some((catalog) => catalog.state === 'STALE_RUNTIME');
+        }
+      }
+      if (observed.state === 'running' && !registryChanged && !runtimeNodeChanged && !runtimeCatalogStale) {
         if (state.runtime === null) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'A running IRIS runtime is not owned by this supervisor; use explicit runtime adoption or stop it through its existing owner');
         assertRuntimeOwnership(state.runtime, observed);
         await assertOwnedRuntimeProcess(state.runtime);
@@ -349,9 +386,49 @@ export class Supervisor {
     const credentials = await readTunnelServiceSecret(this.dataRoot);
     const observed = await runtimeStatus(this.dataRoot);
     if (registry === null || credentials === null || observed.state !== 'running' || observed.endpoint === null) {
-      return { status: layer('FAILED', registry === null ? 'MIGRATION_REQUIRED' : credentials === null ? 'CREDENTIAL_MISSING' : 'LOCAL_MCP_AUTH_FAILED', 'Local runtime prerequisites are not ready'), connectors: [] };
+      return { status: layer('FAILED', registry === null ? 'MIGRATION_REQUIRED' : credentials === null ? 'CREDENTIAL_MISSING' : 'LOCAL_MCP_AUTH_FAILED', 'Local runtime prerequisites are not ready'), connectors: [], catalogs: [] };
     }
     return probeLocalRuntime(observed.endpoint.apiUrl, credentials, registry);
+  }
+
+  public async catalogStatus(): Promise<SupervisorCatalogStatus> {
+    const inspection = await inspectConnectorRegistry(this.dataRoot);
+    if (inspection === null) throw new RuntimeError('MIGRATION_REQUIRED', 'IRIS connector registry is not initialized');
+    const registry = inspection.registry;
+    const observed = await runtimeStatus(this.dataRoot);
+    const credentials = await readTunnelServiceSecret(this.dataRoot);
+    const sources = sourceCatalogs();
+    const live = observed.state === 'running' && observed.endpoint !== null && credentials !== null
+      ? await probeLocalRuntime(observed.endpoint.apiUrl, credentials, registry)
+      : null;
+    const profiles = live?.catalogs.map((profile) => {
+      const binding = registry.connectors.find((candidate) => (candidate.mode === 'FULL' ? 'FULL' : 'PRO') === profile.profile);
+      return binding !== undefined && inspection.staleConnectorIds.includes(binding.connectorId) && profile.state === 'ACTIVE'
+        ? { ...profile, state: 'STALE_CONNECTOR' as const }
+        : profile;
+    }) ?? registry.connectors.map((binding) => catalogProfileStatus(binding, sources[binding.mode === 'FULL' ? 'FULL' : 'PRO']!, null, [], false));
+    const full = profiles.find((profile) => profile.profile === 'FULL') ?? catalogProfileStatus(registry.connectors[0]!, sources.FULL, null, [], false);
+    const pro = profiles.find((profile) => profile.profile === 'PRO') ?? catalogProfileStatus(registry.connectors[1]!, sources.PRO, null, [], false);
+    const state = catalogActivationState([full, pro]);
+    return {
+      state,
+      full,
+      pro,
+      runtimeId: observed.endpoint?.runtimeId ?? null,
+      instanceId: observed.endpoint?.instanceId ?? null,
+      deploymentEpoch: registry.deploymentEpoch,
+      recommendedAction: catalogAction(state),
+    };
+  }
+
+  public async catalogReload(): Promise<SupervisorStackStatus> {
+    const before = await this.catalogStatus();
+    if (before.state !== 'ACTIVE') await this.restart();
+    const after = await this.catalogStatus();
+    if (after.state !== 'ACTIVE') {
+      throw new RuntimeError('MCP_CATALOG_STALE', `IRIS catalog activation did not complete: ${JSON.stringify({ state: after.state, full: after.full, pro: after.pro })}`);
+    }
+    return this.status();
   }
 
   private async monitorOnceUnlocked(): Promise<void> {
@@ -402,7 +479,7 @@ export class Supervisor {
       this.probeTunnel(state.tunnels.pro, registry.connectors.find((connector) => connector.connectorId === 'iris-pro') ?? null),
     ]);
     const tunnelLayer = tunnelResults.every((result) => result.state === 'READY') ? layer('READY', 'READY', 'FULL and PRO tunnel clients are healthy') : combineLayers(tunnelResults, 'TUNNEL_NOT_RUNNING', 'One or more supervisor-owned tunnel clients is not ready');
-    const local = runtimeLayer.state === 'READY' ? await this.localReadiness() : { status: layer('FAILED', 'LOCAL_MCP_AUTH_FAILED', 'L1 requires a ready runtime'), connectors: [] };
+    const local = runtimeLayer.state === 'READY' ? await this.localReadiness() : { status: layer('FAILED', 'LOCAL_MCP_AUTH_FAILED', 'L1 requires a ready runtime'), connectors: [], catalogs: [] };
     const controlPlane = tunnelResults.every((result) => result.state === 'READY') ? layer('READY', 'READY', 'Control-plane clients are running with healthy local readiness') : combineLayers(tunnelResults, 'CONTROL_PLANE_UNREACHABLE', 'Control-plane readiness is not proven for every connector');
     const connectorStatuses = registry.connectors.map((binding) => connectorStatus(binding, local.connectors.find((entry) => entry.connectorId === binding.connectorId), tunnelResults[binding.connectorId === 'iris-full' ? 0 : 1]));
     const e2e = layer('UNKNOWN', 'E2E_PROBE_UNAVAILABLE', 'No safe remote connector probe is configured; /readyz is not treated as end-to-end proof');
@@ -681,7 +758,10 @@ function managedProfile(binding: ConnectorBinding, controlPlaneKey: string, tunn
 
 async function probeLocalRuntime(apiUrl: string, serviceSecret: string, registry: ConnectorRegistryDocument): Promise<LocalReadinessResult> {
   const connectors: ConnectorStatus[] = [];
+  const catalogs: CatalogProfileStatus[] = [];
+  const sources = sourceCatalogs();
   for (const binding of registry.connectors) {
+    const source = sources[binding.mode === 'FULL' ? 'FULL' : 'PRO'];
     const headers = {
       authorization: `Bearer ${serviceSecret}`,
       'content-type': 'application/json',
@@ -692,17 +772,82 @@ async function probeLocalRuntime(apiUrl: string, serviceSecret: string, registry
     };
     const discovered = await postJson(`${apiUrl}${binding.mcpPath}`, { jsonrpc: '2.0', id: 1, method: 'server/discover' }, headers);
     if (!isExpectedDiscovery(discovered, binding.mode)) {
+      catalogs.push(catalogProfileStatus(binding, source, null, [], false));
       connectors.push(connectorStatus(binding, undefined, layer('FAILED', discovered === null ? 'LOCAL_MCP_AUTH_FAILED' : 'RUNTIME_IDENTITY_MISMATCH', 'Authenticated MCP discovery did not match the expected protocol')));
       continue;
     }
     const listed = await postJson(`${apiUrl}${binding.mcpPath}`, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, { ...headers, 'MCP-Protocol-Version': '2026-07-28' });
     const names = toolNames(listed);
-    const expected = [...binding.expectedToolNames];
-    const matches = names.length === expected.length && names.every((name, index) => name === expected[index]);
-    connectors.push(connectorStatus(binding, undefined, matches ? layer('READY', 'READY', `${binding.label} authenticated discovery and tool profile match`) : layer('FAILED', 'CONNECTOR_BINDING_MISMATCH', `${binding.label} tool profile does not match the registry`)));
+    const liveIdentity = listed === null ? null : catalogIdentity(binding.mode, listedToolDefinitions(listed));
+    const catalog = catalogProfileStatus(binding, source, liveIdentity, names, listed !== null);
+    catalogs.push(catalog);
+    const code = catalog.state === 'ACTIVE' ? 'READY'
+      : catalog.state === 'STALE_CONNECTOR' ? 'CONNECTOR_MANIFEST_STALE'
+        : catalog.state === 'UNKNOWN' ? (listed === null ? 'LOCAL_MCP_AUTH_FAILED' : 'MCP_CATALOG_STALE')
+          : 'MCP_CATALOG_STALE';
+    connectors.push(connectorStatus(binding, undefined, catalog.state === 'ACTIVE'
+      ? layer('READY', 'READY', `${binding.label} authenticated discovery and current catalog match`)
+      : layer('FAILED', code, `${binding.label} catalog is ${catalog.state}`)));
   }
-  const status = connectors.every((connector) => connector.state === 'READY') ? layer('READY', 'READY', 'Authenticated local MCP discovery and tool profiles are healthy') : layer('FAILED', connectors.some((connector) => connector.code === 'LOCAL_MCP_AUTH_FAILED') ? 'LOCAL_MCP_AUTH_FAILED' : 'CONNECTOR_BINDING_MISMATCH', 'One or more authenticated local MCP profiles failed readiness');
-  return { status, connectors };
+  const status = connectors.every((connector) => connector.state === 'READY') ? layer('READY', 'READY', 'Authenticated local MCP discovery and current catalogs are healthy') : layer('FAILED',
+    catalogs.some((catalog) => catalog.state === 'STALE_RUNTIME' || catalog.state === 'MISMATCH') ? 'MCP_CATALOG_STALE'
+      : catalogs.some((catalog) => catalog.state === 'STALE_CONNECTOR') ? 'CONNECTOR_MANIFEST_STALE'
+        : connectors.some((connector) => connector.code === 'LOCAL_MCP_AUTH_FAILED') ? 'LOCAL_MCP_AUTH_FAILED' : 'RUNTIME_IDENTITY_MISMATCH',
+    'One or more authenticated local MCP profiles failed catalog readiness');
+  return { status, connectors, catalogs };
+}
+
+function sourceCatalogs(): Record<'FULL' | 'PRO', { readonly identity: McpCatalogIdentity; readonly names: readonly string[] }> {
+  return {
+    FULL: { identity: catalogIdentity('FULL', fullMcpToolDefinitionsV21()), names: catalogToolNames('FULL') },
+    PRO: { identity: catalogIdentity('PRO', proMcpToolDefinitions()), names: catalogToolNames('PRO') },
+  };
+}
+
+function catalogProfileStatus(
+  binding: ConnectorBinding,
+  source: { readonly identity: McpCatalogIdentity; readonly names: readonly string[] },
+  live: McpCatalogIdentity | null,
+  liveNames: readonly string[],
+  listAvailable: boolean,
+): CatalogProfileStatus {
+  const namesMatch = listAvailable && liveNames.length === source.names.length && liveNames.every((name, index) => name === source.names[index]);
+  const runtimeMismatch = listAvailable && !namesMatch || live !== null && (live.catalogHash !== source.identity.catalogHash || live.toolCount !== source.identity.toolCount);
+  const connectorMatches = binding.catalogHash === source.identity.catalogHash
+    && binding.expectedToolNames.length === source.names.length
+    && binding.expectedToolNames.every((name, index) => name === source.names[index]);
+  const state: CatalogActivationState = runtimeMismatch ? 'STALE_RUNTIME'
+    : !listAvailable || live === null ? (listAvailable && namesMatch ? 'MISMATCH' : 'UNKNOWN')
+      : !connectorMatches ? 'STALE_CONNECTOR' : 'ACTIVE';
+  return {
+    profile: binding.mode === 'FULL' ? 'FULL' : 'PRO',
+    source: source.identity,
+    live,
+    liveToolCount: live?.toolCount ?? (listAvailable ? liveNames.length : null),
+    connectorCatalogHash: binding.catalogHash,
+    connectorEpoch: binding.deploymentEpoch,
+    state,
+  };
+}
+
+function catalogActivationState(profiles: readonly CatalogProfileStatus[]): CatalogActivationState {
+  if (profiles.some((profile) => profile.state === 'STALE_RUNTIME')) return 'STALE_RUNTIME';
+  if (profiles.some((profile) => profile.state === 'STALE_CONNECTOR')) return 'STALE_CONNECTOR';
+  if (profiles.some((profile) => profile.state === 'MISMATCH')) return 'MISMATCH';
+  if (profiles.every((profile) => profile.state === 'ACTIVE')) return 'ACTIVE';
+  return 'UNKNOWN';
+}
+
+function catalogAction(state: CatalogActivationState): string {
+  if (state === 'ACTIVE') return 'NONE';
+  if (state === 'STALE_CONNECTOR') return 'RECONNECT_IRIS_CONNECTOR_OR_OPEN_A_NEW_CHAT';
+  if (state === 'STALE_RUNTIME' || state === 'MISMATCH') return 'iris catalog reload';
+  return 'iris catalog status and inspect controlled runtime readiness';
+}
+
+function listedToolDefinitions(value: unknown): readonly unknown[] {
+  if (!isRecord(value) || !isRecord(value.result) || !Array.isArray(value.result.tools)) return [];
+  return value.result.tools;
 }
 
 function connectorStatus(binding: ConnectorBinding, local: ConnectorStatus | undefined, tunnel: LayerStatus): ConnectorStatus {
@@ -962,6 +1107,7 @@ function actionForCode(code: string): string {
   if (code === 'MIGRATION_REQUIRED' || code === 'CREDENTIAL_MISSING') return 'MIGRATE_PERSISTENT_CREDENTIALS';
   if (code === 'CREDENTIAL_INVALID') return 'REPAIR_PRIVATE_CREDENTIAL_FILE';
   if (code === 'PROCESS_OWNERSHIP_AMBIGUOUS') return 'STOP_OR_ADOPT_ONLY_AFTER_IDENTITY_VERIFICATION';
+  if (code === 'MCP_CATALOG_STALE') return 'iris catalog reload';
   if (code === 'CONNECTOR_BINDING_MISMATCH' || code === 'CONNECTOR_MANIFEST_STALE') return 'REGENERATE_MANAGED_PROFILES';
   if (code === 'LOCAL_MCP_AUTH_FAILED') return 'CHECK_TUNNEL_SERVICE_CREDENTIAL_AND_RUNTIME_RESTART';
   if (code === 'E2E_PROBE_UNAVAILABLE') return 'CONFIGURE_A_SAFE_REMOTE_PROBE_OR_VALIDATE_FROM_CHATGPT';

@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import ctypes
 import fcntl
+import hashlib
 import json
 import os
 import secrets
@@ -239,6 +240,154 @@ def write_project_file(root, target):
         os.close(root_fd)
 
 
+def edit_project_file(root, target):
+    try:
+        request = json.loads(sys.stdin.buffer.read(MAX_FILE_BYTES + 1).decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        fail('edit request is not valid UTF-8 JSON')
+    if not isinstance(request, dict):
+        fail('edit request must be an object')
+    find = request.get('find')
+    replace = request.get('replace')
+    expected = request.get('expectedSha256')
+    dry_run = request.get('dryRun', False)
+    if not isinstance(find, str) or len(find) == 0:
+        fail('edit find text must be a non-empty string')
+    if not isinstance(replace, str):
+        fail('edit replacement must be a string')
+    if len(find.encode('utf-8')) > MAX_FILE_BYTES or len(replace.encode('utf-8')) > MAX_FILE_BYTES:
+        fail('edit text exceeds the bounded file size')
+    if not isinstance(expected, str) or len(expected) != 64 or any(character not in '0123456789abcdefABCDEF' for character in expected):
+        fail('edit expectedSha256 must be a SHA-256 hex digest')
+    if not isinstance(dry_run, bool):
+        fail('edit dryRun must be boolean')
+
+    root, parts = validated_relative(root, target)
+    expected_target = os.path.join(root, *parts)
+    root_fd, parent_fd, name = open_parent(root, parts)
+    file_fd = None
+    temp_name = None
+    temp_fd = None
+    try:
+        file_fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+        metadata = os.fstat(file_fd)
+        if descriptor_path(file_fd) != expected_target:
+            fail('edit target pathname no longer identifies the project entry')
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            fail('edit target must be one physical regular file')
+        if metadata.st_size > MAX_FILE_BYTES:
+            fail('edit target exceeds the bounded file size')
+        original_bytes = read_bounded(file_fd)
+        try:
+            original = original_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            fail('edit target is not valid UTF-8; refusing an encoding-changing edit')
+        before_sha256 = hashlib.sha256(original_bytes).hexdigest()
+        if before_sha256.lower() != expected.lower():
+            fail('edit precondition failed: current content hash does not match expectedSha256')
+        matches = original.count(find)
+        if matches == 0:
+            fail('edit target text was not found')
+        if matches != 1:
+            fail(f'edit target text is ambiguous: found {matches} matches')
+        updated = original.replace(find, replace, 1)
+        updated_bytes = updated.encode('utf-8')
+        if len(updated_bytes) > MAX_FILE_BYTES:
+            fail('edited file exceeds the bounded file size')
+        after_sha256 = hashlib.sha256(updated_bytes).hexdigest()
+
+        current = read_current_bytes(root, parent_fd, name, expected_target, metadata)
+        if hashlib.sha256(current).hexdigest() != before_sha256:
+            fail('edit precondition failed: target content changed during execution')
+        if dry_run:
+            sys.stdout.write(json.dumps({
+                'changed': updated_bytes != original_bytes,
+                'beforeSha256': before_sha256,
+                'afterSha256': after_sha256,
+                'bytesBefore': len(original_bytes),
+                'bytesAfter': len(updated_bytes),
+                'matchCount': matches,
+                'dryRun': True,
+            }, separators=(',', ':')) + '\n')
+            return
+
+        temp_name = f'.iris-edit-{os.getpid()}-{secrets.token_hex(16)}'
+        temp_fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+        written = 0
+        while written < len(updated_bytes):
+            count = os.write(temp_fd, updated_bytes[written:])
+            if count <= 0:
+                fail('edited payload could not be completed')
+            written += count
+        os.fsync(temp_fd)
+        temp_metadata = os.fstat(temp_fd)
+        if not stat.S_ISREG(temp_metadata.st_mode) or temp_metadata.st_nlink != 1:
+            fail('temporary edit target lost isolated regular-file identity')
+        current = read_current_bytes(root, parent_fd, name, expected_target, metadata)
+        if hashlib.sha256(current).hexdigest() != before_sha256:
+            fail('edit precondition failed: target content changed before publication')
+        os.rename(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        sys.stdout.write(json.dumps({
+            'changed': updated_bytes != original_bytes,
+            'beforeSha256': before_sha256,
+            'afterSha256': after_sha256,
+            'bytesBefore': len(original_bytes),
+            'bytesAfter': len(updated_bytes),
+            'matchCount': matches,
+            'dryRun': False,
+        }, separators=(',', ':')) + '\n')
+    except OSError as error:
+        fail(f'filesystem operation failed: {error.strerror or error.__class__.__name__}')
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
+def read_bounded(file_fd):
+    chunks = []
+    remaining = MAX_FILE_BYTES + 1
+    while remaining > 0:
+        chunk = os.read(file_fd, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    content = b''.join(chunks)
+    if len(content) > MAX_FILE_BYTES:
+        fail('target exceeds the bounded file size')
+    return content
+
+
+def read_current_bytes(root, parent_fd, name, expected_target, expected_metadata):
+    current_fd = None
+    try:
+        current_fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+        current_metadata = os.fstat(current_fd)
+        if (descriptor_path(current_fd) != expected_target
+                or not stat.S_ISREG(current_metadata.st_mode)
+                or current_metadata.st_nlink != 1
+                or current_metadata.st_dev != expected_metadata.st_dev
+                or current_metadata.st_ino != expected_metadata.st_ino):
+            fail('edit target identity changed during execution')
+        return read_bounded(current_fd)
+    except FileNotFoundError:
+        fail('edit target disappeared during execution')
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+
+
 def swap_private_files(root, left_name, right_name):
     if not os.path.isabs(root):
         fail('swap root must be absolute')
@@ -331,6 +480,11 @@ def main():
         if len(sys.argv) != 4:
             fail('write-file requires project root and target')
         write_project_file(sys.argv[2], sys.argv[3])
+        return
+    if operation == 'edit-file':
+        if len(sys.argv) != 4:
+            fail('edit-file requires project root and target')
+        edit_project_file(sys.argv[2], sys.argv[3])
         return
     if operation == 'swap-files':
         if len(sys.argv) != 5:

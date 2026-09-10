@@ -1,7 +1,10 @@
+import { orderToolDefinitions } from './mcp-catalog.js';
+
 export const V21_LIFECYCLE_TOOL_NAMES = new Set([
   'mission_start',
   'mission_checkpoint',
   'mission_resume',
+  'mission_rebind',
   'mission_cancel',
   'mission_evidence',
   'mission_complete',
@@ -12,7 +15,7 @@ export function augmentV21ToolDefinitions(tools: readonly unknown[]): readonly u
   for (const definition of lifecycleToolDefinitions()) {
     if (!augmented.some((candidate) => isRecord(candidate) && candidate.name === definition.name)) augmented.push(definition);
   }
-  return augmented;
+  return orderToolDefinitions('FULL', augmented);
 }
 
 function augmentExistingDefinition(candidate: unknown): unknown {
@@ -61,6 +64,22 @@ function lifecycleToolDefinitions(): Record<string, unknown>[] {
       name: 'mission_resume',
       description: 'Resume the same mission from its latest durable checkpoint and accepted directive without replaying duplicate requestId calls.',
       inputSchema: { type: 'object', required: ['missionId','expectedRevision','requestId'], properties: { ...mission, ...revision, ...request }, additionalProperties: false },
+      annotations,
+    },
+    {
+      name: 'mission_rebind',
+      description: 'Rebind a durable mission to this newly authenticated owner session using a compare-and-swap binding revision. The mission and project identity remain unchanged.',
+      inputSchema: {
+        type: 'object', required: ['missionId', 'projectId', 'expectedBindingRevision'],
+        properties: {
+          ...sessionId,
+          missionId: { type: 'string', description: 'Stable durable mission UUID.' },
+          projectId: { type: 'string', description: 'Must equal the mission’s already-bound registered project UUID.' },
+          expectedBindingRevision: { type: 'integer', minimum: 1 },
+          reason: { type: 'string', minLength: 1, maxLength: 500 },
+        },
+        additionalProperties: false,
+      },
       annotations,
     },
     {
