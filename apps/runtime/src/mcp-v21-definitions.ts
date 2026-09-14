@@ -1,4 +1,7 @@
 import { orderToolDefinitions } from './mcp-catalog.js';
+import { phase2GroupedToolDefinitions } from './mcp-phase2.js';
+import { phase3GroupedToolDefinitions } from './mcp-phase3.js';
+import { phase4GroupedToolDefinitions } from './mcp-phase4.js';
 
 export const V21_LIFECYCLE_TOOL_NAMES = new Set([
   'mission_start',
@@ -12,6 +15,15 @@ export const V21_LIFECYCLE_TOOL_NAMES = new Set([
 
 export function augmentV21ToolDefinitions(tools: readonly unknown[]): readonly unknown[] {
   const augmented = tools.map(augmentExistingDefinition);
+  for (const definition of phase2GroupedToolDefinitions()) {
+    if (!augmented.some((candidate) => isRecord(candidate) && candidate.name === definition.name)) augmented.push(definition);
+  }
+  for (const definition of phase3GroupedToolDefinitions()) {
+    if (!augmented.some((candidate) => isRecord(candidate) && candidate.name === definition.name)) augmented.push(definition);
+  }
+  for (const definition of phase4GroupedToolDefinitions()) {
+    if (!augmented.some((candidate) => isRecord(candidate) && candidate.name === definition.name)) augmented.push(definition);
+  }
   for (const definition of lifecycleToolDefinitions()) {
     if (!augmented.some((candidate) => isRecord(candidate) && candidate.name === definition.name)) augmented.push(definition);
   }

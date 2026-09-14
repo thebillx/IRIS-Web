@@ -113,7 +113,7 @@ setInterval(() => undefined, 1000);
       ...old,
       schemaVersion: 1,
       connectors: old.connectors.map((connector) => {
-      const stale: Record<string, unknown> = { ...connector, expectedToolNames: ['removed_tool'] };
+        const stale: Record<string, unknown> = { ...connector, expectedToolNames: ['removed_tool'] };
         delete stale.catalogFingerprint;
         delete stale.deploymentEpoch;
         return stale;
@@ -129,11 +129,18 @@ setInterval(() => undefined, 1000);
     const reconciled = JSON.parse(await readFile(registryPath, 'utf8')) as {
       schemaVersion: number;
       deploymentEpoch: number;
-      connectors: Array<{ readonly expectedToolNames: string[]; readonly catalogFingerprint: string; readonly tunnelId: string }>;
+      connectors: Array<{
+        readonly expectedToolNames: string[];
+        readonly catalogFingerprint: string;
+        readonly tunnelId: string;
+        readonly machineId: string | null;
+        readonly leaseGeneration: number;
+      }>;
     };
-    expect(reconciled.schemaVersion).toBe(2);
+    expect(reconciled.schemaVersion).toBe(3);
     expect(reconciled.deploymentEpoch).toBeGreaterThan(created.deploymentEpoch);
     expect(reconciled.connectors[0]?.expectedToolNames).toEqual(fullMcpToolNames());
+    expect(reconciled.connectors.every((connector) => typeof connector.machineId === 'string' && connector.leaseGeneration > 0)).toBe(true);
     expect(reconciled.connectors.map((connector) => connector.tunnelId)).toEqual([
       'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     ]);

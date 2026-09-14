@@ -9,6 +9,7 @@ import { PRO_TOOL_NAMES, proMcpToolDefinitions } from './mcp.js';
 import { fullMcpToolDefinitionsV21, fullMcpToolNames } from './mcp-v21.js';
 import { inspectPrivateRegularFile } from './private-fs.js';
 import { writePrivateJsonAtomic } from './credentials.js';
+import { loadOrCreateMachineId } from './machine-identity.js';
 
 const REGISTRY_FILE = 'connector-registry.json';
 const TUNNEL_ID_PATTERN = /^tunnel_[a-f0-9]{32}$/;
@@ -28,12 +29,14 @@ export interface ConnectorBinding {
   readonly catalogHash: string;
   readonly healthPort: number;
   readonly managedProfilePath: string;
+  readonly machineId: string | null;
   readonly runtimeId: string | null;
   readonly deploymentEpoch: number;
+  readonly leaseGeneration: number;
 }
 
 export interface ConnectorRegistryDocument {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly deploymentEpoch: number;
   readonly updatedAt: string;
   readonly connectors: readonly ConnectorBinding[];
@@ -64,8 +67,10 @@ interface RawConnectorBinding {
   readonly catalogHash?: unknown;
   readonly healthPort: number;
   readonly managedProfilePath: string;
+  readonly machineId?: string | null;
   readonly runtimeId?: string | null;
   readonly deploymentEpoch?: unknown;
+  readonly leaseGeneration?: unknown;
 }
 
 export interface ConnectorSeed {
@@ -108,7 +113,7 @@ export async function reconcileConnectorRegistry(dataRoot: string): Promise<Conn
   }
   const registry: ConnectorRegistryDocument = {
     ...parsed.registry,
-    schemaVersion: 2,
+    schemaVersion: 3,
     deploymentEpoch,
     updatedAt: new Date().toISOString(),
     connectors: parsed.registry.connectors.map((connector) => ({ ...connector, deploymentEpoch })),
@@ -123,8 +128,7 @@ async function readParsedRegistry(dataRoot: string): Promise<{ readonly registry
   if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
   try {
     const value = JSON.parse(inspected.content) as unknown;
-    const parsed = normalizeRegistry(value, dataRoot);
-    return parsed;
+    return normalizeRegistry(value, dataRoot);
   } catch (error) {
     if (error instanceof RuntimeError) throw error;
     throw new RuntimeError('PERSISTENCE_FAILURE', 'IRIS connector registry is invalid', { cause: error });
@@ -136,18 +140,29 @@ export async function initializeConnectorRegistry(dataRoot: string, seed: Connec
   if (existing !== null) return existing;
   validateTunnelId(seed.fullTunnelId, 'fullTunnelId');
   validateTunnelId(seed.proTunnelId, 'proTunnelId');
-  const document = createConnectorRegistry(dataRoot, seed, 1);
+  const machineId = await loadOrCreateMachineId(dataRoot);
+  const document = createConnectorRegistry(dataRoot, seed, 1, machineId, 1);
   await writePrivateJsonAtomic(connectorRegistryPath(dataRoot), document);
   return document;
 }
 
-export function createConnectorRegistry(dataRoot: string, seed: ConnectorSeed, deploymentEpoch: number): ConnectorRegistryDocument {
+export function createConnectorRegistry(
+  dataRoot: string,
+  seed: ConnectorSeed,
+  deploymentEpoch: number,
+  machineId: string | null = null,
+  leaseGeneration = machineId === null ? 0 : 1,
+): ConnectorRegistryDocument {
   validateTunnelId(seed.fullTunnelId, 'fullTunnelId');
   validateTunnelId(seed.proTunnelId, 'proTunnelId');
   if (!Number.isSafeInteger(deploymentEpoch) || deploymentEpoch <= 0) throw new RuntimeError('INVALID_REQUEST', 'Connector deployment epoch is invalid');
+  if (machineId !== null && !isUuid(machineId)) throw new RuntimeError('INVALID_REQUEST', 'Connector machine identity is invalid');
+  if (!Number.isSafeInteger(leaseGeneration) || leaseGeneration < 0 || (machineId === null && leaseGeneration !== 0) || (machineId !== null && leaseGeneration <= 0)) {
+    throw new RuntimeError('INVALID_REQUEST', 'Connector lease generation is invalid');
+  }
   const now = new Date().toISOString();
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     deploymentEpoch,
     updatedAt: now,
     connectors: [
@@ -155,40 +170,45 @@ export function createConnectorRegistry(dataRoot: string, seed: ConnectorSeed, d
         connectorId: 'iris-full', label: 'IRIS FULL', mode: 'FULL', tunnelId: seed.fullTunnelId,
         runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', expectedToolNames: fullMcpToolNames(), catalogFingerprint: catalogFingerprint(fullMcpToolNames()), catalogHash: catalogIdentity('FULL', fullMcpToolDefinitionsV21()).catalogHash,
         healthPort: seed.fullHealthPort ?? 8080, managedProfilePath: path.join(dataRoot, 'tunnel-profiles', 'iris-full.yaml'),
-        runtimeId: null, deploymentEpoch,
+        machineId, runtimeId: null, deploymentEpoch, leaseGeneration,
       },
       {
         connectorId: 'iris-pro', label: 'IRIS PRO', mode: 'PRO', tunnelId: seed.proTunnelId,
         runtime: 'iris-local-runtime', mcpProfile: 'READ_ONLY', mcpPath: '/mcp-pro', expectedToolNames: [...PRO_TOOL_NAMES], catalogFingerprint: catalogFingerprint(PRO_TOOL_NAMES), catalogHash: catalogIdentity('PRO', proMcpToolDefinitions()).catalogHash,
         healthPort: seed.proHealthPort ?? 8081, managedProfilePath: path.join(dataRoot, 'tunnel-profiles', 'iris-pro.yaml'),
-        runtimeId: null, deploymentEpoch,
+        machineId, runtimeId: null, deploymentEpoch, leaseGeneration,
       },
     ],
   };
 }
 
 export async function updateConnectorRuntime(dataRoot: string, runtimeId: string): Promise<ConnectorRegistryDocument> {
-  const current = await requireConnectorRegistry(dataRoot);
-  const nextEpoch = current.deploymentEpoch + 1;
-  const next: ConnectorRegistryDocument = {
-    ...current,
-    deploymentEpoch: nextEpoch,
-    updatedAt: new Date().toISOString(),
-    connectors: current.connectors.map((connector) => ({ ...connector, runtimeId, deploymentEpoch: nextEpoch })),
-  };
-  await writePrivateJsonAtomic(connectorRegistryPath(dataRoot), next);
-  return next;
+  return bindConnectorRuntime(dataRoot, runtimeId);
 }
 
-export async function bindConnectorRuntime(dataRoot: string, runtimeId: string): Promise<ConnectorRegistryDocument> {
+export async function bindConnectorRuntime(dataRoot: string, runtimeId: string, machineIdOverride?: string): Promise<ConnectorRegistryDocument> {
   const current = await requireConnectorRegistry(dataRoot);
-  if (current.connectors.every((connector) => connector.runtimeId === runtimeId)) return current;
+  const machineId = machineIdOverride ?? await loadOrCreateMachineId(dataRoot);
+  if (!isUuid(machineId)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Local machine identity is invalid');
+  const foreign = current.connectors.find((connector) => connector.machineId !== null && connector.machineId !== machineId);
+  if (foreign !== undefined) {
+    throw new RuntimeError('TUNNEL_OWNERSHIP_CONFLICT', `Tunnel ${foreign.tunnelId} is fenced to another machine identity; refusing takeover`);
+  }
+  if (current.connectors.every((connector) => connector.machineId === machineId && connector.runtimeId === runtimeId && connector.leaseGeneration > 0)) return current;
   const deploymentEpoch = current.deploymentEpoch + 1;
+  if (!Number.isSafeInteger(deploymentEpoch) || deploymentEpoch <= 0) throw new RuntimeError('PERSISTENCE_FAILURE', 'Connector deployment epoch overflowed');
   const next: ConnectorRegistryDocument = {
     ...current,
+    schemaVersion: 3,
     deploymentEpoch,
     updatedAt: new Date().toISOString(),
-    connectors: current.connectors.map((connector) => ({ ...connector, runtimeId, deploymentEpoch })),
+    connectors: current.connectors.map((connector) => ({
+      ...connector,
+      machineId,
+      runtimeId,
+      deploymentEpoch,
+      leaseGeneration: nextLeaseGeneration(connector.leaseGeneration),
+    })),
   };
   await writePrivateJsonAtomic(connectorRegistryPath(dataRoot), next);
   return next;
@@ -254,7 +274,7 @@ function validateTunnelId(value: string, name: string): void {
 }
 
 function normalizeRegistry(value: unknown, dataRoot: string): { readonly registry: ConnectorRegistryDocument; readonly changed: boolean; readonly staleConnectorIds: readonly string[] } {
-  if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2) || !isPositiveSafeInteger(value.deploymentEpoch)
+  if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2 && value.schemaVersion !== 3) || !isPositiveSafeInteger(value.deploymentEpoch)
     || typeof value.updatedAt !== 'string' || !Array.isArray(value.connectors) || value.connectors.length !== 2) {
     throw new Error('invalid registry schema');
   }
@@ -272,8 +292,10 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
       && isPort(candidate.healthPort)
       && typeof candidate.managedProfilePath === 'string' && path.isAbsolute(candidate.managedProfilePath)
       && samePhysicalPath(candidate.managedProfilePath, path.join(dataRoot, 'tunnel-profiles', `${candidate.connectorId}.yaml`))
-      && (candidate.runtimeId === null || isRuntimeId(candidate.runtimeId))
-      && (candidate.deploymentEpoch === undefined || (isPositiveSafeInteger(candidate.deploymentEpoch) && candidate.deploymentEpoch === value.deploymentEpoch));
+      && (candidate.machineId === undefined || candidate.machineId === null || isUuid(candidate.machineId))
+      && (candidate.runtimeId === undefined || candidate.runtimeId === null || isRuntimeId(candidate.runtimeId))
+      && (candidate.deploymentEpoch === undefined || (isPositiveSafeInteger(candidate.deploymentEpoch) && candidate.deploymentEpoch === deploymentEpoch))
+      && (candidate.leaseGeneration === undefined || isNonNegativeSafeInteger(candidate.leaseGeneration));
   });
   const rawConnectors = value.connectors.filter(isRawConnector);
   const full = rawConnectors.find((candidate) => candidate.connectorId === 'iris-full');
@@ -282,6 +304,8 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
     || !isExpectedBinding(pro, 'iris-pro', 'IRIS PRO', 'PRO', '/mcp-pro')) {
     throw new Error('invalid connector identity');
   }
+  const ownedMachines = new Set(rawConnectors.flatMap((candidate) => candidate.machineId === undefined || candidate.machineId === null ? [] : [candidate.machineId]));
+  if (ownedMachines.size > 1) throw new Error('split connector machine identity');
   const fullTools = fullMcpToolNames();
   const proTools = [...PRO_TOOL_NAMES];
   const currentTools = new Map([
@@ -290,6 +314,9 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
   ]);
   const connectors = rawConnectors.map((candidate) => {
     const current = currentTools.get(candidate.connectorId)!;
+    const machineId = candidate.machineId ?? null;
+    const leaseGeneration = candidate.leaseGeneration === undefined ? (machineId === null ? 0 : 1) : Number(candidate.leaseGeneration);
+    if ((machineId === null && leaseGeneration !== 0) || (machineId !== null && leaseGeneration <= 0)) throw new Error('invalid connector fencing identity');
     return {
       connectorId: candidate.connectorId,
       label: candidate.label,
@@ -303,12 +330,14 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
       catalogHash: current.hash,
       healthPort: candidate.healthPort,
       managedProfilePath: candidate.managedProfilePath,
+      machineId,
       runtimeId: candidate.runtimeId ?? null,
       deploymentEpoch,
+      leaseGeneration,
     } satisfies ConnectorBinding;
   });
   const registry: ConnectorRegistryDocument = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     deploymentEpoch,
     updatedAt: value.updatedAt,
     connectors,
@@ -322,7 +351,9 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
       || candidate.catalogHash !== current.catalogHash
       || candidate.deploymentEpoch !== deploymentEpoch;
   }).map((candidate) => candidate.connectorId);
-  return { registry, changed: value.schemaVersion !== 2 || staleConnectorIds.length > 0, staleConnectorIds };
+  const ownershipMigrationRequired = value.schemaVersion !== 3
+    || rawConnectors.some((candidate) => candidate.machineId === undefined || candidate.leaseGeneration === undefined);
+  return { registry, changed: ownershipMigrationRequired || staleConnectorIds.length > 0, staleConnectorIds };
 }
 
 function isRawConnector(value: unknown): value is RawConnectorBinding {
@@ -336,6 +367,7 @@ function isRawConnector(value: unknown): value is RawConnectorBinding {
     && (value.mcpPath === '/mcp' || value.mcpPath === '/mcp-pro')
     && isPort(value.healthPort)
     && typeof value.managedProfilePath === 'string'
+    && (value.machineId === undefined || value.machineId === null || isUuid(value.machineId))
     && (value.runtimeId === undefined || value.runtimeId === null || isRuntimeId(value.runtimeId));
 }
 
@@ -365,12 +397,26 @@ function canonicalExistingPath(filename: string): string {
   }
 }
 
+function nextLeaseGeneration(current: number): number {
+  const next = current + 1;
+  if (!Number.isSafeInteger(next) || next <= 0) throw new RuntimeError('PERSISTENCE_FAILURE', 'Connector lease generation overflowed');
+  return next;
+}
+
 function isPositiveSafeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
 function isRuntimeId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 200 && /^[A-Za-z0-9._:-]+$/.test(value);
+}
+
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function isPort(value: unknown): value is number {

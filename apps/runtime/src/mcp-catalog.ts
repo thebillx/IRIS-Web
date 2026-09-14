@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { IdentityCoherenceState, TunnelBindingDiagnostic } from '@iris/domain';
 
 export const MCP_CATALOG_VERSION = '2.3.0' as const;
 export const MCP_SCHEMA_VERSION = '2026-07-28' as const;
@@ -25,10 +26,14 @@ export interface McpCatalogIdentity {
 }
 
 export interface McpCatalogRuntimeContext {
+  readonly machineId?: string | null;
   readonly runtimeId?: string | null;
   readonly instanceId?: string | null;
   readonly runtimeVersion?: string | null;
   readonly deploymentEpoch?: number | null;
+  readonly identityState?: IdentityCoherenceState | null;
+  readonly identityCode?: string | null;
+  readonly tunnelBindings?: readonly TunnelBindingDiagnostic[];
 }
 
 const FULL_CATALOG = [
@@ -73,6 +78,12 @@ const FULL_CATALOG = [
   entry('mission_cancel', 'ORCHESTRATION', 'mission.cancel', '2.1.0'),
   entry('mission_complete', 'ORCHESTRATION', 'mission.complete', '2.1.0'),
   entry('mission_evidence', 'ORCHESTRATION', 'mission.evidence', '2.1.0'),
+  entry('workspace', 'PROJECT_MUTATION', null, 'vNext-phase2'),
+  entry('fs', 'PROJECT_MUTATION', null, 'vNext-phase2'),
+  entry('artifact', 'PROJECT_MUTATION', null, 'vNext-phase2'),
+  entry('shell', 'PROJECT_MUTATION', null, 'vNext-phase3'),
+  entry('job', 'PROJECT_MUTATION', null, 'vNext-phase3'),
+  entry('git', 'PROJECT_MUTATION', null, 'vNext-phase4'),
   entry('catalog_identity', 'READ_ONLY', null, '2.3.0'),
 ] as const satisfies readonly McpCatalogEntry[];
 
@@ -134,11 +145,15 @@ export function catalogIdentityPayload(
 ): Record<string, unknown> {
   return {
     ...catalogIdentity(profile, definitions),
+    machineId: runtime.machineId ?? null,
     runtimeId: runtime.runtimeId ?? null,
     instanceId: runtime.instanceId ?? null,
     runtimeVersion: runtime.runtimeVersion ?? null,
     deploymentEpoch: runtime.deploymentEpoch ?? null,
     connectorProfile: profile,
+    identityState: runtime.identityState ?? null,
+    identityCode: runtime.identityCode ?? null,
+    tunnelBindings: runtime.tunnelBindings ?? [],
   };
 }
 

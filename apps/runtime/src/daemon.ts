@@ -9,7 +9,9 @@ import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
 import { FoundationStateStore, loadOrCreateOwnerAccessSecret, loadOrCreateRuntimeId, removeEndpointIfInstance, removeRuntimeControlIfInstance, writeEndpoint, writeRuntimeControl } from './persistence.js';
 import { loadOrCreateTunnelServiceSecret } from './credentials.js';
-import { readConnectorRegistry } from './connector-registry.js';
+import { inspectConnectorRegistry } from './connector-registry.js';
+import { loadOrCreateMachineId } from './machine-identity.js';
+import { assessConnectorRegistryIdentity } from './identity-coherence.js';
 import { startRuntimeServer, type RuntimeServerHandle } from './server.js';
 import { RuntimeState } from './state.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
@@ -19,6 +21,8 @@ import { WorkerAdapterRegistry } from './durable-mission-workers.js';
 import { recoverDurableMissions } from './durable-mission-recovery.js';
 import { assertSupportedNodeVersion } from './node-runtime.js';
 import { ProjectValidationJobManager } from './project-test.js';
+import { VNextResourceRegistry } from './resource-registry.js';
+import { DurableJobManager } from './durable-job-manager.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -49,10 +53,17 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     : await resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: options.dataRoot });
   await ensureRuntimeDataRoot(dataRoot);
 
+  const machineId = await loadOrCreateMachineId(dataRoot);
   const runtimeId = await loadOrCreateRuntimeId(dataRoot);
   const ownerAccessSecret = await loadOrCreateOwnerAccessSecret(dataRoot);
   const tunnelServiceSecret = await loadOrCreateTunnelServiceSecret(dataRoot);
-  const connectorRegistry = await readConnectorRegistry(dataRoot);
+  const connectorInspection = await inspectConnectorRegistry(dataRoot);
+  const connectorRegistry = connectorInspection?.registry ?? null;
+  const identityCoherence = assessConnectorRegistryIdentity(
+    connectorRegistry,
+    { machineId, runtimeId },
+    connectorInspection?.staleConnectorIds ?? [],
+  );
   const identity: RuntimeIdentity = {
     runtimeId,
     instanceId: randomUUID(),
@@ -100,7 +111,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     const controlSecret = randomBytes(32).toString('base64url');
 
     const health = (): RuntimeHealth => ({
-      status: shuttingDown ? 'stopping' : 'ready',
+      status: shuttingDown ? 'stopping' : identityCoherence.state === 'SPLIT' ? 'failed' : 'ready',
       version: IRIS_VERSION,
       platform: IRIS_PLATFORM,
       runtimeId: identity.runtimeId,
@@ -114,9 +125,24 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       productionModelConnected: state.executorDescriptor().productionModelConnected,
       apiUrl: server?.apiUrl ?? '',
       mcpUrl: server?.mcpUrl ?? '',
+      machineId,
+      identityState: identityCoherence.state,
+      identityCode: identityCoherence.code,
+      tunnelBindings: identityCoherence.tunnelBindings,
     });
 
-    const capabilities = new CapabilityService(state, permissionPolicy, permissionAudit, health, new ProjectValidationJobManager(dataRoot));
+    const resourceRegistry = new VNextResourceRegistry(state, dataRoot);
+    const durableJobs = new DurableJobManager(dataRoot, resourceRegistry);
+    await durableJobs.recover();
+    const capabilities = new CapabilityService(
+      state,
+      permissionPolicy,
+      permissionAudit,
+      health,
+      new ProjectValidationJobManager(dataRoot),
+      resourceRegistry,
+      durableJobs,
+    );
 
     const doctor = async (): Promise<DoctorReport> => {
       const probe = await probeRuntimeAuthority(dataRoot);
@@ -125,12 +151,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       let registryHealthy = true;
       try { await store.read(); } catch { registryHealthy = false; }
       const apiHealthy = server !== undefined && isLoopbackUrl(server.apiUrl);
+      const identityHealthy = identityCoherence.state !== 'SPLIT';
       const checks = [
         { code: 'RUNTIME_AUTHORITY', status: authorityHealthy ? 'pass' as const : 'fail' as const, message: authorityHealthy ? 'Authoritative daemon identity is current' : 'Runtime authority is not owned by this daemon' },
         { code: 'RUNTIME_DATA_ROOT', status: dataRootHealthy ? 'pass' as const : 'fail' as const, message: dataRootHealthy ? 'Runtime data root is private, readable, and writable' : 'Runtime data root is not secure and writable' },
         { code: 'API_LOOPBACK', status: apiHealthy ? 'pass' as const : 'fail' as const, message: apiHealthy ? 'API is bound to IPv4 loopback' : 'API is not bound to IPv4 loopback' },
         { code: 'PROJECT_REGISTRY', status: registryHealthy ? 'pass' as const : 'fail' as const, message: registryHealthy ? 'Project registry is readable' : 'Project registry is unreadable' },
         { code: 'DUPLICATE_AUTHORITY', status: authorityHealthy ? 'pass' as const : 'fail' as const, message: authorityHealthy ? 'No competing authority is observable' : 'Authority identity is ambiguous' },
+        { code: 'IDENTITY_COHERENCE', status: identityHealthy ? 'pass' as const : 'fail' as const, message: identityHealthy ? identityCoherence.detail : `${identityCoherence.code}: ${identityCoherence.detail}` },
       ];
       return { status: checks.every((check) => check.status === 'pass') ? 'pass' : 'fail', checks };
     };
@@ -152,10 +180,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         ...(connectorRegistry === null ? {} : { connectorDeploymentEpoch: connectorRegistry.deploymentEpoch }),
         connectorRuntimeId: runtimeId,
         catalogRuntimeContext: {
+          machineId,
           runtimeId,
           instanceId: identity.instanceId,
           runtimeVersion: identity.version,
           deploymentEpoch: connectorRegistry?.deploymentEpoch ?? null,
+          identityState: identityCoherence.state,
+          identityCode: identityCoherence.code,
+          tunnelBindings: identityCoherence.tunnelBindings,
         },
         requestShutdown: () => {
           void close().catch((error: unknown) => {

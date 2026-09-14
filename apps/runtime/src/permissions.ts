@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type {
   CapabilityDefinition,
+  CapabilityEffect,
   CapabilityId,
   PermissionDecisionRecord,
   PermissionMode,
@@ -23,6 +24,7 @@ export interface PolicyRequest {
   readonly actionId?: string | null | undefined;
   readonly projectId?: string | null | undefined;
   readonly targetPath?: string | null | undefined;
+  readonly effectiveEffects?: readonly CapabilityEffect[] | undefined;
 }
 
 export interface PermissionSnapshot {
@@ -72,6 +74,11 @@ export class PermissionPolicyEngine {
     const definition = capabilityDefinition(input.capabilityId);
     if (definition === null) return record(input, 'HIGH', 'DENY', 'Unknown capability fails closed', null, null);
 
+    const effectConsistency = validateEffectConsistency(definition, input.effectiveEffects);
+    if (!effectConsistency.valid) {
+      return record(input, definition.riskClass, 'DENY', effectConsistency.reason, input.projectId ?? null, normalizedDisplayTarget(input.targetPath));
+    }
+
     if (definition.riskClass === 'SYSTEM') {
       return record(input, definition.riskClass, 'OWNER_REQUIRED', 'System privilege or trust escalation always requires the owner', input.projectId ?? null, normalizedDisplayTarget(input.targetPath));
     }
@@ -104,11 +111,11 @@ export class PermissionPolicyEngine {
     const override = scope.projectId !== null
       && settings.projectOverrides.some((entry) => entry.projectId === scope.projectId && entry.capabilityId === definition.id);
     if (override) {
-      return record(input, definition.riskClass, 'ALLOW_AUTO', 'Owner-approved project policy override matches this capability', scope.projectId, scope.target);
+      return record(input, definition.riskClass, 'ALLOW_AUTO', effectAwareReason('Owner-approved project policy override matches this capability', input.effectiveEffects), scope.projectId, scope.target);
     }
 
-    const decision = decideMode(settings.mode, definition);
-    return record(input, definition.riskClass, decision, decisionReason(settings.mode, definition, decision), scope.projectId, scope.target);
+    const decision = decideMode(settings.mode, definition, input.effectiveEffects ?? []);
+    return record(input, definition.riskClass, decision, decisionReason(settings.mode, definition, decision, input.effectiveEffects ?? []), scope.projectId, scope.target);
   }
 
   public setMode(mode: PermissionMode): Promise<unknown> {
@@ -264,8 +271,28 @@ function projectTargetKind(capabilityId: CapabilityId): Exclude<ProjectTargetKin
   return null;
 }
 
-function decideMode(mode: PermissionMode, definition: CapabilityDefinition): PermissionDecisionRecord['decision'] {
-  if (!definition.mutation && definition.riskClass === 'LOW') return 'ALLOW_AUTO';
+function validateEffectConsistency(
+  definition: CapabilityDefinition,
+  effects: readonly CapabilityEffect[] | undefined,
+): { readonly valid: true; readonly reason: string } | { readonly valid: false; readonly reason: string } {
+  if (effects === undefined) return { valid: true, reason: 'Legacy policy caller supplied no effect metadata' };
+  if (effects.length === 0) return { valid: false, reason: 'Server supplied an empty effective-effect set for a known capability' };
+  if (!definition.mutation && (effects.includes('WRITE') || effects.includes('DESTRUCTIVE'))) {
+    return { valid: false, reason: 'Server effect metadata conflicts with the non-mutating capability definition' };
+  }
+  if (definition.mutation && !effects.some((effect) => effect === 'WRITE' || effect === 'EXECUTE' || effect === 'DESTRUCTIVE')) {
+    return { valid: false, reason: 'Server effect metadata conflicts with the mutating capability definition' };
+  }
+  return { valid: true, reason: 'Server-derived effects are consistent with the capability definition' };
+}
+
+function decideMode(
+  mode: PermissionMode,
+  definition: CapabilityDefinition,
+  effects: readonly CapabilityEffect[],
+): PermissionDecisionRecord['decision'] {
+  const mutatingByEffects = effects.includes('WRITE') || effects.includes('DESTRUCTIVE');
+  if (!definition.mutation && !mutatingByEffects && definition.riskClass === 'LOW') return 'ALLOW_AUTO';
   if (mode === 'ASK_EVERY_TIME') return 'OWNER_REQUIRED';
   if (mode === 'AUTO_APPROVE_LOW_RISK') return definition.riskClass === 'LOW' ? 'ALLOW_AUTO' : 'OWNER_REQUIRED';
   if (mode === 'AUTO_APPROVE_PROJECT_SCOPED') {
@@ -276,9 +303,20 @@ function decideMode(mode: PermissionMode, definition: CapabilityDefinition): Per
   return definition.riskClass === 'LOW' || definition.riskClass === 'MODERATE' ? 'ALLOW_AUTO' : 'OWNER_REQUIRED';
 }
 
-function decisionReason(mode: PermissionMode, definition: CapabilityDefinition, decision: PermissionDecisionRecord['decision']): string {
-  if (decision === 'ALLOW_AUTO') return `${mode} auto-approves ${definition.riskClass} ${definition.requiredScope.toLowerCase()} capability`;
-  return `${mode} requires owner approval for ${definition.riskClass} ${definition.requiredScope.toLowerCase()} capability`;
+function decisionReason(
+  mode: PermissionMode,
+  definition: CapabilityDefinition,
+  decision: PermissionDecisionRecord['decision'],
+  effects: readonly CapabilityEffect[],
+): string {
+  const base = decision === 'ALLOW_AUTO'
+    ? `${mode} auto-approves ${definition.riskClass} ${definition.requiredScope.toLowerCase()} capability`
+    : `${mode} requires owner approval for ${definition.riskClass} ${definition.requiredScope.toLowerCase()} capability`;
+  return effectAwareReason(base, effects);
+}
+
+function effectAwareReason(base: string, effects: readonly CapabilityEffect[] | undefined): string {
+  return effects === undefined ? base : `${base}; effectiveEffects=${effects.join(',')}`;
 }
 
 async function projectById(state: RuntimeState, projectId: string): Promise<ProjectReference | null> {
@@ -307,6 +345,7 @@ function record(
     target,
     decision,
     reason,
+    ...(input.effectiveEffects === undefined ? {} : { effectiveEffects: [...input.effectiveEffects] }),
   };
 }
 
