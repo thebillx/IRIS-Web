@@ -62,7 +62,9 @@ Permission settings are persisted privately in `permissions.json`. First initial
 
 `OWNER_REQUIRED` creates an in-memory, bounded, expiring pending approval and executes nothing. The Web Approval Center can deny, allow the exact action once, or—only for eligible MODERATE project capabilities—persist an always-allow project/capability override.
 
-Approval resolution re-evaluates the live scope and exact target before execution. If session, project, capability, or target changed, the action is denied.
+A FULL owner-authenticated MCP session may resolve a pending approval only when it is the exact originating session for a prepared `CHATGPT` mission action. The `owner_approval_resolve` continuation requires the pending approval ID plus the original mission/task/action/capability/exact-action identity, supports only `ALLOW_ONCE` or `DENY`, never creates an `ALWAYS_ALLOW_PROJECT` override, and consumes the approval at most once. A different client/session, stale mission binding, changed exact action, non-owner session, non-CHATGPT mission, or replay fails closed without widening authority.
+
+Approval resolution re-evaluates the live scope and exact target before execution. If session, project, capability, target, workspace/resource identity, or server-derived effects changed, the action is denied.
 
 The browser approval review surface is bounded by `100dvh`, keeps header/footer outside the scrollable details body, preserves complete exact-action text, wraps long unbroken values, uses native keyboard-operable buttons, and treats Escape/close as cancellation without execution. Routine `ALLOW_AUTO` work never opens this surface.
 

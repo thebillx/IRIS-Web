@@ -291,6 +291,24 @@ async function executeTool(
     return capabilities.execute({ capabilityId: 'mission.action.prepare', clientId: requiredClient, sessionId: requiredSession,
       missionId, taskId: requiredString(args, 'taskId'), actionCapabilityId: missionActionCapability(args, 'capabilityId'), summary: requiredString(args, 'summary') });
   }
+  if (name === 'owner_approval_resolve') {
+    if (principal !== 'owner') throw new RuntimeError('CONTROL_DENIED', 'Only the authenticated owner MCP principal can resolve approvals');
+    const missionId = requiredString(args, 'missionId');
+    await assertChatGptOperationalMission(state, missionId, requiredClient, requiredSession);
+    const decision = requiredString(args, 'decision');
+    if (decision !== 'ALLOW_ONCE' && decision !== 'DENY') throw new Error('decision must be ALLOW_ONCE or DENY');
+    return capabilities.resolveOriginatingOwnerApproval({
+      id: requiredBoundedString(args, 'approvalId', 200),
+      choice: decision,
+      clientId: requiredClient,
+      sessionId: requiredSession,
+      missionId,
+      taskId: requiredString(args, 'taskId'),
+      actionId: requiredString(args, 'actionId'),
+      capabilityId: requiredBoundedString(args, 'capabilityId', 200),
+      exactAction: requiredBoundedString(args, 'exactAction', 4000),
+    });
+  }
   if (name === 'mission_supervisor_gate_set') {
     const missionId = requiredString(args, 'missionId');
     await assertChatGptOperationalMission(state, missionId, requiredClient, requiredSession);
@@ -384,6 +402,7 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'mission_task_create', description: 'Register a task identity inside a mission.', inputSchema: { type: 'object', required: ['missionId','title'], properties: { ...sessionProperty, missionId: { type: 'string' }, title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
     { name: 'mission_task_state_set', description: 'Record orchestration-owned task state.', inputSchema: { type: 'object', required: ['missionId','taskId','state'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, state: { enum: ['PENDING','RUNNING','BLOCKED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
     { name: 'mission_action_prepare', description: 'Prepare one governed IRIS execution action for a CHATGPT-orchestrated mission. Preparation never executes the capability.', inputSchema: { type: 'object', required: ['missionId','taskId','capabilityId','summary'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, capabilityId: { enum: ['file.read','file.write','file.edit','file.delete','directory.create','directory.delete','project.test.run','project.command.run','project.validation.start','git.local','remote.publish'] }, summary: { type: 'string', maxLength: 400 } }, additionalProperties: false } },
+    { name: 'owner_approval_resolve', description: 'Resolve one pending exact mission approval only for the authenticated originating owner session. Supports ALLOW_ONCE or DENY and never creates a persistent policy override.', inputSchema: { type: 'object', required: ['approvalId','missionId','taskId','actionId','capabilityId','exactAction','decision'], properties: { ...sessionProperty, approvalId: { type: 'string', minLength: 1, maxLength: 200 }, missionId: { type: 'string' }, taskId: { type: 'string' }, actionId: { type: 'string' }, capabilityId: { type: 'string', minLength: 1, maxLength: 200 }, exactAction: { type: 'string', minLength: 1, maxLength: 4000 }, decision: { enum: ['ALLOW_ONCE','DENY'] } }, additionalProperties: false } },
     { name: 'mission_supervisor_gate_set', description: 'Record supervisor-gate state only for the active CHATGPT operational orchestrator. The gate never overrides IRIS permission policy.', inputSchema: { type: 'object', required: ['missionId','state'], properties: { ...sessionProperty, missionId: { type: 'string' }, state: { enum: ['NOT_REQUIRED','PENDING','APPROVED','DENIED'] }, reason: { type: ['string','null'], maxLength: 500 } }, additionalProperties: false } },
     { name: 'project_test_run', description: 'Run only the registered project declared test script for one prepared CHATGPT mission action through CapabilityService.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, actionId: { type: 'string' }, projectId: { type: 'string' } }, additionalProperties: false } },
     { name: 'project_validation_run', description: 'Run one exact script physically declared in the selected project root package.json using its declared npm or pnpm packageManager. No shell text is accepted.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId','scriptName'], properties: { ...sessionProperty, ...associationProperties, projectId: { type: 'string' }, scriptName: { type: 'string', minLength: 1, maxLength: 100 } }, additionalProperties: false } },

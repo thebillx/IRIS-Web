@@ -31,7 +31,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     const fixture = await serviceFixture();
     const definitions = phase4GroupedToolDefinitions();
     expect(definitions.map((tool) => tool.name)).toEqual(['git']);
-    expect(catalogToolNames('FULL')).toHaveLength(48);
+    expect(catalogToolNames('FULL')).toHaveLength(49);
     expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['git_status','git_local','remote_publish','workspace','fs','artifact','shell','job','git']));
     expect(catalogToolNames('PRO')).toEqual(['list_projects','project_info','git_status','file_read','search']);
 

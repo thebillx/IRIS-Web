@@ -193,16 +193,100 @@ export class CapabilityService {
   public resolveApproval(id: string, choice: OwnerApprovalChoice): Promise<CapabilityOutcome> {
     this.pruneExpiredApprovals();
     const pending = this.pending.get(id);
-    if (pending?.operation.mission === undefined) return this.resolveApprovalGoverned(id, choice);
-    const result = this.missionActionTail.then(() => this.resolveApprovalGoverned(id, choice), () => this.resolveApprovalGoverned(id, choice));
+    if (pending?.operation.mission === undefined) return this.resolveApprovalGoverned(id, choice, 'approval-center');
+    const result = this.missionActionTail.then(
+      () => this.resolveApprovalGoverned(id, choice, 'approval-center'),
+      () => this.resolveApprovalGoverned(id, choice, 'approval-center'),
+    );
     this.missionActionTail = result.then(() => undefined, () => undefined);
     return result;
   }
 
-  private async resolveApprovalGoverned(id: string, choice: OwnerApprovalChoice): Promise<CapabilityOutcome> {
-    const pending = this.claimPendingApproval(id);
+  public resolveOriginatingOwnerApproval(input: Readonly<{
+    id: string;
+    choice: 'ALLOW_ONCE' | 'DENY';
+    clientId: string;
+    sessionId: string;
+    missionId: string;
+    taskId: string;
+    actionId: string;
+    capabilityId: string;
+    exactAction: string;
+  }>): Promise<CapabilityOutcome> {
+    const result = this.missionActionTail.then(
+      () => this.resolveOriginatingOwnerApprovalGoverned(input),
+      () => this.resolveOriginatingOwnerApprovalGoverned(input),
+    );
+    this.missionActionTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async resolveOriginatingOwnerApprovalGoverned(input: Readonly<{
+    id: string;
+    choice: 'ALLOW_ONCE' | 'DENY';
+    clientId: string;
+    sessionId: string;
+    missionId: string;
+    taskId: string;
+    actionId: string;
+    capabilityId: string;
+    exactAction: string;
+  }>): Promise<CapabilityOutcome> {
+    this.pruneExpiredApprovals();
+    const pending = this.pending.get(input.id);
+    if (pending === undefined) throw new RuntimeError('APPROVAL_NOT_FOUND', 'Pending approval was not found or has expired');
+    if (pending.operation.mission === undefined) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Originating-session approval requires a prepared mission action');
+    }
+    if (pending.operation.mission.orchestratorMode !== 'CHATGPT') {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Originating-session approval is available only for CHATGPT-orchestrated mission actions');
+    }
+
+    const session = this.state.getSessionForClient(input.sessionId, input.clientId);
+    if (session.agentRole !== 'owner') {
+      throw new RuntimeError('CONTROL_DENIED', 'Only the authenticated originating owner session can resolve this approval');
+    }
+    if (pending.view.clientId !== input.clientId || pending.view.sessionId !== input.sessionId) {
+      throw new RuntimeError('CONTROL_DENIED', 'Pending approval belongs to a different client/session');
+    }
+    if (pending.view.missionId !== input.missionId
+      || pending.view.taskId !== input.taskId
+      || pending.view.actionId !== input.actionId
+      || pending.operation.mission.missionId !== input.missionId
+      || pending.operation.mission.taskId !== input.taskId
+      || pending.operation.mission.actionId !== input.actionId) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Pending approval mission/task/action identity does not match');
+    }
+    if (pending.view.capabilityId !== input.capabilityId || pending.view.exactAction !== input.exactAction) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Pending approval capability or exact action does not match');
+    }
+
+    const claimed = this.claimPendingApproval(input.id);
+    return this.resolveClaimedApproval(claimed, input.choice, 'originating-owner-session');
+  }
+
+  private async resolveApprovalGoverned(
+    id: string,
+    choice: OwnerApprovalChoice,
+    source: 'approval-center' | 'originating-owner-session',
+  ): Promise<CapabilityOutcome> {
+    return this.resolveClaimedApproval(this.claimPendingApproval(id), choice, source);
+  }
+
+  private async resolveClaimedApproval(
+    pending: PendingApprovalInternal,
+    choice: OwnerApprovalChoice,
+    source: 'approval-center' | 'originating-owner-session',
+  ): Promise<CapabilityOutcome> {
     if (choice === 'DENY') {
-      const denied: PermissionDecisionRecord = { ...pending.view, timestamp: new Date().toISOString(), decision: 'DENY', reason: 'Owner denied the pending exact action' };
+      const denied: PermissionDecisionRecord = {
+        ...pending.view,
+        timestamp: new Date().toISOString(),
+        decision: 'DENY',
+        reason: source === 'originating-owner-session'
+          ? 'Owner denied the pending exact action through the authenticated originating MCP session'
+          : 'Owner denied the pending exact action',
+      };
       await this.audit.append(denied, 'DENIED');
       if (pending.operation.mission !== undefined) await this.state.markMissionActionDenied(pending.operation.mission, denied.reason);
       return { status: 'denied', reason: denied.reason };
@@ -243,7 +327,9 @@ export class CapabilityService {
       decision: 'ALLOW_ONCE',
       reason: choice === 'ALWAYS_ALLOW_PROJECT'
         ? 'Owner approved this exact action and added the matching project-scoped policy override'
-        : 'Owner approved this exact action once',
+        : source === 'originating-owner-session'
+          ? 'Owner approved this exact action once through the authenticated originating MCP session'
+          : 'Owner approved this exact action once',
     };
     await this.audit.append(approved, 'DECISION');
     return this.executeAndAudit(pending.operation, approved);
