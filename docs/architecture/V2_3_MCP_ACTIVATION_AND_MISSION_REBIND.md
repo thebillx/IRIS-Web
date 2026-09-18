@@ -86,8 +86,8 @@ mission_rebind(missionId, projectId, expectedBindingRevision)
 mission_resume
 ```
 
-For a durable correction case, the existing mission ID remains the same; rebind
-is not mission recreation and does not alter project implementation.
+For the AgriScope correction case, the existing mission ID remains the same;
+rebind is not mission recreation and does not alter project implementation.
 
 ## Troubleshooting
 
@@ -107,7 +107,7 @@ MISSION_SESSION_STALE
 
 Catalog and mission diagnostics never print credentials or secret material.
 
-## Generic execution handoff
+## AgriScope execution handoff
 
 The IRIS-side delivery surface for a registered project is:
 
@@ -128,7 +128,7 @@ long-running check, discover the declaration, prepare one mission action, start
 it with a stable `requestId`, then poll the returned `jobId`; reconnecting and
 retrying the same request does not start a second job.
 
-For a durable project correction mission, resume the existing mission after the
+For the AgriScope correction mission, resume the existing mission after the
 FULL connector exposes the current catalog. If the selected session is new,
 call the governed `mission_rebind` with the existing mission ID, registered
 project ID, and current `bindingRevision`, then continue using that same
