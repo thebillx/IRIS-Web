@@ -4,6 +4,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { IRIS_VERSION, RuntimeError, type RuntimeHealth, type RuntimeIdentity } from '@iris/domain';
 import { AGENT_EXECUTOR_ENV, OPENAI_API_KEY_ENV, OPENAI_MODEL_ENV } from './agent-executor.js';
+import { assertActivationSourceIdentity, type ActivationSourceIdentity } from './activation-source-identity.js';
 import { AUTHORITY_RECOVERY_IN_PROGRESS, probeRuntimeAuthority } from './authority.js';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { readEndpoint, readRuntimeControl, type EndpointDocument, type RuntimeControlDocument } from './persistence.js';
@@ -20,6 +21,9 @@ export interface StartRuntimeOptions {
   readonly dataRoot?: string;
   readonly preferredPort?: number;
   readonly startupDeadlineMs?: number;
+  readonly sourceRoot?: string;
+  readonly protectedReferenceRoot?: string;
+  readonly expectedSourceIdentity?: ActivationSourceIdentity;
 }
 
 export async function runtimeStatus(dataRootInput?: string): Promise<RuntimeObservedStatus> {
@@ -115,21 +119,33 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
     return waitForRunningRuntime(dataRoot, options.startupDeadlineMs ?? 10_000);
   }
 
-  const sourceEntrypoint = path.resolve(import.meta.dirname, 'main.ts');
-  const builtEntrypoint = path.resolve(import.meta.dirname, 'main.js');
+  const runtimeSourceRoot = options.sourceRoot === undefined
+    ? path.resolve(import.meta.dirname, '../../..')
+    : path.resolve(options.sourceRoot);
+  const runtimeDirectory = path.join(runtimeSourceRoot, 'apps', 'runtime');
+  const sourceEntrypoint = path.join(runtimeDirectory, 'src', 'main.ts');
+  const builtEntrypoint = path.join(runtimeDirectory, 'dist', 'main.js');
   const sourceMode = existsSync(sourceEntrypoint);
   const executable = canonicalNodeRuntime().path;
   const args = sourceMode
     ? [
-      '--require', path.resolve(import.meta.dirname, '..', 'node_modules', 'tsx', 'dist', 'preflight.cjs'),
-      '--import', pathToFileURL(path.resolve(import.meta.dirname, '..', 'node_modules', 'tsx', 'dist', 'loader.mjs')).href,
+      '--require', path.join(runtimeDirectory, 'node_modules', 'tsx', 'dist', 'preflight.cjs'),
+      '--import', pathToFileURL(path.join(runtimeDirectory, 'node_modules', 'tsx', 'dist', 'loader.mjs')).href,
       sourceEntrypoint,
     ]
     : [builtEntrypoint];
+  if (options.expectedSourceIdentity !== undefined) {
+    await assertActivationSourceIdentity(
+      runtimeSourceRoot,
+      options.expectedSourceIdentity,
+      'Candidate source identity changed at the runtime launch boundary',
+    );
+  }
   const child = spawn(executable, args, {
+    cwd: runtimeSourceRoot,
     detached: true,
     stdio: 'ignore',
-    env: runtimeChildEnvironment(dataRoot, options.preferredPort),
+    env: runtimeChildEnvironment(dataRoot, options.preferredPort, process.env, options.protectedReferenceRoot),
   });
   child.unref();
   return waitForRunningRuntime(
@@ -201,11 +217,20 @@ export async function stopRuntime(dataRootInput?: string, shutdownDeadlineMs = 1
 
 export const STOP_COMPLETE_CONTRACT = 'target_pid_gone+target_descriptor_absent+target_control_absent+authority_unowned' as const;
 
-export function runtimeChildEnvironment(dataRoot: string, preferredPort?: number, source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function runtimeChildEnvironment(
+  dataRoot: string,
+  preferredPort?: number,
+  source: NodeJS.ProcessEnv = process.env,
+  protectedReferenceRoot?: string,
+): NodeJS.ProcessEnv {
+  const configuredProtectedReferenceRoot = protectedReferenceRoot ?? source.IRIS_PROTECTED_REFERENCE_ROOT?.trim();
   const environment: NodeJS.ProcessEnv = {
     PATH: node24Path(),
     [RUNTIME_DATA_ENV]: dataRoot,
     ...(preferredPort === undefined ? {} : { IRIS_RUNTIME_PORT: String(preferredPort) }),
+    ...(configuredProtectedReferenceRoot === undefined || configuredProtectedReferenceRoot.length === 0
+      ? {}
+      : { IRIS_PROTECTED_REFERENCE_ROOT: configuredProtectedReferenceRoot }),
   };
   for (const name of ['HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE'] as const) {
     const value = source[name];
@@ -305,7 +330,7 @@ function isRemoteStatus(value: unknown): value is { readonly identity: RuntimeId
     && health.pid === identity.pid
     && health.platform === identity.platform
     && health.version === identity.version
-    && (health.status === 'ready' || health.status === 'stopping')
+    && (health.status === 'ready' || health.status === 'failed' || health.status === 'stopping')
     && health.authority === 'owned'
     && typeof health.uptimeMs === 'number'
     && typeof health.apiUrl === 'string'

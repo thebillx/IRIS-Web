@@ -5,6 +5,8 @@ import { promisify } from 'node:util';
 import { RuntimeError } from '@iris/domain';
 import { writePrivateJsonAtomic } from './credentials.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
+import { inspectRegistrationRoot } from './project-path.js';
+import { PROTECTED_REFERENCE_ROOT_ENV } from './permissions.js';
 
 const execFileAsync = promisify(execFile);
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
@@ -26,9 +28,16 @@ export function launchdPaths(dataRoot: string): LaunchdPaths {
   };
 }
 
-export function renderLaunchAgent(dataRoot: string, executable: string, controlScript: string, executableArguments: readonly string[] = []): string {
+export function renderLaunchAgent(
+  dataRoot: string,
+  executable: string,
+  controlScript: string,
+  executableArguments: readonly string[] = [],
+  protectedReferenceRoot?: string,
+): string {
   const paths = launchdPaths(dataRoot);
   const argumentsList = [executable, ...executableArguments, controlScript, 'supervisor'];
+  const configuredProtectedReferenceRoot = protectedReferenceRoot?.trim();
   return [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
@@ -44,6 +53,9 @@ export function renderLaunchAgent(dataRoot: string, executable: string, controlS
     '  <dict>',
     `    <key>IRIS_RUNTIME_DATA_ROOT</key><string>${xml(dataRoot)}</string>`,
     `    <key>PATH</key><string>${xml(node24Path(executable))}</string>`,
+    ...(configuredProtectedReferenceRoot === undefined || configuredProtectedReferenceRoot.length === 0
+      ? []
+      : [`    <key>${PROTECTED_REFERENCE_ROOT_ENV}</key><string>${xml(configuredProtectedReferenceRoot)}</string>`]),
     '  </dict>',
     '  <key>RunAtLoad</key><true/>',
     '  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>',
@@ -56,7 +68,13 @@ export function renderLaunchAgent(dataRoot: string, executable: string, controlS
   ].join('\n');
 }
 
-export async function writeLaunchAgent(dataRoot: string, executable: string, controlScript: string, executableArguments: readonly string[] = []): Promise<LaunchdPaths> {
+export async function writeLaunchAgent(
+  dataRoot: string,
+  executable: string,
+  controlScript: string,
+  executableArguments: readonly string[] = [],
+  protectedReferenceRoot?: string,
+): Promise<LaunchdPaths> {
   const paths = launchdPaths(dataRoot);
   await mkdir(paths.directory, { recursive: true, mode: 0o700 });
   await mkdir(path.dirname(paths.stdout), { recursive: true, mode: 0o700 });
@@ -69,14 +87,28 @@ export async function writeLaunchAgent(dataRoot: string, executable: string, con
     plist: paths.plist,
   });
   const { writePrivateTextAtomic } = await import('./credentials.js');
-  await writePrivateTextAtomic(paths.plist, renderLaunchAgent(dataRoot, executable, controlScript, executableArguments));
+  await writePrivateTextAtomic(paths.plist, renderLaunchAgent(dataRoot, executable, controlScript, executableArguments, protectedReferenceRoot));
   return paths;
 }
 
-export async function installLaunchAgent(dataRoot: string, executable: string, controlScript: string, executableArguments: readonly string[] = []): Promise<LaunchdPaths> {
+export async function installLaunchAgent(
+  dataRoot: string,
+  executable: string,
+  controlScript: string,
+  executableArguments: readonly string[] = [],
+  protectedReferenceRoot?: string,
+): Promise<LaunchdPaths> {
   assertSupportedNodeVersion();
   await access(controlScript).catch(() => { throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Build IRIS before installing its LaunchAgent'); });
-  const paths = await writeLaunchAgent(dataRoot, canonicalNodeRuntime().path, controlScript, executableArguments);
+  let canonicalProtectedReferenceRoot: string | undefined;
+  if (protectedReferenceRoot !== undefined && protectedReferenceRoot.trim().length > 0) {
+    const inspection = await inspectRegistrationRoot(protectedReferenceRoot.trim());
+    if (!inspection.valid || inspection.target === null) {
+      throw new RuntimeError('INVALID_PROJECT_PATH', `${PROTECTED_REFERENCE_ROOT_ENV} must identify an existing canonical non-root directory`);
+    }
+    canonicalProtectedReferenceRoot = inspection.target;
+  }
+  const paths = await writeLaunchAgent(dataRoot, canonicalNodeRuntime().path, controlScript, executableArguments, canonicalProtectedReferenceRoot);
   const domain = launchdDomain();
   const serviceTarget = `${domain}/${LAUNCH_AGENT_LABEL}`;
   try {

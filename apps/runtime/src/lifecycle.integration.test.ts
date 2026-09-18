@@ -5,12 +5,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { probeRuntimeAuthority } from './authority.js';
+import { bindConnectorRuntime, initializeConnectorRegistry } from './connector-registry.js';
 import { runtimeChildEnvironment, runtimeStatus, startRuntime, stopRuntime } from './lifecycle.js';
+import { loadOrCreateMachineId } from './machine-identity.js';
 import { MCP_PROTOCOL_VERSION } from './mcp.js';
 import { loadOrCreateRuntimeId, readEndpoint, readOwnerAccessSecret, readRuntimeControl, writeEndpoint, writeRuntimeControl } from './persistence.js';
 import { node24Path } from './node-runtime.js';
 
 const roots: string[] = [];
+const sourceRoot = path.resolve(import.meta.dirname, '../../..');
 let occupiedServer: Server | undefined;
 let ownerAccessToken = '';
 
@@ -39,15 +42,22 @@ describe('runtime lifecycle integration', () => {
     const environment = runtimeChildEnvironment('/private/tmp/iris-runtime-test', 43110, {
       PATH: node24Path(), HOME: '/Users/test', TMPDIR: '/private/tmp', LANG: 'en_US.UTF-8',
       NODE_OPTIONS: '--require /tmp/untrusted.js', CLOUD_TOKEN: 'secret-value',
+      IRIS_PROTECTED_REFERENCE_ROOT: '/private/tmp/protected-reference',
       IRIS_AGENT_EXECUTOR: 'openai', OPENAI_API_KEY: 'openai-test-secret', IRIS_OPENAI_MODEL: 'gpt-test-model',
     });
     expect(environment).toMatchObject({
       PATH: node24Path(), HOME: '/Users/test', TMPDIR: '/private/tmp', LANG: 'en_US.UTF-8',
       IRIS_RUNTIME_DATA_ROOT: '/private/tmp/iris-runtime-test', IRIS_RUNTIME_PORT: '43110',
+      IRIS_PROTECTED_REFERENCE_ROOT: '/private/tmp/protected-reference',
       IRIS_AGENT_EXECUTOR: 'openai', OPENAI_API_KEY: 'openai-test-secret', IRIS_OPENAI_MODEL: 'gpt-test-model',
     });
     expect(environment.NODE_OPTIONS).toBeUndefined();
     expect(environment.CLOUD_TOKEN).toBeUndefined();
+
+    const explicitlyConfigured = runtimeChildEnvironment('/private/tmp/iris-runtime-test', 43110, {
+      PATH: node24Path(), IRIS_PROTECTED_REFERENCE_ROOT: '/private/tmp/inherited-reference',
+    }, '/private/tmp/explicit-owner-reference');
+    expect(explicitlyConfigured.IRIS_PROTECTED_REFERENCE_ROOT).toBe('/private/tmp/explicit-owner-reference');
 
     const developmentEnvironment = runtimeChildEnvironment('/private/tmp/iris-runtime-test', 43110, {
       PATH: node24Path(),
@@ -57,6 +67,41 @@ describe('runtime lifecycle integration', () => {
     expect(developmentEnvironment.OPENAI_API_KEY).toBeUndefined();
     expect(developmentEnvironment.IRIS_OPENAI_MODEL).toBeUndefined();
   });
+
+  it('rejects a stale expected activation source identity before spawning a runtime', async () => {
+    const dataRoot = await temp('iris-lifecycle-launch-attestation-');
+    const identityBoundStart = startRuntime as unknown as (options: {
+      readonly dataRoot: string;
+      readonly preferredPort: number;
+      readonly startupDeadlineMs: number;
+      readonly sourceRoot: string;
+      readonly expectedSourceIdentity: {
+        readonly head: string;
+        readonly candidateFingerprint: string;
+        readonly trackedModifiedCount: number;
+        readonly fingerprintAlgorithm: 'sha256:sorted-tracked-path-content-v1';
+      };
+    }) => ReturnType<typeof startRuntime>;
+
+    try {
+      await expect(identityBoundStart({
+        dataRoot,
+        preferredPort: 0,
+        startupDeadlineMs: 15_000,
+        sourceRoot,
+        expectedSourceIdentity: {
+          head: 'f'.repeat(40),
+          candidateFingerprint: 'e'.repeat(64),
+          trackedModifiedCount: 0,
+          fingerprintAlgorithm: 'sha256:sorted-tracked-path-content-v1',
+        },
+      })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+      await expect(runtimeStatus(dataRoot)).resolves.toMatchObject({ state: 'stopped' });
+    } finally {
+      const observed = await runtimeStatus(dataRoot);
+      if (observed.state === 'running') await stopRuntime(dataRoot, 15_000);
+    }
+  }, 30_000);
 
   it('recovers a matching stale schema-v1 authority and endpoint that predates runtime control metadata', async () => {
     const dataRoot = await temp('iris-lifecycle-v1-stale-');
@@ -119,6 +164,34 @@ describe('runtime lifecycle integration', () => {
     await expect(runtimeStatus(dataRoot)).resolves.toMatchObject({ state: 'indeterminate' });
     await expect(startRuntime({ dataRoot, preferredPort: 0, startupDeadlineMs: 2_000 })).rejects.toMatchObject({ code: 'AUTHORITY_INDETERMINATE' });
   });
+
+  it('keeps an identity-valid SPLIT daemon observable for bounded recovery without widening readiness', async () => {
+    const dataRoot = await temp('iris-lifecycle-split-observable-');
+    const canonicalRoot = await canonicalDataRoot(dataRoot);
+    const runtimeId = await loadOrCreateRuntimeId(canonicalRoot);
+    const machineId = await loadOrCreateMachineId(canonicalRoot);
+    await initializeConnectorRegistry(canonicalRoot, {
+      fullTunnelId: `tunnel_${'a'.repeat(32)}`,
+      proTunnelId: `tunnel_${'b'.repeat(32)}`,
+    });
+    await bindConnectorRuntime(canonicalRoot, randomUUID(), machineId);
+
+    const started = await startRuntime({ dataRoot, preferredPort: 0, startupDeadlineMs: 15_000 });
+    expect(started.state).toBe('running');
+    expect(started.endpoint?.runtimeId).toBe(runtimeId);
+    expect(started.health).toMatchObject({ status: 'failed', identityState: 'SPLIT', identityCode: 'SPLIT_IDENTITY' });
+
+    const observed = await runtimeStatus(dataRoot);
+    expect(observed).toMatchObject({
+      state: 'running',
+      endpoint: { runtimeId, instanceId: started.endpoint?.instanceId },
+      health: { status: 'failed', identityState: 'SPLIT', identityCode: 'SPLIT_IDENTITY' },
+    });
+
+    const stopped = await stopRuntime(dataRoot, 15_000);
+    expect(stopped.state).toBe('stopped');
+    expect(await probeRuntimeAuthority(canonicalRoot)).toEqual({ state: 'unowned' });
+  }, 30_000);
 
   it('proves one daemon, safe port fallback, multi-session isolation, STOP_COMPLETE, persistence, and immediate restart', async () => {
     const dataRoot = await temp('iris-lifecycle-data-');

@@ -13,6 +13,7 @@ import { inspectProjectTarget, inspectRegistrationRoot, pathIsWithin, type Proje
 import type { RuntimeState } from './state.js';
 
 export const LEGACY_REFERENCE_ROOT = '/Users/bill/iris-native-runtime' as const;
+export const PROTECTED_REFERENCE_ROOT_ENV = 'IRIS_PROTECTED_REFERENCE_ROOT' as const;
 
 export interface PolicyRequest {
   readonly capabilityId: string;
