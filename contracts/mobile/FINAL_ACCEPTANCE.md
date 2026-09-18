@@ -117,7 +117,13 @@ Phase 6 mobile validation is now wired into repository root commands:
 The first broad repository run observed two existing infrastructure timing/ownership failures:
 a 5-second Hermes test timeout and one Phase 3 durable-job result reported LOST instead of
 SUCCEEDED. Both tests were immediately rerun serially with one worker and passed **17/17**.
-The final canonical repository run then passed completely.
+
+The Hermes governed project-test case was then measured independently at about **6.0 seconds**,
+proving that its inherited 5-second Vitest default could produce a false negative under normal
+process load. Only that test's harness timeout was raised to **15 seconds**; production behavior
+and execution deadlines were not changed. Focused Hermes + Phase 3 validation passed **17/17**
+after the change. The final canonical Phase 6 worktree run then passed completely, including
+mobile **48/48** and runtime **308/308**.
 
 ## Live runtime preservation
 
