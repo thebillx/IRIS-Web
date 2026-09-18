@@ -1,6 +1,7 @@
 import { RuntimeError, type MissionEvidence, type OrchestratorMode } from '@iris/domain';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
 import type { DurableMissionLifecycleService } from './durable-mission-service.js';
+import type { McpPrincipal } from './mcp.js';
 import type { RuntimeState } from './state.js';
 
 const CLIENT_ID_HEADER = 'x-iris-client-id';
@@ -13,12 +14,35 @@ export async function executeV21LifecycleTool(
   capabilities: CapabilityService,
   state: RuntimeState,
   lifecycle: DurableMissionLifecycleService,
+  principal: McpPrincipal = 'owner',
 ): Promise<CapabilityOutcome | unknown> {
   if (name === 'mission_create') return createLifecycleMission(args, request, capabilities, state, lifecycle);
 
   const identity = resolveSessionIdentity(args, request, state);
   const missionId = requiredBoundedString(args, 'missionId', 200);
-  await lifecycle.assertSessionControl(missionId, identity.clientId, identity.sessionId);
+  if (name === 'mission_rebind') {
+    if (principal !== 'owner') throw new RuntimeError('CONTROL_DENIED', 'Only the authenticated IRIS owner may rebind a durable mission session');
+    return state.rebindMissionSession({
+      missionId,
+      clientId: identity.clientId,
+      sessionId: identity.sessionId,
+      projectId: requiredBoundedString(args, 'projectId', 200),
+      expectedBindingRevision: requiredPositiveInteger(args, 'expectedBindingRevision'),
+      reason: optionalBoundedString(args, 'reason', 500) ?? 'Owner requested durable cross-session continuation',
+    });
+  }
+  try {
+    await lifecycle.assertSessionControl(missionId, identity.clientId, identity.sessionId);
+  } catch (error) {
+    if (principal === 'owner' && error instanceof RuntimeError && error.code === 'CONTROL_DENIED') {
+      const mission = await state.getMission(missionId).catch(() => null);
+      if (mission !== null && mission.state !== 'COMPLETED' && mission.state !== 'FAILED' && mission.state !== 'CANCELLED'
+        && (mission.clientId !== identity.clientId || mission.sessionId !== identity.sessionId)) {
+        throw new RuntimeError('MISSION_SESSION_STALE', 'Mission session binding is stale; call mission_rebind with the current project and binding revision before resuming');
+      }
+    }
+    throw error;
+  }
 
   if (name === 'mission_start') return lifecycle.start({
     missionId,

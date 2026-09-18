@@ -67,7 +67,8 @@ export type MissionTimelineKind =
   | 'ACTION_DENIED'
   | 'ACTION_FAILED'
   | 'SUPERVISOR_GATE_CHANGED'
-  | 'ORCHESTRATOR_MODE_CHANGED';
+  | 'ORCHESTRATOR_MODE_CHANGED'
+  | 'MISSION_SESSION_REBOUND';
 
 export interface MissionExecutionAssociation {
   readonly missionId: string;
@@ -136,6 +137,21 @@ export interface MissionTimelineEvent {
   readonly message: string;
 }
 
+export interface MissionRebindAuditEvent {
+  readonly id: string;
+  readonly missionId: string;
+  readonly oldClientId: string;
+  readonly oldSessionId: string;
+  readonly newClientId: string;
+  readonly newSessionId: string;
+  readonly principal: 'owner';
+  readonly projectId: string;
+  readonly timestamp: string;
+  readonly reason: string;
+  readonly bindingRevision: number;
+  readonly result: 'SUCCESS';
+}
+
 export interface MissionSnapshot {
   readonly id: string;
   readonly title: string;
@@ -146,6 +162,9 @@ export interface MissionSnapshot {
   readonly orchestratorHandoffIds: readonly string[];
   readonly clientId: string;
   readonly sessionId: string;
+  readonly ownerClientId: string;
+  readonly bindingRevision: number;
+  readonly rebindAudit: readonly MissionRebindAuditEvent[];
   readonly projectId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -264,10 +283,14 @@ export type CapabilityId =
   | 'project.default.set'
   | 'file.read'
   | 'file.write'
+  | 'file.edit'
   | 'file.delete'
   | 'directory.create'
   | 'directory.delete'
   | 'project.command.run'
+  | 'project.validation.discover'
+  | 'project.validation.start'
+  | 'project.validation.job.read'
   | 'git.local'
   | 'runtime.lifecycle'
   | 'web.lifecycle'
@@ -351,7 +374,10 @@ export type RuntimeFailureCode =
   | 'PROCESS_OWNERSHIP_AMBIGUOUS'
   | 'RECOVERY_EXHAUSTED'
   | 'E2E_PROBE_UNAVAILABLE'
-  | 'NODE_VERSION_UNSUPPORTED';
+  | 'NODE_VERSION_UNSUPPORTED'
+  | 'MCP_CATALOG_STALE'
+  | 'MISSION_SESSION_STALE'
+  | 'PRECONDITION_FAILED';
 
 export class RuntimeError extends Error {
   public constructor(

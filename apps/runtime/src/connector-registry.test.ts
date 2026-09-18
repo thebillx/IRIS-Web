@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { bindConnectorRuntime, catalogFingerprint, createConnectorRegistry, initializeConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry } from './connector-registry.js';
+import { bindConnectorRuntime, catalogFingerprint, createConnectorRegistry, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry } from './connector-registry.js';
 import { fullMcpToolNames } from './mcp-v21.js';
 import { PRO_TOOL_NAMES } from './mcp.js';
 
@@ -39,6 +39,9 @@ describe('connector registry', () => {
     });
     await writeFile(path.join(dataRoot, 'connector-registry.json'), JSON.stringify({ ...old, schemaVersion: 1, connectors: oldConnectors }), { mode: 0o600 });
 
+    const inspection = await inspectConnectorRegistry(dataRoot);
+    expect(inspection?.changed).toBe(true);
+    expect(inspection?.staleConnectorIds).toEqual(['iris-full', 'iris-pro']);
     const readable = await readConnectorRegistry(dataRoot);
     expect(readable?.connectors[0]?.expectedToolNames).toEqual(fullMcpToolNames());
     const reconciled = await reconcileConnectorRegistry(dataRoot);

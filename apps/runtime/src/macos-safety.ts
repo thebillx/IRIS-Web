@@ -11,6 +11,16 @@ export type ProcessStartObservation =
   | { readonly state: 'dead' }
   | { readonly state: 'indeterminate' };
 
+export interface SecureProjectFileEditResult {
+  readonly changed: boolean;
+  readonly beforeSha256: string;
+  readonly afterSha256: string;
+  readonly bytesBefore: number;
+  readonly bytesAfter: number;
+  readonly matchCount: number;
+  readonly dryRun: boolean;
+}
+
 export function observeProcessStart(pid: number): ProcessStartObservation {
   const result = spawnSync(PYTHON, ['-I', '-S', HELPER, 'process-start', String(pid)], {
     encoding: 'utf8',
@@ -40,6 +50,32 @@ export async function secureProjectFileWrite(projectRoot: string, targetPath: st
     throw new RuntimeError('CAPABILITY_DENIED', 'macOS safety helper returned an invalid project-write result');
   }
   return parsed.bytes as number;
+}
+
+export async function secureProjectFileEdit(
+  projectRoot: string,
+  targetPath: string,
+  find: string,
+  replace: string,
+  expectedSha256: string,
+  dryRun = false,
+): Promise<SecureProjectFileEditResult> {
+  const parsed = await runJsonHelper(['edit-file', projectRoot, targetPath], JSON.stringify({ find, replace, expectedSha256, dryRun }));
+  if (!isRecord(parsed)
+    || typeof parsed.changed !== 'boolean'
+    || typeof parsed.beforeSha256 !== 'string'
+    || !/^[0-9a-f]{64}$/i.test(parsed.beforeSha256)
+    || typeof parsed.afterSha256 !== 'string'
+    || !/^[0-9a-f]{64}$/i.test(parsed.afterSha256)
+    || !Number.isSafeInteger(parsed.bytesBefore)
+    || !Number.isSafeInteger(parsed.bytesAfter)
+    || !Number.isSafeInteger(parsed.matchCount)
+    || parsed.matchCount !== 1
+    || typeof parsed.dryRun !== 'boolean'
+    || Object.keys(parsed).length !== 7) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'macOS safety helper returned an invalid project-edit result');
+  }
+  return parsed as unknown as SecureProjectFileEditResult;
 }
 
 export async function secureProjectMutation(
@@ -74,7 +110,8 @@ async function runJsonHelper(
     return JSON.parse(stdout) as unknown;
   } catch (error) {
     if (error instanceof RuntimeError) throw error;
-    throw new RuntimeError(errorCode, 'macOS safety helper refused the protected local operation', { cause: error });
+    const detail = error instanceof Error ? error.message.replace(/\s+/g, ' ').slice(-500) : 'unknown helper failure';
+    throw new RuntimeError(errorCode, `macOS safety helper refused the protected local operation${detail.length > 0 ? `: ${detail}` : ''}`, { cause: error });
   }
 }
 

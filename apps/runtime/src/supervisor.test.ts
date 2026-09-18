@@ -38,6 +38,9 @@ describe('IRIS supervisor', () => {
       const readiness = await supervisor.localReadiness();
       expect(readiness.status).toMatchObject({ state: 'READY', code: 'READY' });
       expect(readiness.connectors.map((connector) => connector.expectedToolCount)).toEqual([fullMcpToolNames().length, 5]);
+      expect(readiness.catalogs.map((catalog) => catalog.state)).toEqual(['ACTIVE', 'ACTIVE']);
+      expect(readiness.catalogs.map((catalog) => catalog.live?.catalogHash)).toEqual(readiness.catalogs.map((catalog) => catalog.source.catalogHash));
+      expect((await supervisor.catalogStatus()).state).toBe('ACTIVE');
       const serviceSecret = await readTunnelServiceSecret(dataRoot);
       expect(serviceSecret).not.toBeNull();
       const controlRoute = await fetch(`${daemon.apiUrl}/projects`, { headers: { authorization: `Bearer ${serviceSecret!}` } });
@@ -80,6 +83,7 @@ setInterval(() => undefined, 1000);
     expect(managedProfile).not.toContain('Bearer ');
     const second = await supervisor.up();
     expect(second.localRuntime.state).toBe('READY');
+    expect((await supervisor.catalogStatus()).state).toBe('ACTIVE');
     expect(second.connectors.map((connector) => connector.label)).toEqual(['IRIS FULL', 'IRIS PRO']);
     const stopped = await supervisor.down();
     expect(stopped.runtime.state).toBe('FAILED');

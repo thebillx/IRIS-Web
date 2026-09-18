@@ -249,12 +249,15 @@ function sessionlessProjectRead(capabilityId: CapabilityId): boolean {
   return capabilityId === 'project.info'
     || capabilityId === 'project.git_status'
     || capabilityId === 'project.search'
+    || capabilityId === 'project.validation.discover'
+    || capabilityId === 'project.validation.job.read'
     || capabilityId === 'file.read';
 }
 
 function projectTargetKind(capabilityId: CapabilityId): Exclude<ProjectTargetKind, 'project-root'> | null {
   if (capabilityId === 'file.read') return 'file-read';
   if (capabilityId === 'file.write') return 'file-write';
+  if (capabilityId === 'file.edit') return 'file-edit';
   if (capabilityId === 'file.delete') return 'file-delete';
   if (capabilityId === 'directory.create') return 'directory-create';
   if (capabilityId === 'directory.delete') return 'directory-delete';

@@ -2,6 +2,7 @@ import { RuntimeError } from '@iris/domain';
 import type { CapabilityService } from './capability-service.js';
 import type { DurableMissionLifecycleService } from './durable-mission-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
+import { catalogIdentityPayload, catalogToolNames, type McpCatalogRuntimeContext } from './mcp-catalog.js';
 import { MCP_PROTOCOL_VERSION, fullMcpToolDefinitions, handleMcpRequest, type McpPrincipal } from './mcp.js';
 import { augmentV21ToolDefinitions, V21_LIFECYCLE_TOOL_NAMES } from './mcp-v21-definitions.js';
 import { executeV21LifecycleTool, isCapabilityOutcome, toolError, toolOutcome, toolResult } from './mcp-v21-tools.js';
@@ -21,30 +22,32 @@ export async function handleMcpV21Request(
   broker: MissionBrokerService,
   lifecycle: DurableMissionLifecycleService,
   principal: McpPrincipal = 'owner',
+  runtimeContext: McpCatalogRuntimeContext = {},
 ): Promise<Response> {
-  if (request.method !== 'POST') return handleMcpRequest(request, capabilities, state, broker, principal);
+  if (request.method !== 'POST') return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
 
   let rpc: JsonRpcRequest;
   try {
     rpc = await request.clone().json() as JsonRpcRequest;
   } catch {
-    return handleMcpRequest(request, capabilities, state, broker, principal);
+    return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
   }
 
   if (rpc.method === 'tools/list') {
-    return augmentToolList(await handleMcpRequest(request, capabilities, state, broker, principal));
+    return augmentToolList(await handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext));
   }
-  if (rpc.method !== 'tools/call') return handleMcpRequest(request, capabilities, state, broker, principal);
+  if (rpc.method !== 'tools/call') return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
 
   const params = isRecord(rpc.params) ? rpc.params : null;
   const args = params !== null && isRecord(params.arguments) ? params.arguments : null;
   const name = params !== null && typeof params.name === 'string' ? params.name : null;
-  if (name === null || args === null) return handleMcpRequest(request, capabilities, state, broker, principal);
+  if (name === null || args === null) return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
 
   const lifecycleDirective = name === 'mission_directive' && args.basedOnRevision !== undefined;
   const lifecycleCreate = name === 'mission_create';
-  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate) {
-    return handleMcpRequest(request, capabilities, state, broker, principal);
+  const catalogIdentity = name === 'catalog_identity';
+  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity) {
+    return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
   }
 
   if (request.headers.get('MCP-Protocol-Version') !== MCP_PROTOCOL_VERSION) {
@@ -54,7 +57,9 @@ export async function handleMcpV21Request(
   if (toolHeader !== null && toolHeader !== name) return jsonRpcError(rpc.id ?? null, -32600, 'Mcp-Name does not match tool name', 400);
 
   try {
-    const result = await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle);
+    const result = catalogIdentity
+      ? catalogIdentityPayload('FULL', fullMcpToolDefinitionsV21(), runtimeContext)
+      : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal);
     return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
   } catch (error) {
     const runtimeError = error instanceof RuntimeError
@@ -65,8 +70,11 @@ export async function handleMcpV21Request(
 }
 
 export function fullMcpToolNames(): readonly string[] {
-  return augmentV21ToolDefinitions(fullMcpToolDefinitions())
-    .flatMap((tool) => isRecord(tool) && typeof tool.name === 'string' ? [tool.name] : []);
+  return catalogToolNames('FULL');
+}
+
+export function fullMcpToolDefinitionsV21(): readonly Record<string, unknown>[] {
+  return augmentV21ToolDefinitions(fullMcpToolDefinitions()).filter(isRecord);
 }
 
 async function augmentToolList(base: Response): Promise<Response> {

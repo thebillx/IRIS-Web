@@ -37,6 +37,10 @@ try {
       process.stdout.write(`${JSON.stringify(await supervisor.doctor(), null, 2)}\n`);
     } else if (command === 'connectors') {
       process.stdout.write(`${JSON.stringify(await supervisor.connectors(), null, 2)}\n`);
+    } else if (command === 'catalog' && process.argv[3] === 'status') {
+      process.stdout.write(`${JSON.stringify(await supervisor.catalogStatus(), null, 2)}\n`);
+    } else if (command === 'catalog' && process.argv[3] === 'reload') {
+      printStatus(await supervisor.catalogReload());
     } else if (command === 'logs') {
       process.stdout.write(`${await supervisor.logs()}\n`);
     } else if (command === 'adopt-runtime') {
@@ -62,7 +66,7 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'status') {
       process.stdout.write(`${JSON.stringify({ loaded: await launchAgentLoaded(), paths: launchdPaths(dataRoot) }, null, 2)}\n`);
     } else {
-      process.stderr.write('Usage: iris <up|down|restart|status|doctor|connectors|logs|adopt-runtime|supervisor|credentials|launchd>\n');
+      process.stderr.write('Usage: iris <up|down|restart|status|doctor|connectors|catalog status|catalog reload|logs|adopt-runtime|supervisor|credentials|launchd>\n');
       process.exitCode = 2;
     }
   }
