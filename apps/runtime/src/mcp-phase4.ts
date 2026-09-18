@@ -1,4 +1,4 @@
-import type { CapabilityEffect } from '@iris/domain';
+import type { CapabilityEffect, MissionExecutionAssociation } from '@iris/domain';
 import { RuntimeError } from '@iris/domain';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
 import type { RuntimeState } from './state.js';
@@ -15,7 +15,7 @@ export const PHASE4_GROUPED_TOOL_NAMES = ['git'] as const;
 export type Phase4GroupedToolName = (typeof PHASE4_GROUPED_TOOL_NAMES)[number];
 
 const GIT_KEYS = new Set([
-  'operation','sessionId','projectId','workspaceId','repositoryId','expectedEffects',
+  'operation','sessionId','projectId','workspaceId','repositoryId','expectedEffects','missionId','taskId','actionId',
   'paths','ref','object','left','right','ancestor','descendant','maxCount','maxEntries',
   'branchName','baseRef','destinationPath','message','remote','branch',
 ]);
@@ -35,6 +35,9 @@ export function phase4GroupedToolDefinitions(): readonly Record<string, unknown>
         sessionId: { type: 'string', description: 'IRIS runtime session UUID. May be omitted when x-iris-session-id is supplied.' },
         projectId: { type: 'string', description: 'Registered project UUID; must equal the live session project.' },
         workspaceId: { type: 'string', description: 'Opaque ACTIVE IRIS PRIMARY or WORKTREE workspace UUID.' },
+        missionId: { type: 'string', description: 'Optional prepared CHATGPT mission identity; missionId/taskId/actionId must be supplied together.' },
+        taskId: { type: 'string', description: 'Optional prepared CHATGPT task identity; missionId/taskId/actionId must be supplied together.' },
+        actionId: { type: 'string', description: 'Optional prepared CHATGPT action identity; missionId/taskId/actionId must be supplied together.' },
         repositoryId: { type: 'string', description: 'Opaque verified repository UUID. Required for mutation/network operations; optional assertion for reads.' },
         operation: { enum: OPERATIONS },
         paths: { type: 'array', minItems: 1, maxItems: 24, items: { type: 'string', minLength: 1, maxLength: 1000 }, description: 'Explicit workspace-relative physical regular-file paths only.' },
@@ -76,7 +79,8 @@ export async function executePhase4GroupedTool(
   const operation = requiredEnum(args, 'operation', OPERATIONS);
   const repositoryId = optionalBoundedString(args, 'repositoryId', 200);
   const expectedEffects = optionalExpectedEffects(args);
-  const common = { ...identity, projectId, workspaceId, ...(repositoryId === undefined ? {} : { repositoryId }), ...(expectedEffects === undefined ? {} : { expectedEffects }) };
+  const mission = await optionalMissionAssociation(args, state, identity);
+  const common = { ...identity, projectId, workspaceId, ...(repositoryId === undefined ? {} : { repositoryId }), ...(expectedEffects === undefined ? {} : { expectedEffects }), ...(mission === undefined ? {} : { mission }) };
 
   if (operation === 'status') return capabilities.execute({ capabilityId: 'git.status', operation, ...common });
   if (operation === 'head') return capabilities.execute({ capabilityId: 'git.head', operation, ...common });
@@ -128,6 +132,26 @@ function resolveSessionIdentity(args: Record<string, unknown>, request: Request,
   if (state === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session validation is unavailable');
   state.getSessionForClient(sessionId, clientId);
   return { clientId, sessionId };
+}
+
+async function optionalMissionAssociation(
+  args: Record<string, unknown>,
+  state: RuntimeState | undefined,
+  identity: SessionIdentity,
+): Promise<MissionExecutionAssociation | undefined> {
+  const missionId = optionalBoundedString(args, 'missionId', 200);
+  const taskId = optionalBoundedString(args, 'taskId', 200);
+  const actionId = optionalBoundedString(args, 'actionId', 200);
+  if (missionId === undefined && taskId === undefined && actionId === undefined) return undefined;
+  if (missionId === undefined || taskId === undefined || actionId === undefined) {
+    throw new RuntimeError('INVALID_REQUEST', 'missionId, taskId, and actionId must be supplied together');
+  }
+  if (state === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS mission validation is unavailable');
+  const mission = await state.assertMissionOrchestrator(missionId, 'CHATGPT');
+  if (mission.clientId !== identity.clientId || mission.sessionId !== identity.sessionId) {
+    throw new RuntimeError('MISSION_SESSION_STALE', 'Mission session binding is stale for grouped Git execution');
+  }
+  return { missionId, taskId, actionId, orchestratorMode: 'CHATGPT' };
 }
 
 function requireMutationRepositoryId(value: string | undefined): string {

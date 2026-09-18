@@ -824,11 +824,11 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
 }
 
 function isMissionExecutableOperation(operation: CapabilityOperation): operation is CapabilityOperation & { readonly clientId: string; readonly sessionId: string; readonly mission: MissionExecutionAssociation } {
-  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete' || operation.capabilityId === 'file.edit' || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
+  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'git.local' || operation.capabilityId === 'git.push' || operation.capabilityId === 'remote.publish' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete' || operation.capabilityId === 'file.edit' || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
 }
 
-function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'project.command.run' | 'project.validation.start' | 'git.local' | 'remote.publish' | 'file.read' | 'file.write' | 'file.edit' | 'file.delete' | 'directory.create' | 'directory.delete' {
-  return capabilityId === 'project.test.run' || capabilityId === 'project.command.run' || capabilityId === 'project.validation.start' || capabilityId === 'git.local' || capabilityId === 'remote.publish' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete' || capabilityId === 'file.edit' || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
+function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'project.command.run' | 'project.validation.start' | 'git.local' | 'git.push' | 'remote.publish' | 'file.read' | 'file.write' | 'file.edit' | 'file.delete' | 'directory.create' | 'directory.delete' {
+  return capabilityId === 'project.test.run' || capabilityId === 'project.command.run' || capabilityId === 'project.validation.start' || capabilityId === 'git.local' || capabilityId === 'git.push' || capabilityId === 'remote.publish' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete' || capabilityId === 'file.edit' || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
 }
 
 function describeOperation(operation: CapabilityOperation): string {
