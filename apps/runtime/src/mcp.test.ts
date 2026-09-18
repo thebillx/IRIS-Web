@@ -53,7 +53,7 @@ describe('local MCP transport and permission boundary', () => {
       'runtime_status', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select',
       'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive',
       'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create',
-      'mission_task_state_set', 'mission_action_prepare', 'mission_supervisor_gate_set', 'project_test_run',
+      'mission_task_state_set', 'mission_action_prepare', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run',
       'project_validation_run', 'git_local', 'remote_publish', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete',
     ]) {
       expect(await (await call(10, name, {})).json()).toMatchObject({
@@ -77,7 +77,7 @@ describe('local MCP transport and permission boundary', () => {
     const listed = await handleMcpRequest(rpc('tools/list', 2), fixture.service);
     const listedBody = await listed.json() as { result: { tools: Array<{ name: string; inputSchema: { required?: string[] } }> } };
     expect(listedBody.result.tools.map((tool) => tool.name)).toEqual([
-      'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete', 'catalog_identity',
+      'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete', 'catalog_identity',
     ]);
     expect(listedBody.result.tools.find((tool) => tool.name === 'session_open')?.inputSchema.required).toBeUndefined();
 
@@ -325,6 +325,81 @@ describe('local MCP transport and permission boundary', () => {
 
     expect(await fixture.settings.read()).toEqual(beforePermissions);
     expect(fixture.service.listPendingApprovals()).toHaveLength(0);
+  });
+
+  it('lets only the originating owner session resolve one exact pending mission action once', async () => {
+    const fixture = await serviceFixture();
+    const owner = fixture.state.createSession('chatgpt', 'chatgpt-direct-orchestrator', 'owner');
+    await fixture.state.setSessionCurrentProject(owner.id, owner.clientId, fixture.project.id);
+
+    const create = await handleMcpRequest(rpc('tools/call', 70, {
+      name: 'mission_create', arguments: { title: 'Owner continuation mission', orchestratorMode: 'CHATGPT' },
+    }, true, 'mission_create', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    const createBody = await create.json() as { result: { structuredContent: { id: string } } };
+    const missionId = createBody.result.structuredContent.id;
+
+    const task = await handleMcpRequest(rpc('tools/call', 71, {
+      name: 'mission_task_create', arguments: { missionId, title: 'Write exact proof' },
+    }, true, 'mission_task_create', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    const taskBody = await task.json() as { result: { structuredContent: { tasks: Array<{ id: string }> } } };
+    const taskId = taskBody.result.structuredContent.tasks[0]!.id;
+
+    const prepared = await handleMcpRequest(rpc('tools/call', 72, {
+      name: 'mission_action_prepare', arguments: { missionId, taskId, capabilityId: 'file.write', summary: 'Write exact owner proof' },
+    }, true, 'mission_action_prepare', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    const preparedBody = await prepared.json() as { result: { structuredContent: { tasks: Array<{ actions: Array<{ id: string }> }> } } };
+    const actionId = preparedBody.result.structuredContent.tasks[0]!.actions[0]!.id;
+    await fixture.settings.setMode('ASK_EVERY_TIME');
+
+    const targetPath = path.join(fixture.projectRoot, 'owner-continuation.txt');
+    const pendingResponse = await handleMcpRequest(rpc('tools/call', 73, {
+      name: 'file_write', arguments: {
+        projectId: fixture.project.id, targetPath, content: 'approved-in-chat', missionId, taskId, actionId,
+      },
+    }, true, 'file_write', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    const pendingBody = await pendingResponse.json() as {
+      result: { isError: boolean; structuredContent: { code: string; approval: { id: string; exactAction: string; capabilityId: string } } };
+    };
+    expect(pendingBody.result).toMatchObject({ isError: true, structuredContent: { code: 'OWNER_DECISION_REQUIRED' } });
+    const approval = pendingBody.result.structuredContent.approval;
+    await expect(access(targetPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(fixture.service.listPendingApprovals()).toHaveLength(1);
+
+    const resolveArgs = {
+      approvalId: approval.id, missionId, taskId, actionId, capabilityId: approval.capabilityId,
+      exactAction: approval.exactAction, decision: 'ALLOW_ONCE',
+    };
+    const wrongAction = await handleMcpRequest(rpc('tools/call', 74, {
+      name: 'owner_approval_resolve', arguments: { ...resolveArgs, exactAction: 'changed action' },
+    }, true, 'owner_approval_resolve', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    expect(await wrongAction.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'CAPABILITY_DENIED' } } });
+    expect(fixture.service.listPendingApprovals()).toHaveLength(1);
+
+    const other = fixture.state.createSession('other-client', 'owner-web', 'owner');
+    await fixture.state.setSessionCurrentProject(other.id, other.clientId, fixture.project.id);
+    const wrongSession = await handleMcpRequest(rpc('tools/call', 75, {
+      name: 'owner_approval_resolve', arguments: resolveArgs,
+    }, true, 'owner_approval_resolve', other.clientId, other.id), fixture.service, fixture.state, fixture.broker);
+    expect(await wrongSession.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'MISSION_SESSION_STALE' } } });
+    expect(fixture.service.listPendingApprovals()).toHaveLength(1);
+
+    const persistent = await handleMcpRequest(rpc('tools/call', 76, {
+      name: 'owner_approval_resolve', arguments: { ...resolveArgs, decision: 'ALWAYS_ALLOW_PROJECT' },
+    }, true, 'owner_approval_resolve', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    expect(await persistent.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'INVALID_REQUEST' } } });
+    expect(fixture.service.listPendingApprovals()).toHaveLength(1);
+
+    const approved = await handleMcpRequest(rpc('tools/call', 77, {
+      name: 'owner_approval_resolve', arguments: resolveArgs,
+    }, true, 'owner_approval_resolve', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    expect(await approved.json()).toMatchObject({ result: { isError: false } });
+    await expect(readFile(targetPath, 'utf8')).resolves.toBe('approved-in-chat');
+    expect(fixture.service.listPendingApprovals()).toHaveLength(0);
+
+    const replay = await handleMcpRequest(rpc('tools/call', 78, {
+      name: 'owner_approval_resolve', arguments: resolveArgs,
+    }, true, 'owner_approval_resolve', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    expect(await replay.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'APPROVAL_NOT_FOUND' } } });
   });
 
   it('cannot bypass session/project policy for file mutation', async () => {

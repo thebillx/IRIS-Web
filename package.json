@@ -2,17 +2,21 @@
   "name": "iris",
   "version": "0.0.0",
   "private": true,
-  "bin": { "iris": "scripts/iris.mjs" },
+  "bin": {
+    "iris": "scripts/iris.mjs"
+  },
   "packageManager": "pnpm@10.15.0",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "node scripts/node24.mjs scripts/dev.mjs",
     "runtime": "node scripts/node24.mjs --pnpm --filter @iris/runtime runtime",
     "iris": "node scripts/node24.mjs scripts/iris.mjs",
     "permission-smoke": "node scripts/node24.mjs scripts/permission-smoke.mjs",
-    "test": "node scripts/node24.mjs --pnpm --recursive --if-present test",
+    "test": "node scripts/node24.mjs scripts/mobile-contract.mjs test && node scripts/node24.mjs --pnpm --recursive --if-present test",
     "lint": "node scripts/node24.mjs --bin eslint .",
-    "typecheck": "node scripts/node24.mjs --pnpm --recursive --if-present typecheck",
+    "typecheck": "node scripts/node24.mjs scripts/mobile-contract.mjs typecheck && node scripts/node24.mjs --pnpm --recursive --if-present typecheck",
     "build": "node scripts/node24.mjs --pnpm --recursive --if-present build"
   },
   "devDependencies": {

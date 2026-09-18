@@ -244,7 +244,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     const fixture = await serviceFixture();
     expect(phase3GroupedToolDefinitions().map((tool) => tool.name)).toEqual(['shell','job']);
     expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['shell','job','workspace','fs','artifact','project_validation_run','project_validation_start']));
-    expect(catalogToolNames('FULL')).toHaveLength(48);
+    expect(catalogToolNames('FULL')).toHaveLength(49);
     expect(catalogToolNames('PRO')).toEqual(['list_projects','project_info','git_status','file_read','search']);
 
     await expect(runDeclaredProjectScript(fixture.projectARoot, 'anything')).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
