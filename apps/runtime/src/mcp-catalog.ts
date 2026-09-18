@@ -57,6 +57,7 @@ const FULL_CATALOG = [
   entry('mission_task_create', 'ORCHESTRATION', 'mission.task.create', '2.0.0'),
   entry('mission_task_state_set', 'ORCHESTRATION', 'mission.task.state.set', '2.0.0'),
   entry('mission_action_prepare', 'ORCHESTRATION', 'mission.action.prepare', '2.0.0'),
+  entry('owner_approval_resolve', 'OWNER_MUTATION', null, '2.3.0'),
   entry('mission_supervisor_gate_set', 'ORCHESTRATION', 'mission.supervisor_gate.set', '2.1.0'),
   entry('project_test_run', 'PROJECT_MUTATION', 'project.test.run', '2.0.0'),
   entry('project_validation_run', 'PROJECT_MUTATION', 'project.command.run', '2.2.0'),

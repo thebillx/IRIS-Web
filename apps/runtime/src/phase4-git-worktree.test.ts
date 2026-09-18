@@ -31,7 +31,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     const fixture = await serviceFixture();
     const definitions = phase4GroupedToolDefinitions();
     expect(definitions.map((tool) => tool.name)).toEqual(['git']);
-    expect(catalogToolNames('FULL')).toHaveLength(48);
+    expect(catalogToolNames('FULL')).toHaveLength(49);
     expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['git_status','git_local','remote_publish','workspace','fs','artifact','shell','job','git']));
     expect(catalogToolNames('PRO')).toEqual(['list_projects','project_info','git_status','file_read','search']);
 
@@ -300,6 +300,79 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     expect(failure).not.toContain('SUPERSECRET');
     const audits = await fixture.audit.recent(50);
     expect(JSON.stringify(audits)).not.toContain('SUPERSECRET');
+  });
+
+  it('binds grouped git.push to one prepared CHATGPT mission action and originating owner approval', async () => {
+    const fixture = await serviceFixture();
+    const owner = fixture.state.createSession('chatgpt', 'chatgpt-direct-orchestrator', 'owner');
+    await fixture.state.setSessionCurrentProject(owner.id, owner.clientId, fixture.project.id);
+    const request = new Request('http://127.0.0.1/mcp', { headers: { 'x-iris-client-id': owner.clientId } });
+    const identity = await fixture.engine.inspectRepository(fixture.project.id, fixture.primary.workspaceId);
+
+    const created = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'mission.create', clientId: owner.clientId, sessionId: owner.id,
+      title: 'Mission-bound push', orchestratorMode: 'CHATGPT',
+    }));
+    const missionId = String(created.id);
+    const withTask = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'mission.task.create', clientId: owner.clientId, sessionId: owner.id,
+      missionId, title: 'Push one verified branch',
+    }));
+    const tasks = withTask.tasks as Array<{ id: string }>;
+    const taskId = tasks[0]!.id;
+    const prepared = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'mission.action.prepare', clientId: owner.clientId, sessionId: owner.id,
+      missionId, taskId, actionCapabilityId: 'git.push', summary: 'Push exact mission branch',
+    }));
+    const preparedTasks = prepared.tasks as Array<{ actions: Array<{ id: string }> }>;
+    const actionId = preparedTasks[0]!.actions[0]!.id;
+
+    await git(fixture.projectRoot, ['switch', '-c', 'feature/mission-push']);
+    await writeFile(path.join(fixture.projectRoot, 'mission-push.txt'), 'mission push\n');
+    await git(fixture.projectRoot, ['add', '--', 'mission-push.txt']);
+    await git(fixture.projectRoot, ['commit', '-m', 'mission push']);
+    await fixture.settings.setMode('ASK_EVERY_TIME');
+
+    const pending = await executePhase4GroupedTool('git', {
+      operation: 'push', sessionId: owner.id, projectId: fixture.project.id,
+      workspaceId: fixture.primary.workspaceId, repositoryId: identity.repositoryId,
+      remote: 'origin', branch: 'feature/mission-push',
+      missionId, taskId, actionId,
+      expectedEffects: ['READ','WRITE','EXECUTE','NETWORK'],
+    }, request, fixture.service, fixture.state);
+    expect(pending.status).toBe('owner_required');
+    if (pending.status !== 'owner_required') throw new Error('Expected owner approval');
+    expect(pending.approval).toMatchObject({
+      capabilityId: 'git.push', clientId: owner.clientId, sessionId: owner.id,
+      missionId, taskId, actionId,
+    });
+
+    const approved = await fixture.service.resolveOriginatingOwnerApproval({
+      id: pending.approval.id,
+      choice: 'ALLOW_ONCE',
+      clientId: owner.clientId,
+      sessionId: owner.id,
+      missionId,
+      taskId,
+      actionId,
+      capabilityId: 'git.push',
+      exactAction: pending.approval.exactAction,
+    });
+    expect(approved.status).toBe('executed');
+    const localHead = (await git(fixture.projectRoot, ['rev-parse', 'feature/mission-push'])).stdout.trim();
+    const remoteHead = (await git(fixture.projectRoot, ['ls-remote', '--heads', 'origin', 'refs/heads/feature/mission-push'])).stdout.trim().split(/\s+/)[0];
+    expect(remoteHead).toBe(localHead);
+    await expect(fixture.service.resolveOriginatingOwnerApproval({
+      id: pending.approval.id,
+      choice: 'ALLOW_ONCE',
+      clientId: owner.clientId,
+      sessionId: owner.id,
+      missionId,
+      taskId,
+      actionId,
+      capabilityId: 'git.push',
+      exactAction: pending.approval.exactAction,
+    })).rejects.toMatchObject({ code: 'APPROVAL_NOT_FOUND' });
   });
 
   it('AC-FARM-007 keeps safe push verified and preserves legacy git_local/remote_publish compatibility while protected/force/delete forms stay unavailable', async () => {

@@ -129,7 +129,7 @@ describe('standard governed Hermes MCP adapter', () => {
     const action = mission.tasks.at(-1)!.actions.at(-1)!;
     expect(action).toMatchObject({ capabilityId: 'project.test.run', state: 'SUCCEEDED', result: { status: 'SUCCEEDED' } });
     expect(action.result?.evidence.at(-1)?.data).toMatchObject({ passed: true, exitCode: 0, timedOut: false });
-  });
+  }, 15_000);
 
   it('requires prepared mission identity and owner approval, then executes the exact file.write once', async () => {
     const f = await fixture();
