@@ -4,6 +4,7 @@ import path from 'node:path';
 import {
   RuntimeError,
   type AgentRole,
+  type CapabilityEffect,
   type CapabilityId,
   type MissionExecutionAssociation,
   type MissionEvidence,
@@ -473,7 +474,12 @@ export class RuntimeState {
     }));
   }
 
-  public markMissionActionSucceeded(association: MissionExecutionAssociation, capabilityId: CapabilityId, value: unknown): Promise<void> {
+  public markMissionActionSucceeded(
+    association: MissionExecutionAssociation,
+    capabilityId: CapabilityId,
+    value: unknown,
+    effectiveEffects: readonly CapabilityEffect[] = [],
+  ): Promise<void> {
     return this.updateMissionAction(association, (mission, task, action, now) => ({
       mission: {
         ...mission,
@@ -489,7 +495,7 @@ export class RuntimeState {
           summary: 'Governed capability executed successfully',
           approvalId: action.approvalId,
           completedAt: now,
-          evidence: missionEvidence(capabilityId, value),
+          evidence: missionEvidence(capabilityId, value, effectiveEffects),
         },
       },
     }));
@@ -883,7 +889,7 @@ function appendMissionEvent(
   return [...events, event].slice(-1_000);
 }
 
-function missionEvidence(capabilityId: CapabilityId, value: unknown): readonly MissionEvidence[] {
+function missionEvidence(capabilityId: CapabilityId, value: unknown, effectiveEffects: readonly CapabilityEffect[] = []): readonly MissionEvidence[] {
   const record = typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const data: Record<string, string | number | boolean | null> = {};
   let reference: string | null = null;
@@ -902,6 +908,7 @@ function missionEvidence(capabilityId: CapabilityId, value: unknown): readonly M
   if (typeof record.head === 'string') data.head = record.head.slice(0, 64);
   if (typeof record.localHead === 'string') data.localHead = record.localHead.slice(0, 64);
   if (typeof record.remoteHead === 'string') data.remoteHead = record.remoteHead.slice(0, 64);
+  if (effectiveEffects.length > 0) data.effectiveEffects = effectiveEffects.join(',');
   return [{
     id: randomUUID(),
     kind: 'CAPABILITY_RESULT',

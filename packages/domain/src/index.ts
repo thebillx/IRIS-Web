@@ -11,11 +11,86 @@ export interface RuntimeIdentity {
 }
 
 export type RuntimeStatus = 'starting' | 'ready' | 'stopping' | 'stopped' | 'failed';
+export type IdentityCoherenceState = 'COHERENT' | 'UNBOUND' | 'SPLIT';
+
+export interface TunnelBindingDiagnostic {
+  readonly connectorProfile: 'FULL' | 'PRO';
+  readonly tunnelId: string;
+  readonly deploymentEpoch: number;
+  readonly catalogHash: string;
+  readonly leaseGeneration: number;
+  readonly machineId: string | null;
+  readonly runtimeId: string | null;
+}
 
 export interface ProjectReference {
   readonly id: string;
   readonly name: string;
   readonly rootPath: string;
+}
+
+declare const RESOURCE_ID_BRAND: unique symbol;
+type ResourceIdentity<Kind extends string> = string & { readonly [RESOURCE_ID_BRAND]: Kind };
+export type RepositoryId = ResourceIdentity<'repository'>;
+export type WorkspaceId = ResourceIdentity<'workspace'>;
+export type ArtifactId = ResourceIdentity<'artifact'>;
+export type JobId = ResourceIdentity<'job'>;
+
+export interface RepositoryRecord {
+  readonly repositoryId: RepositoryId;
+  readonly projectId: string;
+  readonly primaryWorkspaceId: WorkspaceId;
+  readonly commonGitDir: string;
+  readonly commonGitDirDevice: string;
+  readonly commonGitDirInode: string;
+  readonly createdAt: string;
+}
+
+export type WorkspaceRole = 'PRIMARY' | 'WORKTREE' | 'SCRATCH';
+export type WorkspaceAuthorizationSource = 'PROJECT_REGISTRATION' | 'GIT_WORKTREE_ADD' | 'OWNER_APPROVAL' | 'SYSTEM_SCRATCH';
+export type WorkspaceLifecycleState = 'ACTIVE' | 'REVOKING' | 'REVOKED' | 'DELETING' | 'DELETED';
+
+export interface WorkspaceRecord {
+  readonly workspaceId: WorkspaceId;
+  readonly projectId: string;
+  readonly repositoryId: RepositoryId | null;
+  readonly physicalRoot: string;
+  readonly role: WorkspaceRole;
+  readonly authorizationSource: WorkspaceAuthorizationSource;
+  readonly createdByAction: string | null;
+  readonly lifecycleState: WorkspaceLifecycleState;
+  readonly createdAt: string;
+}
+
+export type ArtifactSensitivity = 'PUBLIC' | 'INTERNAL' | 'SENSITIVE' | 'RESTRICTED';
+export type ArtifactRetentionPolicy = 'EPHEMERAL' | 'SESSION' | 'MISSION' | 'PROJECT' | 'MANUAL';
+
+export interface ArtifactRecord {
+  readonly artifactId: ArtifactId;
+  readonly physicalPath: string;
+  readonly projectId: string;
+  readonly workspaceId: WorkspaceId;
+  readonly producerJobId: JobId | null;
+  readonly producerActionId: string | null;
+  readonly mime: string;
+  readonly artifactType: string;
+  readonly size: number;
+  readonly sha256: string;
+  readonly sensitivity: ArtifactSensitivity;
+  readonly createdAt: string;
+  readonly retentionPolicy: ArtifactRetentionPolicy;
+}
+
+export interface ArtifactReference {
+  readonly artifactId: ArtifactId;
+  readonly projectId: string;
+  readonly workspaceId: WorkspaceId;
+  readonly mime: string;
+  readonly artifactType: string;
+  readonly size: number;
+  readonly sha256: string;
+  readonly sensitivity: ArtifactSensitivity;
+  readonly retentionPolicy: ArtifactRetentionPolicy;
 }
 
 export type AgentRole = 'owner' | 'planner' | 'implementer' | 'reviewer' | 'security' | 'explorer' | 'other';
@@ -237,6 +312,10 @@ export interface RuntimeHealth {
   readonly productionModelConnected: boolean;
   readonly apiUrl: string;
   readonly mcpUrl: string;
+  readonly machineId?: string;
+  readonly identityState?: IdentityCoherenceState;
+  readonly identityCode?: string | null;
+  readonly tunnelBindings?: readonly TunnelBindingDiagnostic[];
 }
 
 export interface DoctorCheck {
@@ -259,6 +338,7 @@ export type PermissionMode =
 export type RiskClass = 'LOW' | 'MODERATE' | 'HIGH' | 'SYSTEM';
 export type RequiredScope = 'MACHINE' | 'PROJECT' | 'RUNTIME_DATA' | 'OWNER';
 export type PolicyDecision = 'ALLOW_AUTO' | 'ALLOW_ONCE' | 'DENY' | 'OWNER_REQUIRED';
+export type CapabilityEffect = 'READ' | 'WRITE' | 'EXECUTE' | 'NETWORK' | 'DESTRUCTIVE';
 
 export type CapabilityId =
   | 'runtime.status'
@@ -287,10 +367,51 @@ export type CapabilityId =
   | 'file.delete'
   | 'directory.create'
   | 'directory.delete'
+  | 'workspace.list'
+  | 'workspace.get'
+  | 'workspace.create_scratch'
+  | 'workspace.revoke_scratch'
+  | 'fs.list'
+  | 'fs.stat'
+  | 'fs.read'
+  | 'fs.write'
+  | 'fs.edit'
+  | 'fs.mkdir'
+  | 'fs.delete'
+  | 'fs.hash'
+  | 'fs.find'
+  | 'artifact.stat'
+  | 'artifact.open_ref'
+  | 'artifact.register_existing'
+  | 'artifact.release'
+  | 'shell.run'
+  | 'shell.start'
+  | 'job.status'
+  | 'job.logs'
+  | 'job.result'
+  | 'job.cancel'
   | 'project.command.run'
   | 'project.validation.discover'
   | 'project.validation.start'
   | 'project.validation.job.read'
+  | 'git.status'
+  | 'git.head'
+  | 'git.diff'
+  | 'git.log'
+  | 'git.show'
+  | 'git.cat_file'
+  | 'git.merge_base'
+  | 'git.ancestry'
+  | 'git.refs'
+  | 'git.branch_list'
+  | 'git.worktree_list'
+  | 'git.branch_create'
+  | 'git.worktree_add'
+  | 'git.worktree_remove'
+  | 'git.add'
+  | 'git.commit'
+  | 'git.fetch'
+  | 'git.push'
   | 'git.local'
   | 'runtime.lifecycle'
   | 'web.lifecycle'
@@ -323,6 +444,10 @@ export interface PermissionDecisionRecord {
   readonly target: string | null;
   readonly decision: PolicyDecision;
   readonly reason: string;
+  readonly effectiveEffects?: readonly CapabilityEffect[];
+  readonly decisionCode?: string | null;
+  readonly workspaceId?: string | null;
+  readonly resourceId?: string | null;
 }
 
 export type AuditResult = 'DECISION' | 'PENDING' | 'SUCCESS' | 'FAILED' | 'DENIED';
@@ -347,6 +472,8 @@ export type RuntimeFailureCode =
   | 'PORT_UNAVAILABLE'
   | 'INVALID_PROJECT_PATH'
   | 'PROJECT_NOT_FOUND'
+  | 'WORKSPACE_NOT_FOUND'
+  | 'ARTIFACT_NOT_FOUND'
   | 'SESSION_NOT_FOUND'
   | 'SESSION_BUSY'
   | 'MISSION_NOT_FOUND'
@@ -369,6 +496,10 @@ export type RuntimeFailureCode =
   | 'CONNECTOR_BINDING_MISMATCH'
   | 'CONNECTOR_MANIFEST_STALE'
   | 'RUNTIME_IDENTITY_MISMATCH'
+  | 'TUNNEL_OWNERSHIP_CONFLICT'
+  | 'SPLIT_IDENTITY'
+  | 'EFFECT_MISMATCH'
+  | 'UNKNOWN_EFFECT'
   | 'SUPERVISOR_NOT_RUNNING'
   | 'SUPERVISOR_BUSY'
   | 'PROCESS_OWNERSHIP_AMBIGUOUS'

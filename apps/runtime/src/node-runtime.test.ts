@@ -1,3 +1,5 @@
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24PathEntries, nodeVersionMajor } from './node-runtime.js';
 
@@ -9,11 +11,21 @@ describe('IRIS Node runtime selection', () => {
     expect(() => assertSupportedNodeVersion('v24.19.0')).not.toThrow();
   });
 
-  it('resolves an installed Node 24 executable and puts it first in deterministic child PATH', () => {
+  it('resolves an installed Node 24 executable and ignores ambient HOME when building deterministic child PATH', () => {
     const runtime = canonicalNodeRuntime();
-    expect(runtime.major).toBeGreaterThanOrEqual(24);
-    expect(runtime.version).toMatch(/^v24\./);
-    expect(node24PathEntries(runtime.path)[0]).toBe(runtime.path.replace(/\/node$/, ''));
-    expect(node24PathEntries(runtime.path).join(':')).not.toContain('/.hermes/node/bin');
+    const originalHome = process.env.HOME;
+    process.env.HOME = '/tmp/iris-governed-workspace-home';
+    try {
+      const entries = node24PathEntries(runtime.path);
+      expect(runtime.major).toBeGreaterThanOrEqual(24);
+      expect(runtime.version).toMatch(/^v24\./);
+      expect(entries[0]).toBe(runtime.path.replace(/\/node$/, ''));
+      expect(entries).toContain(path.join(os.userInfo().homedir, '.local', 'bin'));
+      expect(entries).not.toContain('/tmp/iris-governed-workspace-home/.local/bin');
+      expect(entries.join(':')).not.toContain('/.hermes/node/bin');
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
   });
 });

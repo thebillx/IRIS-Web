@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { bindConnectorRuntime, catalogFingerprint, createConnectorRegistry, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry } from './connector-registry.js';
+import { bindAdminTunnelIdentity, bindConnectorRuntime, catalogFingerprint, createConnectorRegistry, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry, replaceConnectorCatalogManifest } from './connector-registry.js';
 import { fullMcpToolNames } from './mcp-v21.js';
 import { PRO_TOOL_NAMES } from './mcp.js';
 
@@ -21,6 +21,67 @@ describe('connector registry', () => {
     expect(bound.connectors.every((connector) => connector.runtimeId === 'runtime-a')).toBe(true);
     expect((await stat(path.join(dataRoot, 'connector-registry.json'))).mode & 0o077).toBe(0);
     expect(await readConnectorRegistry(dataRoot)).toEqual(bound);
+  });
+
+  it('binds a dedicated ADMIN tunnel without advancing workload deployment identity', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-registry-admin-'));
+    roots.push(dataRoot);
+    const fullTunnelId = 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const proTunnelId = 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const adminTunnelId = 'tunnel_cccccccccccccccccccccccccccccccc';
+    const created = await initializeConnectorRegistry(dataRoot, { fullTunnelId, proTunnelId });
+    const bound = await bindConnectorRuntime(dataRoot, 'runtime-a');
+    const withAdmin = await bindAdminTunnelIdentity(dataRoot, adminTunnelId);
+    expect(withAdmin.deploymentEpoch).toBe(bound.deploymentEpoch);
+    expect(withAdmin.connectors).toEqual(bound.connectors);
+    expect(withAdmin.admin).toMatchObject({ connectorId: 'iris-admin', label: 'IRIS ADMIN', mode: 'ADMIN', tunnelId: adminTunnelId });
+    expect(withAdmin.admin?.machineId).toBe(bound.connectors[0]?.machineId);
+    expect(withAdmin.admin?.managedProfilePath).toBe(path.join(dataRoot, 'tunnel-profiles', 'iris-admin.yaml'));
+    expect(await bindAdminTunnelIdentity(dataRoot, adminTunnelId)).toEqual(withAdmin);
+    await expect(bindAdminTunnelIdentity(dataRoot, fullTunnelId)).rejects.toThrow('distinct from FULL and PRO');
+    await expect(bindAdminTunnelIdentity(dataRoot, proTunnelId)).rejects.toThrow('distinct from FULL and PRO');
+    expect(created.deploymentEpoch).toBeLessThanOrEqual(withAdmin.deploymentEpoch);
+  });
+
+  it('replaces only catalog manifest identity while preserving tunnel ownership fencing', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-registry-catalog-target-'));
+    roots.push(dataRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    });
+    const before = await bindConnectorRuntime(dataRoot, 'runtime-a');
+    const replaced = await replaceConnectorCatalogManifest(dataRoot, {
+      full: { expectedToolNames: ['candidate_full', 'candidate_extra'], catalogHash: `sha256:${'1'.repeat(64)}` },
+      pro: { expectedToolNames: ['candidate_pro'], catalogHash: `sha256:${'2'.repeat(64)}` },
+    });
+    expect(replaced.deploymentEpoch).toBe(before.deploymentEpoch + 1);
+    expect(replaced.connectors.map((connector) => ({
+      tunnelId: connector.tunnelId,
+      machineId: connector.machineId,
+      runtimeId: connector.runtimeId,
+      leaseGeneration: connector.leaseGeneration,
+      healthPort: connector.healthPort,
+      managedProfilePath: connector.managedProfilePath,
+    }))).toEqual(before.connectors.map((connector) => ({
+      tunnelId: connector.tunnelId,
+      machineId: connector.machineId,
+      runtimeId: connector.runtimeId,
+      leaseGeneration: connector.leaseGeneration,
+      healthPort: connector.healthPort,
+      managedProfilePath: connector.managedProfilePath,
+    })));
+    expect(replaced.connectors[0]).toMatchObject({
+      expectedToolNames: ['candidate_full', 'candidate_extra'],
+      catalogHash: `sha256:${'1'.repeat(64)}`,
+      deploymentEpoch: replaced.deploymentEpoch,
+    });
+    expect(replaced.connectors[1]).toMatchObject({
+      expectedToolNames: ['candidate_pro'],
+      catalogHash: `sha256:${'2'.repeat(64)}`,
+      deploymentEpoch: replaced.deploymentEpoch,
+    });
+    expect(await readConnectorRegistry(dataRoot)).toEqual(replaced);
   });
 
   it('rejects invalid tunnel/profile identities', () => {
@@ -43,7 +104,7 @@ describe('connector registry', () => {
     expect(inspection?.changed).toBe(true);
     expect(inspection?.staleConnectorIds).toEqual(['iris-full', 'iris-pro']);
     const readable = await readConnectorRegistry(dataRoot);
-    expect(readable?.connectors[0]?.expectedToolNames).toEqual(fullMcpToolNames());
+    expect(readable?.connectors[0]?.expectedToolNames).toEqual(['old_tool']);
     const reconciled = await reconcileConnectorRegistry(dataRoot);
     expect(reconciled?.changed).toBe(true);
     expect(reconciled?.registry.deploymentEpoch).toBe(created.deploymentEpoch + 1);

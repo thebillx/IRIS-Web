@@ -52,7 +52,7 @@ export function canonicalNodeRuntime(candidates: readonly string[] = [...VERSION
 export function node24PathEntries(nodePath = canonicalNodeRuntime().path): readonly string[] {
   return unique([
     path.dirname(nodePath),
-    path.join(os.homedir(), '.local', 'bin'),
+    path.join(os.userInfo().homedir, '.local', 'bin'),
     '/opt/homebrew/bin',
     '/opt/homebrew/sbin',
     '/usr/local/bin',

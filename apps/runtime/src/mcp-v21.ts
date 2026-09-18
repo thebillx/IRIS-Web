@@ -4,6 +4,9 @@ import type { DurableMissionLifecycleService } from './durable-mission-service.j
 import type { MissionBrokerService } from './mission-broker.js';
 import { catalogIdentityPayload, catalogToolNames, type McpCatalogRuntimeContext } from './mcp-catalog.js';
 import { MCP_PROTOCOL_VERSION, fullMcpToolDefinitions, handleMcpRequest, type McpPrincipal } from './mcp.js';
+import { executePhase2GroupedTool, isPhase2GroupedTool } from './mcp-phase2.js';
+import { executePhase3GroupedTool, isPhase3GroupedTool } from './mcp-phase3.js';
+import { executePhase4GroupedTool, isPhase4GroupedTool } from './mcp-phase4.js';
 import { augmentV21ToolDefinitions, V21_LIFECYCLE_TOOL_NAMES } from './mcp-v21-definitions.js';
 import { executeV21LifecycleTool, isCapabilityOutcome, toolError, toolOutcome, toolResult } from './mcp-v21-tools.js';
 import type { RuntimeState } from './state.js';
@@ -46,7 +49,10 @@ export async function handleMcpV21Request(
   const lifecycleDirective = name === 'mission_directive' && args.basedOnRevision !== undefined;
   const lifecycleCreate = name === 'mission_create';
   const catalogIdentity = name === 'catalog_identity';
-  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity) {
+  const phase2Grouped = isPhase2GroupedTool(name);
+  const phase3Grouped = isPhase3GroupedTool(name);
+  const phase4Grouped = isPhase4GroupedTool(name);
+  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity && !phase2Grouped && !phase3Grouped && !phase4Grouped) {
     return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
   }
 
@@ -59,12 +65,18 @@ export async function handleMcpV21Request(
   try {
     const result = catalogIdentity
       ? catalogIdentityPayload('FULL', fullMcpToolDefinitionsV21(), runtimeContext)
-      : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal);
+      : phase2Grouped
+        ? await executePhase2GroupedTool(name, args, request, capabilities, state)
+        : phase3Grouped
+          ? await executePhase3GroupedTool(name, args, request, capabilities, state)
+          : phase4Grouped
+            ? await executePhase4GroupedTool(name, args, request, capabilities, state)
+            : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal);
     return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
   } catch (error) {
     const runtimeError = error instanceof RuntimeError
       ? error
-      : new RuntimeError('INVALID_REQUEST', error instanceof Error ? error.message : 'Lifecycle tool call failed');
+      : new RuntimeError('INVALID_REQUEST', error instanceof Error ? error.message : 'Lifecycle/Phase 2 tool call failed');
     return jsonRpcResult(rpc.id ?? null, toolError(runtimeError.code, runtimeError.message));
   }
 }
