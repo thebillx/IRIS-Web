@@ -91,6 +91,32 @@ Explicitly forbidden in the M8 live run:
 - Run Full Sync audit and M7 projection.
 - Capture zero-write ledger and unchanged source revisions.
 
+## Executable owner-only runner
+
+The repository includes an owner-invoked live runner that accepts the credential
+from stdin only. It never accepts a token in argv, never stores the credential,
+constructs every Azure DevOps URL itself, follows no redirects, and records only
+GET requests in the zero-mutation ledger.
+
+Example shape (replace placeholders locally; do not paste credentials into chat):
+
+```sh
+read -s ADO_PAT
+printf '%s' "$ADO_PAT" | pnpm --filter @iris/runtime ado:live-acceptance -- \
+  --token-stdin \
+  --organization <organization> \
+  --project <project> \
+  --board "<exact-board-name>" \
+  --level1-work-item <work-item-id> \
+  --story-work-item <story-id>
+unset ADO_PAT
+```
+
+Use a temporary Work Items **Read** credential for acceptance only. Production
+automation should use the separately governed Microsoft Entra identity path.
+The runner writes its sanitized snapshot and receipt only under the private IRIS
+runtime data root.
+
 ## Release gate
 
 C7 can move from LOCAL_PASS / LIVE_PENDING to COMPLETED only when Levels 1–4 have
