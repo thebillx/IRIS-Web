@@ -11,7 +11,7 @@ import {
 const target: AdoLiveAcceptanceTarget = {
   organization: 'example-org',
   project: 'Example Project',
-  boardName: 'Example Board',
+  teamName: 'Example Team',
   level1WorkItemId: 100,
   storyWorkItemId: 201,
 };
@@ -58,7 +58,10 @@ function fakeFetch(options: { changeRevision?: boolean } = {}) {
     } else if (pathname.endsWith('/_apis/projects/p1/teams')) {
       body = { count: 1, value: [{ id: 't1', name: 'Example Team' }] };
     } else if (pathname.endsWith('/p1/t1/_apis/work/boards')) {
-      body = { count: 1, value: [{ id: 'b1', name: 'Example Board' }] };
+      body = { count: 2, value: [
+        { id: 'b-portfolio', name: 'Portfolio' },
+        { id: 'b-requirements', name: 'Requirements' },
+      ] };
     } else if (pathname.endsWith('/p1/t1/_apis/work/teamsettings/teamfieldvalues')) {
       body = {
         field: { referenceName: 'System.AreaPath' },

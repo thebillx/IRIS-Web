@@ -24,7 +24,7 @@ async function main(): Promise<void> {
   const target: AdoLiveAcceptanceTarget = {
     organization: required('--organization'),
     project: required('--project'),
-    boardName: required('--board'),
+    teamName: required('--team'),
     level1WorkItemId: positive('--level1-work-item'),
     storyWorkItemId: positive('--story-work-item'),
   };

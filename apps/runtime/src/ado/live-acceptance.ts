@@ -8,7 +8,7 @@ import { privateDirectoryProblem } from '../private-fs.js';
 export interface AdoLiveAcceptanceTarget {
   readonly organization: string;
   readonly project: string;
-  readonly boardName: string;
+  readonly teamName: string;
   readonly level1WorkItemId: number;
   readonly storyWorkItemId: number;
 }
@@ -187,27 +187,23 @@ export async function runAdoLiveReadAcceptance(
   const project = parseIdentity(projectResponse.body);
 
   const teams = await listTeams(request, project.id);
-  const boardMatches: { team: TeamRef; board: BoardRef }[] = [];
-  for (const team of teams) {
-    const boards = await listBoards(request, project.id, team.id);
-    for (const board of boards) {
-      if (board.name === target.boardName) boardMatches.push({ team, board });
-    }
-  }
-  if (boardMatches.length === 0) throw new AdoLiveAcceptanceError('NOT_FOUND');
-  if (boardMatches.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
-  const resolved = boardMatches[0]!;
+  const teamMatches = teams.filter(team => team.name === target.teamName);
+  if (teamMatches.length === 0) throw new AdoLiveAcceptanceError('NOT_FOUND');
+  if (teamMatches.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
+  const team = teamMatches[0]!;
+  const boards = await listBoards(request, project.id, team.id);
+  if (boards.length === 0) throw new AdoLiveAcceptanceError('NOT_FOUND');
 
   const teamField = parseTeamField((await request(
     'scope.team_field_values',
-    '/' + encodeURIComponent(project.id) + '/' + encodeURIComponent(resolved.team.id) + '/_apis/work/teamsettings/teamfieldvalues',
+    '/' + encodeURIComponent(project.id) + '/' + encodeURIComponent(team.id) + '/_apis/work/teamsettings/teamfieldvalues',
     { 'api-version': '7.1' },
   )).body);
   if (teamField.field.referenceName !== 'System.AreaPath') throw new AdoLiveAcceptanceError('SCOPE_MISMATCH');
 
   const backlogLevels = parseBacklogs((await request(
     'backlogs.list',
-    '/' + encodeURIComponent(project.id) + '/' + encodeURIComponent(resolved.team.id) + '/_apis/work/backlogs',
+    '/' + encodeURIComponent(project.id) + '/' + encodeURIComponent(team.id) + '/_apis/work/backlogs',
     { 'api-version': '7.1' },
   )).body);
   if (backlogLevels.length === 0 || backlogLevels.length > 100) throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
@@ -235,12 +231,15 @@ export async function runAdoLiveReadAcceptance(
     level.type === 'requirement' && level.workItemTypes.includes(storyType));
   if (matchingRequirement.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
   const requirementBacklog = matchingRequirement[0]!;
-  const level3Ids = await readBacklogIds(request, project.id, resolved.team.id, requirementBacklog.id, limits.maxItems);
+  const requirementBoards = boards.filter(board => board.name === requirementBacklog.name);
+  if (requirementBoards.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
+  const canonicalBoard = requirementBoards[0]!;
+  const level3Ids = await readBacklogIds(request, project.id, team.id, requirementBacklog.id, limits.maxItems);
 
   const fullIds = new Set<number>();
   const membership = new Map<number, Set<string>>();
   for (const backlog of backlogLevels.filter(level => !level.hidden)) {
-    const ids = await readBacklogIds(request, project.id, resolved.team.id, backlog.id, limits.maxItems);
+    const ids = await readBacklogIds(request, project.id, team.id, backlog.id, limits.maxItems);
     for (const id of ids) {
       fullIds.add(id);
       const memberships = membership.get(id) ?? new Set<string>();
@@ -276,7 +275,13 @@ export async function runAdoLiveReadAcceptance(
   const relationCount = sanitizedItems.reduce((sum, workItem) => sum + workItem.relations.length, 0);
   const commentCount = sanitizedItems.reduce((sum, workItem) => sum + workItem.comments.length, 0);
   const observedAt = new Date().toISOString();
-  const targetDigest = digest([target.organization, project.id, resolved.team.id, resolved.board.id]);
+  const targetDigest = digest([
+    target.organization,
+    project.id,
+    team.id,
+    canonicalBoard.id,
+    boards.map(board => [board.id, board.name]).sort(),
+  ]);
 
   const snapshot: AdoLiveAcceptanceSnapshot = {
     schemaVersion: 1,
@@ -284,8 +289,8 @@ export async function runAdoLiveReadAcceptance(
     targetDigest,
     organization: target.organization,
     project,
-    team: resolved.team,
-    board: resolved.board,
+    team,
+    board: canonicalBoard,
     scope: {
       field: teamField.field.referenceName,
       defaultValue: teamField.defaultValue,
@@ -309,8 +314,8 @@ export async function runAdoLiveReadAcceptance(
     observedAt,
     targetDigest,
     projectDigest: digest([project.id, project.name]),
-    teamDigest: digest([resolved.team.id, resolved.team.name]),
-    boardDigest: digest([resolved.board.id, resolved.board.name]),
+    teamDigest: digest([team.id, team.name]),
+    boardDigest: digest([canonicalBoard.id, canonicalBoard.name]),
     level1: { itemCount: 1, commentCount: level1Comments.length, revisionStable: true },
     level2: { itemCount: subtreeIds.size },
     level3: { itemCount: level3Ids.size },
@@ -351,7 +356,7 @@ export async function readPatFromStdin(): Promise<string> {
 }
 
 function validateTarget(target: AdoLiveAcceptanceTarget): void {
-  for (const value of [target.organization, target.project, target.boardName]) {
+  for (const value of [target.organization, target.project, target.teamName]) {
     if (typeof value !== 'string' || value.trim().length === 0 || value.length > 200 || /[\0\r\n]/.test(value)) {
       throw new AdoLiveAcceptanceError('INVALID_INPUT');
     }

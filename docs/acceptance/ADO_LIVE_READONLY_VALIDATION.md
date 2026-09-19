@@ -106,7 +106,7 @@ printf '%s' "$ADO_PAT" | pnpm --filter @iris/runtime ado:live-acceptance -- \
   --token-stdin \
   --organization <organization> \
   --project <project> \
-  --board "<exact-board-name>" \
+  --team "<exact-team-name>" \
   --level1-work-item <work-item-id> \
   --story-work-item <story-id>
 unset ADO_PAT
