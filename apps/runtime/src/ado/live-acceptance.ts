@@ -38,6 +38,7 @@ export interface AdoLiveSanitizedItem {
   readonly iterationPath: string | null;
   readonly parent: number | null;
   readonly changedDate: string;
+  readonly backlogIds: readonly string[];
   readonly comments: readonly { readonly id: string; readonly text: string }[];
   readonly relations: readonly { readonly relation: string; readonly targetWorkItemId: number }[];
 }
@@ -237,9 +238,15 @@ export async function runAdoLiveReadAcceptance(
   const level3Ids = await readBacklogIds(request, project.id, resolved.team.id, requirementBacklog.id, limits.maxItems);
 
   const fullIds = new Set<number>();
+  const membership = new Map<number, Set<string>>();
   for (const backlog of backlogLevels.filter(level => !level.hidden)) {
     const ids = await readBacklogIds(request, project.id, resolved.team.id, backlog.id, limits.maxItems);
-    for (const id of ids) fullIds.add(id);
+    for (const id of ids) {
+      fullIds.add(id);
+      const memberships = membership.get(id) ?? new Set<string>();
+      memberships.add(backlog.id);
+      membership.set(id, memberships);
+    }
     if (fullIds.size > limits.maxItems) throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
   }
 
@@ -265,7 +272,7 @@ export async function runAdoLiveReadAcceptance(
   if (!fullStable || !level1Stable) throw new AdoLiveAcceptanceError('REVISION_CHANGED');
 
   const sanitizedItems = firstPass.map(workItem =>
-    sanitizeLiveItem(workItem, comments.get(workItem.id) ?? []));
+    sanitizeLiveItem(workItem, [...(membership.get(workItem.id) ?? new Set<string>())], comments.get(workItem.id) ?? []));
   const relationCount = sanitizedItems.reduce((sum, workItem) => sum + workItem.relations.length, 0);
   const commentCount = sanitizedItems.reduce((sum, workItem) => sum + workItem.comments.length, 0);
   const observedAt = new Date().toISOString();
@@ -536,6 +543,7 @@ async function readWorkItems(
 
 function sanitizeLiveItem(
   workItem: RawWorkItem,
+  backlogIds: readonly string[],
   comments: readonly { readonly id: string; readonly text: string }[],
 ): AdoLiveSanitizedItem {
   const safeFields = {
@@ -564,6 +572,7 @@ function sanitizeLiveItem(
     iterationPath: stage.canonical.iterationPath,
     parent: stage.canonical.parent,
     changedDate: stage.canonical.changedDate,
+    backlogIds: [...new Set(backlogIds)].sort(),
     comments: comments.map(comment => ({ id: comment.id, text: sanitizeText(comment.text) })),
     relations: workItem.relations.flatMap(relation => {
       if (typeof relation.rel !== 'string' || typeof relation.url !== 'string') return [];

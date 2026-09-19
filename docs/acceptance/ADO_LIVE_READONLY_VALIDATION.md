@@ -117,6 +117,26 @@ automation should use the separately governed Microsoft Entra identity path.
 The runner writes its sanitized snapshot and receipt only under the private IRIS
 runtime data root.
 
+## Supervised semantic finalization
+
+The GET-only runner intentionally stops after acquisition, scope/revision proof and
+sanitized private persistence. Semantic classification is a separate acceptance
+step so transport credentials and model reasoning never share one authority
+boundary.
+
+`live-finalize.ts` accepts a private, target-bound supervised review manifest.
+The manifest contains no ADO credential and provides only semantic evidence,
+record kind and orthogonal truth state for the exact sanitized snapshot. The
+finalizer re-runs the real M5 Gate, requires source-grounded quotes, executes a
+complete M6 publication, routes conflicting/ambiguous/review truth away from
+primary knowledge, builds M7 Wiki output, and verifies every Wiki claim retains
+classification provenance. Missing/extra decisions, stale revisions, invented
+quotes or a target-digest mismatch fail closed.
+
+This means after one successful owner-run GET collection, the remaining
+classification/finalization can be completed from the private sanitized snapshot
+without another Azure DevOps credential prompt.
+
 ## Release gate
 
 C7 can move from LOCAL_PASS / LIVE_PENDING to COMPLETED only when Levels 1–4 have
