@@ -430,11 +430,15 @@ async function readAllComments(
       '/' + encodeURIComponent(projectId) + '/_apis/wit/workItems/' + workItemId + '/comments',
       query,
     );
-    for (const raw of parseArrayResponse(result.body)) {
-      if (!isRecord(raw) || (!Number.isSafeInteger(raw.id) && typeof raw.id !== 'string') || typeof raw.text !== 'string') {
+    for (const raw of parseCommentResponse(result.body)) {
+      if (!isRecord(raw) || typeof raw.text !== 'string') {
         throw new AdoLiveAcceptanceError('UPSTREAM_FAILURE');
       }
-      comments.push({ id: String(raw.id), text: sanitizeText(raw.text) });
+      const commentId = raw.id ?? raw.commentId;
+      if (!Number.isSafeInteger(commentId) && typeof commentId !== 'string') {
+        throw new AdoLiveAcceptanceError('UPSTREAM_FAILURE');
+      }
+      comments.push({ id: String(commentId), text: sanitizeText(raw.text) });
       if (comments.length > maxItems) throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
     }
     continuation = result.continuation;
@@ -683,6 +687,11 @@ function parseArrayResponse(value: unknown): unknown[] {
   if (Array.isArray(value)) return value;
   if (isRecord(value) && Array.isArray(value.value)) return value.value;
   throw new AdoLiveAcceptanceError('UPSTREAM_FAILURE');
+}
+
+function parseCommentResponse(value: unknown): unknown[] {
+  if (isRecord(value) && Array.isArray(value.comments)) return value.comments;
+  return parseArrayResponse(value);
 }
 
 function inferObjectCount(value: unknown): number {

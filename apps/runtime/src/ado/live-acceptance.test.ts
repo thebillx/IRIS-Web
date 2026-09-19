@@ -81,7 +81,7 @@ function fakeFetch(options: { changeRevision?: boolean } = {}) {
     } else if (pathname.endsWith('/p1/t1/_apis/work/backlogs/requirements/workItems')) {
       body = { workItems: [{ target: { id: 201 } }] };
     } else if (/\/p1\/_apis\/wit\/workItems\/\d+\/comments$/i.test(pathname)) {
-      body = { count: 0, value: [] };
+      body = { totalCount: 0, count: 0, comments: [] };
     } else if (/\/p1\/_apis\/wit\/workitems\/\d+$/i.test(pathname)) {
       const id = Number(pathname.split('/').at(-1));
       body = workItem(id);
