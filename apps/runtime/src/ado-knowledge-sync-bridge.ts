@@ -86,6 +86,54 @@ export function knowledgeEnvelope(
   };
 }
 
+export function parseKnowledgeEnvelope(content: string): PersistedKnowledgeEnvelopeV1 {
+  knowledgeAssert(typeof content === 'string' && content.length > 0 && content.length <= 1_048_576, 'Persisted knowledge envelope is invalid');
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    knowledgeAssert(false, 'Persisted knowledge envelope is invalid');
+    throw new Error('UNREACHABLE');
+  }
+  knowledgeAssert(value !== null && typeof value === 'object' && !Array.isArray(value), 'Persisted knowledge envelope is invalid');
+  const envelope = value as Partial<PersistedKnowledgeEnvelopeV1>;
+  const revision = envelope.revision;
+  knowledgeAssert(envelope.schemaVersion === 1
+    && typeof envelope.scopeId === 'string' && /^ado-board:[a-f0-9]{64}$/.test(envelope.scopeId)
+    && typeof envelope.workItemId === 'string' && /^[1-9][0-9]*$/.test(envelope.workItemId)
+    && typeof revision === 'number' && Number.isSafeInteger(revision) && revision > 0
+    && typeof envelope.sourceRawHash === 'string' && /^[a-f0-9]{64}$/.test(envelope.sourceRawHash)
+    && envelope.normalizerVersion === 'm3-v1'
+    && Array.isArray(envelope.facts), 'Persisted knowledge envelope is invalid');
+  const allowedFields = new Set(['type', 'title', 'state', 'description', 'acceptanceCriteria', 'areaPath', 'iterationPath', 'boardColumn', 'tags']);
+  const seen = new Set<string>();
+  const facts = envelope.facts.map(fact => {
+    knowledgeAssert(fact !== null && typeof fact === 'object'
+      && typeof fact.field === 'string' && allowedFields.has(fact.field)
+      && typeof fact.body === 'string'
+      && typeof fact.contentHash === 'string' && /^[a-f0-9]{64}$/.test(fact.contentHash)
+      && fact.contentHash === hash(fact.body)
+      && typeof fact.sourceName === 'string' && fact.sourceName.length > 0
+      && !seen.has(fact.field), 'Persisted knowledge envelope fact is invalid');
+    seen.add(fact.field);
+    return {
+      field: fact.field as PersistedKnowledgeEnvelopeV1['facts'][number]['field'],
+      body: fact.body,
+      contentHash: fact.contentHash,
+      sourceName: fact.sourceName,
+    };
+  });
+  return {
+    schemaVersion: 1,
+    scopeId: envelope.scopeId,
+    workItemId: envelope.workItemId,
+    revision,
+    sourceRawHash: envelope.sourceRawHash,
+    normalizerVersion: 'm3-v1',
+    facts,
+  };
+}
+
 export function gateDecisionFromClassification(
   itemId: number,
   fingerprint: string,
@@ -114,6 +162,10 @@ export function gateDecisionFromClassification(
     reasonCode,
     category: classification.category,
     classificationDigest: digest,
+    evidence: classification.semanticEvidence?.quotes.map(quote => ({
+      field: quote.field,
+      text: quote.text,
+    })) ?? [],
   };
 }
 

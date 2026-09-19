@@ -42,8 +42,11 @@ an arbitrary caller's authority to issue a Knowledge Gate decision.
 3. `inspect` derives current expected/fetched/failed counts from the authoritative
    rows. Counts are not independently updated mutable counters that can drift.
 4. `decide` records one immutable classification per item/run, bound to the source
-   fingerprint and configured gate version. Classification remains an external
-   Knowledge Gate responsibility. Staging alone is never a promotion.
+   fingerprint and configured gate version. The persisted gate row also retains
+   the classification category, a SHA-256 digest of the complete classification,
+   and exact source-grounded semantic evidence quotes when present. Classification
+   remains an external Knowledge Gate responsibility. Staging alone is never a
+   promotion.
 5. `finish` recomputes completeness and policy from the same store snapshot.
    Success commits `COMPLETE`, its end time, audit, and the scope's publication
    pointer together. Failure commits `AUDIT_FAILED` and its end time/audit, without

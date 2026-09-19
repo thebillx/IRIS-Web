@@ -26,6 +26,10 @@ export type FailureCode = 'UNAUTHENTICATED' | 'UNAUTHORIZED' | 'NETWORK_FAILURE'
 export interface FailedItem { itemId: number; code: FailureCode }
 export interface Batch { batchId: string; observations: Observation[]; failures: FailedItem[] }
 export type Disposition = 'PROMOTED' | 'CONTEXT_ONLY' | 'SUPPORTING_EVIDENCE' | 'REJECTED';
+export interface GateEvidence {
+  field: 'title' | 'description' | 'acceptanceCriteria';
+  text: string;
+}
 export interface GateDecision {
   itemId: number;
   fingerprint: string;
@@ -34,6 +38,7 @@ export interface GateDecision {
   reasonCode: string;
   category: string | null;
   classificationDigest: string;
+  evidence: GateEvidence[];
 }
 export interface GateRow extends GateDecision { syncRunId: string; decidedAt: string }
 export interface SourceRow extends Source {
@@ -55,6 +60,13 @@ export interface PublicationPolicy { gateVersion: string; minimumPromoted: numbe
 export function validateGateDecisionMetadata(decision: GateDecision): void {
   if (decision.category !== null) identifier(decision.category);
   requireValid(typeof decision.classificationDigest === 'string' && /^[a-f0-9]{64}$/.test(decision.classificationDigest));
+  bounded(decision.evidence);
+  unique(decision.evidence.map(entry => canonical([entry.field, entry.text])));
+  for (const entry of decision.evidence) {
+    requireValid(['title', 'description', 'acceptanceCriteria'].includes(entry.field));
+    validText(entry.text);
+    requireValid(entry.text.trim().length > 0);
+  }
 }
 export type SyncTrigger = { kind: 'MANUAL' } | { kind: 'INCREMENTAL' } | { kind: 'SCHEDULE'; scheduleId: string };
 export type SyncMode = 'FULL' | 'INCREMENTAL';
@@ -127,6 +139,9 @@ export function requireValid(condition: unknown): asserts condition {
 export function identifier(value: string): void {
   requireValid(typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value));
 }
+export function gateVersion(value: string): void {
+  requireValid(typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$/.test(value));
+}
 export function itemId(value: number): void { requireValid(Number.isSafeInteger(value) && value > 0); }
 export function timestamp(value: string): void {
   requireValid(typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value);
@@ -175,7 +190,7 @@ export function validateFailure(failure: FailedItem): void {
   requireValid(['UNAUTHENTICATED', 'UNAUTHORIZED', 'NETWORK_FAILURE', 'POLICY_DENIED', 'RATE_LIMITED', 'UPSTREAM_FAILURE'].includes(failure.code));
 }
 export function validatePolicy(policy: PublicationPolicy): void {
-  identifier(policy.gateVersion);
+  gateVersion(policy.gateVersion);
   requireValid(Number.isSafeInteger(policy.minimumPromoted) && policy.minimumPromoted >= 0 && policy.minimumPromoted <= MAX_ITEMS && typeof policy.allowRejections === 'boolean');
 }
 export function reconcileMembership(previous: Membership[], current: Membership[], knownItemIds: number[]): Reconciliation {

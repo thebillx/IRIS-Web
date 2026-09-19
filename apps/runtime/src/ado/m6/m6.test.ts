@@ -27,6 +27,7 @@ function harness(store: SyncStore = new MemorySyncStore()) {
       reasonCode: 'SYNTHETIC_DECISION',
       category: disposition === 'PROMOTED' ? 'FUNCTIONAL_BEHAVIOR' : null,
       classificationDigest: hash(JSON.stringify([itemId, disposition, source.fingerprint])),
+      evidence: disposition === 'PROMOTED' ? [{ field: 'description', text: `Source ${itemId}` }] : [],
     }, at);
   };
   const finish = (syncRunId: string) => coordinator.finish(syncRunId, coordinator.inspect(syncRunId).run.version, at);
@@ -258,6 +259,7 @@ describe('M6 completeness audit', () => {
       reasonCode: 'PASS',
       category: 'FUNCTIONAL_BEHAVIOR',
       classificationDigest: hash('synthetic-classification'),
+      evidence: [{ field: 'description' as const, text: 'Source 1' }],
     };
     expect(() => coordinator.decide('run-1', 2, { ...base, fingerprint: hash('stale') }, at)).toThrow('STALE_GATE');
     expect(() => coordinator.decide('run-1', 2, { ...base, gateVersion: 'other-gate' }, at)).toThrow('STALE_GATE');

@@ -20,7 +20,14 @@ export interface SyncScheduler {
   start(request: StartSync): SyncRun;
   status(scope: BoardKey): SchedulerStatus;
 }
-export interface CorpusPartition { sources: SourceRow[]; comments: SyncDocument['comments']; relations: SyncDocument['relations']; links: SyncDocument['links']; membership: SyncDocument['boardMembership'] }
+export interface CorpusPartition {
+  sources: SourceRow[];
+  comments: SyncDocument['comments'];
+  relations: SyncDocument['relations'];
+  links: SyncDocument['links'];
+  membership: SyncDocument['boardMembership'];
+  gates: GateRow[];
+}
 export interface PublishedCorpus { syncRunId: string; promoted: CorpusPartition; contextOnly: CorpusPartition; supportingEvidence: CorpusPartition }
 
 function gateTable(document: SyncDocument, disposition: Disposition): GateRow[] {
@@ -197,6 +204,7 @@ export class SyncCoordinator implements SyncScheduler {
       reasonCode: decision.reasonCode,
       category: decision.category,
       classificationDigest: decision.classificationDigest,
+      evidence: decision.evidence.map(entry => ({ ...entry })),
       decidedAt: at,
     });
     this.save(document);
@@ -263,7 +271,14 @@ export class SyncCoordinator implements SyncScheduler {
     const partition = (gates: GateRow[]): CorpusPartition => {
       const ids = new Set(gates.filter(gate => gate.syncRunId === head.syncRunId).map(gate => gate.itemId));
       const matches = (row: { syncRunId: string; itemId: number }) => row.syncRunId === head.syncRunId && ids.has(row.itemId);
-      return { sources: document.sourceStaging.filter(matches), comments: document.comments.filter(matches), relations: document.relations.filter(matches), links: document.links.filter(matches), membership: document.boardMembership.filter(matches) };
+      return {
+        sources: document.sourceStaging.filter(matches),
+        comments: document.comments.filter(matches),
+        relations: document.relations.filter(matches),
+        links: document.links.filter(matches),
+        membership: document.boardMembership.filter(matches),
+        gates: gates.filter(gate => gate.syncRunId === head.syncRunId),
+      };
     };
     return { syncRunId: head.syncRunId, promoted: partition(document.promoted), contextOnly: partition(document.contextOnly), supportingEvidence: partition(document.supportingEvidence) };
   }
