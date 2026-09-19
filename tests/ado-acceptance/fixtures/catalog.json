@@ -1,0 +1,620 @@
+{
+  "version": 1,
+  "origin": "SYNTHETIC",
+  "logicalSource": {
+    "organization": "sample-org",
+    "project": "sample-project",
+    "team": "sample-team",
+    "board": "sample-board"
+  },
+  "items": [
+    {
+      "key": "epic-container",
+      "id": 1001,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "Epic",
+        "System.Title": "Workspace capabilities",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "CONTEXT_ONLY",
+      "reason": "CONTAINER",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "CONTEXT"
+    },
+    {
+      "key": "normal-story",
+      "id": 1002,
+      "rev": 2,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Save a workspace preference",
+        "System.Description": "<p>Users can save a preference. Reopening the workspace restores that value.</p>",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [
+        {
+          "rel": "System.LinkTypes.Hierarchy-Reverse",
+          "url": "https://ado.example.invalid/sample-org/sample-project/_apis/wit/workItems/1001"
+        }
+      ],
+      "expectedStatus": "PROMOTED",
+      "reason": "REQUIREMENT",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "PRIMARY"
+    },
+    {
+      "key": "story-no-description",
+      "id": 1003,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Unspecified behavior",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "REJECTED",
+      "reason": "INSUFFICIENT_EVIDENCE",
+      "expectedTruthStatus": "NEEDS_REVIEW",
+      "expectedAdmission": "REVIEW"
+    },
+    {
+      "key": "story-acceptance-criteria",
+      "id": 1004,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Validate preference",
+        "Microsoft.VSTS.Common.AcceptanceCriteria": "<ul><li>Given an empty value, saving displays an error.</li><li>Existing saved value remains unchanged.</li></ul>",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "PROMOTED",
+      "reason": "REQUIREMENT",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "PRIMARY"
+    },
+    {
+      "key": "story-comments",
+      "id": 1005,
+      "rev": 3,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Export settings",
+        "System.Description": "Users can export their settings as a local file.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "comments": {
+        "totalCount": 2,
+        "pages": [
+          {
+            "count": 1,
+            "comments": [
+              {
+                "id": 1,
+                "text": "Export includes the selected workspace only.",
+                "createdDate": "2026-01-01T00:00:00Z"
+              }
+            ],
+            "continuationToken": "page-two"
+          },
+          {
+            "count": 1,
+            "comments": [
+              {
+                "id": 2,
+                "text": "[REDACTED_IDENTITY] confirmed the behavior.",
+                "createdDate": "2026-01-02T00:00:00Z"
+              }
+            ]
+          }
+        ]
+      },
+      "expectedStatus": "PROMOTED",
+      "reason": "REQUIREMENT",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "PRIMARY"
+    },
+    {
+      "key": "story-custom-fields",
+      "id": 1006,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Set retention period",
+        "System.Description": "A workspace owner can choose a retention period.",
+        "Custom.RetentionDays": 30,
+        "Custom.Enabled": false,
+        "Custom.Note": null,
+        "Custom.Policy": "<p>Expired drafts are excluded.</p>",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "PROMOTED",
+      "reason": "REQUIREMENT",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "PRIMARY"
+    },
+    {
+      "key": "support-only-story",
+      "id": 1007,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Support QA",
+        "System.Description": "Run the existing manual checks for the release.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "REJECTED",
+      "reason": "SUPPORT_NOISE",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "REJECTED"
+    },
+    {
+      "key": "execution-only-task",
+      "id": 1008,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "Task",
+        "System.Title": "Run deployment checklist",
+        "System.Description": "Execute the existing release steps.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "REJECTED",
+      "reason": "EXECUTION_NOISE",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "REJECTED"
+    },
+    {
+      "key": "placeholder",
+      "id": 1009,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "TBD",
+        "System.Description": "<p>&nbsp;</p>",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "REJECTED",
+      "reason": "PLACEHOLDER",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "REJECTED"
+    },
+    {
+      "key": "context-only-epic",
+      "id": 1010,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "Epic",
+        "System.Title": "Local settings",
+        "System.Description": "Groups related settings requirements; defines no independent behavior.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "CONTEXT_ONLY",
+      "reason": "CONTAINER",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "CONTEXT"
+    },
+    {
+      "key": "supporting-evidence",
+      "id": 1011,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Preference behavior observation",
+        "System.Description": "A test run observed the behavior of the preference requirement; this is evidence, not a requirement.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [
+        {
+          "rel": "System.LinkTypes.Related",
+          "url": "https://ado.example.invalid/sample-org/sample-project/_apis/wit/workItems/1002"
+        }
+      ],
+      "expectedStatus": "SUPPORTING_EVIDENCE",
+      "reason": "SUPPORTING_EVIDENCE",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "EVIDENCE"
+    },
+    {
+      "key": "duplicate-story",
+      "id": 1012,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Save preference copy",
+        "System.Description": "Users can save a preference. Reopening the workspace restores that value.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [
+        {
+          "rel": "System.LinkTypes.Duplicate-Forward",
+          "url": "https://ado.example.invalid/sample-org/sample-project/_apis/wit/workItems/1002"
+        }
+      ],
+      "expectedStatus": "PROMOTED",
+      "reason": "DUPLICATE",
+      "expectedTruthStatus": "DUPLICATE",
+      "expectedAdmission": "PRIMARY"
+    },
+    {
+      "key": "superseded-story",
+      "id": 1013,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Old preference behavior",
+        "System.Description": "The value resets when reopening. Superseded by the linked preference requirement.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [
+        {
+          "rel": "System.LinkTypes.Related",
+          "url": "https://ado.example.invalid/sample-org/sample-project/_apis/wit/workItems/1002",
+          "attributes": {
+            "comment": "Superseded by linked requirement"
+          }
+        }
+      ],
+      "expectedStatus": "PROMOTED",
+      "reason": "SUPERSEDED",
+      "expectedTruthStatus": "SUPERSEDED",
+      "expectedAdmission": "HISTORY"
+    },
+    {
+      "key": "conflicting-story",
+      "id": 1014,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Reset saved preference",
+        "System.Description": "Reopening the workspace must reset the saved preference instead of restoring it.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [
+        {
+          "rel": "System.LinkTypes.Related",
+          "url": "https://ado.example.invalid/sample-org/sample-project/_apis/wit/workItems/1002"
+        }
+      ],
+      "expectedStatus": "PROMOTED",
+      "reason": "CONFLICT",
+      "expectedTruthStatus": "CONFLICTING",
+      "expectedAdmission": "REVIEW"
+    },
+    {
+      "key": "ambiguous-story",
+      "id": 1015,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Maybe retain settings",
+        "System.Description": "Either retain or clear the value; a decision is still needed.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "REJECTED",
+      "reason": "AMBIGUOUS",
+      "expectedTruthStatus": "AMBIGUOUS",
+      "expectedAdmission": "REVIEW"
+    },
+    {
+      "key": "orphan-relation",
+      "id": 1016,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Unresolved parent",
+        "System.Description": "Users can view a saved preference.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [
+        {
+          "rel": "System.LinkTypes.Hierarchy-Reverse",
+          "url": "https://ado.example.invalid/sample-org/sample-project/_apis/wit/workItems/1999"
+        }
+      ],
+      "expectedStatus": "PROMOTED",
+      "reason": "INCOMPLETE_GRAPH",
+      "expectedTruthStatus": "NEEDS_REVIEW",
+      "expectedAdmission": "REVIEW"
+    },
+    {
+      "key": "valid-support-requirement",
+      "id": 1017,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Support offline preference viewing",
+        "System.Description": "When disconnected, users can view the last saved preference. Editing is disabled until connected.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "PROMOTED",
+      "reason": "REQUIREMENT",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "PRIMARY"
+    },
+    {
+      "key": "retest",
+      "id": 1018,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Retest",
+        "System.Description": "Repeat existing QA checks.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "REJECTED",
+      "reason": "SUPPORT_NOISE",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "REJECTED"
+    },
+    {
+      "key": "prepare-data",
+      "id": 1019,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "User Story",
+        "System.Title": "Prepare Data",
+        "System.Description": "Prepare temporary test records.",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [],
+      "expectedStatus": "REJECTED",
+      "reason": "SUPPORT_NOISE",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "REJECTED"
+    },
+    {
+      "key": "feature-subtree",
+      "id": 1020,
+      "rev": 1,
+      "fields": {
+        "System.WorkItemType": "Feature",
+        "System.Title": "Preference management",
+        "System.ChangedDate": "2026-01-15T00:00:00.000Z"
+      },
+      "relations": [
+        {
+          "rel": "System.LinkTypes.Hierarchy-Reverse",
+          "url": "https://ado.example.invalid/sample-org/sample-project/_apis/wit/workItems/1001"
+        },
+        {
+          "rel": "System.LinkTypes.Hierarchy-Forward",
+          "url": "https://ado.example.invalid/sample-org/sample-project/_apis/wit/workItems/1004"
+        }
+      ],
+      "expectedStatus": "CONTEXT_ONLY",
+      "reason": "CONTAINER",
+      "expectedTruthStatus": "CURRENT",
+      "expectedAdmission": "CONTEXT"
+    }
+  ],
+  "scenarios": [
+    {
+      "key": "pagination",
+      "kind": "pages",
+      "pages": [
+        {
+          "count": 2,
+          "value": [
+            1001,
+            1002
+          ],
+          "continuationToken": "page-two"
+        },
+        {
+          "count": 2,
+          "value": [
+            1002,
+            1004
+          ]
+        }
+      ],
+      "expectedUniqueIds": [
+        1001,
+        1002,
+        1004
+      ]
+    },
+    {
+      "key": "upstream-401",
+      "kind": "error",
+      "status": 401,
+      "body": {
+        "message": "Access unavailable"
+      },
+      "expectedCode": "UNAUTHENTICATED",
+      "retryable": false
+    },
+    {
+      "key": "upstream-403",
+      "kind": "error",
+      "status": 403,
+      "body": {
+        "message": "Access unavailable"
+      },
+      "expectedCode": "UNAUTHORIZED",
+      "retryable": false
+    },
+    {
+      "key": "upstream-429",
+      "kind": "error",
+      "status": 429,
+      "headers": {
+        "retry-after": "2"
+      },
+      "body": {
+        "message": "Request limited"
+      },
+      "expectedCode": "RATE_LIMITED",
+      "retryable": true
+    },
+    {
+      "key": "upstream-5xx",
+      "kind": "error",
+      "status": 503,
+      "body": {
+        "message": "Temporarily unavailable"
+      },
+      "expectedCode": "UPSTREAM_FAILURE",
+      "retryable": true
+    },
+    {
+      "key": "malformed-item",
+      "kind": "invalid",
+      "input": {
+        "id": "not-an-integer",
+        "fields": []
+      },
+      "expectedCode": "INVALID_ITEM"
+    },
+    {
+      "key": "bounded-description",
+      "kind": "generated",
+      "generator": "repeat",
+      "unit": "x",
+      "limit": 4096,
+      "lengths": [
+        4095,
+        4096,
+        4097
+      ],
+      "expectedCode": "INPUT_LIMIT"
+    },
+    {
+      "key": "unsafe-links",
+      "kind": "links",
+      "values": [
+        "javascript:alert(1)",
+        "file:///outside-workspace",
+        "https://external.example.invalid/untrusted",
+        "https://ado.example.invalid/sample-org/other-project/_apis/wit/workItems/1002"
+      ],
+      "expectedCode": "UNTRUSTED_LINK"
+    },
+    {
+      "key": "pii-redaction",
+      "kind": "generated",
+      "generator": "synthetic-pii-in-memory",
+      "surfaces": [
+        "title",
+        "description",
+        "comments",
+        "customFields",
+        "links",
+        "upstreamError"
+      ],
+      "expectedCode": "REDACTED"
+    },
+    {
+      "key": "pagination-cycle",
+      "kind": "pages",
+      "pages": [
+        {
+          "count": 1,
+          "value": [
+            1001
+          ],
+          "continuationToken": "same-page"
+        },
+        {
+          "count": 1,
+          "value": [
+            1002
+          ],
+          "continuationToken": "same-page"
+        }
+      ],
+      "expectedCode": "INCOMPLETE_SCAN"
+    },
+    {
+      "key": "backlog-discovery",
+      "kind": "backlogs",
+      "levels": [
+        {
+          "name": "Portfolio",
+          "type": "portfolio",
+          "workItemTypes": [
+            "Epic"
+          ]
+        },
+        {
+          "name": "Capabilities",
+          "type": "portfolio",
+          "workItemTypes": [
+            "Feature"
+          ]
+        },
+        {
+          "name": "Requirements",
+          "type": "requirement",
+          "workItemTypes": [
+            "User Story",
+            "Requirement"
+          ]
+        },
+        {
+          "name": "Tasks",
+          "type": "task",
+          "workItemTypes": [
+            "Task"
+          ]
+        }
+      ],
+      "expectedCode": "DISCOVERED_NOT_HARDCODED"
+    },
+    {
+      "key": "graph-cycle",
+      "kind": "edges",
+      "edges": [
+        [
+          1001,
+          1020
+        ],
+        [
+          1020,
+          1001
+        ]
+      ],
+      "expectedCode": "INVALID_GRAPH"
+    },
+    {
+      "key": "classifier-invalid",
+      "kind": "classifier",
+      "responses": [
+        {
+          "status": "UNKNOWN"
+        },
+        {
+          "status": "PROMOTED",
+          "reason": ""
+        },
+        {
+          "status": "PROMOTED",
+          "reason": "REQUIREMENT",
+          "sourceId": 1999
+        }
+      ],
+      "expectedCode": "INVALID_CLASSIFICATION"
+    },
+    {
+      "key": "admin-only-story",
+      "kind": "item-overlay",
+      "base": "support-only-story",
+      "fields": {
+        "System.Title": "Schedule review meeting",
+        "System.Description": "Book a room and invite reviewers."
+      },
+      "expectedCode": "ADMIN_NOISE"
+    }
+  ]
+}

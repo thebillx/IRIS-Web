@@ -29,9 +29,15 @@ importers:
 
   apps/runtime:
     dependencies:
+      '@iris/ado':
+        specifier: workspace:*
+        version: link:../../packages/ado
       '@iris/domain':
         specifier: workspace:*
         version: link:../../packages/domain
+      '@iris/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
     devDependencies:
       '@types/node':
         specifier: ^24.3.0
@@ -67,6 +73,16 @@ importers:
       vitest:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@24.13.3)(jsdom@30.0.1)(tsx@4.23.13)
+
+  packages/ado:
+    dependencies:
+      parse5:
+        specifier: 8.0.1
+        version: 8.0.1
+    devDependencies:
+      '@types/node':
+        specifier: ^24.3.0
+        version: 24.13.3
 
   packages/domain: {}
 
