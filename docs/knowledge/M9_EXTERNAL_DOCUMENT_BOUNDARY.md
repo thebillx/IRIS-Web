@@ -74,3 +74,12 @@ After that compatibility fix:
 - Cross-project/workspace artifact substitution, source/version drift, oversize content, unavailable connectors, and timeout fail closed.
 - Focused M9 external-document suite: 29/29 PASS.
 - typecheck, lint, and build: PASS.
+
+## M9-D revision history and cross-source correlation
+
+- Added external-document revision snapshots and deterministic diffs for unchanged, metadata-only, and content-changing revisions.
+- Revision comparison is bound to exact project/provider/source/source-link identity and rejects time reversal or source rebinding.
+- Added same-project evidence graph covering ADO Work Item, external document, Bug, Test Case, Pull Request, Commit, and Build identities.
+- Every cross-source relation remains `SUPPORTING_EVIDENCE`; implementation/QA evidence never becomes requirement truth by correlation alone.
+- Cross-project edges remain denied at this layer and are delegated to the explicit M9-E authority boundary.
+- Focused M9-D tests: 6/6 PASS.
