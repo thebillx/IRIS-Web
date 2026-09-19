@@ -88,6 +88,7 @@ export interface AdoLiveAcceptanceReceipt {
   readonly level3: { readonly itemCount: number };
   readonly level4: { readonly itemCount: number; readonly commentCount: number; readonly relationCount: number };
   readonly requestCount: number;
+  readonly areaPathMismatchCount: number;
   readonly zeroMutation: true;
   readonly revisionStable: boolean;
 }
@@ -208,34 +209,6 @@ export async function runAdoLiveReadAcceptance(
   )).body);
   if (backlogLevels.length === 0 || backlogLevels.length > 100) throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
 
-  const level1Before = parseWorkItem((await request(
-    'level1.work_item',
-    '/' + encodeURIComponent(project.id) + '/_apis/wit/workitems/' + target.level1WorkItemId,
-    { '$expand': 'all', 'api-version': '7.1' },
-  )).body);
-  assertInScope(level1Before, teamField);
-  const level1Comments = await readAllComments(request, project.id, target.level1WorkItemId, limits.maxItems);
-
-  const story = parseWorkItem((await request(
-    'level2.story_anchor',
-    '/' + encodeURIComponent(project.id) + '/_apis/wit/workitems/' + target.storyWorkItemId,
-    { '$expand': 'all', 'api-version': '7.1' },
-  )).body);
-  assertInScope(story, teamField);
-
-  const featureRoot = await findFeatureAncestor(request, project.id, story, limits.maxItems, teamField);
-  const subtreeIds = await collectSubtree(request, project.id, featureRoot, limits.maxItems, teamField);
-
-  const storyType = textField(story.fields['System.WorkItemType']);
-  const matchingRequirement = backlogLevels.filter(level =>
-    level.type === 'requirement' && level.workItemTypes.includes(storyType));
-  if (matchingRequirement.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
-  const requirementBacklog = matchingRequirement[0]!;
-  const requirementBoards = boards.filter(board => board.name === requirementBacklog.name);
-  if (requirementBoards.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
-  const canonicalBoard = requirementBoards[0]!;
-  const level3Ids = await readBacklogIds(request, project.id, team.id, requirementBacklog.id, limits.maxItems);
-
   const fullIds = new Set<number>();
   const membership = new Map<number, Set<string>>();
   for (const backlog of backlogLevels.filter(level => !level.hidden)) {
@@ -249,8 +222,38 @@ export async function runAdoLiveReadAcceptance(
     if (fullIds.size > limits.maxItems) throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
   }
 
+  if (!fullIds.has(target.level1WorkItemId) || !fullIds.has(target.storyWorkItemId)) {
+    throw new AdoLiveAcceptanceError('SCOPE_MISMATCH');
+  }
+
+  const level1Before = parseWorkItem((await request(
+    'level1.work_item',
+    '/' + encodeURIComponent(project.id) + '/_apis/wit/workitems/' + target.level1WorkItemId,
+    { '$expand': 'all', 'api-version': '7.1' },
+  )).body);
+  const level1Comments = await readAllComments(request, project.id, target.level1WorkItemId, limits.maxItems);
+
+  const story = parseWorkItem((await request(
+    'level2.story_anchor',
+    '/' + encodeURIComponent(project.id) + '/_apis/wit/workitems/' + target.storyWorkItemId,
+    { '$expand': 'all', 'api-version': '7.1' },
+  )).body);
+
+  const featureRoot = await findFeatureAncestor(request, project.id, story, limits.maxItems, fullIds);
+  const subtreeIds = await collectSubtree(request, project.id, featureRoot, limits.maxItems, fullIds);
+
+  const storyType = textField(story.fields['System.WorkItemType']);
+  const matchingRequirement = backlogLevels.filter(level =>
+    level.type === 'requirement' && level.workItemTypes.includes(storyType));
+  if (matchingRequirement.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
+  const requirementBacklog = matchingRequirement[0]!;
+  const requirementBoards = boards.filter(board => board.name === requirementBacklog.name);
+  if (requirementBoards.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
+  const canonicalBoard = requirementBoards[0]!;
+  const level3Ids = await readBacklogIds(request, project.id, team.id, requirementBacklog.id, limits.maxItems);
+
   const firstPass = await readWorkItems(request, project.id, [...fullIds], limits.maxItems);
-  for (const workItem of firstPass) assertInScope(workItem, teamField);
+  const areaPathMismatchCount = firstPass.filter(workItem => !isInConfiguredArea(workItem, teamField)).length;
 
   const comments = new Map<number, readonly { readonly id: string; readonly text: string }[]>();
   for (const workItem of firstPass) {
@@ -321,6 +324,7 @@ export async function runAdoLiveReadAcceptance(
     level3: { itemCount: level3Ids.size },
     level4: { itemCount: fullIds.size, commentCount, relationCount },
     requestCount: ledger.length,
+    areaPathMismatchCount,
     zeroMutation: true,
     revisionStable: true,
   };
@@ -455,7 +459,7 @@ async function findFeatureAncestor(
   projectId: string,
   start: RawWorkItem,
   maxItems: number,
-  scope: ReturnType<typeof parseTeamField>,
+  authorizedIds: ReadonlySet<number>,
 ): Promise<RawWorkItem> {
   let current = start;
   const seen = new Set<number>();
@@ -465,12 +469,13 @@ async function findFeatureAncestor(
     seen.add(current.id);
     const parentIds = relationTargets(current, 'System.LinkTypes.Hierarchy-Reverse');
     if (parentIds.length !== 1) throw new AdoLiveAcceptanceError('NOT_FOUND');
+    const parentId = parentIds[0]!;
+    if (!authorizedIds.has(parentId)) throw new AdoLiveAcceptanceError('SCOPE_MISMATCH');
     current = parseWorkItem((await request(
       'level2.parent',
-      '/' + encodeURIComponent(projectId) + '/_apis/wit/workitems/' + parentIds[0],
+      '/' + encodeURIComponent(projectId) + '/_apis/wit/workitems/' + parentId,
       { '$expand': 'relations', 'api-version': '7.1' },
     )).body);
-    assertInScope(current, scope);
   }
   throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
 }
@@ -480,7 +485,7 @@ async function collectSubtree(
   projectId: string,
   root: RawWorkItem,
   maxItems: number,
-  scope: ReturnType<typeof parseTeamField>,
+  authorizedIds: ReadonlySet<number>,
 ): Promise<Set<number>> {
   const seen = new Set<number>();
   const queue = [root];
@@ -490,13 +495,12 @@ async function collectSubtree(
     seen.add(current.id);
     if (seen.size > maxItems) throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
     for (const childId of relationTargets(current, 'System.LinkTypes.Hierarchy-Forward')) {
-      if (seen.has(childId)) continue;
+      if (!authorizedIds.has(childId) || seen.has(childId)) continue;
       const child = parseWorkItem((await request(
         'level2.child',
         '/' + encodeURIComponent(projectId) + '/_apis/wit/workitems/' + childId,
         { '$expand': 'relations', 'api-version': '7.1' },
       )).body);
-      assertInScope(child, scope);
       queue.push(child);
     }
   }
@@ -704,11 +708,10 @@ function inferObjectCount(value: unknown): number {
   return 1;
 }
 
-function assertInScope(workItem: RawWorkItem, scope: ReturnType<typeof parseTeamField>): void {
+function isInConfiguredArea(workItem: RawWorkItem, scope: ReturnType<typeof parseTeamField>): boolean {
   const area = textField(workItem.fields['System.AreaPath']);
-  const allowed = scope.values.some(candidate =>
+  return scope.values.some(candidate =>
     area === candidate.value || (candidate.includeChildren && area.startsWith(candidate.value + '\\')));
-  if (!allowed) throw new AdoLiveAcceptanceError('SCOPE_MISMATCH');
 }
 
 function textField(value: unknown): string {
