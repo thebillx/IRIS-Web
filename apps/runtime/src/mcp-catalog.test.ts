@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { catalogIdentity, catalogToolNames, orderToolDefinitions } from './mcp-catalog.js';
+import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, MCP_CATALOG_VERSION, orderToolDefinitions } from './mcp-catalog.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
 import { proMcpToolDefinitions } from './mcp.js';
 
@@ -15,6 +15,20 @@ describe('canonical MCP catalog', () => {
       ? { ...definition, inputSchema: { type: 'object', properties: { changed: { type: 'boolean' } } } }
       : definition);
     expect(catalogIdentity('FULL', changed).catalogHash).not.toBe(first.catalogHash);
+  });
+
+  it('derives a version-bound PRO identity without changing the five-tool schema surface', () => {
+    const definitions = proMcpToolDefinitions();
+    const v23 = catalogIdentityAtVersion('PRO', definitions, '2.3.0');
+    const v24 = catalogIdentityAtVersion('PRO', definitions, '2.4.0');
+
+    expect(v23).toMatchObject({ profile: 'PRO', catalogVersion: '2.3.0', toolCount: 5 });
+    expect(v24).toMatchObject({ profile: 'PRO', catalogVersion: '2.4.0', toolCount: 5 });
+    expect(v23.catalogHash).toBe('sha256:8952f22b28a5fc43b99a215455a024a7d422acb8d0da7d5d4f4b037e73e9f363');
+    expect(v24.catalogHash).toBe('sha256:93f69d86d1b010b7ad7756c186d93dd4edf59cdb17cbc93fd308c72c2f303e09');
+    expect(v23.catalogHash).not.toBe(v24.catalogHash);
+    expect(MCP_CATALOG_VERSION).toBe('2.4.0');
+    expect(catalogIdentity('PRO', definitions)).toEqual(v24);
   });
 
   it('keeps the exact read-only PRO allowlist separate from governed FULL tools', () => {

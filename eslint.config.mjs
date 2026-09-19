@@ -3,7 +3,7 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['**/dist/**', '**/coverage/**', '**/.cache/**'] },
+  { ignores: ['**/dist/**', '**/coverage/**', '**/.cache/**', '**/.iris-package-home/**', '**/Library/**'] },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {

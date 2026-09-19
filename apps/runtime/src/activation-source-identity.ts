@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstat, readFile, realpath } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { access, lstat, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { RuntimeError } from '@iris/domain';
@@ -50,14 +51,55 @@ export async function assertActivationSourceIdentity(
   return current;
 }
 
+export async function assertActivationWorkloadReady(root: string): Promise<void> {
+  const physicalRoot = await realpath(root).catch((error: unknown) => {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Activation candidate root is unavailable', { cause: error });
+  });
+  const sourceEntrypoint = path.join(physicalRoot, 'apps', 'runtime', 'src', 'main.ts');
+  const sourceMode = await lstat(sourceEntrypoint).then((metadata) => metadata.isFile(), () => false);
+  if (sourceMode) {
+    await verifyRuntimeDependency(physicalRoot, 'apps/runtime/node_modules/tsx/dist/preflight.cjs');
+    await verifyRuntimeDependency(physicalRoot, 'apps/runtime/node_modules/tsx/dist/loader.mjs');
+  } else {
+    await verifyRuntimeDependency(physicalRoot, 'apps/runtime/dist/main.js');
+  }
+  await verifyRuntimeDependency(physicalRoot, 'apps/runtime/node_modules/@iris/domain/package.json');
+  await verifyRuntimeDependency(physicalRoot, 'apps/runtime/node_modules/@iris/domain/src/index.ts');
+  await verifyRuntimeDependency(physicalRoot, 'apps/web/node_modules/.bin/vite', true);
+  await verifyRuntimeDependency(physicalRoot, 'apps/web/node_modules/vite/package.json');
+  await verifyRuntimeDependency(physicalRoot, 'apps/web/node_modules/@vitejs/plugin-react/package.json');
+  await verifyRuntimeDependency(physicalRoot, 'apps/web/node_modules/react/package.json');
+  await verifyRuntimeDependency(physicalRoot, 'apps/web/node_modules/react-dom/package.json');
+}
+
+async function verifyRuntimeDependency(root: string, relative: string, executable = false): Promise<void> {
+  const lexical = path.resolve(root, relative);
+  if (!pathIsWithin(root, lexical)) throw new RuntimeError('PRECONDITION_FAILED', 'Activation runtime dependency escapes candidate root');
+  const physical = await realpath(lexical).catch((error: unknown) => {
+    throw new RuntimeError('PRECONDITION_FAILED', `Activation candidate is not runtime-ready: missing ${relative}`, { cause: error });
+  });
+  if (!pathIsWithin(root, physical)) {
+    throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency resolves outside candidate root: ${relative}`);
+  }
+  const metadata = await lstat(physical).catch((error: unknown) => {
+    throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency metadata is unavailable: ${relative}`, { cause: error });
+  });
+  if (!metadata.isFile()) throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency is not a regular file: ${relative}`);
+  if (executable) {
+    await access(physical, fsConstants.X_OK).catch((error: unknown) => {
+      throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency is not executable: ${relative}`, { cause: error });
+    });
+  }
+}
+
 async function assertNoUntrackedWorkloadSource(root: string): Promise<void> {
   const untracked = splitNul(await boundedGit(root, [
-    'ls-files', '--others', '--exclude-standard', '-z', '--', 'apps/runtime', 'apps/web',
+    'ls-files', '--others', '--exclude-standard', '-z', '--', 'apps/runtime', 'apps/web', 'packages/domain',
   ]));
   if (untracked.length > 0) {
     throw new RuntimeError(
       'PRECONDITION_FAILED',
-      'Candidate workload source contains untracked files under apps/runtime or apps/web',
+      'Candidate workload source contains untracked files under apps/runtime, apps/web, or packages/domain',
     );
   }
 }

@@ -528,12 +528,14 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
     admin,
   };
   const staleConnectorIds = rawConnectors.filter((candidate) => {
-    const current = registry.connectors.find((connector) => connector.connectorId === candidate.connectorId)!;
+    const source = currentTools.get(candidate.connectorId);
+    if (source === undefined) return true;
+    const sourceFingerprint = catalogFingerprint(source.names);
     return !Array.isArray(candidate.expectedToolNames)
-      || candidate.expectedToolNames.length !== current.expectedToolNames.length
-      || candidate.expectedToolNames.some((name, index) => name !== current.expectedToolNames[index])
-      || candidate.catalogFingerprint !== current.catalogFingerprint
-      || candidate.catalogHash !== current.catalogHash
+      || candidate.expectedToolNames.length !== source.names.length
+      || candidate.expectedToolNames.some((name, index) => name !== source.names[index])
+      || candidate.catalogFingerprint !== sourceFingerprint
+      || candidate.catalogHash !== source.hash
       || candidate.deploymentEpoch !== deploymentEpoch;
   }).map((candidate) => candidate.connectorId);
   const ownershipMigrationRequired = value.schemaVersion !== 3

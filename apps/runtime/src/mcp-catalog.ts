@@ -125,6 +125,14 @@ export function orderToolDefinitions(profile: McpCatalogProfile, definitions: re
 }
 
 export function catalogIdentity(profile: McpCatalogProfile, definitions: readonly unknown[]): McpCatalogIdentity {
+  return catalogIdentityAtVersion(profile, definitions, MCP_CATALOG_VERSION);
+}
+
+export function catalogIdentityAtVersion(
+  profile: McpCatalogProfile,
+  definitions: readonly unknown[],
+  catalogVersion: McpCatalogVersion,
+): McpCatalogIdentity {
   const entries = definitions.map((definition) => {
     const name = isRecord(definition) && typeof definition.name === 'string' ? definition.name : 'invalid';
     const canonical = catalogEntries(profile).find((entry) => entry.toolName === name);
@@ -141,8 +149,8 @@ export function catalogIdentity(profile: McpCatalogProfile, definitions: readonl
       inputSchema: isRecord(definition) ? canonicalJson(definition.inputSchema ?? null) : null,
     };
   });
-  const catalogHash = `sha256:${createHash('sha256').update(stableJson({ catalogVersion: MCP_CATALOG_VERSION, profile, entries })).digest('hex')}`;
-  return { profile, catalogVersion: MCP_CATALOG_VERSION, catalogHash, toolCount: entries.length };
+  const catalogHash = `sha256:${createHash('sha256').update(stableJson({ catalogVersion, profile, entries })).digest('hex')}`;
+  return { profile, catalogVersion, catalogHash, toolCount: entries.length };
 }
 
 export function catalogIdentityPayload(
