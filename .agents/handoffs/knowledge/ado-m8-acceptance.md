@@ -144,15 +144,29 @@ conflicting/ambiguous truth state, M6 review isolation, grounded Wiki retrieval
 with classification provenance, and durable SQLite reopen behavior.
 
 M8_LOCAL_PRODUCTION_ACCEPTANCE=PASS
-M8_LIVE_ADO_LEVEL_1=PENDING
-M8_LIVE_ADO_LEVEL_2=PENDING
-M8_LIVE_ADO_LEVEL_3=PENDING
-M8_LIVE_ADO_LEVEL_4=PENDING
-ZERO_ADO_MUTATION_LIVE_LEDGER=PENDING
-C7_STATE=LOCAL_PASS_LIVE_PENDING
-C8_READY=NO
+M8_LIVE_ADO_LEVEL_1=PASS
+M8_LIVE_ADO_LEVEL_2=PASS
+M8_LIVE_ADO_LEVEL_3=PASS
+M8_LIVE_ADO_LEVEL_4=PASS
+ZERO_ADO_MUTATION_LIVE_LEDGER=PASS
+LIVE_REVISION_STABILITY=PASS
+LIVE_REQUEST_METHODS=GET_ONLY
+LIVE_UNIQUE_WORK_ITEMS=1221
+LIVE_COMMENTS=1331
+LIVE_RELATIONS=6067
+LIVE_REQUEST_COUNT=589
+LIVE_AREA_PATH_MISMATCH_COUNT=0
+LIVE_TARGET_DIGEST=b406814ba1dec62cecc03d79b4fb03e01149fe48d76540ca11440829fdd35039
+C7_STATE=COMPLETED
+C8_READY=YES
 
-Live progression is documented in
-`docs/acceptance/ADO_LIVE_READONLY_VALIDATION.md`. C7 must remain open/blocked
-until a separately authorized Azure DevOps binding is available and Levels 1–4
-produce a sanitized zero-write request ledger.
+Live execution occurred on the owner-run RARW host behind the required VPN.
+The exact Team was `Board OPO Build`; the authorized backlog context was
+`Epics` + `Stories`. Historical Story reference `94747` was correctly detected
+outside Team membership and was not forced into scope. Level 2 instead derived
+Feature root `14288` from authorized Epic `15126`.
+
+The sanitized live receipt is recorded in
+`docs/acceptance/ADO_LIVE_ACCEPTANCE_RECEIPT_2026-09-20.md`. The private
+1,221-item snapshot remains outside Git. C7 is closed; C8 canonical convergence
+validation and protected-main handoff may proceed.

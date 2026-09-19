@@ -107,8 +107,10 @@ printf '%s' "$ADO_PAT" | pnpm --filter @iris/runtime ado:live-acceptance -- \
   --organization <organization> \
   --project <project> \
   --team "<exact-team-name>" \
+  --epic-board "<exact-epic-board-name>" \
+  --requirement-backlog "<exact-requirement-backlog-name>" \
   --level1-work-item <work-item-id> \
-  --story-work-item <story-id>
+  --story-work-item <historical-reference-story-id>
 unset ADO_PAT
 ```
 
@@ -142,7 +144,27 @@ without another Azure DevOps credential prompt.
 
 ## Release gate
 
-C7 can move from LOCAL_PASS / LIVE_PENDING to COMPLETED only when Levels 1–4 have
-separately authorized evidence and the zero-mutation ledger is retained. Until
-then, C8 protected-main handoff remains blocked even though local production-module
-acceptance passes.
+Live acceptance completed on 2026-09-20 using the owner-run RARW host behind the
+required VPN. The sanitized receipt is
+`docs/acceptance/ADO_LIVE_ACCEPTANCE_RECEIPT_2026-09-20.md`.
+
+Observed result:
+
+- Level 1: PASS
+- Level 2: PASS
+- Level 3: PASS
+- Level 4: PASS
+- zero-mutation ledger: PASS
+- revision stability: PASS
+- request methods: GET only
+- unique Work Items: 1,221
+- comments: 1,331
+- relations: 6,067
+- Area Path mismatches: 0
+
+The historical Story reference `94747` was outside the authorized Team backlog
+membership and therefore was not used to widen scope. Feature root `14288` was
+derived from authorized Epic `15126` instead.
+
+C7 is complete. C8 may proceed with canonical repository validation and the
+protected-main handoff.
