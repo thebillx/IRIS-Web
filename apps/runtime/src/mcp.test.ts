@@ -7,11 +7,14 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { PermissionAuditStore } from './audit.js';
 import { CapabilityService } from './capability-service.js';
+import { DurableJobManager } from './durable-job-manager.js';
 import { handleMcpProRequest, handleMcpRequest, MCP_PROTOCOL_VERSION } from './mcp.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
 import { FoundationStateStore } from './persistence.js';
+import { ProjectValidationJobManager } from './project-test.js';
+import { VNextResourceRegistry } from './resource-registry.js';
 import { RuntimeState } from './state.js';
 
 const roots: string[] = [];
@@ -463,12 +466,14 @@ async function serviceFixture() {
   const policy = new PermissionPolicyEngine(state, settings, sourceRoot, dataRoot, legacyRoot);
   const audit = new PermissionAuditStore(dataRoot);
   const broker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
+  const resources = new VNextResourceRegistry(state, dataRoot);
+  const jobs = new DurableJobManager(dataRoot, resources);
   const service = new CapabilityService(state, policy, audit, () => ({
     status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid,
     uptimeMs: 1, authority: 'owned', connectedClients: state.listClients().length, connectedSessions: state.listSessions().length,
     agentExecutorType: 'local-development-executor', productionModelConnected: false,
     apiUrl: 'http://127.0.0.1:43110', mcpUrl: 'http://127.0.0.1:43110/mcp',
-  }));
+  }), new ProjectValidationJobManager(dataRoot), resources, jobs);
   return { sourceRoot, dataRoot, legacyRoot, projectRoot, state, project, session, settings, policy, audit, broker, service };
 }
 

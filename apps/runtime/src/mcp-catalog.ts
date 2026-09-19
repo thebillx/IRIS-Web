@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { IdentityCoherenceState, TunnelBindingDiagnostic } from '@iris/domain';
 
-export const MCP_CATALOG_VERSION = '2.3.0' as const;
+export const MCP_CATALOG_VERSION = '2.4.0' as const;
 export const MCP_SCHEMA_VERSION = '2026-07-28' as const;
+export type McpCatalogVersion = '2.3.0' | typeof MCP_CATALOG_VERSION;
+export const MCP_SUPPORTED_CATALOG_VERSIONS = ['2.3.0', MCP_CATALOG_VERSION] as const satisfies readonly McpCatalogVersion[];
 
 export type McpCatalogProfile = 'FULL' | 'PRO';
 export type McpMutationClass = 'READ_ONLY' | 'ORCHESTRATION' | 'PROJECT_MUTATION' | 'OWNER_MUTATION';
@@ -20,9 +22,13 @@ export interface McpCatalogEntry {
 
 export interface McpCatalogIdentity {
   readonly profile: McpCatalogProfile;
-  readonly catalogVersion: typeof MCP_CATALOG_VERSION;
+  readonly catalogVersion: McpCatalogVersion;
   readonly catalogHash: string;
   readonly toolCount: number;
+}
+
+export function isSupportedCatalogVersion(value: unknown): value is McpCatalogVersion {
+  return typeof value === 'string' && (MCP_SUPPORTED_CATALOG_VERSIONS as readonly string[]).includes(value);
 }
 
 export interface McpCatalogRuntimeContext {

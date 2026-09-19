@@ -11,7 +11,7 @@ import { assertActivationSourceIdentity, type ActivationSourceIdentity } from '.
 import { bindAdminTunnelIdentity, bindConnectorRuntime, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry, replaceConnectorCatalogManifest, seedFromLegacyProfiles, type AdminConnectorBinding, type ConnectorBinding, type ConnectorCatalogManifest, type ConnectorRegistryDocument } from './connector-registry.js';
 import { credentialPaths, inspectCredentialStatus, loadOrCreateTunnelServiceSecret, readTunnelServiceSecret, rotateTunnelServiceSecret, type CredentialStatus } from './credentials.js';
 import { ensureRuntimeDataRoot, resolveRuntimeDataRoot, resolveSourceRoot } from './data-root.js';
-import { catalogIdentity, catalogToolNames, type McpCatalogIdentity } from './mcp-catalog.js';
+import { catalogIdentity, catalogToolNames, isSupportedCatalogVersion, type McpCatalogIdentity } from './mcp-catalog.js';
 import { observeProcessStart } from './macos-safety.js';
 import { proMcpToolDefinitions } from './mcp.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
@@ -1533,7 +1533,7 @@ function catalogIdentityFromToolResponse(value: unknown): McpCatalogIdentity | n
   if (!isRecord(value) || !isRecord(value.result) || !isRecord(value.result.structuredContent)) return null;
   const identity = value.result.structuredContent;
   if ((identity.profile !== 'FULL' && identity.profile !== 'PRO')
-    || identity.catalogVersion !== '2.3.0'
+    || !isSupportedCatalogVersion(identity.catalogVersion)
     || !/^sha256:[0-9a-f]{64}$/.test(typeof identity.catalogHash === 'string' ? identity.catalogHash : '')
     || !Number.isSafeInteger(identity.toolCount)
     || Number(identity.toolCount) < 0) return null;

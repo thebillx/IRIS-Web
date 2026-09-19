@@ -145,8 +145,27 @@ async function validateArgvPolicy(policy: ProfileDefinition['argvPolicy'], argv:
     await verifyPhysicalScript(workspace, cwd, candidate, ['.robot']);
     return;
   }
-  if (policy === 'PNPM_SCRIPT' || policy === 'NPM_SCRIPT') {
-    if (argv.length < 2 || argv[0] !== 'run' || !SCRIPT_NAME.test(argv[1]!)) throw new RuntimeError('CAPABILITY_DENIED', 'package-manager profiles only allow run <declared-script-name> form');
+  if (policy === 'PNPM_SCRIPT') {
+    const regular = argv.length >= 2 && argv[0] === 'run' && SCRIPT_NAME.test(argv[1]!);
+    const compatibility = argv.length === 4
+      && argv[0] === '--config.ignore-scripts=true'
+      && argv[1] === '--config.enable-pre-post-scripts=false'
+      && argv[2] === 'run'
+      && SCRIPT_NAME.test(argv[3]!);
+    if (!regular && !compatibility) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'pnpm-script only allows run <declared-script-name> or the server-owned ignore-scripts compatibility form');
+    }
+    return;
+  }
+  if (policy === 'NPM_SCRIPT') {
+    const regular = argv.length >= 2 && argv[0] === 'run' && SCRIPT_NAME.test(argv[1]!);
+    const compatibility = argv.length === 3
+      && argv[0] === 'run'
+      && argv[1] === '--ignore-scripts'
+      && SCRIPT_NAME.test(argv[2]!);
+    if (!regular && !compatibility) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'npm-script only allows run <declared-script-name> or the server-owned ignore-scripts compatibility form');
+    }
     return;
   }
   for (const item of argv) {
@@ -191,6 +210,9 @@ function buildEnvironment(profile: ProfileDefinition, workspace: WorkspaceRecord
     LANG: 'en_US.UTF-8',
     LC_ALL: '',
     CI: '1',
+    ...((profile.argvPolicy === 'PNPM_SCRIPT' || profile.argvPolicy === 'NPM_SCRIPT')
+      ? { npm_config_ignore_scripts: 'true' }
+      : {}),
   };
   const redactionValues: string[] = [];
   for (const [key, value] of entries) {

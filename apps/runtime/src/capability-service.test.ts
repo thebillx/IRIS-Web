@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { access, link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +10,7 @@ import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
 import { FoundationStateStore } from './persistence.js';
 import { RuntimeState } from './state.js';
+import { VNextResourceRegistry } from './resource-registry.js';
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
@@ -202,6 +204,135 @@ describe('capability execution and owner approval', () => {
     expect(projects.some((project) => project.rootPath === reboundRoot)).toBe(false);
   });
 
+  it('preserves legacy project.search multi-line/hidden-file behavior through the bounded PRIMARY fs preset', async () => {
+    const fixture = await serviceFixture();
+    await writeFile(path.join(fixture.projectRoot, 'search.txt'), 'needle first\nno match\nneedle second\n');
+    await writeFile(path.join(fixture.projectRoot, '.hidden-search.txt'), 'hidden needle\n');
+    await mkdir(path.join(fixture.projectRoot, 'node_modules'));
+    await writeFile(path.join(fixture.projectRoot, 'node_modules', 'ignored.txt'), 'needle must stay ignored\n');
+
+    const result = await fixture.service.execute({
+      capabilityId: 'project.search',
+      clientId: fixture.session.clientId,
+      projectId: fixture.project.id,
+      query: 'needle',
+    });
+    expect(result.status).toBe('executed');
+    if (result.status !== 'executed') return;
+    expect(result.value).toMatchObject({ truncated: false });
+    const value = result.value as { matches: Array<{ path: string; line: number; text: string }> };
+    expect(value.matches).toEqual(expect.arrayContaining([
+      { path: 'search.txt', line: 1, text: 'needle first' },
+      { path: 'search.txt', line: 3, text: 'needle second' },
+      { path: '.hidden-search.txt', line: 1, text: 'hidden needle' },
+    ]));
+    expect(value.matches.some((match) => match.path.includes('node_modules'))).toBe(false);
+    expect(result.value).not.toHaveProperty('workspaceId');
+    expect(result.value).not.toHaveProperty('root');
+    expect(result.value).not.toHaveProperty('mode');
+  });
+
+  it('preserves legacy search matches beyond the 1 MiB text-read limit and still ignores binary files', async () => {
+    const fixture = await serviceFixture();
+    const largePrefix = 'x'.repeat(1024 * 1024 + 128);
+    await writeFile(path.join(fixture.projectRoot, 'large-search.txt'), `${largePrefix}\nneedle after one mebibyte\n`);
+    await writeFile(path.join(fixture.projectRoot, 'binary-search.bin'), Buffer.concat([
+      Buffer.from('needle must be discarded\n', 'utf8'),
+      Buffer.from([0]),
+      Buffer.from('binary tail\n', 'utf8'),
+    ]));
+
+    const result = await fixture.service.execute({
+      capabilityId: 'project.search',
+      clientId: fixture.session.clientId,
+      projectId: fixture.project.id,
+      query: 'needle',
+    });
+    expect(result.status).toBe('executed');
+    if (result.status !== 'executed') return;
+    const value = result.value as { matches: Array<{ path: string; line: number; text: string }>; truncated: boolean };
+    expect(value.matches).toEqual(expect.arrayContaining([
+      { path: 'large-search.txt', line: 2, text: 'needle after one mebibyte' },
+    ]));
+    expect(value.matches.some((match) => match.path === 'binary-search.bin')).toBe(false);
+    expect(value.truncated).toBe(false);
+  });
+
+  it('AC-COMPAT-001 preserves legacy file/directory behavior while execution converges onto the PRIMARY fs engine', async () => {
+    const fixture = await serviceFixture();
+    const file = path.join(fixture.projectRoot, 'compat.txt');
+    const directory = path.join(fixture.projectRoot, 'compat-dir');
+
+    const created = await fixture.service.execute({
+      capabilityId: 'file.write', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, targetPath: file, content: 'first',
+    });
+    expect(created).toMatchObject({ status: 'executed', value: { targetPath: file, bytes: 5 } });
+    if (created.status !== 'executed') return;
+    expect(created.value).not.toHaveProperty('workspaceId');
+    expect(created.value).not.toHaveProperty('relativePath');
+
+    const read = await fixture.service.execute({
+      capabilityId: 'file.read', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, targetPath: file,
+    });
+    expect(read).toMatchObject({ status: 'executed', value: { targetPath: file, content: 'first' } });
+
+    const replaced = await fixture.service.execute({
+      capabilityId: 'file.write', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, targetPath: file, content: 'second',
+    });
+    expect(replaced).toMatchObject({ status: 'executed', value: { targetPath: file, bytes: 6 } });
+    await expect(readFile(file, 'utf8')).resolves.toBe('second');
+
+    const edited = await fixture.service.execute({
+      capabilityId: 'file.edit', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, targetPath: file,
+      find: 'second', replace: 'third',
+      expectedSha256: createHash('sha256').update('second').digest('hex'),
+    });
+    expect(edited).toMatchObject({
+      status: 'executed',
+      value: {
+        targetPath: file,
+        changed: true,
+        matchCount: 1,
+        bytesBefore: 6,
+        bytesAfter: 5,
+        dryRun: false,
+      },
+    });
+    if (edited.status === 'executed') {
+      expect(edited.value).not.toHaveProperty('workspaceId');
+      expect(edited.value).not.toHaveProperty('relativePath');
+    }
+    await expect(readFile(file, 'utf8')).resolves.toBe('third');
+
+    const mkdirFirst = await fixture.service.execute({
+      capabilityId: 'directory.create', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, targetPath: directory,
+    });
+    const mkdirAgain = await fixture.service.execute({
+      capabilityId: 'directory.create', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, targetPath: directory,
+    });
+    expect(mkdirFirst).toMatchObject({ status: 'executed', value: { targetPath: directory, created: true } });
+    expect(mkdirAgain).toMatchObject({ status: 'executed', value: { targetPath: directory, created: false } });
+
+    const deletedFile = await fixture.service.execute({
+      capabilityId: 'file.delete', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, targetPath: file,
+    });
+    const deletedDirectory = await fixture.service.execute({
+      capabilityId: 'directory.delete', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, targetPath: directory,
+    });
+    expect(deletedFile).toMatchObject({ status: 'executed', value: { targetPath: file, deleted: true } });
+    expect(deletedDirectory).toMatchObject({ status: 'executed', value: { targetPath: directory, deleted: true } });
+    await expect(access(file)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(access(directory)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('denies hard-linked project aliases before read, write, or delete can reach the outside inode', async () => {
     const fixture = await serviceFixture();
     const outside = await temp('iris-capability-hardlink-outside-');
@@ -284,7 +415,7 @@ async function serviceFixture() {
     uptimeMs: 1, authority: 'owned', connectedClients: state.listClients().length, connectedSessions: state.listSessions().length,
     agentExecutorType: 'local-development-executor', productionModelConnected: false,
     apiUrl: 'http://127.0.0.1:43110', mcpUrl: 'http://127.0.0.1:43110/mcp',
-  }));
+  }), undefined, new VNextResourceRegistry(state, dataRoot));
   return { sourceRoot, dataRoot, legacyRoot, projectRoot, state, project, session, settings, policy, audit, service };
 }
 
