@@ -1,9 +1,12 @@
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
+import { inspectActivationSourceIdentity } from './activation-source-identity.js';
 import { probeRuntimeAuthority } from './authority.js';
 import { bindConnectorRuntime, initializeConnectorRegistry } from './connector-registry.js';
 import { runtimeChildEnvironment, runtimeStatus, startRuntime, stopRuntime } from './lifecycle.js';
@@ -101,6 +104,41 @@ describe('runtime lifecycle integration', () => {
       const observed = await runtimeStatus(dataRoot);
       if (observed.state === 'running') await stopRuntime(dataRoot, 15_000);
     }
+  }, 30_000);
+
+  it('rejects an identity-valid but unhydrated activation candidate before runtime spawn', async () => {
+    const dataRoot = await temp('iris-lifecycle-unhydrated-');
+    const candidate = await temp('iris-lifecycle-unhydrated-source-');
+    await mkdir(path.join(candidate, 'apps', 'runtime', 'src'), { recursive: true });
+    await mkdir(path.join(candidate, 'apps', 'web', 'src'), { recursive: true });
+    await mkdir(path.join(candidate, 'packages', 'domain', 'src'), { recursive: true });
+    await writeFile(path.join(candidate, 'apps', 'runtime', 'src', 'main.ts'), 'export const runtime = true;\n');
+    await writeFile(path.join(candidate, 'apps', 'web', 'src', 'App.tsx'), 'export const App = () => null;\n');
+    await writeFile(path.join(candidate, 'packages', 'domain', 'package.json'), '{"name":"@iris/domain","exports":{".":"./src/index.ts"}}\n');
+    await writeFile(path.join(candidate, 'packages', 'domain', 'src', 'index.ts'), 'export const domain = true;\n');
+    const run = promisify(execFile);
+    await run('git', ['init', '-b', 'fixture'], { cwd: candidate, encoding: 'utf8', timeout: 10_000 });
+    await run('git', ['add', '--', 'apps/runtime/src/main.ts', 'apps/web/src/App.tsx', 'packages/domain/package.json', 'packages/domain/src/index.ts'], {
+      cwd: candidate, encoding: 'utf8', timeout: 10_000,
+    });
+    await run('git', [
+      '-c', 'user.name=IRIS Test',
+      '-c', 'user.email=iris-test@example.invalid',
+      'commit', '-m', 'unhydrated activation fixture',
+    ], { cwd: candidate, encoding: 'utf8', timeout: 10_000 });
+    const expectedSourceIdentity = await inspectActivationSourceIdentity(candidate);
+
+    await expect(startRuntime({
+      dataRoot,
+      preferredPort: 0,
+      startupDeadlineMs: 15_000,
+      sourceRoot: candidate,
+      expectedSourceIdentity,
+    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    await expect(runtimeStatus(dataRoot)).resolves.toMatchObject({ state: 'stopped' });
+    await expect(readEndpoint(dataRoot)).resolves.toBeNull();
+    await expect(readRuntimeControl(dataRoot)).resolves.toBeNull();
   }, 30_000);
 
   it('recovers a matching stale schema-v1 authority and endpoint that predates runtime control metadata', async () => {

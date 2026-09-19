@@ -6,14 +6,15 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { inspectActivationSourceIdentity } from './activation-source-identity.js';
-import { bindConnectorRuntime, initializeConnectorRegistry, readConnectorRegistry } from './connector-registry.js';
+import { bindConnectorRuntime, initializeConnectorRegistry, readConnectorRegistry, type ConnectorBinding } from './connector-registry.js';
 import { credentialPaths, loadOrCreateTunnelServiceSecret, persistControlPlaneApiKey, readTunnelServiceSecret } from './credentials.js';
 import { startDaemon } from './daemon.js';
+import { catalogIdentityAtVersion } from './mcp-catalog.js';
 import { fullMcpToolNames } from './mcp-v21.js';
 import { loadOrCreateRuntimeId, writeEndpoint } from './persistence.js';
-import { createSupervisor, supervisorAdminChildEnvironment } from './supervisor.js';
+import { catalogProfileStatusWithoutAuthoritativeIdentity, createSupervisor, supervisorAdminChildEnvironment } from './supervisor.js';
 import { startSupervisorNativeControlServer } from './supervisor-native-control.js';
-import { MCP_PROTOCOL_VERSION } from './mcp.js';
+import { MCP_PROTOCOL_VERSION, proMcpToolDefinitions } from './mcp.js';
 import { runtimeStatus } from './lifecycle.js';
 
 const roots: string[] = [];
@@ -43,6 +44,232 @@ describe('IRIS supervisor', () => {
     });
   });
 
+  it('does not fabricate a PRO catalog identity in cross-source compatibility mode', () => {
+    const names = ['list_projects', 'project_info', 'git_status', 'file_read', 'search'];
+    const binding: ConnectorBinding = {
+      connectorId: 'iris-pro',
+      label: 'IRIS PRO',
+      mode: 'PRO',
+      tunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      runtime: 'iris-local-runtime',
+      mcpProfile: 'READ_ONLY',
+      mcpPath: '/mcp-pro',
+      expectedToolNames: names,
+      catalogFingerprint: 'a'.repeat(64),
+      catalogHash: `sha256:${'b'.repeat(64)}`,
+      healthPort: 8081,
+      managedProfilePath: '/private/tmp/iris-pro.yaml',
+      machineId: null,
+      runtimeId: 'runtime',
+      deploymentEpoch: 20,
+      leaseGeneration: 1,
+    };
+    const source = {
+      identity: {
+        profile: 'PRO' as const,
+        catalogVersion: '2.3.0' as const,
+        catalogHash: binding.catalogHash,
+        toolCount: names.length,
+      },
+      names,
+    };
+
+    expect(catalogProfileStatusWithoutAuthoritativeIdentity(binding, source, names, true)).toMatchObject({
+      live: null,
+      liveToolCount: 5,
+      state: 'UNKNOWN',
+    });
+    expect(catalogProfileStatusWithoutAuthoritativeIdentity(binding, source, names.slice(0, -1), true)).toMatchObject({
+      live: null,
+      liveToolCount: 4,
+      state: 'STALE_RUNTIME',
+    });
+  });
+
+  it('labels cross-source catalog diagnostics and does not recommend reload without authoritative runtime identity', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-cross-source-status-'));
+    roots.push(dataRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    });
+    const supervisorDirectory = path.join(dataRoot, 'supervisor');
+    await mkdir(supervisorDirectory, { recursive: true });
+    await writeFile(path.join(supervisorDirectory, 'state.json'), JSON.stringify({
+      schemaVersion: 3,
+      supervisorId: 'cross-source-fixture',
+      updatedAt: new Date().toISOString(),
+      workloadSourceRoot: '/Users/example/older-workload',
+      runtime: null,
+      web: null,
+      admin: null,
+      adminTunnel: null,
+      tunnels: { full: null, pro: null },
+      recovery: {
+        attempts: 0,
+        terminal: false,
+        lastFailureCode: null,
+        nextAttemptAt: null,
+        windowStartedAt: null,
+      },
+    }));
+
+    const supervisor = await createSupervisor({
+      dataRoot,
+      sourceRoot: '/Users/example/new-control-source',
+    });
+    const status = await supervisor.catalogStatus();
+
+    expect(status.sourceMode).toBe('BOUND_WORKLOAD_COMPATIBILITY');
+    expect(status.state).toBe('UNKNOWN');
+    expect(status.recommendedAction).toBe('USE_CONTROLLED_ACTIVATION_BEFORE_CATALOG_RELOAD');
+    expect(status.pro.live).toBeNull();
+    expect(status.pro.liveToolCount).toBeNull();
+    await expect(supervisor.catalogReload()).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+  });
+
+  it('keeps authenticated cross-source workload transport operable but degraded until catalog identity is authoritative', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-cross-source-readiness-'));
+    roots.push(dataRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    });
+    await bindConnectorRuntime(dataRoot, await loadOrCreateRuntimeId(dataRoot));
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const daemon = await startDaemon({ dataRoot, preferredPort: 0 });
+    try {
+      const supervisorDirectory = path.join(dataRoot, 'supervisor');
+      await mkdir(supervisorDirectory, { recursive: true });
+      await writeFile(path.join(supervisorDirectory, 'state.json'), JSON.stringify({
+        schemaVersion: 3,
+        supervisorId: 'cross-source-readiness-fixture',
+        updatedAt: new Date().toISOString(),
+        workloadSourceRoot: '/Users/example/older-workload',
+        runtime: null,
+        web: null,
+        admin: null,
+        adminTunnel: null,
+        tunnels: { full: null, pro: null },
+        recovery: {
+          attempts: 0,
+          terminal: false,
+          lastFailureCode: null,
+          nextAttemptAt: null,
+          windowStartedAt: null,
+        },
+      }));
+
+      const supervisor = await createSupervisor({
+        dataRoot,
+        sourceRoot: '/Users/example/new-control-source',
+      });
+      const readiness = await supervisor.localReadiness();
+
+      expect(readiness.status).toMatchObject({
+        state: 'DEGRADED',
+        code: 'CATALOG_IDENTITY_UNVERIFIED',
+      });
+      expect(readiness.connectors.map((connector) => connector.state)).toEqual(['READY', 'UNKNOWN']);
+      expect(readiness.connectors[1]).toMatchObject({ code: 'CATALOG_IDENTITY_UNVERIFIED' });
+      expect(readiness.catalogs.map((catalog) => catalog.state)).toEqual(['ACTIVE', 'UNKNOWN']);
+      expect(readiness.catalogs[1]?.live).toBeNull();
+      expect(readiness.catalogs[1]?.liveToolCount).toBe(5);
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  it('keeps supervisor up operable in cross-source degraded mode without replacing the healthy workload', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-cross-source-up-'));
+    const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-cross-source-up-fake-'));
+    roots.push(dataRoot, fakeRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      fullHealthPort: await freePort(),
+      proHealthPort: await freePort(),
+    });
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const fakeTunnel = await fakeTunnelClient(fakeRoot);
+    const webPort = await freePort();
+    const adminPort = await freePort();
+    const supervisor = await createSupervisor({
+      dataRoot,
+      sourceRoot,
+      tunnelClientPath: fakeTunnel,
+      webPort,
+      adminPort,
+    });
+
+    try {
+      const baseline = await supervisor.up();
+      expect(baseline.localRuntime.state).toBe('READY');
+      const statePath = path.join(dataRoot, 'supervisor', 'state.json');
+      const before = JSON.parse(await readFile(statePath, 'utf8')) as {
+        workloadSourceRoot: string;
+        runtime: { pid: number } | null;
+        web: { pid: number } | null;
+        tunnels: { full: { pid: number } | null; pro: { pid: number } | null };
+      };
+      await writeFile(statePath, JSON.stringify({
+        ...before,
+        workloadSourceRoot: '/Users/example/older-workload',
+      }), { mode: 0o600 });
+
+      const transition = await supervisor.up();
+      expect(transition.localRuntime).toMatchObject({
+        state: 'DEGRADED',
+        code: 'CATALOG_IDENTITY_UNVERIFIED',
+      });
+      expect(transition.state).toBe('DEGRADED');
+      expect(transition.connectors.map((connector) => connector.state)).toEqual(['READY', 'UNKNOWN']);
+      expect(transition.connectors[1]).toMatchObject({ code: 'CATALOG_IDENTITY_UNVERIFIED' });
+
+      const after = JSON.parse(await readFile(statePath, 'utf8')) as {
+        workloadSourceRoot: string;
+        runtime: { pid: number } | null;
+        web: { pid: number } | null;
+        tunnels: { full: { pid: number } | null; pro: { pid: number } | null };
+      };
+      expect(after.workloadSourceRoot).toBe('/Users/example/older-workload');
+      expect(after.runtime?.pid).toBe(before.runtime?.pid);
+      expect(after.web?.pid).toBe(before.web?.pid);
+      expect(after.tunnels.full?.pid).toBe(before.tunnels.full?.pid);
+      expect(after.tunnels.pro?.pid).toBe(before.tunnels.pro?.pid);
+
+      await writeFile(statePath, JSON.stringify({
+        ...after,
+        recovery: {
+          attempts: 3,
+          terminal: false,
+          lastFailureCode: 'RUNTIME_NOT_RUNNING',
+          nextAttemptAt: null,
+          windowStartedAt: new Date().toISOString(),
+        },
+      }), { mode: 0o600 });
+      await (supervisor as unknown as { monitorOnceUnlocked(): Promise<void> }).monitorOnceUnlocked();
+      const monitored = JSON.parse(await readFile(statePath, 'utf8')) as {
+        runtime: { pid: number } | null;
+        web: { pid: number } | null;
+        tunnels: { full: { pid: number } | null; pro: { pid: number } | null };
+        recovery: { attempts: number; terminal: boolean; lastFailureCode: string | null };
+      };
+      expect(monitored.recovery).toMatchObject({
+        attempts: 3,
+        terminal: false,
+        lastFailureCode: 'RUNTIME_NOT_RUNNING',
+      });
+      expect(monitored.runtime?.pid).toBe(before.runtime?.pid);
+      expect(monitored.web?.pid).toBe(before.web?.pid);
+      expect(monitored.tunnels.full?.pid).toBe(before.tunnels.full?.pid);
+      expect(monitored.tunnels.pro?.pid).toBe(before.tunnels.pro?.pid);
+    } finally {
+      await supervisor.down().catch(() => undefined);
+    }
+  }, 60_000);
+
   it('proves authenticated local discovery and exact profile catalogs for FULL and PRO', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-local-'));
     roots.push(dataRoot);
@@ -57,7 +284,10 @@ describe('IRIS supervisor', () => {
       expect(readiness.connectors.map((connector) => connector.expectedToolCount)).toEqual([fullMcpToolNames().length, 5]);
       expect(readiness.catalogs.map((catalog) => catalog.state)).toEqual(['ACTIVE', 'ACTIVE']);
       expect(readiness.catalogs.map((catalog) => catalog.live?.catalogHash)).toEqual(readiness.catalogs.map((catalog) => catalog.source.catalogHash));
-      expect((await supervisor.catalogStatus()).state).toBe('ACTIVE');
+      const catalogStatus = await supervisor.catalogStatus();
+      expect(catalogStatus.state).toBe('ACTIVE');
+      expect(catalogStatus.sourceMode).toBe('STRICT_CONTROL_SOURCE');
+      expect(catalogStatus.recommendedAction).toBe('NONE');
       const serviceSecret = await readTunnelServiceSecret(dataRoot);
       expect(serviceSecret).not.toBeNull();
       const controlRoute = await fetch(`${daemon.apiUrl}/projects`, { headers: { authorization: `Bearer ${serviceSecret!}` } });
@@ -204,6 +434,7 @@ setInterval(() => undefined, 1000);
         controlSourceRoot: sourceRoot,
         protectedReferenceRoot: sourceRoot,
         adminChildWorkingDirectory: sourceRoot,
+        adminSourceCoherent: true,
         adminEnvironmentCoherent: true,
       });
       expect(nativeStatus.adminChildEnvironmentDigest).toMatch(/^[0-9a-f]{64}$/);
@@ -211,6 +442,7 @@ setInterval(() => undefined, 1000);
       expect(nativeAdminStatus).toMatchObject({
         adminChildWorkingDirectory: sourceRoot,
         protectedReferenceRoot: sourceRoot,
+        adminSourceCoherent: true,
         adminEnvironmentCoherent: true,
         activationStatusAvailable: true,
         activationPrepareAvailable: true,
@@ -224,7 +456,13 @@ setInterval(() => undefined, 1000);
       type State = {
         readonly runtime: { readonly pid: number } | null;
         readonly web: { readonly pid: number } | null;
-        readonly admin: { readonly pid: number; readonly processStartTimeMs?: number | null; readonly startedAt: string } | null;
+        readonly admin: {
+          readonly pid: number;
+          readonly processStartTimeMs?: number | null;
+          readonly startedAt: string;
+          readonly workingDirectory?: string | null;
+          readonly environmentDigest?: string | null;
+        } | null;
         readonly adminTunnel: { readonly pid: number; readonly tunnelId?: string | null; readonly profileDigest?: string | null } | null;
         readonly tunnels: {
           readonly full: { readonly pid: number; readonly tunnelId?: string | null; readonly profileDigest?: string | null } | null;
@@ -266,9 +504,44 @@ setInterval(() => undefined, 1000);
       expect(afterWorkloadDigest.runtime?.pid).toBe(afterAdminDigest.runtime?.pid);
       expect(afterWorkloadDigest.admin?.pid).toBe(afterAdminDigest.admin?.pid);
 
-      const recycle = await nativeToolCall(native.mcpUrl, secret, 'admin_recycle', {});
+      await writeFile(statePath, JSON.stringify({
+        ...afterWorkloadDigest,
+        admin: afterWorkloadDigest.admin === null ? null : {
+          ...afterWorkloadDigest.admin,
+          workingDirectory: '/Users/example/older-control-source',
+        },
+      }), { mode: 0o600 });
+
+      const staleAdminStatus = await supervisor.adminNativeStatus();
+      expect(staleAdminStatus).toMatchObject({
+        adminSourceCoherent: false,
+        readiness: 'DEGRADED',
+      });
+      const staleSupervisorStatus = await supervisor.supervisorNativeStatus();
+      expect(staleSupervisorStatus).toMatchObject({
+        adminSourceCoherent: false,
+        readiness: 'DEGRADED',
+      });
+
+      const readableActivation = await supervisor.adminToolCall('activation_status', {});
+      expect(readableActivation.isError).toBe(false);
+      const rollbackRecovery = await supervisor.adminToolCall('activation_rollback', { transactionId: randomUUID() });
+      expect(rollbackRecovery.isError).toBe(true);
+      await expect(supervisor.adminToolCall('activation_prepare', {}))
+        .rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+      if (typeof staleSupervisorStatus.adminChildIdentity !== 'string'
+        || typeof staleSupervisorStatus.adminProfileDigest !== 'string') {
+        throw new Error('missing stale admin recycle preconditions');
+      }
+      const recycle = await nativeToolCall(native.mcpUrl, secret, 'admin_recycle', {
+        expectedAdminIdentity: staleSupervisorStatus.adminChildIdentity,
+        expectedAdminProfileDigest: staleSupervisorStatus.adminProfileDigest,
+      });
       expect(recycle).toMatchObject({
         adminIdentityChanged: true,
+        adminSourceCoherent: true,
+        adminEnvironmentCoherent: true,
         adminRouteReady: true,
         workloadRuntimeIdUnchanged: true,
         workloadInstanceIdUnchanged: true,
@@ -485,6 +758,56 @@ setInterval(() => undefined, 1000);
     }
   }, 60_000);
 
+  it('rejects a candidate whose runtime dependencies disappear after identity inspection without disturbing the baseline', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-dependency-race-'));
+    const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-dependency-race-fake-'));
+    roots.push(dataRoot, fakeRoot);
+    const alternateRoot = await alternateCatalogSource(fakeRoot);
+    await initializeActivationIdentityRepo(alternateRoot);
+    const expectedIdentity = await inspectActivationSourceIdentity(alternateRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      fullHealthPort: await freePort(),
+      proHealthPort: await freePort(),
+    });
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const fakeTunnel = await fakeTunnelClient(fakeRoot);
+    const supervisor = await createSupervisor({
+      dataRoot,
+      sourceRoot,
+      tunnelClientPath: fakeTunnel,
+      webPort: await freePort(),
+      adminPort: await freePort(),
+    });
+
+    try {
+      const baseline = await supervisor.up();
+      expect(baseline.localRuntime.state).toBe('READY');
+      const beforeRuntime = await runtimeStatus(dataRoot);
+      const beforeRegistry = await readConnectorRegistry(dataRoot);
+      if (beforeRuntime.state !== 'running' || beforeRuntime.endpoint === null || beforeRegistry === null) {
+        throw new Error('baseline runtime or connector registry is not ready');
+      }
+
+      await rm(path.join(alternateRoot, 'apps', 'web', 'node_modules', '.bin', 'vite'));
+
+      await expect(supervisor.replaceWorkloadSourceRoot(alternateRoot, expectedIdentity))
+        .rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+      const afterRuntime = await runtimeStatus(dataRoot);
+      const afterRegistry = await readConnectorRegistry(dataRoot);
+      expect(afterRuntime.state).toBe('running');
+      expect(afterRuntime.endpoint?.instanceId).toBe(beforeRuntime.endpoint.instanceId);
+      expect(afterRuntime.endpoint?.pid).toBe(beforeRuntime.endpoint.pid);
+      expect((await supervisor.workloadBinding()).sourceRoot).toBe(sourceRoot);
+      expect(afterRegistry?.deploymentEpoch).toBe(beforeRegistry.deploymentEpoch);
+    } finally {
+      await supervisor.down().catch(() => undefined);
+    }
+  }, 60_000);
+
   it('rejects a candidate that changes after catalog preflight but before cutover while preserving the baseline', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-source-race-'));
     const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-source-race-fake-'));
@@ -654,6 +977,96 @@ setInterval(() => undefined, 1000);
     }
   }, 60_000);
 
+  it('derives the target PRO manifest hash from the authoritative candidate catalog version', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-version-bound-probe-'));
+    const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-version-bound-probe-fake-'));
+    roots.push(dataRoot, fakeRoot);
+    const candidateRoot = await alternateCatalogSource(fakeRoot);
+    const candidateCatalogPath = path.join(candidateRoot, 'apps', 'runtime', 'src', 'mcp-catalog.ts');
+    const candidateCatalog = await readFile(candidateCatalogPath, 'utf8');
+    const currentVersion = "export const MCP_CATALOG_VERSION = '2.4.0' as const;";
+    if (!candidateCatalog.includes(currentVersion)) throw new Error('candidate catalog version marker not found');
+    await writeFile(candidateCatalogPath, candidateCatalog.replace(
+      currentVersion,
+      "export const MCP_CATALOG_VERSION = '2.3.0' as const;",
+    ));
+
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      fullHealthPort: await freePort(),
+      proHealthPort: await freePort(),
+    });
+    await bindConnectorRuntime(dataRoot, await loadOrCreateRuntimeId(dataRoot));
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const baseline = await startDaemon({ dataRoot, preferredPort: 0 });
+    const supervisor = await createSupervisor({
+      dataRoot,
+      sourceRoot,
+      webPort: await freePort(),
+      adminPort: await freePort(),
+    });
+    const probe = supervisor as unknown as {
+      probeTargetCatalogManifest(sourceRoot: string): Promise<{
+        readonly full: { readonly expectedToolNames: readonly string[]; readonly catalogHash: string };
+        readonly pro: { readonly expectedToolNames: readonly string[]; readonly catalogHash: string };
+      }>;
+    };
+
+    try {
+      const manifest = await probe.probeTargetCatalogManifest(candidateRoot);
+      const expectedV23 = catalogIdentityAtVersion('PRO', proMcpToolDefinitions(), '2.3.0');
+      const currentV24 = catalogIdentityAtVersion('PRO', proMcpToolDefinitions(), '2.4.0');
+
+      expect(manifest.pro.expectedToolNames).toEqual([
+        'list_projects', 'project_info', 'git_status', 'file_read', 'search',
+      ]);
+      expect(manifest.pro.catalogHash).toBe(expectedV23.catalogHash);
+      expect(manifest.pro.catalogHash).not.toBe(currentV24.catalogHash);
+      expect(manifest.full.catalogHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    } finally {
+      await baseline.close();
+    }
+  }, 60_000);
+
+  it('rejects a target that changes a PRO input schema while preserving the same five tool names', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-pro-schema-drift-'));
+    const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-pro-schema-drift-fake-'));
+    roots.push(dataRoot, fakeRoot);
+    const candidateRoot = await alternateCatalogSource(fakeRoot);
+    const mcpPath = path.join(candidateRoot, 'apps', 'runtime', 'src', 'mcp.ts');
+    const mcp = await readFile(mcpPath, 'utf8');
+    const marker = "search: { name: 'search', description: 'Search text in an explicitly selected registered project.', inputSchema: { type: 'object', required: ['projectId', 'query'], properties: { ...projectId, query: { type: 'string', minLength: 1, maxLength: 500 } }, additionalProperties: false } },";
+    if (!mcp.includes(marker)) throw new Error('candidate PRO schema marker not found');
+    await writeFile(mcpPath, mcp.replace(marker, marker.replace('maxLength: 500', 'maxLength: 499')));
+
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      fullHealthPort: await freePort(),
+      proHealthPort: await freePort(),
+    });
+    await bindConnectorRuntime(dataRoot, await loadOrCreateRuntimeId(dataRoot));
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const baseline = await startDaemon({ dataRoot, preferredPort: 0 });
+    const supervisor = await createSupervisor({
+      dataRoot,
+      sourceRoot,
+      webPort: await freePort(),
+      adminPort: await freePort(),
+    });
+    const probe = supervisor as unknown as {
+      probeTargetCatalogManifest(sourceRoot: string): Promise<unknown>;
+    };
+
+    try {
+      await expect(probe.probeTargetCatalogManifest(candidateRoot))
+        .rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    } finally {
+      await baseline.close();
+    }
+  }, 60_000);
+
   it('hands off an intentional FULL catalog transition A -> B -> A while preserving workload ownership', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-cross-catalog-'));
     const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-cross-catalog-fake-'));
@@ -696,11 +1109,15 @@ setInterval(() => undefined, 1000);
       const beforeOwnership = ownership(before);
 
       const switched = await supervisor.replaceWorkloadSourceRoot(alternateRoot);
-      expect(switched.localRuntime.state).toBe('READY');
+      expect(switched.localRuntime).toMatchObject({ state: 'DEGRADED', code: 'CATALOG_IDENTITY_UNVERIFIED' });
       expect(switched.tunnel.state).toBe('READY');
       expect(switched.controlPlane.state).toBe('READY');
       expect((await supervisor.workloadBinding()).sourceRoot).toBe(alternateRoot);
-      expect((await supervisor.catalogStatus()).state).toBe('ACTIVE');
+      expect(await supervisor.catalogStatus()).toMatchObject({
+        state: 'UNKNOWN',
+        sourceMode: 'BOUND_WORKLOAD_COMPATIBILITY',
+        recommendedAction: 'USE_CONTROLLED_ACTIVATION_BEFORE_CATALOG_RELOAD',
+      });
       const afterB = await readConnectorRegistry(dataRoot);
       if (afterB === null) throw new Error('missing alternate connector registry');
       const afterBFull = afterB.connectors.find((connector) => connector.mode === 'FULL');
@@ -801,11 +1218,15 @@ setInterval(() => undefined, 1000);
       }).automaticRecoveryTick()).resolves.toBeUndefined();
 
       const switched = await switching;
-      expect(switched.localRuntime.state).toBe('READY');
+      expect(switched.localRuntime).toMatchObject({ state: 'DEGRADED', code: 'CATALOG_IDENTITY_UNVERIFIED' });
       expect(switched.tunnel.state).toBe('READY');
       expect(switched.controlPlane.state).toBe('READY');
       expect((await activator.workloadBinding()).sourceRoot).toBe(alternateRoot);
-      expect((await activator.catalogStatus()).state).toBe('ACTIVE');
+      expect(await activator.catalogStatus()).toMatchObject({
+        state: 'UNKNOWN',
+        sourceMode: 'BOUND_WORKLOAD_COMPATIBILITY',
+        recommendedAction: 'USE_CONTROLLED_ACTIVATION_BEFORE_CATALOG_RELOAD',
+      });
       const outerStatus = await outer.supervisorNativeStatus();
       expect(outerStatus.readiness).toBe('READY');
       expect(outerStatus.workloadCatalogId).toBe(
@@ -1081,8 +1502,50 @@ async function alternateCatalogSource(fakeRoot: string): Promise<string> {
   await cp(path.join(sourceRoot, 'apps', 'runtime', 'src'), path.join(alternateRuntime, 'src'), { recursive: true });
   await cp(path.join(sourceRoot, 'apps', 'runtime', 'package.json'), path.join(alternateRuntime, 'package.json'));
   await cp(path.join(sourceRoot, 'apps', 'runtime', 'macos-safety-helper.py'), path.join(alternateRuntime, 'macos-safety-helper.py'));
-  await symlink(path.join(sourceRoot, 'apps', 'runtime', 'node_modules'), path.join(alternateRuntime, 'node_modules'), 'dir');
-  await symlink(path.join(sourceRoot, 'apps', 'web'), path.join(alternateRoot, 'apps', 'web'), 'dir');
+
+  const runtimeNodeModules = path.join(alternateRuntime, 'node_modules');
+  const tsxSource = await realpath(path.join(sourceRoot, 'apps', 'runtime', 'node_modules', 'tsx'));
+  await mkdir(runtimeNodeModules, { recursive: true });
+  await cp(tsxSource, path.join(runtimeNodeModules, 'tsx'), { recursive: true });
+  const esbuildSource = await realpath(path.join(path.dirname(tsxSource), 'esbuild'));
+  await cp(esbuildSource, path.join(runtimeNodeModules, 'esbuild'), { recursive: true });
+  const esbuildPlatformPackage = process.arch === 'arm64' ? '@esbuild/darwin-arm64' : '@esbuild/darwin-x64';
+  const esbuildPlatformSource = await realpath(path.join(path.dirname(esbuildSource), ...esbuildPlatformPackage.split('/')));
+  const esbuildPlatformDestination = path.join(runtimeNodeModules, ...esbuildPlatformPackage.split('/'));
+  await mkdir(path.dirname(esbuildPlatformDestination), { recursive: true });
+  await cp(esbuildPlatformSource, esbuildPlatformDestination, { recursive: true });
+
+  const domainRoot = path.join(alternateRoot, 'packages', 'domain');
+  await mkdir(path.dirname(domainRoot), { recursive: true });
+  await cp(path.join(sourceRoot, 'packages', 'domain'), domainRoot, { recursive: true });
+  const runtimeScope = path.join(runtimeNodeModules, '@iris');
+  await mkdir(runtimeScope, { recursive: true });
+  await symlink(domainRoot, path.join(runtimeScope, 'domain'), 'dir');
+
+  const alternateWeb = path.join(alternateRoot, 'apps', 'web');
+  const viteBin = path.join(alternateWeb, 'node_modules', '.bin');
+  await mkdir(viteBin, { recursive: true });
+  await cp(path.join(sourceRoot, 'apps', 'web', 'package.json'), path.join(alternateWeb, 'package.json'));
+  const fakeVite = path.join(alternateWeb, 'fake-vite.cjs');
+  await writeFile(fakeVite, `#!/usr/bin/env node
+const { createServer } = require('node:http');
+const args = process.argv.slice(2);
+const portIndex = args.indexOf('--port');
+const port = Number(portIndex >= 0 ? args[portIndex + 1] : '5173');
+const server = createServer((_request, response) => {
+  response.statusCode = 200;
+  response.end('IRIS test web');
+});
+server.listen(port, '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`);
+  await chmod(fakeVite, 0o700);
+  await symlink(path.relative(viteBin, fakeVite), path.join(viteBin, 'vite'));
+  for (const packageName of ['vite', '@vitejs/plugin-react', 'react', 'react-dom']) {
+    const packageRoot = path.join(alternateWeb, 'node_modules', ...packageName.split('/'));
+    await mkdir(packageRoot, { recursive: true });
+    await writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({ name: packageName }) + '\n');
+  }
 
   const catalogPath = path.join(alternateRuntime, 'src', 'mcp-catalog.ts');
   const catalog = await readFile(catalogPath, 'utf8');
@@ -1110,8 +1573,9 @@ async function alternateCatalogSource(fakeRoot: string): Promise<string> {
 
 async function initializeActivationIdentityRepo(root: string): Promise<void> {
   const run = promisify(execFile);
+  await writeFile(path.join(root, '.gitignore'), 'apps/runtime/node_modules/\napps/web/node_modules/\npackages/domain/node_modules/\n');
   await run('git', ['init', '-b', 'r4-fixture'], { cwd: root, encoding: 'utf8', timeout: 10_000 });
-  await run('git', ['add', '--', 'apps/runtime/src', 'apps/runtime/package.json', 'apps/runtime/macos-safety-helper.py', 'apps/runtime/node_modules', 'apps/web'], {
+  await run('git', ['add', '--', '.gitignore', 'apps/runtime/src', 'apps/runtime/package.json', 'apps/runtime/macos-safety-helper.py', 'apps/web/package.json', 'apps/web/fake-vite.cjs', 'packages/domain'], {
     cwd: root, encoding: 'utf8', timeout: 10_000,
   });
   await run('git', [

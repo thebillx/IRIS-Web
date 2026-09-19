@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { RuntimeError } from '@iris/domain';
-import { ACTIVATION_FINGERPRINT_ALGORITHM, inspectActivationSourceIdentity, type ActivationSourceIdentity } from './activation-source-identity.js';
+import { ACTIVATION_FINGERPRINT_ALGORITHM, assertActivationWorkloadReady, inspectActivationSourceIdentity, type ActivationSourceIdentity } from './activation-source-identity.js';
 import { writePrivateJsonAtomic } from './credentials.js';
 import { FoundationStateStore } from './persistence.js';
 import { RuntimeState } from './state.js';
@@ -155,8 +155,13 @@ export class ActivationController {
             lastFailureCode: 'RECOVERY_REQUIRED',
           });
       } else {
-        const provenRolledBack = current.readiness === 'READY'
-          && current.workloadSourceRoot === transaction.preActivation.workloadSourceRoot;
+        let provenRolledBack = false;
+        try {
+          assertRolledBackBinding(current, transaction);
+          provenRolledBack = true;
+        } catch {
+          provenRolledBack = false;
+        }
         transaction = provenRolledBack
           ? updateTransaction(transaction, {
             state: 'ROLLED_BACK',
@@ -290,9 +295,7 @@ export class ActivationController {
         const post = requiresRuntimeRestore
           ? await this.runtime.applySourceRoot(transaction.preActivation.workloadSourceRoot)
           : await this.runtime.snapshot();
-        if (post.workloadSourceRoot !== transaction.preActivation.workloadSourceRoot || post.readiness !== 'READY') {
-          throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Rollback did not restore the captured prior workload binding');
-        }
+        assertRolledBackBinding(post, transaction);
         transaction = updateTransaction(transaction, {
           state: 'ROLLED_BACK',
           postRollback: post,
@@ -362,6 +365,7 @@ class ProductionCandidateInspector implements ActivationCandidateInspector {
     const identity = await this.git.inspectRepository(projectId, workspaceId, repositoryId);
     if (identity.repositoryId !== repositoryId) throw new RuntimeError('CAPABILITY_DENIED', 'Activation repository identity mismatch');
     const sourceIdentity = await inspectActivationSourceIdentity(identity.workspaceRoot);
+    await assertActivationWorkloadReady(identity.workspaceRoot);
     return {
       projectId,
       workspaceId,
@@ -423,7 +427,8 @@ function assertRuntimePreparePreconditions(runtime: ActivationRuntimeSnapshot, e
   if (runtime.deploymentEpoch !== expected.expectedCurrentDeploymentEpoch) throw new RuntimeError('PRECONDITION_FAILED', 'Deployment epoch is stale');
   if (expected.expectedRuntimeId !== undefined && runtime.runtimeId !== expected.expectedRuntimeId) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime identity is stale');
   if (expected.expectedCatalogId !== undefined && runtime.catalogId !== expected.expectedCatalogId) throw new RuntimeError('PRECONDITION_FAILED', 'Catalog identity is stale');
-  if (runtime.runtimeId === null || runtime.instanceId === null || runtime.catalogId === null || runtime.deploymentEpoch === null) {
+  if (runtime.runtimeId === null || runtime.instanceId === null || runtime.catalogId === null || runtime.deploymentEpoch === null
+    || runtime.fullToolCount === null || runtime.proToolCount === null) {
     throw new RuntimeError('PRECONDITION_FAILED', 'Pre-activation runtime/catalog identity is incomplete');
   }
 }
@@ -436,17 +441,51 @@ function assertPreApplyRuntimeMatches(current: ActivationRuntimeSnapshot, transa
 function assertAppliedBinding(snapshot: ActivationRuntimeSnapshot, transaction: ActivationTransaction): void {
   if (snapshot.readiness !== 'READY') throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Activated workload did not reach READY through the persistent admin surface');
   if (snapshot.workloadSourceRoot !== transaction.candidate.sourceRoot) throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Activated workload source binding does not match the prepared candidate');
-  if (snapshot.runtimeId === null || snapshot.instanceId === null || snapshot.catalogId === null || snapshot.deploymentEpoch === null) {
+  if (snapshot.runtimeId === null || snapshot.instanceId === null || snapshot.catalogId === null || snapshot.deploymentEpoch === null
+    || snapshot.fullToolCount === null || snapshot.proToolCount === null) {
     throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Activated workload identity is incomplete');
+  }
+  if (snapshot.runtimeId !== transaction.preActivation.runtimeId) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Activation changed the persistent runtime identity');
+  }
+  if (snapshot.instanceId === transaction.preActivation.instanceId) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Activation did not replace the workload runtime instance');
+  }
+  if (snapshot.proToolCount !== transaction.preActivation.proToolCount) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Activation changed the bounded PRO tool count');
   }
   if (snapshot.deploymentEpoch <= transaction.expectedCurrentDeploymentEpoch) {
     throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Activation did not advance the deployment epoch');
   }
 }
 
+function assertRolledBackBinding(snapshot: ActivationRuntimeSnapshot, transaction: ActivationTransaction): void {
+  const expected = transaction.preActivation;
+  if (snapshot.readiness !== 'READY' || snapshot.workloadSourceRoot !== expected.workloadSourceRoot) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Rollback did not restore the captured prior workload binding');
+  }
+  if (snapshot.runtimeId === null || snapshot.instanceId === null || snapshot.catalogId === null || snapshot.deploymentEpoch === null) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Rolled-back workload identity is incomplete');
+  }
+  if (snapshot.runtimeId !== expected.runtimeId || snapshot.catalogId !== expected.catalogId) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Rollback did not restore the captured runtime/catalog identity');
+  }
+  if (expected.fullToolCount !== null && snapshot.fullToolCount !== expected.fullToolCount) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Rollback did not restore the captured FULL tool count');
+  }
+  if (expected.proToolCount !== null && snapshot.proToolCount !== expected.proToolCount) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Rollback did not restore the captured PRO tool count');
+  }
+  if (expected.deploymentEpoch !== null && snapshot.deploymentEpoch < expected.deploymentEpoch) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Rollback moved the deployment epoch backwards');
+  }
+}
+
 function assertSnapshotIdentity(current: ActivationRuntimeSnapshot, expected: ActivationRuntimeSnapshot, message: string): void {
   if (current.runtimeId !== expected.runtimeId || current.instanceId !== expected.instanceId || current.catalogId !== expected.catalogId
-    || current.deploymentEpoch !== expected.deploymentEpoch || current.workloadSourceRoot !== expected.workloadSourceRoot) {
+    || current.deploymentEpoch !== expected.deploymentEpoch || current.workloadSourceRoot !== expected.workloadSourceRoot
+    || expected.fullToolCount !== null && current.fullToolCount !== expected.fullToolCount
+    || expected.proToolCount !== null && current.proToolCount !== expected.proToolCount) {
     throw new RuntimeError('PRECONDITION_FAILED', message);
   }
 }

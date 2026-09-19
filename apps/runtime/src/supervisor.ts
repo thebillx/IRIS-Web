@@ -7,11 +7,11 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { RuntimeError, type RuntimeFailureCode } from '@iris/domain';
-import { assertActivationSourceIdentity, type ActivationSourceIdentity } from './activation-source-identity.js';
+import { assertActivationSourceIdentity, assertActivationWorkloadReady, type ActivationSourceIdentity } from './activation-source-identity.js';
 import { bindAdminTunnelIdentity, bindConnectorRuntime, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry, replaceConnectorCatalogManifest, seedFromLegacyProfiles, type AdminConnectorBinding, type ConnectorBinding, type ConnectorCatalogManifest, type ConnectorRegistryDocument } from './connector-registry.js';
 import { credentialPaths, inspectCredentialStatus, loadOrCreateTunnelServiceSecret, readTunnelServiceSecret, rotateTunnelServiceSecret, type CredentialStatus } from './credentials.js';
 import { ensureRuntimeDataRoot, resolveRuntimeDataRoot, resolveSourceRoot } from './data-root.js';
-import { catalogIdentity, catalogToolNames, isSupportedCatalogVersion, type McpCatalogIdentity } from './mcp-catalog.js';
+import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, isSupportedCatalogVersion, type McpCatalogIdentity } from './mcp-catalog.js';
 import { observeProcessStart } from './macos-safety.js';
 import { proMcpToolDefinitions } from './mcp.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
@@ -152,6 +152,7 @@ export interface CatalogProfileStatus {
 
 export interface SupervisorCatalogStatus {
   readonly state: CatalogActivationState;
+  readonly sourceMode: 'STRICT_CONTROL_SOURCE' | 'BOUND_WORKLOAD_COMPATIBILITY';
   readonly full: CatalogProfileStatus;
   readonly pro: CatalogProfileStatus;
   readonly runtimeId: string | null;
@@ -394,6 +395,7 @@ export class Supervisor {
     if (expectedSourceIdentity !== undefined) {
       await assertActivationSourceIdentity(sourceRoot, expectedSourceIdentity, 'Candidate source identity does not match the prepared activation before preflight');
     }
+    await assertActivationWorkloadReady(sourceRoot);
     if (sameSourceRoot(state.workloadSourceRoot, sourceRoot) && expectedSourceIdentity === undefined) {
       const current = await this.status();
       if (current.runtime.state === 'READY' && current.tunnel.state === 'READY' && current.controlPlane.state === 'READY' && current.localRuntime.state === 'READY') return current;
@@ -444,6 +446,13 @@ export class Supervisor {
     const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
     if (full === undefined || pro === undefined || full.runtimeId === null || pro.runtimeId === null) {
       throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'FULL and PRO runtime-bound connector identities are required before target catalog probing');
+    }
+    const baselineStatus = await this.catalogStatus();
+    const baselineFullIdentity = baselineStatus.full.live;
+    if (baselineFullIdentity === null
+      || baselineFullIdentity.catalogHash !== full.catalogHash
+      || baselineFullIdentity.toolCount !== full.expectedToolNames.length) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Current FULL runtime identity does not match the bound connector baseline before target probing');
     }
 
     const probeDataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-target-probe-'));
@@ -501,19 +510,22 @@ export class Supervisor {
       if (proNames.length !== pro.expectedToolNames.length || !proNames.every((name, index) => name === pro.expectedToolNames[index])) {
         throw new RuntimeError('PRECONDITION_FAILED', 'Target workload changes the PRO catalog; bounded Phase 5 activation permits a FULL catalog transition only');
       }
-      const structured = isRecord(fullIdentityResponse) && isRecord(fullIdentityResponse.result) && isRecord(fullIdentityResponse.result.structuredContent)
-        ? fullIdentityResponse.result.structuredContent
-        : null;
-      const fullCatalogHash = structured !== null && typeof structured.catalogHash === 'string' && /^sha256:[0-9a-f]{64}$/.test(structured.catalogHash)
-        ? structured.catalogHash
-        : null;
-      const fullToolCount = structured !== null && Number.isSafeInteger(structured.toolCount) ? Number(structured.toolCount) : null;
-      if (fullCatalogHash === null || fullToolCount !== fullNames.length) {
+      const fullIdentity = catalogIdentityFromToolResponse(fullIdentityResponse);
+      if (fullIdentity === null || fullIdentity.toolCount !== fullNames.length) {
         throw new RuntimeError('MCP_CATALOG_STALE', 'Target FULL catalog identity did not match its live tool list');
       }
+      const targetProDefinitions = listedToolDefinitions(proListed);
+      const baselineVersionProIdentity = catalogIdentityAtVersion('PRO', targetProDefinitions, baselineFullIdentity.catalogVersion);
+      if (baselineVersionProIdentity.catalogHash !== pro.catalogHash) {
+        throw new RuntimeError('PRECONDITION_FAILED', 'Target workload changes the bounded PRO catalog schema');
+      }
+      const proIdentity = catalogIdentityAtVersion('PRO', targetProDefinitions, fullIdentity.catalogVersion);
+      if (proIdentity.toolCount !== proNames.length) {
+        throw new RuntimeError('MCP_CATALOG_STALE', 'Target PRO catalog identity did not match its live tool list');
+      }
       manifest = {
-        full: { expectedToolNames: fullNames, catalogHash: fullCatalogHash },
-        pro: { expectedToolNames: proNames, catalogHash: pro.catalogHash },
+        full: { expectedToolNames: fullNames, catalogHash: fullIdentity.catalogHash },
+        pro: { expectedToolNames: proNames, catalogHash: proIdentity.catalogHash },
       };
     } catch (error) {
       failure = error;
@@ -680,13 +692,15 @@ export class Supervisor {
       supervisorAdminChildEnvironment(this.dataRoot, this.adminPort, this.protectedReferenceRoot),
     );
     const adminChildEnvironmentDigest = state.admin?.environmentDigest ?? null;
+    const adminChildWorkingDirectory = state.admin?.workingDirectory ?? null;
+    const adminSourceCoherent = await adminProcessMatchesControlSource(state.admin, this.sourceRoot);
     return {
       supervisorControlOwner: 'OUTER_SUPERVISOR_DAEMON',
       supervisorProcessId: process.pid,
       supervisorProcessIdentity: currentProcessIdentity(),
       controlSourceRoot: this.sourceRoot,
       protectedReferenceRoot: this.protectedReferenceRoot ?? null,
-      readiness: observed.state === 'running' && state.admin !== null && state.adminTunnel !== null ? 'READY' : 'DEGRADED',
+      readiness: observed.state === 'running' && state.admin !== null && state.adminTunnel !== null && adminSourceCoherent ? 'READY' : 'DEGRADED',
       workloadRuntimeId: observed.endpoint?.runtimeId ?? null,
       workloadInstanceId: observed.endpoint?.instanceId ?? null,
       workloadCatalogId: typeof admin.fullCatalogId === 'string' ? admin.fullCatalogId : null,
@@ -694,9 +708,10 @@ export class Supervisor {
       adminTunnelBindingId: registry?.admin?.tunnelId ?? null,
       adminChildIdentity: ownedProcessIdentity(state.admin),
       adminChildStartedAt: state.admin?.startedAt ?? null,
-      adminChildWorkingDirectory: state.admin?.workingDirectory ?? null,
+      adminChildWorkingDirectory,
       adminChildEnvironmentDigest,
       expectedAdminEnvironmentDigest,
+      adminSourceCoherent,
       adminEnvironmentCoherent: adminChildEnvironmentDigest !== null && adminChildEnvironmentDigest === expectedAdminEnvironmentDigest,
       workloadTunnelIdentity: ownedProcessIdentity(state.tunnels.full),
       adminTunnelIdentity: ownedProcessIdentity(state.adminTunnel),
@@ -716,15 +731,18 @@ export class Supervisor {
       supervisorAdminChildEnvironment(this.dataRoot, this.adminPort, this.protectedReferenceRoot),
     );
     const adminChildEnvironmentDigest = state.admin?.environmentDigest ?? null;
+    const adminChildWorkingDirectory = state.admin?.workingDirectory ?? null;
+    const adminSourceCoherent = await adminProcessMatchesControlSource(state.admin, this.sourceRoot);
     return {
       adminChildIdentity: ownedProcessIdentity(state.admin),
       adminChildStartedAt: state.admin?.startedAt ?? null,
-      adminChildWorkingDirectory: state.admin?.workingDirectory ?? null,
+      adminChildWorkingDirectory,
       adminChildEnvironmentDigest,
       expectedAdminEnvironmentDigest,
       protectedReferenceRoot: this.protectedReferenceRoot ?? null,
+      adminSourceCoherent,
       adminEnvironmentCoherent: adminChildEnvironmentDigest !== null && adminChildEnvironmentDigest === expectedAdminEnvironmentDigest,
-      readiness: status.readiness ?? 'DEGRADED',
+      readiness: adminSourceCoherent ? (status.readiness ?? 'DEGRADED') : 'DEGRADED',
       activationStatusAvailable: toolNames.includes('activation_status'),
       activationPrepareAvailable: toolNames.includes('activation_prepare'),
       activationApplyAvailable: toolNames.includes('activation_apply'),
@@ -789,10 +807,25 @@ export class Supervisor {
     if (afterAdminIdentity === null || afterAdminIdentity === beforeAdminIdentity) {
       throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Admin recycle did not produce a new child identity');
     }
+    const adminSourceCoherent = await adminProcessMatchesControlSource(persisted.admin, this.sourceRoot);
+    if (!adminSourceCoherent) {
+      throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Recycled admin child is not bound to the current control source');
+    }
+    const expectedAdminEnvironmentDigest = launchEnvironmentDigest(
+      supervisorAdminChildEnvironment(this.dataRoot, this.adminPort, this.protectedReferenceRoot),
+    );
+    const adminEnvironmentCoherent = persisted.admin?.environmentDigest !== undefined
+      && persisted.admin.environmentDigest !== null
+      && persisted.admin.environmentDigest === expectedAdminEnvironmentDigest;
+    if (!adminEnvironmentCoherent) {
+      throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Recycled admin child environment does not match the current control-plane authority');
+    }
     return {
       beforeAdminIdentity,
       afterAdminIdentity,
       adminIdentityChanged: true,
+      adminSourceCoherent: true,
+      adminEnvironmentCoherent: true,
       adminProfileDigest: persisted.adminTunnel?.profileDigest ?? null,
       adminRouteReady: afterAdmin.readiness === 'READY',
       workloadRuntimeIdUnchanged: true,
@@ -807,6 +840,22 @@ export class Supervisor {
   public async adminToolCall(name: string, args: Record<string, unknown>): Promise<SupervisorAdminToolCallResult> {
     if (!['activation_status', 'activation_prepare', 'activation_apply', 'activation_confirm', 'activation_rollback'].includes(name)) {
       throw new RuntimeError('INVALID_REQUEST', 'Only the bounded activation lifecycle is available through native supervisor control');
+    }
+    if (name === 'activation_prepare' || name === 'activation_apply' || name === 'activation_confirm') {
+      const state = await this.readState();
+      const expectedAdminEnvironmentDigest = launchEnvironmentDigest(
+        supervisorAdminChildEnvironment(this.dataRoot, this.adminPort, this.protectedReferenceRoot),
+      );
+      const adminSourceCoherent = await adminProcessMatchesControlSource(state.admin, this.sourceRoot);
+      const adminEnvironmentCoherent = state.admin?.environmentDigest !== undefined
+        && state.admin.environmentDigest !== null
+        && state.admin.environmentDigest === expectedAdminEnvironmentDigest;
+      if (!adminSourceCoherent || !adminEnvironmentCoherent) {
+        throw new RuntimeError(
+          'PRECONDITION_FAILED',
+          'Activation mutation requires an admin child bound to the current control source; recycle the admin child first',
+        );
+      }
     }
     return callSupervisorAdminTool(this.dataRoot, this.adminPort, name, args);
   }
@@ -858,17 +907,26 @@ export class Supervisor {
     const state = catalogActivationState([full, pro]);
     return {
       state,
+      sourceMode: strictCatalog ? 'STRICT_CONTROL_SOURCE' : 'BOUND_WORKLOAD_COMPATIBILITY',
       full,
       pro,
       runtimeId: observed.endpoint?.runtimeId ?? null,
       instanceId: observed.endpoint?.instanceId ?? null,
       deploymentEpoch: registry.deploymentEpoch,
-      recommendedAction: catalogAction(state),
+      recommendedAction: !strictCatalog && state !== 'ACTIVE'
+        ? 'USE_CONTROLLED_ACTIVATION_BEFORE_CATALOG_RELOAD'
+        : catalogAction(state),
     };
   }
 
   public async catalogReload(): Promise<SupervisorStackStatus> {
     const before = await this.catalogStatus();
+    if (before.sourceMode !== 'STRICT_CONTROL_SOURCE') {
+      throw new RuntimeError(
+        'PRECONDITION_FAILED',
+        'Catalog reload cannot replace a workload bound to another source root; use controlled activation first',
+      );
+    }
     if (before.state !== 'ACTIVE') await this.restart();
     const after = await this.catalogStatus();
     if (after.state !== 'ACTIVE') {
@@ -879,7 +937,12 @@ export class Supervisor {
 
   private async monitorOnceUnlocked(): Promise<void> {
     const current = await this.status();
-    if (current.runtime.state === 'READY' && current.tunnel.state === 'READY' && current.controlPlane.state === 'READY' && current.localRuntime.state === 'READY') {
+    const controlledTransition = current.localRuntime.state === 'DEGRADED'
+      && current.localRuntime.code === 'CATALOG_IDENTITY_UNVERIFIED';
+    if (current.runtime.state === 'READY'
+      && current.tunnel.state === 'READY'
+      && current.controlPlane.state === 'READY'
+      && (current.localRuntime.state === 'READY' || controlledTransition)) {
       const state = await this.readState();
       if (state.recovery.windowStartedAt !== null && recoveryWindowExpired(state.recovery)) {
         await this.writeState({ ...state, recovery: emptyRecovery() });
@@ -1452,24 +1515,42 @@ async function probeLocalRuntime(apiUrl: string, serviceSecret: string, registry
         jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'catalog_identity', arguments: {} },
       }, { ...headers, 'MCP-Protocol-Version': '2026-07-28', 'Mcp-Name': 'catalog_identity' })
       : null;
+    // PRO intentionally has no catalog_identity tool. In cross-source mode,
+    // deriving its identity with this control-plane source would fabricate the
+    // apparent catalog version/hash instead of observing the workload runtime.
     const liveIdentity = binding.mode === 'FULL'
       ? catalogIdentityFromToolResponse(fullIdentityResponse)
-      : listed === null ? null : catalogIdentity(binding.mode, listedToolDefinitions(listed));
-    const catalog = catalogProfileStatus(binding, source, liveIdentity, names, listed !== null);
+      : listed === null || !strictCatalog ? null : catalogIdentity(binding.mode, listedToolDefinitions(listed));
+    const catalog = binding.mode === 'PRO' && !strictCatalog
+      ? catalogProfileStatusWithoutAuthoritativeIdentity(binding, source, names, listed !== null)
+      : catalogProfileStatus(binding, source, liveIdentity, names, listed !== null);
     catalogs.push(catalog);
+    const compatibilityUnknown = binding.mode === 'PRO'
+      && !strictCatalog
+      && listed !== null
+      && catalog.state === 'UNKNOWN';
     const code = catalog.state === 'ACTIVE' ? 'READY'
-      : catalog.state === 'STALE_CONNECTOR' ? 'CONNECTOR_MANIFEST_STALE'
-        : catalog.state === 'UNKNOWN' ? (listed === null ? 'LOCAL_MCP_AUTH_FAILED' : 'MCP_CATALOG_STALE')
-          : 'MCP_CATALOG_STALE';
+      : compatibilityUnknown ? 'CATALOG_IDENTITY_UNVERIFIED'
+        : catalog.state === 'STALE_CONNECTOR' ? 'CONNECTOR_MANIFEST_STALE'
+          : catalog.state === 'UNKNOWN' ? (listed === null ? 'LOCAL_MCP_AUTH_FAILED' : 'MCP_CATALOG_STALE')
+            : 'MCP_CATALOG_STALE';
     connectors.push(connectorStatus(binding, undefined, catalog.state === 'ACTIVE'
       ? layer('READY', 'READY', `${binding.label} authenticated discovery and current catalog match`)
-      : layer('FAILED', code, `${binding.label} catalog is ${catalog.state}`)));
+      : compatibilityUnknown
+        ? layer('UNKNOWN', code, `${binding.label} authenticated tool list matches the bound workload catalog, but PRO catalog identity is not authoritative across source roots`)
+        : layer('FAILED', code, `${binding.label} catalog is ${catalog.state}`)));
   }
-  const status = connectors.every((connector) => connector.state === 'READY') ? layer('READY', 'READY', 'Authenticated local MCP discovery and current catalogs are healthy') : layer('FAILED',
-    catalogs.some((catalog) => catalog.state === 'STALE_RUNTIME' || catalog.state === 'MISMATCH') ? 'MCP_CATALOG_STALE'
-      : catalogs.some((catalog) => catalog.state === 'STALE_CONNECTOR') ? 'CONNECTOR_MANIFEST_STALE'
-        : connectors.some((connector) => connector.code === 'LOCAL_MCP_AUTH_FAILED') ? 'LOCAL_MCP_AUTH_FAILED' : 'RUNTIME_IDENTITY_MISMATCH',
-    'One or more authenticated local MCP profiles failed catalog readiness');
+  const failedConnector = connectors.find((connector) => connector.state === 'FAILED');
+  const unknownConnector = connectors.find((connector) => connector.state === 'UNKNOWN');
+  const status = failedConnector !== undefined
+    ? layer('FAILED',
+      catalogs.some((catalog) => catalog.state === 'STALE_RUNTIME' || catalog.state === 'MISMATCH') ? 'MCP_CATALOG_STALE'
+        : catalogs.some((catalog) => catalog.state === 'STALE_CONNECTOR') ? 'CONNECTOR_MANIFEST_STALE'
+          : failedConnector.code === 'LOCAL_MCP_AUTH_FAILED' ? 'LOCAL_MCP_AUTH_FAILED' : 'RUNTIME_IDENTITY_MISMATCH',
+      'One or more authenticated local MCP profiles failed catalog readiness')
+    : unknownConnector !== undefined
+      ? layer('DEGRADED', 'CATALOG_IDENTITY_UNVERIFIED', 'Authenticated local MCP transport is healthy but one compatibility-mode catalog identity is not authoritative')
+      : layer('READY', 'READY', 'Authenticated local MCP discovery and current catalogs are healthy');
   return { status, connectors, catalogs };
 }
 
@@ -1514,6 +1595,26 @@ export function catalogProfileStatus(
   };
 }
 
+export function catalogProfileStatusWithoutAuthoritativeIdentity(
+  binding: ConnectorBinding,
+  source: { readonly identity: McpCatalogIdentity; readonly names: readonly string[] },
+  liveNames: readonly string[],
+  listAvailable: boolean,
+): CatalogProfileStatus {
+  const namesMatch = listAvailable
+    && liveNames.length === source.names.length
+    && liveNames.every((name, index) => name === source.names[index]);
+  return {
+    profile: binding.mode === 'FULL' ? 'FULL' : 'PRO',
+    source: source.identity,
+    live: null,
+    liveToolCount: listAvailable ? liveNames.length : null,
+    connectorCatalogHash: binding.catalogHash,
+    connectorEpoch: binding.deploymentEpoch,
+    state: !listAvailable ? 'UNKNOWN' : namesMatch ? 'UNKNOWN' : 'STALE_RUNTIME',
+  };
+}
+
 function catalogActivationState(profiles: readonly CatalogProfileStatus[]): CatalogActivationState {
   if (profiles.some((profile) => profile.state === 'STALE_RUNTIME')) return 'STALE_RUNTIME';
   if (profiles.some((profile) => profile.state === 'STALE_CONNECTOR')) return 'STALE_CONNECTOR';
@@ -1551,7 +1652,11 @@ function listedToolDefinitions(value: unknown): readonly unknown[] {
 }
 
 function connectorStatus(binding: ConnectorBinding, local: ConnectorStatus | undefined, tunnel: LayerStatus): ConnectorStatus {
-    const chosen = local === undefined ? tunnel : local.state === 'READY' && tunnel.state === 'READY' ? local : layer('FAILED', local.code !== 'READY' ? local.code : tunnel.code, `${binding.label} is not ready`);
+  const chosen = local === undefined
+    ? tunnel
+    : tunnel.state !== 'READY'
+      ? layer('FAILED', tunnel.code, `${binding.label} tunnel is not ready`)
+      : local;
   return { ...chosen, connectorId: binding.connectorId, label: binding.label, tunnelId: binding.tunnelId, profile: binding.mcpProfile, expectedToolCount: binding.expectedToolNames.length };
 }
 
@@ -1592,6 +1697,18 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
   } catch {
     return null;
   }
+}
+
+async function adminProcessMatchesControlSource(record: OwnedProcess | null, controlSourceRoot: string): Promise<boolean> {
+  if (record === null || record.workingDirectory === undefined || record.workingDirectory === null) return false;
+  if (!sameSourceRoot(record.workingDirectory, controlSourceRoot)) return false;
+  if (await inspectProcess(record) !== 'running') return false;
+  const command = await commandForPid(record.pid);
+  if (command === null) return false;
+  const sourceEntrypoint = path.resolve(import.meta.dirname, 'supervisor-admin-main.ts');
+  const builtEntrypoint = path.resolve(import.meta.dirname, 'supervisor-admin-main.js');
+  const expectedEntrypoint = existsSync(sourceEntrypoint) ? sourceEntrypoint : builtEntrypoint;
+  return commandIncludesPath(command, expectedEntrypoint);
 }
 
 async function spawnManaged(

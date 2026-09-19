@@ -4,7 +4,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { IRIS_VERSION, RuntimeError, type RuntimeHealth, type RuntimeIdentity } from '@iris/domain';
 import { AGENT_EXECUTOR_ENV, OPENAI_API_KEY_ENV, OPENAI_MODEL_ENV } from './agent-executor.js';
-import { assertActivationSourceIdentity, type ActivationSourceIdentity } from './activation-source-identity.js';
+import { assertActivationSourceIdentity, assertActivationWorkloadReady, type ActivationSourceIdentity } from './activation-source-identity.js';
 import { AUTHORITY_RECOVERY_IN_PROGRESS, probeRuntimeAuthority } from './authority.js';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { readEndpoint, readRuntimeControl, type EndpointDocument, type RuntimeControlDocument } from './persistence.js';
@@ -140,6 +140,7 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
       options.expectedSourceIdentity,
       'Candidate source identity changed at the runtime launch boundary',
     );
+    await assertActivationWorkloadReady(runtimeSourceRoot);
   }
   const child = spawn(executable, args, {
     cwd: runtimeSourceRoot,

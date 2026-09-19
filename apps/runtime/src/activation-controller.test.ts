@@ -126,6 +126,51 @@ describe('persistent activation controller', () => {
     }]);
   });
 
+  it('fails activation when apply rotates the persistent runtime ID', async () => {
+    const harness = await createHarness();
+    const prepared = await harness.controller.prepare(harness.input());
+    harness.runtime.nextRuntimeIdOverride = 'runtime-rotated';
+
+    await expect(harness.controller.apply(prepared.transactionId))
+      .rejects.toMatchObject({ code: 'RUNTIME_IDENTITY_MISMATCH' });
+
+    const status = await harness.controller.status(prepared.transactionId);
+    expect(status.transaction).toMatchObject({
+      state: 'APPLY_FAILED',
+      lastFailureCode: 'RUNTIME_IDENTITY_MISMATCH',
+    });
+  });
+
+  it('fails activation when apply reuses the pre-activation runtime instance', async () => {
+    const harness = await createHarness();
+    const prepared = await harness.controller.prepare(harness.input());
+    harness.runtime.reuseInstanceIdNextApply = true;
+
+    await expect(harness.controller.apply(prepared.transactionId))
+      .rejects.toMatchObject({ code: 'RUNTIME_IDENTITY_MISMATCH' });
+
+    const status = await harness.controller.status(prepared.transactionId);
+    expect(status.transaction).toMatchObject({
+      state: 'APPLY_FAILED',
+      lastFailureCode: 'RUNTIME_IDENTITY_MISMATCH',
+    });
+  });
+
+  it('fails activation when apply changes the bounded PRO tool count', async () => {
+    const harness = await createHarness();
+    const prepared = await harness.controller.prepare(harness.input());
+    harness.runtime.nextProToolCountOverride = 6;
+
+    await expect(harness.controller.apply(prepared.transactionId))
+      .rejects.toMatchObject({ code: 'RUNTIME_IDENTITY_MISMATCH' });
+
+    const status = await harness.controller.status(prepared.transactionId);
+    expect(status.transaction).toMatchObject({
+      state: 'APPLY_FAILED',
+      lastFailureCode: 'RUNTIME_IDENTITY_MISMATCH',
+    });
+  });
+
   it('recovers interrupted APPLYING as APPLIED when the prepared candidate runtime already reached READY', async () => {
     const harness = await createHarness();
     const prepared = await harness.controller.prepare(harness.input());
@@ -183,6 +228,32 @@ describe('persistent activation controller', () => {
     expect(recovered?.lastFailureCode).toBeNull();
   });
 
+  it('does not recover interrupted rollback as complete when the restored catalog identity is wrong', async () => {
+    const harness = await createHarness();
+    const prepared = await harness.controller.prepare(harness.input());
+    await harness.controller.apply(prepared.transactionId);
+    await forceTransactionState(harness.dataRoot, prepared.transactionId, 'ROLLBACK_IN_PROGRESS');
+    harness.runtime.current = {
+      readiness: 'READY',
+      runtimeId: 'runtime-a',
+      instanceId: 'instance-a-12',
+      catalogId: CATALOG_B,
+      deploymentEpoch: 12,
+      fullToolCount: 48,
+      proToolCount: 5,
+      workloadSourceRoot: SOURCE_A,
+    };
+
+    const restarted = new ActivationController(harness.dataRoot, harness.inspector, harness.runtime) as unknown as {
+      recoverInterrupted(): Promise<{ state: string; lastFailureCode: string | null } | null>;
+    };
+    const recovered = await restarted.recoverInterrupted();
+    expect(recovered).toMatchObject({
+      state: 'APPLY_FAILED',
+      lastFailureCode: 'RECOVERY_REQUIRED',
+    });
+  });
+
   it('fails closed to APPLY_FAILED when interrupted activation outcome is ambiguous and remains explicitly rollbackable', async () => {
     const harness = await createHarness();
     const prepared = await harness.controller.prepare(harness.input());
@@ -234,6 +305,16 @@ describe('persistent activation controller', () => {
     await expect(harness.controller.confirm(applied.transactionId)).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
+  it('rejects confirmation when the post-apply PRO tool count drifts', async () => {
+    const harness = await createHarness();
+    const prepared = await harness.controller.prepare(harness.input());
+    const applied = await harness.controller.apply(prepared.transactionId);
+    harness.runtime.current = { ...harness.runtime.current, proToolCount: 6 };
+
+    await expect(harness.controller.confirm(applied.transactionId))
+      .rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+  });
+
   it('rolls back a prepared-only transaction without replacing workload runtime', async () => {
     const harness = await createHarness();
     const prepared = await harness.controller.prepare(harness.input());
@@ -251,6 +332,22 @@ describe('persistent activation controller', () => {
     expect(rolled.state).toBe('ROLLED_BACK');
     expect(rolled.postRollback).toMatchObject({ workloadSourceRoot: SOURCE_A, readiness: 'READY' });
     expect(harness.runtime.appliedRoots).toEqual([SOURCE_B, SOURCE_A]);
+  });
+
+  it('fails rollback when the restored workload changes the persistent runtime ID', async () => {
+    const harness = await createHarness();
+    const prepared = await harness.controller.prepare(harness.input());
+    await harness.controller.apply(prepared.transactionId);
+    harness.runtime.nextRuntimeIdOverride = 'runtime-rotated-on-rollback';
+
+    await expect(harness.controller.rollback(prepared.transactionId))
+      .rejects.toMatchObject({ code: 'RUNTIME_IDENTITY_MISMATCH' });
+
+    const status = await harness.controller.status(prepared.transactionId);
+    expect(status.transaction).toMatchObject({
+      state: 'APPLY_FAILED',
+      lastFailureCode: 'RUNTIME_IDENTITY_MISMATCH',
+    });
   });
 
   it('restores the captured prior binding after a failed apply', async () => {
@@ -354,6 +451,9 @@ class FakeRuntimeAdapter implements ActivationRuntimeAdapter {
     readonly fingerprintAlgorithm: 'sha256:sorted-tracked-path-content-v1';
   } | undefined> = [];
   public failNextApplyAfterMutation = false;
+  public nextRuntimeIdOverride: string | null = null;
+  public reuseInstanceIdNextApply = false;
+  public nextProToolCountOverride: number | null = null;
 
   public constructor(public current: ActivationRuntimeSnapshot) {}
 
@@ -371,16 +471,25 @@ class FakeRuntimeAdapter implements ActivationRuntimeAdapter {
     this.appliedSourceIdentities.push(sourceIdentity);
     const nextEpoch = (this.current.deploymentEpoch ?? 0) + 1;
     const isTarget = sourceRoot === SOURCE_B;
+    const previousInstanceId = this.current.instanceId;
+    const runtimeId = this.nextRuntimeIdOverride ?? 'runtime-a';
+    const instanceId = this.reuseInstanceIdNextApply
+      ? previousInstanceId
+      : isTarget ? `instance-b-${nextEpoch}` : `instance-a-${nextEpoch}`;
+    const proToolCount = this.nextProToolCountOverride ?? 5;
+    this.nextRuntimeIdOverride = null;
+    this.reuseInstanceIdNextApply = false;
+    this.nextProToolCountOverride = null;
     this.current = {
       ...this.current,
       readiness: 'READY',
       workloadSourceRoot: sourceRoot,
-      runtimeId: 'runtime-a',
-      instanceId: isTarget ? `instance-b-${nextEpoch}` : `instance-a-${nextEpoch}`,
+      runtimeId,
+      instanceId,
       catalogId: isTarget ? CATALOG_B : CATALOG_A,
       deploymentEpoch: nextEpoch,
       fullToolCount: isTarget ? 50 : 48,
-      proToolCount: 5,
+      proToolCount,
     };
     if (this.failNextApplyAfterMutation) {
       this.failNextApplyAfterMutation = false;

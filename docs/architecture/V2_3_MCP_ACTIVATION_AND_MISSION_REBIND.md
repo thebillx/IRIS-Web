@@ -41,10 +41,36 @@ pnpm iris catalog status
 ```
 
 It reports source/live identity for FULL and PRO, connector metadata, runtime
-identity, deployment epoch, and one of `ACTIVE`, `STALE_RUNTIME`,
-`STALE_CONNECTOR`, `MISMATCH`, or `UNKNOWN`.
+identity, deployment epoch, source mode, and one of `ACTIVE`,
+`STALE_RUNTIME`, `STALE_CONNECTOR`, `MISMATCH`, or `UNKNOWN`.
 
-For a stale runtime or connector deployment, use:
+Two source modes are meaningful:
+
+- `STRICT_CONTROL_SOURCE`: the supervisor control source and active workload
+  source are the same checkout. A stale runtime/catalog can use the bounded
+  `pnpm iris catalog reload` path.
+- `BOUND_WORKLOAD_COMPATIBILITY`: the control source is newer or otherwise
+  different from the active workload source. A catalog reload is intentionally
+  refused; use the controlled source-root activation lifecycle first.
+
+A cross-source PRO tool list is not an authoritative catalog version because PRO
+intentionally does not expose `catalog_identity`. IRIS therefore reports that
+identity as unverified instead of recomputing a newer apparent version from the
+control source.
+
+Before a controlled source-root activation, the candidate must pass both Git
+identity inspection and workload runtime-readiness preflight. Source-mode
+startup requires the source-local tsx loader, the workspace `@iris/domain`
+export target, and the web Vite/runtime packages to resolve physically inside
+the candidate root.
+
+Activation mutation also requires the persistent admin child to be bound to the
+current control source and expected admin environment. If it is stale, use the
+bounded admin-only recycle path with exact admin identity/profile-digest
+preconditions. That recycle must preserve workload runtime ID, runtime instance,
+catalog ID, deployment epoch, workload tunnel, and web identity.
+
+For a stale same-source runtime or connector deployment, use:
 
 ```text
 pnpm iris catalog reload
@@ -53,9 +79,10 @@ pnpm iris catalog reload
 This is a governed, serialized restart only when activation is needed. It
 preserves the runtime ID, credentials, connector tunnel IDs, missions, and
 supervisor ownership. It regenerates managed profiles and verifies both
-authenticated profiles before returning success. A stale source catalog is
-reconciled into derived connector deployment metadata; connector identity is
-not recreated.
+authenticated profiles before returning success. A valid-shaped prior-version
+catalog hash is treated as stale derived connector metadata and can be
+reconciled without recreating connector ownership; malformed connector identity
+still fails closed.
 
 If source and local runtime identities match but ChatGPT still presents an old
 manifest, the platform-side connector is stale. IRIS reports
@@ -92,9 +119,16 @@ rebind is not mission recreation and does not alter project implementation.
 ## Troubleshooting
 
 ```text
-SOURCE_COUNT != LIVE_COUNT
+STRICT_CONTROL_SOURCE + SOURCE_COUNT != LIVE_COUNT
 → STALE_RUNTIME
 → pnpm iris catalog reload
+
+BOUND_WORKLOAD_COMPATIBILITY
+→ do not run catalog reload
+→ verify candidate hydration + source identity
+→ recycle only the stale admin child when required
+→ use activation_prepare → activation_apply → verify → activation_confirm
+→ activation_rollback on any post-apply identity/readiness mismatch
 
 SOURCE == LIVE but ChatGPT toolset is old
 → STALE_CONNECTOR / connector manifest cache

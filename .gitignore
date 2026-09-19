@@ -6,3 +6,9 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# Governed package-manager/cache homes created by IRIS execution profiles.
+.iris-package-home/
+.cache/
+/Library/Caches/pnpm/
+/Library/pnpm/

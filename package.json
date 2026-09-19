@@ -11,6 +11,7 @@
   },
   "scripts": {
     "dev": "node scripts/node24.mjs scripts/dev.mjs",
+    "hydrate": "HOME=\"$PWD/.iris-package-home\" XDG_CACHE_HOME=\"$PWD/.iris-package-home/cache\" XDG_DATA_HOME=\"$PWD/.iris-package-home/data\" XDG_STATE_HOME=\"$PWD/.iris-package-home/state\" corepack pnpm install --frozen-lockfile",
     "runtime": "node scripts/node24.mjs --pnpm --filter @iris/runtime runtime",
     "iris": "node scripts/node24.mjs scripts/iris.mjs",
     "permission-smoke": "node scripts/node24.mjs scripts/permission-smoke.mjs",

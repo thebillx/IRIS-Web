@@ -115,6 +115,61 @@ describe('connector registry', () => {
     expect(reconciled?.registry.connectors[1]?.catalogFingerprint).toBe(catalogFingerprint(PRO_TOOL_NAMES));
   });
 
+  it('reconciles valid-shaped prior-version catalog hashes without changing connector ownership', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-registry-version-stale-'));
+    roots.push(dataRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    });
+    const bound = await bindConnectorRuntime(dataRoot, 'runtime-a');
+    const ownership = bound.connectors.map((connector) => ({
+      connectorId: connector.connectorId,
+      tunnelId: connector.tunnelId,
+      machineId: connector.machineId,
+      runtimeId: connector.runtimeId,
+      leaseGeneration: connector.leaseGeneration,
+    }));
+    const currentHashes = bound.connectors.map((connector) => connector.catalogHash);
+
+    const filename = path.join(dataRoot, 'connector-registry.json');
+    const raw = JSON.parse(await readFile(filename, 'utf8')) as {
+      connectors: Array<Record<string, unknown>>;
+      [key: string]: unknown;
+    };
+    const priorHashes = new Map([
+      ['iris-full', 'sha256:fd788b9b922d28a6aa56f05c1b903d490425d1d1bbcb7044a6ea91a0c318e276'],
+      ['iris-pro', 'sha256:8952f22b28a5fc43b99a215455a024a7d422acb8d0da7d5d4f4b037e73e9f363'],
+    ]);
+    await writeFile(filename, JSON.stringify({
+      ...raw,
+      connectors: raw.connectors.map((connector) => ({
+        ...connector,
+        catalogHash: priorHashes.get(String(connector.connectorId)),
+      })),
+    }), { mode: 0o600 });
+
+    const inspection = await inspectConnectorRegistry(dataRoot);
+    expect(inspection?.changed).toBe(true);
+    expect(inspection?.staleConnectorIds).toEqual(['iris-full', 'iris-pro']);
+    expect(inspection?.registry.connectors.map((connector) => connector.catalogHash)).toEqual([
+      priorHashes.get('iris-full'),
+      priorHashes.get('iris-pro'),
+    ]);
+
+    const reconciled = await reconcileConnectorRegistry(dataRoot);
+    expect(reconciled?.changed).toBe(true);
+    expect(reconciled?.registry.deploymentEpoch).toBe(bound.deploymentEpoch + 1);
+    expect(reconciled?.registry.connectors.map((connector) => connector.catalogHash)).toEqual(currentHashes);
+    expect(reconciled?.registry.connectors.map((connector) => ({
+      connectorId: connector.connectorId,
+      tunnelId: connector.tunnelId,
+      machineId: connector.machineId,
+      runtimeId: connector.runtimeId,
+      leaseGeneration: connector.leaseGeneration,
+    }))).toEqual(ownership);
+  });
+
   it('rejects malformed identity and unknown connector injection while ignoring stale derived names', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-registry-invalid-'));
     roots.push(dataRoot);
