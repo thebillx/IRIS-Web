@@ -25,6 +25,8 @@ async function main(): Promise<void> {
     organization: required('--organization'),
     project: required('--project'),
     teamName: required('--team'),
+    epicBoardName: required('--epic-board'),
+    requirementBacklogName: required('--requirement-backlog'),
     level1WorkItemId: positive('--level1-work-item'),
     storyWorkItemId: positive('--story-work-item'),
   };

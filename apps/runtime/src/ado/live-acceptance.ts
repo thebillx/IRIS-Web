@@ -9,6 +9,8 @@ export interface AdoLiveAcceptanceTarget {
   readonly organization: string;
   readonly project: string;
   readonly teamName: string;
+  readonly epicBoardName: string;
+  readonly requirementBacklogName: string;
   readonly level1WorkItemId: number;
   readonly storyWorkItemId: number;
 }
@@ -89,6 +91,9 @@ export interface AdoLiveAcceptanceReceipt {
   readonly level4: { readonly itemCount: number; readonly commentCount: number; readonly relationCount: number };
   readonly requestCount: number;
   readonly areaPathMismatchCount: number;
+  readonly preferredStoryWorkItemId: number;
+  readonly preferredStoryInTeam: boolean;
+  readonly selectedFeatureRootId: number;
   readonly zeroMutation: true;
   readonly revisionStable: boolean;
 }
@@ -209,6 +214,21 @@ export async function runAdoLiveReadAcceptance(
   )).body);
   if (backlogLevels.length === 0 || backlogLevels.length > 100) throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
 
+  const epicBacklogs = backlogLevels.filter(level => !level.hidden && level.name === target.epicBoardName);
+  const requirementBacklogs = backlogLevels.filter(level =>
+    !level.hidden && level.type === 'requirement' && level.name === target.requirementBacklogName);
+  if (epicBacklogs.length !== 1 || requirementBacklogs.length !== 1) {
+    throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
+  }
+  const epicBacklog = epicBacklogs[0]!;
+  const requirementBacklog = requirementBacklogs[0]!;
+  const epicBoards = boards.filter(board => board.name === target.epicBoardName);
+  const requirementBoards = boards.filter(board => board.name === target.requirementBacklogName);
+  if (epicBoards.length !== 1 || requirementBoards.length !== 1) {
+    throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
+  }
+  const canonicalBoard = requirementBoards[0]!;
+
   const fullIds = new Set<number>();
   const membership = new Map<number, Set<string>>();
   for (const backlog of backlogLevels.filter(level => !level.hidden)) {
@@ -222,9 +242,13 @@ export async function runAdoLiveReadAcceptance(
     if (fullIds.size > limits.maxItems) throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
   }
 
-  if (!fullIds.has(target.level1WorkItemId) || !fullIds.has(target.storyWorkItemId)) {
+  if (!fullIds.has(target.level1WorkItemId)
+    || !membership.get(target.level1WorkItemId)?.has(epicBacklog.id)) {
     throw new AdoLiveAcceptanceError('SCOPE_MISMATCH');
   }
+
+  const preferredStoryInTeam = fullIds.has(target.storyWorkItemId)
+    && (membership.get(target.storyWorkItemId)?.has(requirementBacklog.id) ?? false);
 
   const level1Before = parseWorkItem((await request(
     'level1.work_item',
@@ -233,23 +257,8 @@ export async function runAdoLiveReadAcceptance(
   )).body);
   const level1Comments = await readAllComments(request, project.id, target.level1WorkItemId, limits.maxItems);
 
-  const story = parseWorkItem((await request(
-    'level2.story_anchor',
-    '/' + encodeURIComponent(project.id) + '/_apis/wit/workitems/' + target.storyWorkItemId,
-    { '$expand': 'all', 'api-version': '7.1' },
-  )).body);
-
-  const featureRoot = await findFeatureAncestor(request, project.id, story, limits.maxItems, fullIds);
+  const featureRoot = await findFeatureDescendant(request, project.id, level1Before, limits.maxItems, fullIds);
   const subtreeIds = await collectSubtree(request, project.id, featureRoot, limits.maxItems, fullIds);
-
-  const storyType = textField(story.fields['System.WorkItemType']);
-  const matchingRequirement = backlogLevels.filter(level =>
-    level.type === 'requirement' && level.workItemTypes.includes(storyType));
-  if (matchingRequirement.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
-  const requirementBacklog = matchingRequirement[0]!;
-  const requirementBoards = boards.filter(board => board.name === requirementBacklog.name);
-  if (requirementBoards.length !== 1) throw new AdoLiveAcceptanceError('AMBIGUOUS_TARGET');
-  const canonicalBoard = requirementBoards[0]!;
   const level3Ids = await readBacklogIds(request, project.id, team.id, requirementBacklog.id, limits.maxItems);
 
   const firstPass = await readWorkItems(request, project.id, [...fullIds], limits.maxItems);
@@ -282,6 +291,8 @@ export async function runAdoLiveReadAcceptance(
     target.organization,
     project.id,
     team.id,
+    target.epicBoardName,
+    target.requirementBacklogName,
     canonicalBoard.id,
     boards.map(board => [board.id, board.name]).sort(),
   ]);
@@ -325,6 +336,9 @@ export async function runAdoLiveReadAcceptance(
     level4: { itemCount: fullIds.size, commentCount, relationCount },
     requestCount: ledger.length,
     areaPathMismatchCount,
+    preferredStoryWorkItemId: target.storyWorkItemId,
+    preferredStoryInTeam,
+    selectedFeatureRootId: featureRoot.id,
     zeroMutation: true,
     revisionStable: true,
   };
@@ -360,7 +374,13 @@ export async function readPatFromStdin(): Promise<string> {
 }
 
 function validateTarget(target: AdoLiveAcceptanceTarget): void {
-  for (const value of [target.organization, target.project, target.teamName]) {
+  for (const value of [
+    target.organization,
+    target.project,
+    target.teamName,
+    target.epicBoardName,
+    target.requirementBacklogName,
+  ]) {
     if (typeof value !== 'string' || value.trim().length === 0 || value.length > 200 || /[\0\r\n]/.test(value)) {
       throw new AdoLiveAcceptanceError('INVALID_INPUT');
     }
@@ -454,30 +474,35 @@ async function readAllComments(
   return comments;
 }
 
-async function findFeatureAncestor(
+async function findFeatureDescendant(
   request: (operation: string, pathname: string, query: Readonly<Record<string, string>>) => Promise<HttpResult>,
   projectId: string,
-  start: RawWorkItem,
+  epic: RawWorkItem,
   maxItems: number,
   authorizedIds: ReadonlySet<number>,
 ): Promise<RawWorkItem> {
-  let current = start;
   const seen = new Set<number>();
-  for (let depth = 0; depth < Math.min(maxItems, 50); depth += 1) {
-    if (textField(current.fields['System.WorkItemType']) === 'Feature') return current;
-    if (seen.has(current.id)) throw new AdoLiveAcceptanceError('UPSTREAM_FAILURE');
+  const queue = [epic];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (seen.has(current.id)) continue;
     seen.add(current.id);
-    const parentIds = relationTargets(current, 'System.LinkTypes.Hierarchy-Reverse');
-    if (parentIds.length !== 1) throw new AdoLiveAcceptanceError('NOT_FOUND');
-    const parentId = parentIds[0]!;
-    if (!authorizedIds.has(parentId)) throw new AdoLiveAcceptanceError('SCOPE_MISMATCH');
-    current = parseWorkItem((await request(
-      'level2.parent',
-      '/' + encodeURIComponent(projectId) + '/_apis/wit/workitems/' + parentId,
-      { '$expand': 'relations', 'api-version': '7.1' },
-    )).body);
+    if (seen.size > maxItems) throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
+    if (current.id !== epic.id && textField(current.fields['System.WorkItemType']) === 'Feature') {
+      return current;
+    }
+    const childIds = relationTargets(current, 'System.LinkTypes.Hierarchy-Forward').sort((left, right) => left - right);
+    for (const childId of childIds) {
+      if (!authorizedIds.has(childId) || seen.has(childId)) continue;
+      const child = parseWorkItem((await request(
+        'level2.feature_candidate',
+        '/' + encodeURIComponent(projectId) + '/_apis/wit/workitems/' + childId,
+        { '$expand': 'relations', 'api-version': '7.1' },
+      )).body);
+      queue.push(child);
+    }
   }
-  throw new AdoLiveAcceptanceError('LIMIT_EXCEEDED');
+  throw new AdoLiveAcceptanceError('NOT_FOUND');
 }
 
 async function collectSubtree(

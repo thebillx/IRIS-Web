@@ -12,6 +12,8 @@ const target: AdoLiveAcceptanceTarget = {
   organization: 'example-org',
   project: 'Example Project',
   teamName: 'Example Team',
+  epicBoardName: 'Epics',
+  requirementBacklogName: 'Stories',
   level1WorkItemId: 100,
   storyWorkItemId: 201,
 };
@@ -37,6 +39,7 @@ function workItem(id: number) {
     },
     relations: [] as { rel: string; url: string }[],
   };
+  if (id === 100) base.relations.push(relation('System.LinkTypes.Hierarchy-Forward', 200));
   if (id === 200) base.relations.push(relation('System.LinkTypes.Hierarchy-Forward', 201));
   if (id === 201) base.relations.push(relation('System.LinkTypes.Hierarchy-Reverse', 200));
   return base;
@@ -59,8 +62,8 @@ function fakeFetch(options: { changeRevision?: boolean } = {}) {
       body = { count: 1, value: [{ id: 't1', name: 'Example Team' }] };
     } else if (pathname.endsWith('/p1/t1/_apis/work/boards')) {
       body = { count: 2, value: [
-        { id: 'b-portfolio', name: 'Portfolio' },
-        { id: 'b-requirements', name: 'Requirements' },
+        { id: 'b-portfolio', name: 'Epics' },
+        { id: 'b-requirements', name: 'Stories' },
       ] };
     } else if (pathname.endsWith('/p1/t1/_apis/work/teamsettings/teamfieldvalues')) {
       body = {
@@ -72,8 +75,8 @@ function fakeFetch(options: { changeRevision?: boolean } = {}) {
       body = {
         count: 2,
         value: [
-          { id: 'portfolio', name: 'Portfolio', rank: 2, type: 'portfolio', isHidden: false, workItemTypes: [{ name: 'Epic' }, { name: 'Feature' }] },
-          { id: 'requirements', name: 'Requirements', rank: 1, type: 'requirement', isHidden: false, workItemTypes: [{ name: 'User Story' }] },
+          { id: 'portfolio', name: 'Epics', rank: 2, type: 'portfolio', isHidden: false, workItemTypes: [{ name: 'Epic' }, { name: 'Feature' }] },
+          { id: 'requirements', name: 'Stories', rank: 1, type: 'requirement', isHidden: false, workItemTypes: [{ name: 'User Story' }] },
         ],
       };
     } else if (pathname.endsWith('/p1/t1/_apis/work/backlogs/portfolio/workItems')) {
