@@ -1,6 +1,6 @@
 # IRIS Phase 7 — Browser and GitHub Connector Plan
 
-Status: READY_FOR_SAVE_POINT
+Status: COMPLETE
 Baseline: `98ddb023f36c46c0a4d00f2443951419da8ceb31`
 Branch: `codex/phase7-browser-github-impl`
 No live external write is authorized by this plan.
@@ -123,7 +123,7 @@ Exit: deterministic E2E receipt with no external production write.
 
 ### NEXT-7 — Final Phase 7 acceptance / save point
 
-Status: READY_FOR_SAVE_POINT
+Status: COMPLETE
 
 - canonical lint/typecheck/build/test;
 - serial proof for known process-sensitive runtime tests if required;
