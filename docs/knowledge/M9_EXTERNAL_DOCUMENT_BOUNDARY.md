@@ -93,3 +93,14 @@ After that compatibility fix:
 - Added explicit cross-project graph grant with project allowlist, relation allowlist, expiry, and node/link resource budgets.
 - Cross-project graph edges remain `SUPPORTING_EVIDENCE`; an allowed graph does not create cross-project write authority or requirement truth.
 - Focused M9-D/E tests: 17/17 PASS.
+
+## M9-F acceptance, security, and optional controlled write-back
+
+- Added an optional Azure DevOps Wiki write-back intent boundary. It accepts only a governed text/Markdown artifact, exact project/connector/wiki identity, allowlisted Wiki path, explicit CREATE/UPDATE operation, expiry, artifact-size limit, and remote-version fence.
+- Write-back remains disabled unless a trusted grant enables it, always returns `requiresOwnerApproval: true`, and intentionally returns `transportEnabled: false`; M9 does not introduce an approval bypass or an unreviewed network mutation path.
+- Added end-to-end M9 acceptance coverage for connector-independent references, source-drift → stale-topic propagation, scheduled sync reuse, cross-project evidence graph, and write-back gating.
+- Added M9 security acceptance for caller URL rejection, cross-project artifact substitution, cross-project graph authority, Wiki path traversal, and transport-disabled write-back.
+- Focused M9 + existing Figma read acceptance: 79/79 PASS.
+- typecheck, lint, and build: PASS.
+
+Final full-suite rerun is required after all M9-F files are staged because activation-source tests intentionally reject untracked files under executable workload roots.
