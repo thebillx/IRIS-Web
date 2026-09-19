@@ -375,6 +375,96 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     })).rejects.toMatchObject({ code: 'APPROVAL_NOT_FOUND' });
   });
 
+  it('AC-COMPAT-002 routes legacy git_status/git_local/remote_publish through governed Git while preserving old result contracts', async () => {
+    const fixture = await serviceFixture();
+    await writeFile(path.join(fixture.projectRoot, 'owned.txt'), 'changed\n');
+    await writeFile(path.join(fixture.projectRoot, 'compat-untracked.txt'), 'new\n');
+
+    const status = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'git.local',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      operation: 'status',
+    }));
+    expect(status).toMatchObject({ operation: 'status', trackedDiffOnly: true });
+    expect(status.untrackedFiles).toEqual(expect.arrayContaining(['compat-untracked.txt']));
+    expect(status).not.toHaveProperty('repositoryId');
+    expect(status).not.toHaveProperty('workspaceId');
+
+    const names = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'git.local',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      operation: 'diff-name-only',
+    }));
+    expect(String(names.stdout)).toContain('owned.txt');
+    expect(names).toMatchObject({ trackedOnly: true, paths: [] });
+
+    const checked = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'git.local',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      operation: 'diff-check',
+    }));
+    expect(checked).toMatchObject({ operation: 'diff-check', passed: true, whitespaceIssues: false, trackedOnly: true });
+
+    const added = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'git.local',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      operation: 'add',
+      paths: ['owned.txt', 'compat-untracked.txt'],
+    }));
+    expect(added).toEqual({ operation: 'add', paths: ['owned.txt', 'compat-untracked.txt'] });
+
+    const committed = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'git.local',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      operation: 'commit',
+      message: 'compat staged set',
+    }));
+    expect(committed).toMatchObject({ operation: 'commit', head: expect.stringMatching(/^[0-9a-f]{40}$/) });
+    expect(committed.head).not.toBe(fixture.baseline);
+
+    const parsed = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'project.git_status',
+      clientId: fixture.session.clientId,
+      projectId: fixture.project.id,
+    }));
+    expect(parsed).toEqual({ branch: 'main', clean: true, stagedChanges: 0, trackedChanges: 0, untrackedChanges: 0 });
+
+    await git(fixture.projectRoot, ['switch', '-c', 'feature/compat-wrapper']);
+    await fixture.settings.setMode('ASK_EVERY_TIME');
+    const pending = await fixture.service.execute({
+      capabilityId: 'remote.publish',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+    });
+    expect(pending.status).toBe('owner_required');
+    if (pending.status !== 'owner_required') throw new Error('Expected remote.publish owner approval');
+    const published = await fixture.service.resolveApproval(pending.approval.id, 'ALLOW_ONCE');
+    expect(published.status).toBe('executed');
+    if (published.status !== 'executed') return;
+    expect(published.value).toMatchObject({
+      operation: 'push-current-feature-branch',
+      branch: 'feature/compat-wrapper',
+      remote: 'origin',
+      verified: true,
+    });
+    const publishValue = published.value as Record<string, unknown>;
+    expect(publishValue.localHead).toBe(publishValue.remoteHead);
+    expect(publishValue).not.toHaveProperty('force');
+    expect(publishValue).not.toHaveProperty('delete');
+    expect(publishValue).not.toHaveProperty('repositoryId');
+  });
+
   it('AC-FARM-007 keeps safe push verified and preserves legacy git_local/remote_publish compatibility while protected/force/delete forms stay unavailable', async () => {
     const fixture = await serviceFixture();
     const identity = await fixture.engine.inspectRepository(fixture.project.id, fixture.primary.workspaceId);

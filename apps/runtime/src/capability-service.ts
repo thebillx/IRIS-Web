@@ -23,16 +23,13 @@ import { PermissionAuditStore } from './audit.js';
 import { capabilityDefinition } from './capability-registry.js';
 import { PermissionPolicyEngine, type PolicyRequest } from './permissions.js';
 import { inspectProjectTarget } from './project-path.js';
-import { secureProjectFileEdit, secureProjectFileRead, secureProjectFileWrite, secureProjectMutation } from './macos-safety.js';
-import { inspectProjectGitStatus } from './git-status.js';
-import { searchProjectText } from './project-search.js';
-import { discoverDeclaredProjectValidation, ProjectValidationJobManager, runDeclaredProjectScript, runDeclaredProjectTest } from './project-test.js';
-import { pushCurrentFeatureBranch, runProjectGitLocal, type GitLocalOperation } from './project-git.js';
+import { discoverDeclaredProjectValidation, ProjectValidationJobManager } from './project-test.js';
+import { ValidationCompatibilityAdapter } from './validation-compatibility.js';
 import { assertExpectedEffects, deriveCapabilityEffects } from './capability-effects.js';
 import { WorkspaceFilesystemEngine, type FsFindMode, type FsIgnoreMode, type FsReadMode, type FsWriteMode } from './filesystem-engine.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { DurableJobManager } from './durable-job-manager.js';
-import { GovernedGitEngine, type Phase4GitOperationName, type Phase4GitRequest } from './governed-git-engine.js';
+import { GovernedGitEngine, type GitCompatibilityOperation, type Phase4GitOperationName, type Phase4GitRequest } from './governed-git-engine.js';
 import type { RuntimeState } from './state.js';
 
 type Phase4GitCapabilityId = Exclude<Extract<CapabilityId, `git.${string}`>, 'git.local'>;
@@ -57,7 +54,7 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'project.validation.discover'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string }
   | { readonly capabilityId: 'project.validation.start'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly scriptName: string; readonly requestId: string }
   | { readonly capabilityId: 'project.validation.job.read'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string; readonly jobId: string; readonly view: 'status' | 'logs' | 'result' }
-  | { readonly capabilityId: 'git.local'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly operation: GitLocalOperation; readonly paths?: readonly string[] | undefined; readonly message?: string | undefined }
+  | { readonly capabilityId: 'git.local'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly operation: GitCompatibilityOperation; readonly paths?: readonly string[] | undefined; readonly message?: string | undefined }
   | { readonly capabilityId: 'remote.publish'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'mission.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'mission.get'; readonly missionId: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
@@ -132,6 +129,9 @@ interface Phase2Preflight {
 export class CapabilityService {
   private readonly pending = new Map<string, PendingApprovalInternal>();
   private missionActionTail: Promise<void> = Promise.resolve();
+  private validationCompatibilityAdapter: ValidationCompatibilityAdapter | undefined;
+  private resources: VNextResourceRegistry | undefined;
+  private jobs: DurableJobManager | undefined;
 
   public constructor(
     private readonly state: RuntimeState,
@@ -139,9 +139,12 @@ export class CapabilityService {
     private readonly audit: PermissionAuditStore,
     private readonly health: () => RuntimeHealth,
     private readonly validationJobs: ProjectValidationJobManager = new ProjectValidationJobManager(),
-    private readonly resources?: VNextResourceRegistry,
-    private readonly jobs?: DurableJobManager,
-  ) {}
+    resources?: VNextResourceRegistry,
+    jobs?: DurableJobManager,
+  ) {
+    this.resources = resources;
+    this.jobs = jobs;
+  }
 
   public permissionSnapshot() {
     return this.policy.snapshot();
@@ -508,18 +511,48 @@ export class CapabilityService {
       const project = await this.authorizedProject(operation);
       return { id: project.id, name: project.name, rootPath: project.rootPath, isDefault: project.id === await this.state.getDefaultProjectId() };
     }
-    if (operation.capabilityId === 'project.git_status') return inspectProjectGitStatus((await this.authorizedProject(operation)).rootPath);
-    if (operation.capabilityId === 'project.search') return searchProjectText((await this.authorizedProject(operation)).rootPath, operation.query);
-    if (operation.capabilityId === 'project.test.run') return runDeclaredProjectTest((await this.authorizedProject(operation)).rootPath);
-    if (operation.capabilityId === 'project.command.run') return runDeclaredProjectScript((await this.authorizedProject(operation)).rootPath, operation.scriptName);
+    if (operation.capabilityId === 'project.git_status') {
+      const project = await this.authorizedProject(operation);
+      const workspace = await this.resourceRegistry().primaryWorkspace(project.id);
+      return this.gitEngine().compatibilityProjectStatus(project.id, workspace.workspaceId);
+    }
+    if (operation.capabilityId === 'project.search') {
+      const project = await this.authorizedProject(operation);
+      const resources = this.resourceRegistry();
+      const workspace = await resources.primaryWorkspace(project.id);
+      return new WorkspaceFilesystemEngine(resources).compatibilityTextSearch(project.id, workspace.workspaceId, operation.query);
+    }
+    if (operation.capabilityId === 'project.test.run') {
+      const project = await this.authorizedProject(operation);
+      return this.validationCompatibility().run(project, 'test', decision.effectiveEffects ?? [], operation.mission);
+    }
+    if (operation.capabilityId === 'project.command.run') {
+      const project = await this.authorizedProject(operation);
+      return this.validationCompatibility().run(project, operation.scriptName, decision.effectiveEffects ?? [], operation.mission);
+    }
     if (operation.capabilityId === 'project.validation.discover') return discoverDeclaredProjectValidation((await this.authorizedProject(operation)).rootPath);
-    if (operation.capabilityId === 'project.validation.start') return this.validationJobs.start((await this.authorizedProject(operation)).rootPath, operation.scriptName, operation.requestId);
-    if (operation.capabilityId === 'project.validation.job.read') return this.validationJobs.read(operation.jobId, operation.view, (await this.authorizedProject(operation)).rootPath);
+    if (operation.capabilityId === 'project.validation.start') {
+      const project = await this.authorizedProject(operation);
+      return this.validationCompatibility().start(project, operation.scriptName, operation.requestId, decision.effectiveEffects ?? [], operation.mission);
+    }
+    if (operation.capabilityId === 'project.validation.job.read') {
+      const project = await this.authorizedProject(operation);
+      return this.validationCompatibility().read(project, operation.jobId, operation.view);
+    }
     if (operation.capabilityId === 'git.local') {
       const project = await this.authorizedProject(operation);
-      return runProjectGitLocal(project.rootPath, { operation: operation.operation, ...(operation.paths === undefined ? {} : { paths: operation.paths }), ...(operation.message === undefined ? {} : { message: operation.message }) });
+      const workspace = await this.resourceRegistry().primaryWorkspace(project.id);
+      return this.gitEngine().compatibilityLocal(project.id, workspace.workspaceId, {
+        operation: operation.operation,
+        ...(operation.paths === undefined ? {} : { paths: operation.paths }),
+        ...(operation.message === undefined ? {} : { message: operation.message }),
+      });
     }
-    if (operation.capabilityId === 'remote.publish') return pushCurrentFeatureBranch((await this.authorizedProject(operation)).rootPath);
+    if (operation.capabilityId === 'remote.publish') {
+      const project = await this.authorizedProject(operation);
+      const workspace = await this.resourceRegistry().primaryWorkspace(project.id);
+      return this.gitEngine().compatibilityRemotePublish(project.id, workspace.workspaceId);
+    }
     if (operation.capabilityId === 'mission.list') return { missions: await this.state.listMissions() };
     if (operation.capabilityId === 'mission.get') return this.state.getMission(operation.missionId);
     if (operation.capabilityId === 'mission.create') return this.state.createMission(operation.clientId, operation.sessionId, operation.title, operation.orchestratorMode ?? 'HERMES');
@@ -544,42 +577,69 @@ export class CapabilityService {
 
     const project = await this.authorizedProject(operation);
     if (operation.capabilityId === 'file.read') {
-      const target = await this.revalidateTarget(project, operation.targetPath, 'file-read');
-      return { targetPath: target, content: await secureProjectFileRead(project.rootPath, target) };
+      const target = await this.legacyPrimaryFsTarget(project, operation.targetPath, 'file-read');
+      const result = await target.fs.readText(project.id, target.workspaceId, target.relativePath, MAX_FILE_BYTES, 'utf-8');
+      return { targetPath: target.absolutePath, content: result.text };
     }
     if (operation.capabilityId === 'file.write') {
       const bytes = Buffer.byteLength(operation.content, 'utf8');
       if (bytes > MAX_FILE_BYTES) throw new RuntimeError('CAPABILITY_DENIED', 'File write exceeds the V1 local capability size limit');
-      const target = await this.revalidateTarget(project, operation.targetPath, 'file-write');
-      const written = await secureProjectFileWrite(project.rootPath, target, operation.content);
-      if (written !== bytes) throw new RuntimeError('CAPABILITY_DENIED', 'Protected project write byte count did not match the approved exact action');
-      return { targetPath: target, bytes };
+      const target = await this.legacyPrimaryFsTarget(project, operation.targetPath, 'file-write');
+      let writtenBytes: number;
+      try {
+        const created = await target.fs.write(project.id, target.workspaceId, target.relativePath, 'CREATE', operation.content);
+        if (!('bytes' in created)) throw new RuntimeError('CAPABILITY_DENIED', 'Workspace CREATE returned an invalid compatibility result');
+        writtenBytes = created.bytes;
+      } catch (error) {
+        if (!(error instanceof RuntimeError) || error.code !== 'PRECONDITION_FAILED') throw error;
+        const metadata = await target.fs.stat(project.id, target.workspaceId, target.relativePath);
+        if (metadata.type !== 'file' || metadata.symlink || metadata.hardLinkCount !== 1) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'Legacy file.write replacement target is not one physical regular file', { cause: error });
+        }
+        const replaced = await target.fs.write(project.id, target.workspaceId, target.relativePath, 'REPLACE', operation.content);
+        if (!('bytes' in replaced)) throw new RuntimeError('CAPABILITY_DENIED', 'Workspace REPLACE returned an invalid compatibility result');
+        writtenBytes = replaced.bytes;
+      }
+      if (writtenBytes !== bytes) throw new RuntimeError('CAPABILITY_DENIED', 'Workspace file write byte count did not match the approved exact action');
+      return { targetPath: target.absolutePath, bytes };
     }
     if (operation.capabilityId === 'file.edit') {
       if (Buffer.byteLength(operation.find, 'utf8') === 0 || Buffer.byteLength(operation.find, 'utf8') > MAX_FILE_BYTES || Buffer.byteLength(operation.replace, 'utf8') > MAX_FILE_BYTES || !/^[0-9a-f]{64}$/i.test(operation.expectedSha256)) throw new RuntimeError('CAPABILITY_DENIED', 'File edit requires bounded UTF-8 text and a SHA-256 precondition');
-      const target = await this.revalidateTarget(project, operation.targetPath, 'file-edit');
-      try {
-        const result = await secureProjectFileEdit(project.rootPath, target, operation.find, operation.replace, operation.expectedSha256, operation.dryRun ?? false);
-        return { targetPath: target, ...result, summary: result.changed ? 'One exact text occurrence is ready or was replaced' : 'The exact edit produced no byte change' };
-      } catch (error) {
-        if (error instanceof RuntimeError && /precondition/i.test(error.message)) throw new RuntimeError('PRECONDITION_FAILED', error.message, { cause: error });
-        throw error;
-      }
+      const target = await this.legacyPrimaryFsTarget(project, operation.targetPath, 'file-edit');
+      const result = await target.fs.edit(project.id, target.workspaceId, target.relativePath, operation.find, operation.replace, operation.expectedSha256, operation.dryRun ?? false);
+      return {
+        targetPath: target.absolutePath,
+        changed: result.changed,
+        beforeSha256: result.beforeSha256,
+        afterSha256: result.afterSha256,
+        bytesBefore: result.bytesBefore,
+        bytesAfter: result.bytesAfter,
+        matchCount: result.matchCount,
+        dryRun: result.dryRun,
+        summary: result.changed ? 'One exact text occurrence is ready or was replaced' : 'The exact edit produced no byte change',
+      };
     }
     if (operation.capabilityId === 'file.delete') {
-      const target = await this.revalidateTarget(project, operation.targetPath, 'file-delete');
-      const result = await secureProjectMutation('unlink', project.rootPath, target);
-      return { targetPath: target, deleted: result.deleted === true };
+      const target = await this.legacyPrimaryFsTarget(project, operation.targetPath, 'file-delete');
+      const result = await target.fs.delete(project.id, target.workspaceId, target.relativePath);
+      return { targetPath: target.absolutePath, deleted: result.deleted === true };
     }
     if (operation.capabilityId === 'directory.create') {
-      const target = await this.revalidateTarget(project, operation.targetPath, 'directory-create');
-      const result = await secureProjectMutation('mkdir', project.rootPath, target);
-      return { targetPath: target, created: result.created === true };
+      const target = await this.legacyPrimaryFsTarget(project, operation.targetPath, 'directory-create');
+      try {
+        const result = await target.fs.mkdir(project.id, target.workspaceId, target.relativePath);
+        return { targetPath: target.absolutePath, created: result.created === true };
+      } catch (error) {
+        if (!(error instanceof RuntimeError) || error.code !== 'PRECONDITION_FAILED') throw error;
+        const metadata = await target.fs.stat(project.id, target.workspaceId, target.relativePath);
+        if (metadata.type !== 'directory' || metadata.symlink) throw error;
+        return { targetPath: target.absolutePath, created: false };
+      }
     }
     if (operation.capabilityId === 'directory.delete') {
-      const target = await this.revalidateTarget(project, operation.targetPath, 'directory-delete');
-      const result = await secureProjectMutation('rmdir', project.rootPath, target);
-      return { targetPath: target, deleted: result.deleted === true };
+      const target = await this.legacyPrimaryFsTarget(project, operation.targetPath, 'directory-delete');
+      const result = await target.fs.delete(project.id, target.workspaceId, target.relativePath);
+      return { targetPath: target.absolutePath, deleted: result.deleted === true };
     }
     throw new RuntimeError('CAPABILITY_DENIED', 'Capability execution is not implemented');
   }
@@ -671,8 +731,19 @@ export class CapabilityService {
     throw new RuntimeError('CAPABILITY_DENIED', 'Phase 2 capability execution is not implemented');
   }
 
+  private validationCompatibility(): ValidationCompatibilityAdapter {
+    this.validationCompatibilityAdapter ??= new ValidationCompatibilityAdapter(
+      this.jobManager(),
+      this.resourceRegistry(),
+      this.validationJobs,
+    );
+    return this.validationCompatibilityAdapter;
+  }
+
   private jobManager(): DurableJobManager {
-    if (this.jobs === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Phase 3 durable job manager is not configured for this runtime');
+    if (this.jobs === undefined) {
+      this.jobs = new DurableJobManager(this.state.dataRoot, this.resourceRegistry());
+    }
     return this.jobs;
   }
 
@@ -681,7 +752,9 @@ export class CapabilityService {
   }
 
   private resourceRegistry(): VNextResourceRegistry {
-    if (this.resources === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Phase 2 resource registry is not configured for this runtime');
+    if (this.resources === undefined) {
+      this.resources = new VNextResourceRegistry(this.state, this.state.dataRoot);
+    }
     return this.resources;
   }
 
@@ -698,6 +771,26 @@ export class CapabilityService {
     const project = (await this.state.listProjects()).find((entry) => entry.id === session.currentProjectId);
     if (project === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Live session project is no longer registered');
     return project;
+  }
+
+  private async legacyPrimaryFsTarget(
+    project: ProjectReference,
+    targetPath: string,
+    kind: 'file-read' | 'file-write' | 'file-edit' | 'file-delete' | 'directory-create' | 'directory-delete',
+  ) {
+    const absolutePath = await this.revalidateTarget(project, targetPath, kind);
+    const resources = this.resourceRegistry();
+    const workspace = await resources.primaryWorkspace(project.id);
+    const relativePath = path.relative(workspace.physicalRoot, absolutePath);
+    if (relativePath.length === 0 || path.isAbsolute(relativePath) || relativePath === '..' || relativePath.startsWith(`..${path.sep}`)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Legacy project target does not map to the authorized PRIMARY workspace');
+    }
+    return {
+      absolutePath,
+      relativePath,
+      workspaceId: workspace.workspaceId,
+      fs: new WorkspaceFilesystemEngine(resources),
+    };
   }
 
   private async revalidateTarget(project: ProjectReference, targetPath: string, kind: 'file-read' | 'file-write' | 'file-edit' | 'file-delete' | 'directory-create' | 'directory-delete'): Promise<string> {

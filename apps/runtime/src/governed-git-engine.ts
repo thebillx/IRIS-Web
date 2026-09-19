@@ -21,12 +21,21 @@ const MAX_CAT_CONTENT = 64 * 1024;
 const MAX_REF_ENTRIES = 200;
 const MAX_LOG_ENTRIES = 100;
 const MAX_GIT_PATHS = 24;
+const MAX_COMPAT_GIT_PATHS = 100;
 const PROTECTED_BRANCH = /^(main|master|release(?:[-/].*)?)$/i;
 const SAFE_PUSH_BRANCH = /^(feature|fix|hotfix|chore|codex)\/[A-Za-z0-9._/-]+$/i;
 const BRANCH_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 const REF_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._/@{}^~:+/-]{0,199}$/;
 const REMOTE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/;
 const COMMIT_MESSAGE = /^[^\0\r\n]{1,200}$/;
+
+export type GitCompatibilityOperation = 'status' | 'head' | 'diff' | 'diff-check' | 'diff-name-only' | 'add' | 'commit';
+
+export interface GitCompatibilityInput {
+  readonly operation: GitCompatibilityOperation;
+  readonly paths?: readonly string[];
+  readonly message?: string;
+}
 
 export type Phase4GitOperationName =
   | 'status'
@@ -142,6 +151,108 @@ export class GovernedGitEngine {
     if (request.operation === 'fetch') return this.fetch(identity, request.remote);
     if (request.operation === 'push') return this.push(identity, request.remote, request.branch);
     throw new RuntimeError('CAPABILITY_DENIED', 'Unsupported governed Git operation');
+  }
+
+  public async compatibilityProjectStatus(projectId: string, workspaceId: string): Promise<Record<string, unknown>> {
+    const identity = await this.inspectRepository(projectId, workspaceId);
+    const result = await requireGit(identity.workspaceRoot, ['status', '--porcelain=v1', '--branch', '--untracked-files=normal'], 'compatibility status');
+    return parseCompatibilityProjectStatus(result.stdout);
+  }
+
+  public async compatibilityLocal(projectId: string, workspaceId: string, input: GitCompatibilityInput): Promise<Record<string, unknown>> {
+    const identity = await this.inspectRepository(projectId, workspaceId);
+    if (input.operation === 'status') {
+      const result = await requireGit(identity.workspaceRoot, ['status', '--short', '--branch', '--untracked-files=all'], 'compatibility status');
+      return {
+        ...boundedOutput('status', result),
+        ...await compatibilityUntrackedInventory(identity.workspaceRoot, input.paths),
+        trackedDiffOnly: true,
+      };
+    }
+    if (input.operation === 'head') {
+      const result = await requireGit(identity.workspaceRoot, ['rev-parse', 'HEAD'], 'compatibility HEAD');
+      return { operation: 'head', head: result.stdout.trim() };
+    }
+    if (input.operation === 'diff') {
+      const result = await requireGit(identity.workspaceRoot, ['diff', 'HEAD', '--no-ext-diff', ...compatibilityDiffPathspec(identity.workspaceRoot, input.paths)], 'compatibility diff');
+      return {
+        ...boundedOutput('diff', result),
+        ...await compatibilityUntrackedInventory(identity.workspaceRoot, input.paths),
+        paths: input.paths ?? [],
+        trackedOnly: true,
+      };
+    }
+    if (input.operation === 'diff-check') {
+      const result = await runGit(identity.workspaceRoot, ['diff', 'HEAD', '--check', ...compatibilityDiffPathspec(identity.workspaceRoot, input.paths)]);
+      if (result.exitCode === 2 && !result.timedOut && !result.outputLimitExceeded) {
+        return {
+          ...boundedOutput('diff-check', result),
+          ...await compatibilityUntrackedInventory(identity.workspaceRoot, input.paths),
+          status: 'whitespace_issues',
+          passed: false,
+          whitespaceIssues: true,
+          trackedOnly: true,
+        };
+      }
+      if (result.exitCode !== 0 || result.timedOut || result.outputLimitExceeded) throw gitFailure('compatibility diff-check', result);
+      return {
+        ...boundedOutput('diff-check', result),
+        ...await compatibilityUntrackedInventory(identity.workspaceRoot, input.paths),
+        status: 'passed',
+        passed: true,
+        whitespaceIssues: false,
+        trackedOnly: true,
+      };
+    }
+    if (input.operation === 'diff-name-only') {
+      const result = await requireGit(identity.workspaceRoot, ['diff', 'HEAD', '--name-only', ...compatibilityDiffPathspec(identity.workspaceRoot, input.paths)], 'compatibility diff-name-only');
+      return {
+        ...boundedOutput('diff-name-only', result),
+        ...await compatibilityUntrackedInventory(identity.workspaceRoot, input.paths),
+        paths: input.paths ?? [],
+        trackedOnly: true,
+      };
+    }
+
+    await this.ensureRepositoryBinding(identity);
+    if (input.operation === 'add') {
+      const selected = validateCompatibilityPaths(identity.workspaceRoot, input.paths);
+      await requireGit(identity.workspaceRoot, ['add', '--', ...selected], 'compatibility add');
+      return { operation: 'add', paths: selected };
+    }
+    if (input.operation === 'commit') {
+      if (typeof input.message !== 'string' || !COMMIT_MESSAGE.test(input.message.trim())) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Commit message must be one bounded single line');
+      }
+      await requireGit(identity.workspaceRoot, [
+        '-c', 'core.hooksPath=/dev/null',
+        '-c', 'commit.gpgSign=false',
+        'commit', '-m', input.message.trim(),
+      ], 'compatibility commit');
+      const head = (await requireGit(identity.workspaceRoot, ['rev-parse', 'HEAD'], 'compatibility commit HEAD')).stdout.trim();
+      return { operation: 'commit', head };
+    }
+    throw new RuntimeError('CAPABILITY_DENIED', 'Unsupported compatibility Git operation');
+  }
+
+  public async compatibilityRemotePublish(projectId: string, workspaceId: string): Promise<Record<string, unknown>> {
+    const identity = await this.inspectRepository(projectId, workspaceId);
+    await this.ensureRepositoryBinding(identity);
+    const branch = (await requireGit(identity.workspaceRoot, ['symbolic-ref', '--quiet', '--short', 'HEAD'], 'compatibility publish branch')).stdout.trim();
+    if (branch.length === 0 || PROTECTED_BRANCH.test(branch)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Remote publish rejects protected or detached branches');
+    }
+    const remote = await requireConfiguredRemote(identity.workspaceRoot, 'origin');
+    const defaultRef = await optionalGit(identity.workspaceRoot, ['symbolic-ref', '--quiet', '--short', `refs/remotes/${remote}/HEAD`]);
+    if (defaultRef.stdout.trim() === `${remote}/${branch}`) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Remote publish rejects the configured default branch');
+    }
+    const localHead = (await requireGit(identity.workspaceRoot, ['rev-parse', 'HEAD'], 'compatibility publish HEAD')).stdout.trim();
+    await requireGit(identity.workspaceRoot, ['push', '--porcelain', remote, `refs/heads/${branch}:refs/heads/${branch}`], 'compatibility feature branch push', NETWORK_TIMEOUT_MS);
+    const remoteHeadResult = await requireGit(identity.workspaceRoot, ['ls-remote', '--heads', remote, `refs/heads/${branch}`], 'compatibility remote HEAD verification', NETWORK_TIMEOUT_MS);
+    const remoteHead = remoteHeadResult.stdout.trim().split(/\s+/)[0] ?? '';
+    if (remoteHead !== localHead) throw new RuntimeError('CAPABILITY_DENIED', 'Remote branch HEAD verification failed after compatibility publish');
+    return { operation: 'push-current-feature-branch', branch, remote, localHead, remoteHead, verified: true };
   }
 
   public async inspectRepository(projectId: string, workspaceId: string, expectedRepositoryId?: string): Promise<GitRepositoryIdentity> {
@@ -386,6 +497,61 @@ export class GovernedGitEngine {
     await assertMissing(destinationPath, 'Worktree destination already exists');
     return destinationPath;
   }
+}
+
+function parseCompatibilityProjectStatus(stdout: string): Record<string, unknown> {
+  const lines = stdout.split('\n').filter((line) => line.length > 0);
+  const branchLine = lines[0] ?? '';
+  if (!branchLine.startsWith('## ')) throw new RuntimeError('CAPABILITY_DENIED', 'Git status response did not contain a branch header');
+  const rawBranch = branchLine.slice(3).split('...')[0]!.trim();
+  const unbornPrefix = 'No commits yet on ';
+  const branch = rawBranch.startsWith(unbornPrefix)
+    ? rawBranch.slice(unbornPrefix.length).trim()
+    : rawBranch === 'HEAD (no branch)' || rawBranch.length === 0 ? 'DETACHED' : rawBranch;
+  const changes = lines.slice(1);
+  let stagedChanges = 0;
+  let trackedChanges = 0;
+  let untrackedChanges = 0;
+  for (const line of changes) {
+    if (line.startsWith('??')) {
+      untrackedChanges += 1;
+      continue;
+    }
+    if (line.length < 2) throw new RuntimeError('CAPABILITY_DENIED', 'Git status response contained malformed change metadata');
+    if (line[0] !== ' ') stagedChanges += 1;
+    trackedChanges += 1;
+  }
+  return { branch, clean: changes.length === 0, stagedChanges, trackedChanges, untrackedChanges };
+}
+
+function compatibilityDiffPathspec(root: string, supplied: readonly string[] | undefined): string[] {
+  return supplied === undefined ? [] : ['--', ...validateCompatibilityPaths(root, supplied)];
+}
+
+function validateCompatibilityPaths(root: string, supplied: readonly string[] | undefined): string[] {
+  if (!Array.isArray(supplied) || supplied.length === 0 || supplied.length > MAX_COMPAT_GIT_PATHS) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Git path selection requires an explicit bounded path list');
+  }
+  return supplied.map((item) => {
+    if (typeof item !== 'string' || item.length === 0 || item.length > 1000 || item.includes('\0')) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Git path is invalid');
+    }
+    const absolute = path.resolve(root, item);
+    const relative = path.relative(root, absolute);
+    if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Git path escapes or broadly targets the registered project root');
+    }
+    return relative;
+  });
+}
+
+async function compatibilityUntrackedInventory(root: string, paths: readonly string[] | undefined): Promise<Record<string, unknown>> {
+  const selection = paths === undefined ? [] : ['--', ...validateCompatibilityPaths(root, paths)];
+  const result = await requireGit(root, ['ls-files', '--others', '--exclude-standard', '-z', ...selection], 'compatibility untracked inventory');
+  return {
+    untrackedFiles: result.stdout.split('\0').filter((item) => item.length > 0),
+    untrackedFilesTruncated: result.outputLimitExceeded,
+  };
 }
 
 async function inspectRepositoryPhysicalIdentity(projectId: string, workspace: WorkspaceRecord): Promise<GitRepositoryIdentity> {

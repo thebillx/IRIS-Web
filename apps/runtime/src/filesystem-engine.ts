@@ -20,6 +20,9 @@ const MAX_MAX_ENTRIES = 2_000;
 const MAX_SCAN_ENTRIES = 50_000;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_RANGE_BYTES = 1024 * 1024;
+const COMPAT_SEARCH_CHUNK_BYTES = 256 * 1024;
+const MAX_COMPAT_SEARCH_BYTES = 64 * 1024 * 1024;
+const MAX_COMPAT_LINE_PREFIX_BYTES = 4 * 1024;
 const MAX_WRITE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_FIND_RESULTS = 100;
 const MAX_FIND_RESULTS = 1_000;
@@ -194,6 +197,137 @@ export class WorkspaceFilesystemEngine {
     const operation = resolved.metadata.type === 'directory' ? 'rmdir' : 'unlink';
     const result = await secureProjectMutation(operation, resolved.workspace.physicalRoot, resolved.absolutePath);
     return { workspaceId: resolved.workspace.workspaceId, relativePath: resolved.relativePath, deleted: result.deleted === true, type: resolved.metadata.type };
+  }
+
+  public async compatibilityTextSearch(projectId: string, workspaceId: string, queryInput: string) {
+    const query = queryInput.trim();
+    if (query.length === 0 || query.length > 500 || query.includes('\0')) {
+      throw new RuntimeError('INVALID_REQUEST', 'Search query must be between 1 and 500 characters');
+    }
+    const resolved = await this.resolveTarget(projectId, workspaceId, '.', 'directory');
+    const settings = normalizeListOptions({
+      recursive: true,
+      maxDepth: MAX_MAX_DEPTH,
+      maxEntries: MAX_MAX_ENTRIES,
+      ignoreMode: 'PROJECT',
+      includeHidden: true,
+    });
+    const inventory = await collectInventory(resolved.workspace.physicalRoot, resolved.absolutePath, settings);
+    const matches: Array<{ path: string; line: number; text: string }> = [];
+    const queryBytes = Buffer.from(query, 'utf8');
+    let overflow = false;
+    let incomplete = false;
+    let scannedBytes = 0;
+
+    for (const entry of inventory.entries) {
+      if (entry.type !== 'file' || entry.size === 0) continue;
+      if (entry.size > MAX_COMPAT_SEARCH_BYTES - scannedBytes) {
+        incomplete = true;
+        continue;
+      }
+      scannedBytes += entry.size;
+      try {
+        const remaining = Math.max(0, 100 - matches.length);
+        const file = await this.compatibilityFileMatches(
+          projectId,
+          workspaceId,
+          entry.relativePath,
+          entry.size,
+          queryBytes,
+          remaining + 1,
+        );
+        if (file.binary) continue;
+        matches.push(...file.matches.slice(0, remaining));
+        if (file.matches.length > remaining) {
+          overflow = true;
+          break;
+        }
+      } catch {
+        // Aliased/ineligible or concurrently changed content is omitted, but
+        // compatibility output must say the search was not exhaustive.
+        incomplete = true;
+      }
+    }
+    return { matches, truncated: overflow || incomplete || inventory.scanTruncated };
+  }
+
+  private async compatibilityFileMatches(
+    projectId: string,
+    workspaceId: string,
+    relativePath: string,
+    fileSize: number,
+    queryBytes: Buffer,
+    matchLimit: number,
+  ): Promise<{ readonly binary: boolean; readonly matches: readonly { path: string; line: number; text: string }[] }> {
+    const matches: Array<{ path: string; line: number; text: string }> = [];
+    const normalizedPath = relativePath.split(path.sep).join('/');
+    const tailBytes = Math.max(0, queryBytes.length - 1);
+    let offset = 0;
+    let lineNumber = 1;
+    let lineMatched = false;
+    let lineOpen = false;
+    let searchTail = Buffer.alloc(0);
+    let prefix = Buffer.alloc(0);
+
+    const appendPrefix = (segment: Buffer): void => {
+      if (prefix.length >= MAX_COMPAT_LINE_PREFIX_BYTES || segment.length === 0) return;
+      const remaining = MAX_COMPAT_LINE_PREFIX_BYTES - prefix.length;
+      prefix = Buffer.concat([prefix, segment.subarray(0, remaining)]);
+    };
+    const observe = (segment: Buffer): void => {
+      if (segment.length > 0) lineOpen = true;
+      if (!lineMatched) {
+        const candidate = searchTail.length === 0 ? segment : Buffer.concat([searchTail, segment]);
+        if (candidate.indexOf(queryBytes) >= 0) lineMatched = true;
+        searchTail = tailBytes === 0
+          ? Buffer.alloc(0)
+          : Buffer.from(candidate.subarray(Math.max(0, candidate.length - tailBytes)));
+      }
+      appendPrefix(segment);
+    };
+    const finishLine = (): void => {
+      if (lineMatched && matches.length < matchLimit) {
+        matches.push({
+          path: normalizedPath,
+          line: lineNumber,
+          text: prefix.toString('utf8').slice(0, 500),
+        });
+      }
+      lineNumber += 1;
+      lineMatched = false;
+      lineOpen = false;
+      searchTail = Buffer.alloc(0);
+      prefix = Buffer.alloc(0);
+    };
+
+    while (offset < fileSize) {
+      const length = Math.min(COMPAT_SEARCH_CHUNK_BYTES, fileSize - offset);
+      const range = await this.readRange(projectId, workspaceId, relativePath, offset, length);
+      const chunk = Buffer.from(range.base64, 'base64');
+      if (chunk.length !== range.bytes || range.offset !== offset || range.fileSize !== fileSize || chunk.includes(0)) {
+        if (chunk.includes(0)) return { binary: true, matches: [] };
+        throw new RuntimeError('PRECONDITION_FAILED', 'Compatibility search byte-range identity changed');
+      }
+      if (chunk.length === 0) throw new RuntimeError('PRECONDITION_FAILED', 'Compatibility search made no byte-range progress');
+
+      let start = 0;
+      while (start < chunk.length) {
+        const newline = chunk.indexOf(0x0a, start);
+        if (newline < 0) {
+          observe(chunk.subarray(start));
+          break;
+        }
+        observe(chunk.subarray(start, newline));
+        finishLine();
+        start = newline + 1;
+      }
+      offset += chunk.length;
+      if (range.eof && offset < fileSize) {
+        throw new RuntimeError('PRECONDITION_FAILED', 'Compatibility search reached EOF before the inventoried file size');
+      }
+    }
+    if (lineOpen || lineMatched || prefix.length > 0 || searchTail.length > 0) finishLine();
+    return { binary: false, matches };
   }
 
   public async find(projectId: string, workspaceId: string, root: string, options: FsFindOptions) {

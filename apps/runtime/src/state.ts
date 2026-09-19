@@ -45,11 +45,15 @@ export class RuntimeState {
   private mutationTail: Promise<void> = Promise.resolve();
   private missionMutationTail: Promise<void> = Promise.resolve();
 
+  public readonly dataRoot: string;
+
   public constructor(
     private readonly store: FoundationStateStore,
     private readonly executor: AgentExecutor = new LocalDevelopmentAgentExecutor(),
     private readonly missionStore: MissionLedgerStore = new MissionLedgerStore(store.dataRoot),
-  ) {}
+  ) {
+    this.dataRoot = store.dataRoot;
+  }
 
   public executorDescriptor() {
     return this.executor.descriptor;

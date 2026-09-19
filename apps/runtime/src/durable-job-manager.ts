@@ -266,6 +266,13 @@ export class DurableJobManager {
     const claim = await waitForClaim(claimPath, resultPath, jobId, runnerIdentity);
     const verified = await verifyClaim(claim, jobId, runnerIdentity);
     if (!verified || claim.runnerPid !== spawnedRunnerPid) {
+      if (claim.runnerPid === spawnedRunnerPid) {
+        const terminal = await waitForTrustedTerminalResult(resultPath, jobId, runnerIdentity, 1_000);
+        if (terminal !== null) {
+          const finished = await this.finishFromRunner(queued, terminal);
+          return startView(finished);
+        }
+      }
       const lost = { ...queued, state: 'LOST' as const, finishedAt: new Date().toISOString() };
       await this.replaceJob(lost);
       throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable target identity could not be verified after permitted spawn');
@@ -301,6 +308,34 @@ export class DurableJobManager {
 
   public async result(projectId: string, jobId: string): Promise<Record<string, unknown>> {
     return resultView(await this.reconcile(await this.getOwnedJob(projectId, jobId)));
+  }
+
+  public async compatibilitySnapshot(projectId: string, jobId: string, maxLogBytes = INLINE_OUTPUT_BYTES): Promise<Record<string, unknown>> {
+    if (!Number.isSafeInteger(maxLogBytes) || maxLogBytes < 1 || maxLogBytes > LOG_WINDOW_MAX) {
+      throw new RuntimeError('INVALID_REQUEST', 'Compatibility log bound is outside the durable-job limit');
+    }
+    const job = await this.reconcile(await this.getOwnedJob(projectId, jobId));
+    const [stdout, stderr, runnerResult] = await Promise.all([
+      readLogTail(job.stdoutPath, maxLogBytes),
+      readLogTail(job.stderrPath, maxLogBytes),
+      readRunnerResult(job.resultPath),
+    ]);
+    return {
+      jobId: job.jobId,
+      requestId: job.requestId,
+      projectId: job.projectId,
+      workspaceId: job.workspaceId,
+      state: job.state,
+      startedAt: job.startedAt,
+      finishedAt: job.finishedAt,
+      exitCode: job.exitCode,
+      signal: job.signal,
+      timedOut: runnerResult?.timedOut ?? false,
+      stdout: stdout.text,
+      stderr: stderr.text,
+      stdoutTruncated: stdout.truncated,
+      stderrTruncated: stderr.truncated,
+    };
   }
 
   public async cancel(projectId: string, jobId: string): Promise<Record<string, unknown>> {
@@ -419,6 +454,20 @@ export class DurableJobManager {
 
 function argvDigest(argv: readonly string[]): string { return createHash('sha256').update(JSON.stringify(argv)).digest('hex'); }
 function startView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, requestId: job.requestId, state: job.state, workspaceId: job.workspaceId, startedAt: job.startedAt, effectiveEffects: job.effectiveEffects }; }
+async function readLogTail(filename: string, maxBytes: number): Promise<{ readonly text: string; readonly truncated: boolean }> {
+  const metadata = await stat(filename);
+  const length = Math.min(maxBytes, metadata.size);
+  const offset = Math.max(0, metadata.size - length);
+  const handle = await open(filename, 'r');
+  try {
+    const buffer = Buffer.alloc(length);
+    const result = length === 0 ? { bytesRead: 0 } : await handle.read(buffer, 0, length, offset);
+    return { text: buffer.subarray(0, result.bytesRead).toString('utf8'), truncated: metadata.size > maxBytes };
+  } finally {
+    await handle.close();
+  }
+}
+
 function statusView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, requestId: job.requestId, projectId: job.projectId, workspaceId: job.workspaceId, state: job.state, startedAt: job.startedAt, finishedAt: job.finishedAt, pid: job.pid, processStartMarker: job.processStartMarker, processGroupId: job.processGroupId, runnerIdentity: job.runnerIdentity, effectiveEffects: job.effectiveEffects }; }
 function resultView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, state: job.state, exitCode: job.exitCode, signal: job.signal, startedAt: job.startedAt, finishedAt: job.finishedAt, logArtifactIds: job.logArtifactIds, artifactIds: job.artifactIds }; }
 function isTerminal(state: DurableJobState): boolean { return state === 'SUCCEEDED' || state === 'FAILED' || state === 'CANCELLED' || state === 'LOST' || state === 'INTERRUPTED'; }
@@ -459,6 +508,20 @@ async function waitForRunnerClaim(filename: string, resultPath: string, jobId: s
   throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not publish a verifiable runner claim before target spawn');
 }
 async function waitForClaim(filename: string, resultPath: string, jobId: string, runnerIdentity: string): Promise<RunnerClaim> { const deadline = Date.now() + 8000; while (Date.now() < deadline) { const claim = await readClaim(filename); if (claim !== null && claim.jobId === jobId && claim.runnerIdentity === runnerIdentity) return claim; const runnerResult = await readRunnerResult(resultPath); if (runnerResult !== null) { const detail = runnerResult.error === null ? 'runner terminated before target claim' : runnerResult.error.replace(/\s+/g, ' ').slice(-300); throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Durable runner failed before publishing a target claim: ${detail}`); } await new Promise((resolve) => setTimeout(resolve, 25)); } throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not publish a verified target process claim'); }
+async function waitForTrustedTerminalResult(filename: string, jobId: string, runnerIdentity: string, timeoutMs: number): Promise<RunnerResult | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await readRunnerResult(filename);
+    if (result !== null) {
+      if (result.jobId !== jobId || result.runnerIdentity !== runnerIdentity) {
+        throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable terminal result identity does not match the verified runner');
+      }
+      return result;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return null;
+}
 async function readRunnerClaim(filename: string): Promise<RunnerOnlyClaim | null> { try { const value = JSON.parse(await readFile(filename, 'utf8')) as RunnerOnlyClaim; return value.schemaVersion === 1 ? value : null; } catch { return null; } }
 async function readClaim(filename: string): Promise<RunnerClaim | null> { try { const value = JSON.parse(await readFile(filename, 'utf8')) as RunnerClaim; return value.schemaVersion === 1 ? value : null; } catch { return null; } }
 async function readRunnerResult(filename: string): Promise<RunnerResult | null> { try { const value = JSON.parse(await readFile(filename, 'utf8')) as RunnerResult; return value.schemaVersion === 1 ? value : null; } catch { return null; } }

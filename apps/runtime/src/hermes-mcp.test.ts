@@ -1,16 +1,19 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { PermissionAuditStore } from './audit.js';
 import { CapabilityService } from './capability-service.js';
+import { DurableJobManager } from './durable-job-manager.js';
 import { handleHermesMcpRequest, HERMES_MCP_PROTOCOL_VERSION } from './hermes-mcp.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
 import { FoundationStateStore } from './persistence.js';
+import { ProjectValidationJobManager } from './project-test.js';
+import { VNextResourceRegistry } from './resource-registry.js';
 import { RuntimeState } from './state.js';
 
 const execFileAsync = promisify(execFile);
@@ -18,8 +21,8 @@ const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 async function fixture() {
-  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-hermes-mcp-source-')); roots.push(sourceRoot);
-  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-hermes-mcp-data-')); roots.push(dataRoot);
+  const sourceRoot = await realpath(await mkdtemp(path.join(os.tmpdir(), 'iris-hermes-mcp-source-'))); roots.push(sourceRoot);
+  const dataRoot = await realpath(await mkdtemp(path.join(os.tmpdir(), 'iris-hermes-mcp-data-'))); roots.push(dataRoot);
   const projectRoot = path.join(sourceRoot, 'proof-worktree'); await mkdir(projectRoot);
   await execFileAsync('/usr/bin/git', ['init', '-b', 'proof'], { cwd: projectRoot });
   await writeFile(path.join(projectRoot, 'untracked.txt'), 'read-only proof\n');
@@ -33,10 +36,12 @@ async function fixture() {
   await broker.bindHermesSession({ missionId: mission.id, hermesSessionId: '20260905_120000_mcp001', worktreePath: project.rootPath, branch: 'proof' });
   const settings = new PermissionSettingsStore(dataRoot); await settings.initialize();
   const audit = new PermissionAuditStore(dataRoot);
+  const resources = new VNextResourceRegistry(state, dataRoot);
+  const jobs = new DurableJobManager(dataRoot, resources);
   const capabilities = new CapabilityService(state, new PermissionPolicyEngine(state, settings, sourceRoot, dataRoot), audit, () => ({
     status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid, uptimeMs: 1,
     authority: 'owned', connectedClients: 1, connectedSessions: 1, agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '',
-  }));
+  }), new ProjectValidationJobManager(dataRoot), resources, jobs);
   return { state, broker, capabilities, settings, audit, mission, projectRoot: project.rootPath };
 }
 

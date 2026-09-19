@@ -4,11 +4,14 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PermissionAuditStore } from './audit.js';
 import { CapabilityService } from './capability-service.js';
+import { DurableJobManager } from './durable-job-manager.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { MissionLedgerStore } from './mission-store.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
 import { FoundationStateStore } from './persistence.js';
+import { ProjectValidationJobManager } from './project-test.js';
+import { VNextResourceRegistry } from './resource-registry.js';
 import { RuntimeState } from './state.js';
 
 const roots: string[] = [];
@@ -25,11 +28,16 @@ async function fixture() {
   const settings = new PermissionSettingsStore(dataRoot); await settings.initialize();
   const audit = new PermissionAuditStore(dataRoot);
   const policy = new PermissionPolicyEngine(state, settings, sourceRoot, dataRoot, path.join(sourceRoot, 'legacy'));
+  const resources = new VNextResourceRegistry(state, dataRoot);
+  const jobs = new DurableJobManager(dataRoot, resources);
   const service = new CapabilityService(
     state,
     policy,
     audit,
     () => ({ status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid, uptimeMs: 1, authority: 'owned', connectedClients: 1, connectedSessions: 1, agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '' }),
+    new ProjectValidationJobManager(dataRoot),
+    resources,
+    jobs,
   );
   const broker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
   return { sourceRoot, dataRoot, projectRoot: project.rootPath, state, project, session, settings, policy, audit, service, broker };
@@ -212,7 +220,18 @@ describe('V2 selectable mission orchestrator mode', () => {
     const persisted = await restarted.getMission(p.mission.id);
     expect(persisted).toMatchObject({ orchestratorMode: 'HERMES', orchestratorVersion: 2 });
     const resumedSession = await restarted.rehydrateBrokerMissionSession(p.mission.id);
-    await expect(new CapabilityService(restarted, new PermissionPolicyEngine(restarted, f.settings, f.sourceRoot, f.dataRoot, path.join(f.sourceRoot, 'legacy')), f.audit, () => ({ status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid, uptimeMs: 1, authority: 'owned', connectedClients: 1, connectedSessions: 1, agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '' })).execute({ capabilityId: 'file.write', clientId: resumedSession.clientId, sessionId: resumedSession.id, projectId: f.project.id, targetPath: target, content: 'replay', mission: { missionId: p.mission.id, taskId: p.taskId, actionId: p.actionId, orchestratorMode: 'HERMES' } })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    const restartedResources = new VNextResourceRegistry(restarted, f.dataRoot);
+    const restartedJobs = new DurableJobManager(f.dataRoot, restartedResources);
+    const restartedService = new CapabilityService(
+      restarted,
+      new PermissionPolicyEngine(restarted, f.settings, f.sourceRoot, f.dataRoot, path.join(f.sourceRoot, 'legacy')),
+      f.audit,
+      () => ({ status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid, uptimeMs: 1, authority: 'owned', connectedClients: 1, connectedSessions: 1, agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '' }),
+      new ProjectValidationJobManager(f.dataRoot),
+      restartedResources,
+      restartedJobs,
+    );
+    await expect(restartedService.execute({ capabilityId: 'file.write', clientId: resumedSession.clientId, sessionId: resumedSession.id, projectId: f.project.id, targetPath: target, content: 'replay', mission: { missionId: p.mission.id, taskId: p.taskId, actionId: p.actionId, orchestratorMode: 'HERMES' } })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
     await expect(readFile(target, 'utf8')).resolves.toBe('once');
   });
 });
