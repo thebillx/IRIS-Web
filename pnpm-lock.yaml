@@ -29,6 +29,9 @@ importers:
 
   apps/runtime:
     dependencies:
+      '@iris/ado':
+        specifier: workspace:*
+        version: link:../../packages/ado
       '@iris/domain':
         specifier: workspace:*
         version: link:../../packages/domain
