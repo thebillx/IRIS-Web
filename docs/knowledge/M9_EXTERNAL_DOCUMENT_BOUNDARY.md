@@ -64,3 +64,13 @@ After that compatibility fix:
 - full parallel suite reaches only process-sensitive timeout failures in two Phase 4 Git cases and one legacy Phase 8 validation case;
 - exact affected files rerun with `--maxWorkers=1` PASS;
 - M9 source-focused tests, typecheck, lint and build remain required at each review slice.
+
+## M9-C SharePoint / PDF / Excel / attachment ingestion
+
+- Added governed acquisition orchestration with connector availability, timeout, bounded streaming bytes, source/version pinning, artifact ownership checks, and SHA-256 content receipts.
+- Added typed SharePoint adapter boundary where connector-owned transport receives source identity rather than caller URLs or headers.
+- Added local PDF/Excel extraction adapter boundary keyed by governed artifact ID, not filesystem path.
+- Added ADO attachment routing that accepts only governed ArtifactReference identity, routes supported PDF/Excel MIME types, and leaves unsupported binaries reference-only.
+- Cross-project/workspace artifact substitution, source/version drift, oversize content, unavailable connectors, and timeout fail closed.
+- Focused M9 external-document suite: 29/29 PASS.
+- typecheck, lint, and build: PASS.
