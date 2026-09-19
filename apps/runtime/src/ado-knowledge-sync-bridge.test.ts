@@ -98,7 +98,7 @@ describe('ADO M5 to M6 sync bridge', () => {
 
   it('binds the full gate classification to the source fingerprint and policy version', () => {
     const fingerprint = hash('source-fingerprint');
-    const decision = gateDecisionFromClassification(101, fingerprint, classification);
+    const decision = gateDecisionFromClassification(101, fingerprint, classification, 'CURRENT');
     expect(decision).toMatchObject({
       itemId: 101,
       fingerprint,
@@ -108,17 +108,18 @@ describe('ADO M5 to M6 sync bridge', () => {
       category: 'FUNCTIONAL_BEHAVIOR',
     });
     expect(decision.classificationDigest).toMatch(/^[a-f0-9]{64}$/);
-    expect(gateDecisionFromClassification(101, fingerprint, structuredClone(classification)).classificationDigest)
+    expect(gateDecisionFromClassification(101, fingerprint, structuredClone(classification), 'CURRENT').classificationDigest)
       .toBe(decision.classificationDigest);
+    expect(decision.truthStatus).toBe('CURRENT');
   });
 
   it('changes the classification digest when semantic evidence changes', () => {
     const fingerprint = hash('source-fingerprint');
-    const baseline = gateDecisionFromClassification(101, fingerprint, classification);
+    const baseline = gateDecisionFromClassification(101, fingerprint, classification, 'CURRENT');
     const changed = gateDecisionFromClassification(101, fingerprint, {
       ...classification,
       score: 86,
-    });
+    }, 'CURRENT');
     expect(changed.classificationDigest).not.toBe(baseline.classificationDigest);
   });
 });

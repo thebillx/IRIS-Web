@@ -11,7 +11,7 @@ export type SourceReference = SourceIdentity & Readonly<{
   revision: string;
   changedDate: string;
   location: Readonly<{ kind: 'FIELD' | 'COMMENT'; name: string }>;
-  classification?: Readonly<{ gateVersion: string; digest: string }>;
+  classification?: Readonly<{ gateVersion: string; digest: string; truthStatus: 'DUPLICATE' | 'SUPERSEDED' | 'CURRENT' | 'CONFLICTING' | 'AMBIGUOUS' | 'NEEDS_REVIEW' }>;
 }>;
 export type SourceFragment = Readonly<{ reference: SourceReference; text: string; status: KnowledgeStatus }>;
 export type Provenance = Readonly<{ reference: SourceReference; status: 'PROMOTED' | 'SUPPORTING_EVIDENCE' }>;

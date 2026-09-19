@@ -28,7 +28,14 @@ export interface CorpusPartition {
   membership: SyncDocument['boardMembership'];
   gates: GateRow[];
 }
-export interface PublishedCorpus { syncRunId: string; promoted: CorpusPartition; contextOnly: CorpusPartition; supportingEvidence: CorpusPartition }
+export interface PublishedCorpus {
+  syncRunId: string;
+  promoted: CorpusPartition;
+  contextOnly: CorpusPartition;
+  supportingEvidence: CorpusPartition;
+  review: CorpusPartition;
+  history: CorpusPartition;
+}
 
 function gateTable(document: SyncDocument, disposition: Disposition): GateRow[] {
   switch (disposition) {
@@ -204,6 +211,7 @@ export class SyncCoordinator implements SyncScheduler {
       reasonCode: decision.reasonCode,
       category: decision.category,
       classificationDigest: decision.classificationDigest,
+      truthStatus: decision.truthStatus,
       evidence: decision.evidence.map(entry => ({ ...entry })),
       decidedAt: at,
     });
@@ -269,7 +277,8 @@ export class SyncCoordinator implements SyncScheduler {
     const head = document.publishedHeads.find(head => sameScope(head.scope, scope));
     if (!head) return null;
     const partition = (gates: GateRow[]): CorpusPartition => {
-      const ids = new Set(gates.filter(gate => gate.syncRunId === head.syncRunId).map(gate => gate.itemId));
+      const selected = gates.filter(gate => gate.syncRunId === head.syncRunId);
+      const ids = new Set(selected.map(gate => gate.itemId));
       const matches = (row: { syncRunId: string; itemId: number }) => row.syncRunId === head.syncRunId && ids.has(row.itemId);
       return {
         sources: document.sourceStaging.filter(matches),
@@ -277,9 +286,19 @@ export class SyncCoordinator implements SyncScheduler {
         relations: document.relations.filter(matches),
         links: document.links.filter(matches),
         membership: document.boardMembership.filter(matches),
-        gates: gates.filter(gate => gate.syncRunId === head.syncRunId),
+        gates: selected,
       };
     };
-    return { syncRunId: head.syncRunId, promoted: partition(document.promoted), contextOnly: partition(document.contextOnly), supportingEvidence: partition(document.supportingEvidence) };
+    const currentTruth = (gate: GateRow) => gate.truthStatus === 'CURRENT' || gate.truthStatus === 'DUPLICATE';
+    const reviewTruth = (gate: GateRow) => ['CONFLICTING', 'AMBIGUOUS', 'NEEDS_REVIEW'].includes(gate.truthStatus);
+    const all = decisions(document);
+    return {
+      syncRunId: head.syncRunId,
+      promoted: partition(document.promoted.filter(currentTruth)),
+      contextOnly: partition(document.contextOnly.filter(currentTruth)),
+      supportingEvidence: partition(document.supportingEvidence.filter(currentTruth)),
+      review: partition(all.filter(reviewTruth)),
+      history: partition(all.filter(gate => gate.truthStatus === 'SUPERSEDED')),
+    };
   }
 }

@@ -81,7 +81,7 @@ function published() {
     failures: [],
   }, at);
   const source = store.read().sourceStaging[0]!;
-  coordinator.decide('wiki-run', 2, gateDecisionFromClassification(101, source.fingerprint, classification), at);
+  coordinator.decide('wiki-run', 2, gateDecisionFromClassification(101, source.fingerprint, classification, 'CURRENT'), at);
   expect(coordinator.finish('wiki-run', 3, at).published).toBe(true);
   return coordinator.published({
     organizationId: 'org-1', projectId: 'project-1', teamId: 'team-1', boardId: 'board-1',
@@ -102,6 +102,7 @@ describe('M6 to M7 Wiki convergence bridge', () => {
     const citation = input.candidates[0]!.references[0]!;
     expect(citation.classification?.gateVersion).toBe(corpus.promoted.gates[0]!.gateVersion);
     expect(citation.classification?.digest).toBe(corpus.promoted.gates[0]!.classificationDigest);
+    expect(citation.classification?.truthStatus).toBe('CURRENT');
   });
 
   it('builds a grounded Wiki and answers only from cited promoted text', () => {
@@ -127,6 +128,8 @@ describe('M6 to M7 Wiki convergence bridge', () => {
         gates: [{ ...gate, disposition: 'CONTEXT_ONLY' as const, category: null, evidence: [] }],
       },
       supportingEvidence: { sources: [], comments: [], relations: [], links: [], membership: [], gates: [] },
+      review: { sources: [], comments: [], relations: [], links: [], membership: [], gates: [] },
+      history: { sources: [], comments: [], relations: [], links: [], membership: [], gates: [] },
     };
     const input = buildWikiInputFromPublishedCorpus(contextCorpus, { topics: [topic] });
     expect(input.candidates).toEqual([]);

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { TruthStatus } from '@iris/shared/ado/knowledge-gate';
 
 export class SyncError extends Error {
   constructor(readonly code: 'INVALID_INPUT' | 'INVALID_SNAPSHOT' | 'PERSISTENCE_FAILURE' | 'CONFLICT' | 'INVALID_STATE' | 'CHECKPOINT_CONFLICT' | 'STALE_GATE' | 'NOT_FOUND') { super(code); }
@@ -38,6 +39,7 @@ export interface GateDecision {
   reasonCode: string;
   category: string | null;
   classificationDigest: string;
+  truthStatus: TruthStatus;
   evidence: GateEvidence[];
 }
 export interface GateRow extends GateDecision { syncRunId: string; decidedAt: string }
@@ -60,6 +62,7 @@ export interface PublicationPolicy { gateVersion: string; minimumPromoted: numbe
 export function validateGateDecisionMetadata(decision: GateDecision): void {
   if (decision.category !== null) identifier(decision.category);
   requireValid(typeof decision.classificationDigest === 'string' && /^[a-f0-9]{64}$/.test(decision.classificationDigest));
+  requireValid(['DUPLICATE', 'SUPERSEDED', 'CURRENT', 'CONFLICTING', 'AMBIGUOUS', 'NEEDS_REVIEW'].includes(decision.truthStatus));
   bounded(decision.evidence);
   unique(decision.evidence.map(entry => canonical([entry.field, entry.text])));
   for (const entry of decision.evidence) {

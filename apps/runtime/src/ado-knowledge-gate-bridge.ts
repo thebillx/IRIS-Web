@@ -3,8 +3,11 @@ import {
   classifyKnowledge,
   gatePolicyFromBacklogs,
   type Classification,
+  type ConceptResolution,
+  type RecordKind,
   type SemanticClassifier,
   type SourceRecord,
+  type TruthStatus,
 } from '@iris/shared/ado/knowledge-gate';
 import type { Backlog } from './ado/discovery.js';
 import type { CanonicalKnowledgeCandidate } from './ado-knowledge-bridge.js';
@@ -33,6 +36,7 @@ export function policyVersionForBacklogs(backlogs: readonly Backlog[]): string {
 export function toGateSourceRecord(
   candidate: CanonicalKnowledgeCandidate,
   children: readonly GateChildCandidate[] = [],
+  kind: RecordKind = 'WORK_ITEM',
 ): SourceRecord {
   assertCandidate(candidate);
   const facts = new Map(candidate.facts.map(entry => [entry.field, entry.fact.body] as const));
@@ -57,7 +61,7 @@ export function toGateSourceRecord(
       revision: String(candidate.node.provenance.revision),
     },
     workItemType,
-    kind: 'WORK_ITEM',
+    kind,
     title: facts.get('title') ?? '',
     description: facts.get('description') ?? '',
     acceptanceCriteria: facts.get('acceptanceCriteria') ?? '',
@@ -70,9 +74,19 @@ export function classifyCanonicalKnowledge(
   backlogs: readonly Backlog[],
   semantic?: SemanticClassifier,
   children: readonly GateChildCandidate[] = [],
+  kind: RecordKind = 'WORK_ITEM',
 ): Classification {
   const policy = gatePolicyFromBacklogs(backlogs, policyVersionForBacklogs(backlogs));
-  return classifyKnowledge(toGateSourceRecord(candidate, children), policy, semantic);
+  return classifyKnowledge(toGateSourceRecord(candidate, children, kind), policy, semantic);
+}
+
+export function truthStatusForClaim(resolution: ConceptResolution, claimId: string): TruthStatus {
+  knowledgeAssert(resolution !== null && typeof resolution === 'object'
+    && Array.isArray(resolution.claimStates)
+    && typeof claimId === 'string' && claimId.length > 0, 'Expected resolved concept claim state');
+  const matches = resolution.claimStates.filter(state => state.id === claimId);
+  knowledgeAssert(matches.length === 1, 'Claim truth state is missing or ambiguous');
+  return matches[0]!.status;
 }
 
 function assertCandidate(candidate: CanonicalKnowledgeCandidate): void {

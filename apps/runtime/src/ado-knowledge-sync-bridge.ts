@@ -1,5 +1,5 @@
 import type { RawSourceStage } from '@iris/ado';
-import type { Classification } from '@iris/shared/ado/knowledge-gate';
+import type { Classification, TruthStatus } from '@iris/shared/ado/knowledge-gate';
 import type { CanonicalKnowledgeCandidate } from './ado-knowledge-bridge.js';
 import { knowledgeAssert } from './ado-knowledge-provenance.js';
 import { canonical, hash, type GateDecision, type Membership, type Observation } from './ado/m6/model.js';
@@ -138,6 +138,7 @@ export function gateDecisionFromClassification(
   itemId: number,
   fingerprint: string,
   classification: Classification,
+  truthStatus: TruthStatus,
 ): GateDecision {
   knowledgeAssert(Number.isSafeInteger(itemId) && itemId > 0, 'Gate decision requires positive item ID');
   knowledgeAssert(typeof fingerprint === 'string' && /^[a-f0-9]{64}$/.test(fingerprint), 'Gate decision requires source fingerprint');
@@ -162,6 +163,7 @@ export function gateDecisionFromClassification(
     reasonCode,
     category: classification.category,
     classificationDigest: digest,
+    truthStatus,
     evidence: classification.semanticEvidence?.quotes.map(quote => ({
       field: quote.field,
       text: quote.text,

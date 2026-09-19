@@ -155,7 +155,7 @@ function promotedCategory(gate: GateRow): Category {
 }
 
 function classification(gate: GateRow): NonNullable<SourceReference['classification']> {
-  return { gateVersion: gate.gateVersion, digest: gate.classificationDigest };
+  return { gateVersion: gate.gateVersion, digest: gate.classificationDigest, truthStatus: gate.truthStatus };
 }
 
 function fullReference(

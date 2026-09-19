@@ -33,6 +33,7 @@ export function referenceKey(reference: SourceReference): string {
     reference.location.name,
     reference.classification?.gateVersion ?? null,
     reference.classification?.digest ?? null,
+    reference.classification?.truthStatus ?? null,
   ]);
 }
 
@@ -56,7 +57,8 @@ function validReference(reference: SourceReference): boolean {
     && !!reference.location && ['FIELD', 'COMMENT'].includes(reference.location.kind) && strings([reference.location.name])
     && (reference.classification === undefined
       || (strings([reference.classification.gateVersion])
-        && /^[a-f0-9]{64}$/.test(reference.classification.digest)));
+        && /^[a-f0-9]{64}$/.test(reference.classification.digest)
+        && ['DUPLICATE', 'SUPERSEDED', 'CURRENT', 'CONFLICTING', 'AMBIGUOUS', 'NEEDS_REVIEW'].includes(reference.classification.truthStatus)));
 }
 
 export function validateSources(sources: readonly SourceFragment[]): Issue[] {
