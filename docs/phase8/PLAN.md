@@ -1,6 +1,6 @@
 # IRIS Phase 8 — Compatibility Convergence Plan
 
-Status: READY_FOR_SAVE_POINT
+Status: COMPLETE
 Baseline: `d514b10afa4c06cdd6afa211d4c3fbf573a9b3c2`
 Branch: `codex/phase8-compat-convergence`
 Mission: `231bc628-6256-413a-b82e-1195f2d5b48c`
@@ -140,7 +140,7 @@ Exit: `AC-IRIS-005=PASS`, `AC-COMPAT-004=PASS`, and `CURRENT_42_TOOLS_BREAKING_C
 
 ### NEXT-7 — Final Phase 8 acceptance and save point
 
-Status: READY_FOR_SAVE_POINT
+Status: COMPLETE
 
 Canonical evidence:
 
