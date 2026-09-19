@@ -23,8 +23,8 @@ const scope: ScopeResponse = {
   backlogIteration: { id: 'iteration-root', name: 'All', path: 'ExampleProject' },
 };
 const backlogs: readonly Backlog[] = [
-  { id: 'delivery', name: 'Deliverables', rank: 40, workItemTypes: ['Issue', 'Request'] },
-  { id: 'strategy', name: 'Strategy', rank: 2, workItemTypes: ['Outcome'] },
+  { id: 'delivery', name: 'Deliverables', rank: 40, type: 'requirement', workItemTypes: ['Issue', 'Request'] },
+  { id: 'strategy', name: 'Strategy', rank: 2, type: 'portfolio', workItemTypes: ['Outcome'] },
 ];
 const limits = { maxPages: 8, maxPageItems: 3, maxItems: 20, chunkSize: 2 };
 const policy: ReadPolicy = {
@@ -84,10 +84,13 @@ describe('pure Board discovery', () => {
   it('keeps alternate levels and types with source-defined rank', () => {
     const result = discoverBacklogs(backlogs, 10);
     expect(result.map(backlog => backlog.id)).toEqual(['strategy', 'delivery']);
+    expect(result[0]!.type).toBe('portfolio');
+    expect(result[1]!.type).toBe('requirement');
     expect(result[1]!.workItemTypes).toEqual(['Issue', 'Request']);
     expect(backlogs[0]!.id).toBe('delivery');
     expect(() => discoverBacklogs([backlogs[0]!, backlogs[0]!], 10)).toThrow('INVALID_RESPONSE');
     expect(() => discoverBacklogs([{ ...backlogs[0]!, rank: NaN }], 10)).toThrow('INVALID_RESPONSE');
+    expect(() => discoverBacklogs([{ ...backlogs[0]!, type: 'unknown' as Backlog['type'] }], 10)).toThrow('INVALID_RESPONSE');
   });
 });
 

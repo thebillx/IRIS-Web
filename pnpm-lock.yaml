@@ -35,6 +35,9 @@ importers:
       '@iris/domain':
         specifier: workspace:*
         version: link:../../packages/domain
+      '@iris/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
     devDependencies:
       '@types/node':
         specifier: ^24.3.0

@@ -89,14 +89,17 @@ export function isAreaInScope(scope: BoardScope, path: string): boolean {
   pathSegments(path);
   return scope.areaPaths.some(area => path === area.path || (area.includeChildren && path.startsWith(`${area.path}\\`)));
 }
-export interface Backlog extends Identity { readonly rank: number; readonly workItemTypes: readonly string[] }
+export type BacklogType = 'portfolio' | 'requirement' | 'task';
+export interface Backlog extends Identity { readonly rank: number; readonly type: BacklogType; readonly workItemTypes: readonly string[] }
 export function discoverBacklogs(backlogs: readonly Backlog[], maxEntries: number): readonly Backlog[] {
   positive(maxEntries);
   if (backlogs.length > maxEntries) throw new DiscoveryError('LIMIT_EXCEEDED');
   const seen = new Set<string>();
   for (const backlog of backlogs) {
     text(backlog.id); text(backlog.name);
-    if (seen.has(backlog.id) || !Number.isSafeInteger(backlog.rank) || backlog.rank < 0 || !backlog.workItemTypes.length || backlog.workItemTypes.length > maxEntries) throw new DiscoveryError('INVALID_RESPONSE');
+    if (seen.has(backlog.id) || !Number.isSafeInteger(backlog.rank) || backlog.rank < 0
+      || !['portfolio', 'requirement', 'task'].includes(backlog.type)
+      || !backlog.workItemTypes.length || backlog.workItemTypes.length > maxEntries) throw new DiscoveryError('INVALID_RESPONSE');
     seen.add(backlog.id);
     backlog.workItemTypes.forEach(text);
     if (new Set(backlog.workItemTypes).size !== backlog.workItemTypes.length) throw new DiscoveryError('INVALID_RESPONSE');
