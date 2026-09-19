@@ -83,3 +83,13 @@ After that compatibility fix:
 - Every cross-source relation remains `SUPPORTING_EVIDENCE`; implementation/QA evidence never becomes requirement truth by correlation alone.
 - Cross-project edges remain denied at this layer and are delegated to the explicit M9-E authority boundary.
 - Focused M9-D tests: 6/6 PASS.
+
+## M9-E freshness, scheduled sync, and cross-project graph
+
+- Added external Wiki freshness assessment that marks exact affected topics `STALE_SOURCE` on source version/hash drift and `STALE_AGE` on policy age expiry.
+- Freshness checks fail closed on source identity rebinding.
+- Added scheduled Board-sync planning that converts only due enabled `ScheduleIntent` records into the existing M6 `StartSync` contract with `trigger.kind = SCHEDULE`; no second sync engine is introduced.
+- Missing schedule inventory/policy snapshots and duplicate schedule identities fail closed.
+- Added explicit cross-project graph grant with project allowlist, relation allowlist, expiry, and node/link resource budgets.
+- Cross-project graph edges remain `SUPPORTING_EVIDENCE`; an allowed graph does not create cross-project write authority or requirement truth.
+- Focused M9-D/E tests: 17/17 PASS.
