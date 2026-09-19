@@ -112,8 +112,11 @@ printf '%s' "$ADO_PAT" | pnpm --filter @iris/runtime ado:live-acceptance -- \
 unset ADO_PAT
 ```
 
-Use a temporary Work Items **Read** credential for acceptance only. Production
-automation should use the separately governed Microsoft Entra identity path.
+Use a temporary PAT with **Work Items: Read** plus **Project and Team: Read**
+for acceptance only. The Core project/team discovery endpoints require the
+project/team read permission, while Work/Boards/Work Item endpoints use the work
+read permission. Do not grant write/manage scopes. Production automation should
+use the separately governed Microsoft Entra identity path.
 The runner writes its sanitized snapshot and receipt only under the private IRIS
 runtime data root.
 
