@@ -34,12 +34,8 @@ The foundational structured tools are:
 
 There is no arbitrary shell, remote account, credential, or cloud capability.
 
-MCP does not own a separate permission path. Every tool call is routed through the same daemon `CapabilityService` used by the localhost Web API. File and directory tools require explicit client/session identity; the live session current project and physical target boundary are revalidated immediately before execution. `DENY` and `OWNER_REQUIRED` outcomes are returned as MCP tool errors and execute nothing.
+MCP does not own a separate permission path. Every tool call is routed through the same daemon `CapabilityService` used by the localhost Web API. File, directory, Git, and governed shell tools require explicit client/session identity; the live session current project and physical target boundary are revalidated immediately before execution. `DENY` and `OWNER_REQUIRED` outcomes execute nothing. For a prepared `CHATGPT` mission action, the exact originating ChatGPT session may apply the user's explicit in-chat `ALLOW_ONCE` decision directly through `owner_approval_resolve`; no second owner-principal hop is required.
 
 Application sessions are IRIS runtime sessions and remain separate from MCP protocol transport state. Multiple local clients may call the same daemon; machine authority and permission mode remain machine-shared while current project remains session-scoped.
 
-Durable missions retain a durable authenticated owner principal while their active session
-binding can be renewed through the owner-only, revision-bound `mission_rebind`
-tool. Rebind preserves the mission/project identity, revokes the old session's
-mutation authority, and records a bounded audit/timeline event. PRO exposes no
-mission or mutation tools.
+Durable missions retain a durable owner identity while their active session binding can be renewed through the revision-bound `mission_rebind` tool by the active ChatGPT tunnel session. Rebind preserves the mission/project identity, revokes the old session's mutation authority, and records a bounded audit/timeline event. PRO exposes no mission or mutation tools.

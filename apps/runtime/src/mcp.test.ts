@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { PermissionAuditStore } from './audit.js';
 import { CapabilityService } from './capability-service.js';
 import { DurableJobManager } from './durable-job-manager.js';
-import { handleMcpProRequest, handleMcpRequest, MCP_PROTOCOL_VERSION } from './mcp.js';
+import { handleMcpProRequest, handleMcpRequest, MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
@@ -22,6 +22,56 @@ const execFileAsync = promisify(execFile);
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('local MCP transport and permission boundary', () => {
+  it('accepts the tunnel-client v0.0.12 Streamable HTTP initialize contract', async () => {
+    const initialize = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+          protocolVersion: TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+          capabilities: { roots: { listChanged: true } },
+          clientInfo: { name: 'tunnel-client', version: '0.0.12' },
+        },
+      }),
+    }), {} as CapabilityService, undefined, undefined, 'tunnel-service');
+
+    expect(initialize.status).toBe(200);
+    expect(initialize.headers.get('content-type')).toContain('application/json');
+    expect(initialize.headers.get('Mcp-Session-Id')).toBeNull();
+    expect(await initialize.json()).toMatchObject({ result: {
+      protocolVersion: TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+      capabilities: { tools: {} },
+      serverInfo: { name: 'IRIS' },
+    } });
+
+    const initialized = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json', accept: 'application/json, text/event-stream',
+        'MCP-Protocol-Version': TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }),
+    }), {} as CapabilityService, undefined, undefined, 'tunnel-service');
+    expect(initialized.status).toBe(202);
+
+    const listed = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json', accept: 'application/json, text/event-stream',
+        'MCP-Protocol-Version': TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+    }), {} as CapabilityService, undefined, undefined, 'tunnel-service');
+    expect(listed.status).toBe(200);
+    expect((await listed.json() as { result: { tools: unknown[] } }).result.tools.length).toBeGreaterThan(0);
+
+    const stream = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
+      method: 'GET', headers: { accept: 'text/event-stream' },
+    }), {} as CapabilityService, undefined, undefined, 'tunnel-service');
+    expect(stream.status).toBe(405);
+    expect(stream.headers.get('allow')).toBe('POST');
+  });
+
   it('exposes only the dedicated sessionless read tools on the Pro endpoint', async () => {
     const fixture = await serviceFixture();
     await Promise.all([
@@ -403,6 +453,48 @@ describe('local MCP transport and permission boundary', () => {
       name: 'owner_approval_resolve', arguments: resolveArgs,
     }, true, 'owner_approval_resolve', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
     expect(await replay.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'APPROVAL_NOT_FOUND' } } });
+  });
+
+  it('lets the originating ChatGPT tunnel session apply an explicit allow-once decision without a second owner principal', async () => {
+    const fixture = await serviceFixture();
+    const tunnel = fixture.state.createSession('chatgpt-tunnel-approval', 'iris-tunnel-service', 'other');
+    await fixture.state.setSessionCurrentProject(tunnel.id, tunnel.clientId, fixture.project.id);
+
+    const create = await handleMcpRequest(rpc('tools/call', 79, {
+      name: 'mission_create', arguments: { title: 'Tunnel-approved action', orchestratorMode: 'CHATGPT' },
+    }, true, 'mission_create', tunnel.clientId, tunnel.id), fixture.service, fixture.state, fixture.broker, 'tunnel-service');
+    const createBody = await create.json() as { result: { structuredContent: { id: string } } };
+    const missionId = createBody.result.structuredContent.id;
+
+    const task = await handleMcpRequest(rpc('tools/call', 80, {
+      name: 'mission_task_create', arguments: { missionId, title: 'Write after chat approval' },
+    }, true, 'mission_task_create', tunnel.clientId, tunnel.id), fixture.service, fixture.state, fixture.broker, 'tunnel-service');
+    const taskBody = await task.json() as { result: { structuredContent: { tasks: Array<{ id: string }> } } };
+    const taskId = taskBody.result.structuredContent.tasks[0]!.id;
+
+    const prepared = await handleMcpRequest(rpc('tools/call', 81, {
+      name: 'mission_action_prepare', arguments: { missionId, taskId, capabilityId: 'file.write', summary: 'Write exact tunnel approval proof' },
+    }, true, 'mission_action_prepare', tunnel.clientId, tunnel.id), fixture.service, fixture.state, fixture.broker, 'tunnel-service');
+    const preparedBody = await prepared.json() as { result: { structuredContent: { tasks: Array<{ actions: Array<{ id: string }> }> } } };
+    const actionId = preparedBody.result.structuredContent.tasks[0]!.actions[0]!.id;
+    await fixture.settings.setMode('ASK_EVERY_TIME');
+
+    const targetPath = path.join(fixture.projectRoot, 'tunnel-approved.txt');
+    const pending = await handleMcpRequest(rpc('tools/call', 82, {
+      name: 'file_write', arguments: { projectId: fixture.project.id, targetPath, content: 'approved', missionId, taskId, actionId },
+    }, true, 'file_write', tunnel.clientId, tunnel.id), fixture.service, fixture.state, fixture.broker, 'tunnel-service');
+    const pendingBody = await pending.json() as { result: { structuredContent: { approval: { id: string; exactAction: string; capabilityId: string } } } };
+    const approval = pendingBody.result.structuredContent.approval;
+    await expect(access(targetPath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    const resolved = await handleMcpRequest(rpc('tools/call', 83, {
+      name: 'owner_approval_resolve', arguments: {
+        approvalId: approval.id, missionId, taskId, actionId, capabilityId: approval.capabilityId,
+        exactAction: approval.exactAction, decision: 'ALLOW_ONCE',
+      },
+    }, true, 'owner_approval_resolve', tunnel.clientId, tunnel.id), fixture.service, fixture.state, fixture.broker, 'tunnel-service');
+    expect(await resolved.json()).toMatchObject({ result: { isError: false } });
+    await expect(readFile(targetPath, 'utf8')).resolves.toBe('approved');
   });
 
   it('cannot bypass session/project policy for file mutation', async () => {

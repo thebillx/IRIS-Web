@@ -74,6 +74,33 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
   });
 
+  it('allows shell.run to bind to one prepared CHATGPT mission action', async () => {
+    const fixture = await serviceFixture();
+    const primary = await fixture.resources.primaryWorkspace(fixture.projectA.id);
+    await writeFile(path.join(fixture.projectARoot, 'mission-shell.mjs'), "console.log('mission-shell-ok')\n");
+
+    let mission = await fixture.state.createMission(fixture.sessionA.clientId, fixture.sessionA.id, 'Mission shell', 'CHATGPT');
+    mission = await fixture.state.createMissionTask(mission.id, fixture.sessionA.clientId, fixture.sessionA.id, 'Run approved shell');
+    const taskId = mission.tasks[0]!.id;
+    mission = await fixture.state.prepareMissionAction(
+      mission.id, taskId, fixture.sessionA.clientId, fixture.sessionA.id, 'shell.run', 'Run one governed shell action',
+    );
+    const actionId = mission.tasks[0]!.actions[0]!.id;
+
+    const request = new Request('http://127.0.0.1/mcp', { headers: { 'x-iris-client-id': fixture.sessionA.clientId } });
+    const outcome = await executePhase3GroupedTool('shell', {
+      operation: 'run', sessionId: fixture.sessionA.id, projectId: fixture.projectA.id, workspaceId: primary.workspaceId,
+      missionId: mission.id, taskId, actionId,
+      executable: 'node', argv: ['mission-shell.mjs'], cwd: '.', executionProfile: 'node-script', envOverrides: {}, timeoutMs: 5000,
+      expectedEffects: ALL_EXECUTION_EFFECTS,
+    }, request, fixture.service, fixture.state);
+    const value = executedValue<Record<string, unknown>>(outcome);
+    expect(value.stdoutTail).toContain('mission-shell-ok');
+
+    const completed = await fixture.state.getMission(mission.id);
+    expect(completed.tasks[0]?.actions[0]).toMatchObject({ state: 'SUCCEEDED', capabilityId: 'shell.run' });
+  });
+
   it('AC-SEC-010 redacts explicit secrets, excludes ambient secret inheritance, bounds inline output, and keeps audit/artifact metadata secret-free', async () => {
     const fixture = await serviceFixture();
     const primary = await fixture.resources.primaryWorkspace(fixture.projectA.id);

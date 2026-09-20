@@ -5,6 +5,9 @@ import type { MissionBrokerService } from './mission-broker.js';
 import type { RuntimeState } from './state.js';
 
 export const MCP_PROTOCOL_VERSION = '2026-07-28' as const;
+export const LEGACY_MCP_PROTOCOL_VERSION = '2025-11-25' as const;
+export const TUNNEL_CLIENT_MCP_PROTOCOL_VERSION = '2025-06-18' as const;
+const INITIALIZE_PROTOCOL_VERSIONS = new Set<string>([LEGACY_MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION]);
 const CLIENT_ID_HEADER = 'x-iris-client-id';
 const SESSION_ID_HEADER = 'x-iris-session-id';
 
@@ -74,8 +77,26 @@ async function handleMcpTransportRequest(
       });
   }
 
-  if (request.headers.get('MCP-Protocol-Version') !== MCP_PROTOCOL_VERSION) {
-    return jsonRpcError(rpc.id ?? null, -32600, `MCP-Protocol-Version must be ${MCP_PROTOCOL_VERSION}`, 400);
+  if (rpc.method === 'initialize') {
+    const params = isRecord(rpc.params) ? rpc.params : null;
+    const clientInfo = params !== null && isRecord(params.clientInfo) ? params.clientInfo : null;
+    if (typeof params?.protocolVersion !== 'string'
+      || !INITIALIZE_PROTOCOL_VERSIONS.has(params.protocolVersion)
+      || !isRecord(params.capabilities)
+      || typeof clientInfo?.name !== 'string'
+      || typeof clientInfo.version !== 'string') {
+      return jsonRpcError(rpc.id ?? null, -32602, 'Invalid initialize parameters', 400);
+    }
+    return jsonRpcResult(rpc.id ?? null, {
+      protocolVersion: params.protocolVersion,
+      capabilities: { tools: {} },
+      serverInfo: { name: profile === 'pro' ? 'IRIS Pro Read Only' : 'IRIS', version: '0.0.0' },
+    });
+  }
+
+  const protocolVersion = request.headers.get('MCP-Protocol-Version');
+  if (protocolVersion !== MCP_PROTOCOL_VERSION && !INITIALIZE_PROTOCOL_VERSIONS.has(protocolVersion ?? '')) {
+    return jsonRpcError(rpc.id ?? null, -32600, 'Unsupported MCP-Protocol-Version', 400);
   }
   const methodHeader = request.headers.get('Mcp-Method');
   if (methodHeader !== null && methodHeader !== rpc.method) return jsonRpcError(rpc.id ?? null, -32600, 'Mcp-Method does not match JSON-RPC method', 400);
@@ -292,7 +313,6 @@ async function executeTool(
       missionId, taskId: requiredString(args, 'taskId'), actionCapabilityId: missionActionCapability(args, 'capabilityId'), summary: requiredString(args, 'summary') });
   }
   if (name === 'owner_approval_resolve') {
-    if (principal !== 'owner') throw new RuntimeError('CONTROL_DENIED', 'Only the authenticated owner MCP principal can resolve approvals');
     const missionId = requiredString(args, 'missionId');
     await assertChatGptOperationalMission(state, missionId, requiredClient, requiredSession);
     const decision = requiredString(args, 'decision');
@@ -401,8 +421,8 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'mission_state_set', description: 'Record orchestration-owned mission state; this does not grant execution authority.', inputSchema: { type: 'object', required: ['missionId', 'state'], properties: { ...sessionProperty, missionId: { type: 'string' }, state: { enum: ['PLANNED','RUNNING','WAITING_APPROVAL','WAITING_SUPERVISOR','PAUSED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
     { name: 'mission_task_create', description: 'Register a task identity inside a mission.', inputSchema: { type: 'object', required: ['missionId','title'], properties: { ...sessionProperty, missionId: { type: 'string' }, title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
     { name: 'mission_task_state_set', description: 'Record orchestration-owned task state.', inputSchema: { type: 'object', required: ['missionId','taskId','state'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, state: { enum: ['PENDING','RUNNING','BLOCKED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
-    { name: 'mission_action_prepare', description: 'Prepare one governed IRIS execution action for a CHATGPT-orchestrated mission. Preparation never executes the capability.', inputSchema: { type: 'object', required: ['missionId','taskId','capabilityId','summary'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, capabilityId: { enum: ['file.read','file.write','file.edit','file.delete','directory.create','directory.delete','project.test.run','project.command.run','project.validation.start','git.local','git.push','remote.publish'] }, summary: { type: 'string', maxLength: 400 } }, additionalProperties: false } },
-    { name: 'owner_approval_resolve', description: 'Resolve one pending exact mission approval only for the authenticated originating owner session. Supports ALLOW_ONCE or DENY and never creates a persistent policy override.', inputSchema: { type: 'object', required: ['approvalId','missionId','taskId','actionId','capabilityId','exactAction','decision'], properties: { ...sessionProperty, approvalId: { type: 'string', minLength: 1, maxLength: 200 }, missionId: { type: 'string' }, taskId: { type: 'string' }, actionId: { type: 'string' }, capabilityId: { type: 'string', minLength: 1, maxLength: 200 }, exactAction: { type: 'string', minLength: 1, maxLength: 4000 }, decision: { enum: ['ALLOW_ONCE','DENY'] } }, additionalProperties: false } },
+    { name: 'mission_action_prepare', description: 'Prepare one governed IRIS execution action for a CHATGPT-orchestrated mission. Preparation never executes the capability.', inputSchema: { type: 'object', required: ['missionId','taskId','capabilityId','summary'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, capabilityId: { enum: ['file.read','file.write','file.edit','file.delete','directory.create','directory.delete','project.test.run','project.command.run','project.validation.start','shell.run','shell.start','git.local','git.push','remote.publish'] }, summary: { type: 'string', maxLength: 400 } }, additionalProperties: false } },
+    { name: 'owner_approval_resolve', description: 'Resolve one pending exact CHATGPT mission approval from the originating ChatGPT session after the user explicitly approves in chat. Supports ALLOW_ONCE or DENY and never creates a persistent policy override.', inputSchema: { type: 'object', required: ['approvalId','missionId','taskId','actionId','capabilityId','exactAction','decision'], properties: { ...sessionProperty, approvalId: { type: 'string', minLength: 1, maxLength: 200 }, missionId: { type: 'string' }, taskId: { type: 'string' }, actionId: { type: 'string' }, capabilityId: { type: 'string', minLength: 1, maxLength: 200 }, exactAction: { type: 'string', minLength: 1, maxLength: 4000 }, decision: { enum: ['ALLOW_ONCE','DENY'] } }, additionalProperties: false } },
     { name: 'mission_supervisor_gate_set', description: 'Record supervisor-gate state only for the active CHATGPT operational orchestrator. The gate never overrides IRIS permission policy.', inputSchema: { type: 'object', required: ['missionId','state'], properties: { ...sessionProperty, missionId: { type: 'string' }, state: { enum: ['NOT_REQUIRED','PENDING','APPROVED','DENIED'] }, reason: { type: ['string','null'], maxLength: 500 } }, additionalProperties: false } },
     { name: 'project_test_run', description: 'Run only the registered project declared test script for one prepared CHATGPT mission action through CapabilityService.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, actionId: { type: 'string' }, projectId: { type: 'string' } }, additionalProperties: false } },
     { name: 'project_validation_run', description: 'Run one exact script physically declared in the selected project root package.json using its declared npm or pnpm packageManager. No shell text is accepted.', inputSchema: { type: 'object', required: ['missionId','taskId','actionId','scriptName'], properties: { ...sessionProperty, ...associationProperties, projectId: { type: 'string' }, scriptName: { type: 'string', minLength: 1, maxLength: 100 } }, additionalProperties: false } },
@@ -601,9 +621,9 @@ function supervisorGateState(record: Record<string, unknown>, name: string): Sup
   throw new Error(`${name} is not a supported supervisor gate state`);
 }
 
-function missionActionCapability(record: Record<string, unknown>, name: string): 'file.read' | 'file.write' | 'file.edit' | 'file.delete' | 'directory.create' | 'directory.delete' | 'project.test.run' | 'project.command.run' | 'project.validation.start' | 'git.local' | 'git.push' | 'remote.publish' {
+function missionActionCapability(record: Record<string, unknown>, name: string): 'file.read' | 'file.write' | 'file.edit' | 'file.delete' | 'directory.create' | 'directory.delete' | 'project.test.run' | 'project.command.run' | 'project.validation.start' | 'shell.run' | 'shell.start' | 'git.local' | 'git.push' | 'remote.publish' {
   const value = record[name];
-  if (value === 'file.read' || value === 'file.write' || value === 'file.edit' || value === 'file.delete' || value === 'directory.create' || value === 'directory.delete' || value === 'project.test.run' || value === 'project.command.run' || value === 'project.validation.start' || value === 'git.local' || value === 'git.push' || value === 'remote.publish') return value;
+  if (value === 'file.read' || value === 'file.write' || value === 'file.edit' || value === 'file.delete' || value === 'directory.create' || value === 'directory.delete' || value === 'project.test.run' || value === 'project.command.run' || value === 'project.validation.start' || value === 'shell.run' || value === 'shell.start' || value === 'git.local' || value === 'git.push' || value === 'remote.publish') return value;
   throw new Error(`${name} is not a supported governed mission capability`);
 }
 

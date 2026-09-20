@@ -8,6 +8,8 @@ import type {
   CapabilityEffect,
   CapabilityId,
   MissionExecutionAssociation,
+  WorkerExecutionAssociation,
+  WorkerRuntimeFence,
   MissionState,
   MissionTaskState,
   OrchestratorMode,
@@ -31,6 +33,7 @@ import { VNextResourceRegistry } from './resource-registry.js';
 import { DurableJobManager } from './durable-job-manager.js';
 import { GovernedGitEngine, type GitCompatibilityOperation, type Phase4GitOperationName, type Phase4GitRequest } from './governed-git-engine.js';
 import type { RuntimeState } from './state.js';
+import type { MultiWorkerRoutingService } from './multi-worker/service.js';
 
 type Phase4GitCapabilityId = Exclude<Extract<CapabilityId, `git.${string}`>, 'git.local'>;
 type Phase4GitOperationCore = Phase4GitRequest & {
@@ -104,6 +107,7 @@ type CapabilityOperationCore =
 
 export type CapabilityOperation = CapabilityOperationCore & {
   readonly mission?: MissionExecutionAssociation | undefined;
+  readonly worker?: WorkerExecutionAssociation | undefined;
   readonly expectedEffects?: readonly string[] | undefined;
 };
 
@@ -132,6 +136,7 @@ export class CapabilityService {
   private validationCompatibilityAdapter: ValidationCompatibilityAdapter | undefined;
   private resources: VNextResourceRegistry | undefined;
   private jobs: DurableJobManager | undefined;
+  private multiWorker: MultiWorkerRoutingService | undefined;
 
   public constructor(
     private readonly state: RuntimeState,
@@ -141,9 +146,11 @@ export class CapabilityService {
     private readonly validationJobs: ProjectValidationJobManager = new ProjectValidationJobManager(),
     resources?: VNextResourceRegistry,
     jobs?: DurableJobManager,
+    multiWorker?: MultiWorkerRoutingService,
   ) {
     this.resources = resources;
     this.jobs = jobs;
+    this.multiWorker = multiWorker;
   }
 
   public permissionSnapshot() {
@@ -245,10 +252,7 @@ export class CapabilityService {
       throw new RuntimeError('CAPABILITY_DENIED', 'Originating-session approval is available only for CHATGPT-orchestrated mission actions');
     }
 
-    const session = this.state.getSessionForClient(input.sessionId, input.clientId);
-    if (session.agentRole !== 'owner') {
-      throw new RuntimeError('CONTROL_DENIED', 'Only the authenticated originating owner session can resolve this approval');
-    }
+    this.state.getSessionForClient(input.sessionId, input.clientId);
     if (pending.view.clientId !== input.clientId || pending.view.sessionId !== input.sessionId) {
       throw new RuntimeError('CONTROL_DENIED', 'Pending approval belongs to a different client/session');
     }
@@ -338,7 +342,60 @@ export class CapabilityService {
     return this.executeAndAudit(pending.operation, approved);
   }
 
+  private async authorizeWorkerOperation(operation: CapabilityOperation): Promise<void> {
+    if (operation.worker === undefined) return;
+    if (this.multiWorker === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Multi-worker execution authority is not available in this runtime');
+    if (!workerExecutableCapability(operation.capabilityId)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker capability is not enabled for native multi-worker execution');
+    }
+    if (!('clientId' in operation) || typeof operation.clientId !== 'string'
+      || !('sessionId' in operation) || typeof operation.sessionId !== 'string'
+      || !('projectId' in operation) || typeof operation.projectId !== 'string') {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker capability requires explicit client/session/project identity');
+    }
+    if (operation.mission !== undefined && operation.mission.missionId !== operation.worker.missionId) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker and Mission execution identities disagree');
+    }
+
+    const workspaceId = 'workspaceId' in operation && typeof operation.workspaceId === 'string'
+      ? operation.workspaceId
+      : undefined;
+    await this.multiWorker.authorizeExecution({
+      association: operation.worker,
+      sessionId: operation.sessionId,
+      projectId: operation.projectId,
+      ...(workspaceId === undefined ? {} : { workspaceId }),
+      capabilityId: operation.capabilityId,
+      runtimeFence: this.workerRuntimeFence(),
+      request: workerCapabilityRequest(operation),
+    });
+  }
+
+  private workerRuntimeFence(): WorkerRuntimeFence {
+    const health = this.health();
+    const full = health.tunnelBindings?.find((entry) => entry.connectorProfile === 'FULL');
+    if (health.identityState !== 'COHERENT'
+      || typeof health.machineId !== 'string'
+      || full === undefined
+      || full.machineId !== health.machineId
+      || full.runtimeId !== health.runtimeId
+      || !Number.isSafeInteger(full.deploymentEpoch)
+      || full.deploymentEpoch <= 0
+      || !/^sha256:[a-f0-9]{64}$/.test(full.catalogHash)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker execution requires coherent FULL runtime/catalog identity');
+    }
+    return {
+      machineId: health.machineId,
+      runtimeId: health.runtimeId,
+      instanceId: health.instanceId,
+      deploymentEpoch: full.deploymentEpoch,
+      connectorProfile: 'FULL',
+      catalogHash: full.catalogHash,
+    };
+  }
+
   private async evaluateOperation(operation: CapabilityOperation): Promise<PermissionDecisionRecord> {
+    await this.authorizeWorkerOperation(operation);
     const request = requestForOperation(operation);
     if (isPhase4GitOperation(operation)) {
       if (operation.capabilityId !== phase4GitCapabilityId(operation.operation)) {
@@ -464,8 +521,8 @@ export class CapabilityService {
     const view: PendingApprovalView = {
       ...record,
       id: randomUUID(),
-      exactAction: describeOperation(operation),
-      canAlwaysAllowProject: record.projectId !== null && definition?.riskClass === 'MODERATE' && definition.requiredScope === 'PROJECT',
+      exactAction: `${describeOperation(operation)}${describeWorkerAssociation(operation)}`,
+      canAlwaysAllowProject: operation.worker === undefined && record.projectId !== null && definition?.riskClass === 'MODERATE' && definition.requiredScope === 'PROJECT',
     };
     this.pending.set(view.id, { view, operation, expiresAt: Date.now() + APPROVAL_TTL_MS });
     return view;
@@ -477,6 +534,7 @@ export class CapabilityService {
   }
 
   private async executeAndAudit(operation: CapabilityOperation, decision: PermissionDecisionRecord): Promise<CapabilityOutcome> {
+    await this.authorizeWorkerOperation(operation);
     const association = operation.mission;
     if (association !== undefined) await this.state.markMissionActionStarted(association);
     let value: unknown;
@@ -913,15 +971,54 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
   } else {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId, targetPath: operation.targetPath };
   }
-  return operation.mission === undefined ? request : { ...request, missionId: operation.mission.missionId, taskId: operation.mission.taskId, actionId: operation.mission.actionId };
+  const missionBound = operation.mission === undefined
+    ? request
+    : { ...request, missionId: operation.mission.missionId, taskId: operation.mission.taskId, actionId: operation.mission.actionId };
+  return operation.worker === undefined ? missionBound : {
+    ...missionBound,
+    missionId: operation.worker.missionId,
+    orchestrationRunId: operation.worker.orchestrationRunId,
+    workerTaskId: operation.worker.workerTaskId,
+    workerId: operation.worker.workerId,
+    assignmentId: operation.worker.assignmentId,
+    authorityDigest: operation.worker.authorityDigest,
+  };
+}
+
+function workerExecutableCapability(capabilityId: CapabilityId): boolean {
+  return capabilityId === 'project.search'
+    || capabilityId === 'fs.list'
+    || capabilityId === 'fs.stat'
+    || capabilityId === 'fs.read'
+    || capabilityId === 'fs.hash'
+    || capabilityId === 'fs.find';
+}
+
+function workerCapabilityRequest(operation: CapabilityOperation): {
+  readonly paths?: readonly string[];
+  readonly processProfile?: string | null;
+} {
+  if (operation.capabilityId === 'fs.find') return { paths: [operation.root] };
+  if (operation.capabilityId === 'fs.list'
+    || operation.capabilityId === 'fs.stat'
+    || operation.capabilityId === 'fs.read'
+    || operation.capabilityId === 'fs.hash') {
+    return { paths: [operation.path] };
+  }
+  return {};
 }
 
 function isMissionExecutableOperation(operation: CapabilityOperation): operation is CapabilityOperation & { readonly clientId: string; readonly sessionId: string; readonly mission: MissionExecutionAssociation } {
-  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'git.local' || operation.capabilityId === 'git.push' || operation.capabilityId === 'remote.publish' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete' || operation.capabilityId === 'file.edit' || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
+  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'shell.run' || operation.capabilityId === 'shell.start' || operation.capabilityId === 'git.local' || operation.capabilityId === 'git.push' || operation.capabilityId === 'remote.publish' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete' || operation.capabilityId === 'file.edit' || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
 }
 
-function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'project.command.run' | 'project.validation.start' | 'git.local' | 'git.push' | 'remote.publish' | 'file.read' | 'file.write' | 'file.edit' | 'file.delete' | 'directory.create' | 'directory.delete' {
-  return capabilityId === 'project.test.run' || capabilityId === 'project.command.run' || capabilityId === 'project.validation.start' || capabilityId === 'git.local' || capabilityId === 'git.push' || capabilityId === 'remote.publish' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete' || capabilityId === 'file.edit' || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
+function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'project.command.run' | 'project.validation.start' | 'shell.run' | 'shell.start' | 'git.local' | 'git.push' | 'remote.publish' | 'file.read' | 'file.write' | 'file.edit' | 'file.delete' | 'directory.create' | 'directory.delete' {
+  return capabilityId === 'project.test.run' || capabilityId === 'project.command.run' || capabilityId === 'project.validation.start' || capabilityId === 'shell.run' || capabilityId === 'shell.start' || capabilityId === 'git.local' || capabilityId === 'git.push' || capabilityId === 'remote.publish' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete' || capabilityId === 'file.edit' || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
+}
+
+function describeWorkerAssociation(operation: CapabilityOperation): string {
+  if (operation.worker === undefined) return '';
+  return ` workerRun=${operation.worker.orchestrationRunId} workerTask=${operation.worker.workerTaskId} worker=${operation.worker.workerId} assignment=${operation.worker.assignmentId} authorityDigest=${operation.worker.authorityDigest}`;
 }
 
 function describeOperation(operation: CapabilityOperation): string {

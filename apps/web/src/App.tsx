@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
 import { V21MissionLifecyclePanel, type V21MissionLifecycle } from './mission-control-v21.js';
+import { MultiWorkerObservabilityPanel, type MultiWorkerObservability } from './multi-worker-observability.js';
 
 type Health = {
   status: string;
@@ -90,6 +91,7 @@ type Mission = {
   timeline: Array<{ id: string; timestamp: string; kind: string; taskId: string | null; actionId: string | null; message: string }>;
   broker: MissionBroker | null;
   lifecycle?: V21MissionLifecycle | null;
+  multiWorker?: MultiWorkerObservability | null;
 };
 type PermissionMode = 'ASK_EVERY_TIME' | 'AUTO_APPROVE_LOW_RISK' | 'AUTO_APPROVE_PROJECT_SCOPED' | 'FULL_LOCAL_OWNER';
 type RiskClass = 'LOW' | 'MODERATE' | 'HIGH' | 'SYSTEM';
@@ -110,6 +112,9 @@ type AuditEvent = {
   result: string;
 };
 export type PendingApproval = Omit<AuditEvent, 'result'> & {
+  missionId?: string | null;
+  taskId?: string | null;
+  actionId?: string | null;
   exactAction: string;
   canAlwaysAllowProject: boolean;
 };
@@ -635,6 +640,10 @@ function MissionControl(props: {
             onResume={() => props.onRequestLifecycleAction?.(mission, 'resume')}
             onCancel={() => props.onRequestLifecycleAction?.(mission, 'cancel')}
           />
+          <MultiWorkerObservabilityPanel
+            observability={mission.multiWorker ?? null}
+            missionTitle={mission.title}
+          />
           <div className="mission-tasks">{mission.tasks.map((task) => <article key={task.id}>
             <header><strong>{task.title}</strong><span>{task.state}</span></header>
             {task.actions.length === 0 ? <p>No governed actions prepared.</p> : <ul>{task.actions.map((action) => <li key={action.id}>
@@ -668,7 +677,7 @@ function PermissionsPage(props: { permissions: PermissionSnapshot | null; onRequ
 
 function ApprovalCenter(props: { approvals: PendingApproval[]; selectedSession: Session | null; onReview(approval: PendingApproval): void }): ReactElement {
   return <>
-    <div className="page-heading"><div><p className="eyebrow">Owner decisions</p><h1>Approval Center</h1><p>{props.selectedSession === null ? 'Showing machine or browser-client decisions that are not tied to another session.' : 'Showing decisions for the current session plus machine-level decisions for this browser client.'}</p></div></div>
+    <div className="page-heading"><div><p className="eyebrow">Owner decisions</p><h1>Approval Center</h1><p>{props.selectedSession === null ? 'Showing machine, browser-client, and mission-bound owner decisions available to this authenticated owner.' : 'Showing decisions for the current session plus machine, browser-client, and mission-bound owner decisions.'}</p></div></div>
     <section>{props.approvals.length === 0 ? <p>No pending owner decisions in this session context.</p> : <div className="approval-list">{props.approvals.map((approval) => <article key={approval.id} className="approval-row">
       <div><strong>{humanCapability(approval.capabilityId)}</strong><span className={`risk risk-${approval.riskClass.toLowerCase()}`}>{approval.riskClass}</span><p>{approval.reason}</p><code>{approval.target ?? 'No filesystem target'}</code></div>
       <button onClick={() => props.onReview(approval)}>Review exact action</button>
@@ -728,6 +737,8 @@ export function approvalBelongsToSessionContext(
   clientId: string,
   selectedSessionId: string | null,
 ): boolean {
+  const missionBound = approval.missionId != null && approval.taskId != null && approval.actionId != null;
+  if (missionBound) return true;
   if (approval.sessionId !== null) {
     return selectedSessionId !== null
       && approval.sessionId === selectedSessionId
