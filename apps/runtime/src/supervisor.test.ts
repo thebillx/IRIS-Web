@@ -999,7 +999,7 @@ setInterval(() => undefined, 1000);
     const candidateRoot = await alternateCatalogSource(fakeRoot);
     const candidateCatalogPath = path.join(candidateRoot, 'apps', 'runtime', 'src', 'mcp-catalog.ts');
     const candidateCatalog = await readFile(candidateCatalogPath, 'utf8');
-    const currentVersion = "export const MCP_CATALOG_VERSION = '2.5.0' as const;";
+    const currentVersion = "export const MCP_CATALOG_VERSION = '2.6.0' as const;";
     if (!candidateCatalog.includes(currentVersion)) throw new Error('candidate catalog version marker not found');
     await writeFile(candidateCatalogPath, candidateCatalog.replace(
       currentVersion,
@@ -1533,9 +1533,22 @@ async function alternateCatalogSource(fakeRoot: string): Promise<string> {
   const domainRoot = path.join(alternateRoot, 'packages', 'domain');
   await mkdir(path.dirname(domainRoot), { recursive: true });
   await cp(path.join(sourceRoot, 'packages', 'domain'), domainRoot, { recursive: true });
+
+  const adoRoot = path.join(alternateRoot, 'packages', 'ado');
+  await mkdir(adoRoot, { recursive: true });
+  await cp(path.join(sourceRoot, 'packages', 'ado', 'package.json'), path.join(adoRoot, 'package.json'));
+  await cp(path.join(sourceRoot, 'packages', 'ado', 'src'), path.join(adoRoot, 'src'), { recursive: true });
+  const adoNodeModules = path.join(adoRoot, 'node_modules');
+  await mkdir(adoNodeModules, { recursive: true });
+  const parse5Source = await realpath(path.join(sourceRoot, 'packages', 'ado', 'node_modules', 'parse5'));
+  await cp(parse5Source, path.join(adoNodeModules, 'parse5'), { recursive: true });
+  const entitiesSource = await realpath(path.join(path.dirname(parse5Source), 'entities'));
+  await cp(entitiesSource, path.join(adoNodeModules, 'entities'), { recursive: true });
+
   const runtimeScope = path.join(runtimeNodeModules, '@iris');
   await mkdir(runtimeScope, { recursive: true });
   await symlink(domainRoot, path.join(runtimeScope, 'domain'), 'dir');
+  await symlink(adoRoot, path.join(runtimeScope, 'ado'), 'dir');
 
   const alternateWeb = path.join(alternateRoot, 'apps', 'web');
   const viteBin = path.join(alternateWeb, 'node_modules', '.bin');
@@ -1588,9 +1601,9 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
 
 async function initializeActivationIdentityRepo(root: string): Promise<void> {
   const run = promisify(execFile);
-  await writeFile(path.join(root, '.gitignore'), 'apps/runtime/node_modules/\napps/web/node_modules/\npackages/domain/node_modules/\n');
+  await writeFile(path.join(root, '.gitignore'), 'apps/runtime/node_modules/\napps/web/node_modules/\npackages/domain/node_modules/\npackages/ado/node_modules/\n');
   await run('git', ['init', '-b', 'r4-fixture'], { cwd: root, encoding: 'utf8', timeout: 10_000 });
-  await run('git', ['add', '--', '.gitignore', 'apps/runtime/src', 'apps/runtime/package.json', 'apps/runtime/macos-safety-helper.py', 'apps/web/package.json', 'apps/web/fake-vite.cjs', 'packages/domain'], {
+  await run('git', ['add', '--', '.gitignore', 'apps/runtime/src', 'apps/runtime/package.json', 'apps/runtime/macos-safety-helper.py', 'apps/web/package.json', 'apps/web/fake-vite.cjs', 'packages/domain', 'packages/ado'], {
     cwd: root, encoding: 'utf8', timeout: 10_000,
   });
   await run('git', [

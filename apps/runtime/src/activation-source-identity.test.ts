@@ -40,6 +40,12 @@ describe('activation source identity workload closure', () => {
     await expect(inspectActivationSourceIdentity(root)).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
+  it('rejects an untracked workspace-ADO source file used by the runtime', async () => {
+    const root = await fixture();
+    await writeFile(path.join(root, 'packages', 'ado', 'src', 'injected.ts'), 'export const injected = true;\n');
+    await expect(inspectActivationSourceIdentity(root)).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+  });
+
   it('rejects a clean source candidate that is not hydrated for runtime startup', async () => {
     const root = await fixture();
     await expect(assertActivationWorkloadReady(root)).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
@@ -95,6 +101,21 @@ async function hydrateWorkload(root: string): Promise<void> {
     path.join(root, 'apps', 'runtime', 'node_modules', '@iris', 'domain'),
     'dir',
   );
+  await symlink(
+    path.join(root, 'packages', 'ado'),
+    path.join(root, 'apps', 'runtime', 'node_modules', '@iris', 'ado'),
+    'dir',
+  );
+  await mkdir(path.join(root, 'packages', 'ado', 'node_modules', 'parse5'), { recursive: true });
+  await writeFile(
+    path.join(root, 'packages', 'ado', 'node_modules', 'parse5', 'package.json'),
+    '{"name":"parse5","version":"8.0.1"}\n',
+  );
+  await mkdir(path.join(root, 'packages', 'ado', 'node_modules', 'entities'), { recursive: true });
+  await writeFile(
+    path.join(root, 'packages', 'ado', 'node_modules', 'entities', 'package.json'),
+    '{"name":"entities","version":"6.0.1"}\n',
+  );
   const webNodeModules = path.join(root, 'apps', 'web', 'node_modules');
   await mkdir(path.join(webNodeModules, '.bin'), { recursive: true });
   const vite = path.join(webNodeModules, '.bin', 'vite');
@@ -113,13 +134,16 @@ async function fixture(): Promise<string> {
   await mkdir(path.join(root, 'apps', 'runtime', 'src'), { recursive: true });
   await mkdir(path.join(root, 'apps', 'web', 'src'), { recursive: true });
   await mkdir(path.join(root, 'packages', 'domain', 'src'), { recursive: true });
-  await writeFile(path.join(root, '.gitignore'), 'apps/runtime/node_modules/\napps/web/node_modules/\n');
+  await mkdir(path.join(root, 'packages', 'ado', 'src'), { recursive: true });
+  await writeFile(path.join(root, '.gitignore'), 'apps/runtime/node_modules/\napps/web/node_modules/\npackages/ado/node_modules/\n');
   await writeFile(path.join(root, 'apps', 'runtime', 'src', 'main.ts'), 'export const runtime = true;\n');
   await writeFile(path.join(root, 'apps', 'web', 'src', 'App.tsx'), 'export const App = () => null;\n');
   await writeFile(path.join(root, 'packages', 'domain', 'package.json'), '{"name":"@iris/domain","exports":{".":"./src/index.ts"}}\n');
   await writeFile(path.join(root, 'packages', 'domain', 'src', 'index.ts'), 'export const domain = true;\n');
+  await writeFile(path.join(root, 'packages', 'ado', 'package.json'), '{"name":"@iris/ado","exports":{".":"./src/index.ts"}}\n');
+  await writeFile(path.join(root, 'packages', 'ado', 'src', 'index.ts'), 'export const ado = true;\n');
   await execFileAsync('git', ['init', '-b', 'fixture'], { cwd: root, encoding: 'utf8', timeout: 10_000 });
-  await execFileAsync('git', ['add', '--', '.gitignore', 'apps/runtime/src/main.ts', 'apps/web/src/App.tsx', 'packages/domain/package.json', 'packages/domain/src/index.ts'], {
+  await execFileAsync('git', ['add', '--', '.gitignore', 'apps/runtime/src/main.ts', 'apps/web/src/App.tsx', 'packages/domain/package.json', 'packages/domain/src/index.ts', 'packages/ado/package.json', 'packages/ado/src/index.ts'], {
     cwd: root, encoding: 'utf8', timeout: 10_000,
   });
   await execFileAsync('git', [
