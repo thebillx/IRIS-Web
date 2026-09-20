@@ -421,6 +421,28 @@ export interface WorkerResult {
   readonly createdAt: string;
 }
 
+export type WorkerReviewDecision =
+  | 'ACCEPT'
+  | 'RETRY'
+  | 'REASSIGN'
+  | 'SPLIT_TASK'
+  | 'REQUEST_MORE_EVIDENCE'
+  | 'CANCEL';
+
+export interface WorkerReview {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly taskId: string;
+  readonly workerId: string;
+  readonly resultId: string;
+  readonly decision: WorkerReviewDecision;
+  readonly instruction: string;
+  readonly requestedEvidence: readonly string[];
+  readonly reviewedByOrchestratorId: string;
+  readonly basedOnRunRevision: number;
+  readonly createdAt: string;
+}
+
 export interface RuntimeClientState {
   readonly clientId: string;
   readonly connected: boolean;

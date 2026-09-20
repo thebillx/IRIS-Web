@@ -525,3 +525,185 @@ describe('IRIS multi-worker M07 structured worker results', () => {
     expect((await f.service.getTask(f.task.id)).resultId).toBe(result.id);
   });
 });
+
+describe('IRIS multi-worker M08 Orchestrator review loop', () => {
+  async function reviewableResult() {
+    const f = await fixture();
+    const run = (await f.service.createRun({
+      expectedGeneration: 0,
+      missionId: f.mission.id,
+      parentOrchestratorId: f.session.agentId,
+    })).run;
+    const worker = await f.service.createWorker({
+      expectedGeneration: 1,
+      orchestrationRunId: run.id,
+      principalId: 'worker-review-1',
+      workerType: 'IRIS_LOGICAL',
+      role: 'RESEARCH',
+    });
+    const task = await f.service.createTask(taskInput(
+      2,
+      run.id,
+      f.mission.tasks[0]!.id,
+      f.workspace.workspaceId,
+      'worker-review-1',
+    ));
+    await f.service.assignTask({
+      expectedGeneration: 3,
+      orchestrationRunId: run.id,
+      taskId: task.id,
+      workerId: worker.id,
+      runtimeFence: f.runtimeFence,
+    });
+    await f.service.startTask({
+      expectedGeneration: 4,
+      orchestrationRunId: run.id,
+      taskId: task.id,
+      requestId: randomUUID(),
+    });
+    await f.service.completeTask({
+      expectedGeneration: 5,
+      orchestrationRunId: run.id,
+      taskId: task.id,
+    });
+    const result = await f.service.recordResult({
+      expectedGeneration: 6,
+      orchestrationRunId: run.id,
+      taskId: task.id,
+      workerId: worker.id,
+      status: 'SUCCEEDED',
+      summary: 'Review-ready result',
+      evidenceRefs: ['evidence:review-ready'],
+      artifactIds: [],
+      filesRead: ['apps/runtime/src/state.ts'],
+      filesChanged: [],
+      commandsExecuted: [],
+      validationResults: [{ name: 'review-ready', status: 'PASSED', summary: 'Ready for Orchestrator review' }],
+      risks: [],
+      blockers: [],
+      recommendedNextActions: ['Review result'],
+    });
+    return { ...f, run, worker, task, result };
+  }
+
+  it('accepts one successful result, finalizes only the orchestration run, and leaves the parent Mission untouched', async () => {
+    const f = await reviewableResult();
+    const before = await f.service.getRun(f.run.id);
+    expect(before.run.revision).toBe(7);
+
+    const review = await f.service.reviewResult({
+      expectedGeneration: 7,
+      orchestrationRunId: f.run.id,
+      resultId: f.result.id,
+      parentOrchestratorId: f.session.agentId,
+      basedOnRunRevision: before.run.revision,
+      decision: 'ACCEPT',
+      instruction: 'Accept the verified worker result',
+      requestedEvidence: [],
+    });
+
+    expect(review).toMatchObject({
+      resultId: f.result.id,
+      taskId: f.task.id,
+      workerId: f.worker.id,
+      decision: 'ACCEPT',
+      reviewedByOrchestratorId: f.session.agentId,
+      basedOnRunRevision: 7,
+    });
+    const final = await f.service.getRun(f.run.id);
+    expect(final.generation).toBe(8);
+    expect(final.run.state).toBe('SUCCEEDED');
+    expect(final.reviews).toEqual([review]);
+    expect(await f.service.getReview(review.id)).toEqual(review);
+    expect(await f.service.listReviews(f.run.id)).toEqual([review]);
+    expect((await f.state.getMission(f.mission.id)).state).not.toBe('COMPLETED');
+  });
+
+  it.each([
+    ['RETRY', []],
+    ['REASSIGN', []],
+    ['SPLIT_TASK', []],
+    ['REQUEST_MORE_EVIDENCE', ['Provide one additional validation receipt']],
+    ['CANCEL', []],
+  ] as const)('records %s as an explicit follow-up decision without mutating the completed worker task', async (decision, requestedEvidence) => {
+    const f = await reviewableResult();
+    const before = await f.service.getRun(f.run.id);
+    const review = await f.service.reviewResult({
+      expectedGeneration: 7,
+      orchestrationRunId: f.run.id,
+      resultId: f.result.id,
+      parentOrchestratorId: f.session.agentId,
+      basedOnRunRevision: before.run.revision,
+      decision,
+      instruction: `Review decision: ${decision}`,
+      requestedEvidence,
+    });
+
+    expect(review.decision).toBe(decision);
+    expect((await f.service.getRun(f.run.id)).run.state).toBe('WAITING');
+    expect((await f.service.getTask(f.task.id)).state).toBe('SUCCEEDED');
+    expect((await f.state.getMission(f.mission.id)).state).not.toBe('COMPLETED');
+  });
+
+  it('fails closed on foreign/stale Orchestrator review authority and duplicate result review', async () => {
+    const f = await reviewableResult();
+    const before = await f.service.getRun(f.run.id);
+
+    await expect(f.service.reviewResult({
+      expectedGeneration: 7,
+      orchestrationRunId: f.run.id,
+      resultId: f.result.id,
+      parentOrchestratorId: 'foreign-orchestrator',
+      basedOnRunRevision: before.run.revision,
+      decision: 'RETRY',
+      instruction: 'Retry',
+      requestedEvidence: [],
+    })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+
+    await expect(f.service.reviewResult({
+      expectedGeneration: 7,
+      orchestrationRunId: f.run.id,
+      resultId: f.result.id,
+      parentOrchestratorId: f.session.agentId,
+      basedOnRunRevision: before.run.revision - 1,
+      decision: 'RETRY',
+      instruction: 'Retry',
+      requestedEvidence: [],
+    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    await expect(f.service.reviewResult({
+      expectedGeneration: 7,
+      orchestrationRunId: f.run.id,
+      resultId: f.result.id,
+      parentOrchestratorId: f.session.agentId,
+      basedOnRunRevision: before.run.revision,
+      decision: 'REQUEST_MORE_EVIDENCE',
+      instruction: 'Need more evidence',
+      requestedEvidence: [],
+    })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+
+    const first = await f.service.reviewResult({
+      expectedGeneration: 7,
+      orchestrationRunId: f.run.id,
+      resultId: f.result.id,
+      parentOrchestratorId: f.session.agentId,
+      basedOnRunRevision: before.run.revision,
+      decision: 'RETRY',
+      instruction: 'Retry with the same bounded authority',
+      requestedEvidence: [],
+    });
+    expect(first.decision).toBe('RETRY');
+
+    await expect(f.service.reviewResult({
+      expectedGeneration: 8,
+      orchestrationRunId: f.run.id,
+      resultId: f.result.id,
+      parentOrchestratorId: f.session.agentId,
+      basedOnRunRevision: 8,
+      decision: 'REASSIGN',
+      instruction: 'Reassign',
+      requestedEvidence: [],
+    })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    expect((await f.store.read()).generation).toBe(8);
+  });
+});

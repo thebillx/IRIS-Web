@@ -3,6 +3,7 @@ import type {
   Worker,
   WorkerAssignment,
   WorkerResult,
+  WorkerReview,
   WorkerTask,
 } from '@iris/domain';
 
@@ -14,6 +15,7 @@ export interface MultiWorkerDocument {
   readonly tasks: readonly WorkerTask[];
   readonly assignments: readonly WorkerAssignment[];
   readonly results: readonly WorkerResult[];
+  readonly reviews: readonly WorkerReview[];
 }
 
 export function emptyMultiWorkerDocument(): MultiWorkerDocument {
@@ -25,6 +27,7 @@ export function emptyMultiWorkerDocument(): MultiWorkerDocument {
     tasks: [],
     assignments: [],
     results: [],
+    reviews: [],
   };
 }
 

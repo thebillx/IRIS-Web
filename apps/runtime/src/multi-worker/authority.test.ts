@@ -132,6 +132,7 @@ function fixture() {
     tasks: [task],
     assignments: [assignment],
     results: [],
+    reviews: [],
   };
   const claims: WorkerAuthorityClaims = {
     missionId,

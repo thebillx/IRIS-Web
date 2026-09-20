@@ -9,6 +9,7 @@ import type {
   Worker,
   WorkerAssignment,
   WorkerResult,
+  WorkerReview,
   WorkerTask,
   WorkerTaskAuthorityMetadata,
   WorkspaceId,
@@ -146,6 +147,7 @@ function fixture(generation = 1): MultiWorkerDocument {
     tasks: [task],
     assignments: [assignment],
     results: [result],
+    reviews: [],
   };
 }
 
@@ -184,6 +186,36 @@ describe('IRIS multi-worker M02 domain and persistence', () => {
       tasks: Array<{ authority: { projectId: string } }>;
     };
     document.tasks[0]!.authority.projectId = randomUUID();
+    expect(() => validateMultiWorkerDocument(document)).toThrowError(expect.objectContaining({ code: 'PERSISTENCE_FAILURE' }));
+  });
+
+  it('rejects forged or stale persisted Orchestrator review bindings', () => {
+    const document = structuredClone(fixture()) as unknown as {
+      runs: Array<OrchestrationRun>;
+      reviews: WorkerReview[];
+    };
+    const run = document.runs[0]!;
+    document.runs[0] = { ...run, revision: 2 };
+    const base: WorkerReview = {
+      id: randomUUID(),
+      orchestrationRunId: run.id,
+      taskId: run.taskIds[0]!,
+      workerId: run.workerIds[0]!,
+      resultId: run.resultIds[0]!,
+      decision: 'ACCEPT',
+      instruction: 'Accept the reviewed result',
+      requestedEvidence: [],
+      reviewedByOrchestratorId: run.parentOrchestratorId,
+      basedOnRunRevision: 1,
+      createdAt: '2026-09-20T01:11:00.000Z',
+    };
+    document.reviews = [base];
+    expect(validateMultiWorkerDocument(document).reviews).toHaveLength(1);
+
+    document.reviews = [{ ...base, reviewedByOrchestratorId: 'foreign-orchestrator' }];
+    expect(() => validateMultiWorkerDocument(document)).toThrowError(expect.objectContaining({ code: 'PERSISTENCE_FAILURE' }));
+
+    document.reviews = [{ ...base, reviewedByOrchestratorId: run.parentOrchestratorId, basedOnRunRevision: 2 }];
     expect(() => validateMultiWorkerDocument(document)).toThrowError(expect.objectContaining({ code: 'PERSISTENCE_FAILURE' }));
   });
 

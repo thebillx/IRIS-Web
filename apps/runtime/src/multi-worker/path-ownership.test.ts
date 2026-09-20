@@ -70,6 +70,7 @@ function document(owner: WorkerTask, releasedAt: string | null = null): MultiWor
     tasks: [owner],
     assignments: [assignment],
     results: [],
+    reviews: [],
   };
 }
 

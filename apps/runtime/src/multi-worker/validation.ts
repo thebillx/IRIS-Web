@@ -4,6 +4,7 @@ import {
   type Worker,
   type WorkerAssignment,
   type WorkerResult,
+  type WorkerReview,
   type WorkerRuntimeFence,
   type WorkerTask,
   type WorkerTaskAuthorityMetadata,
@@ -16,18 +17,20 @@ const MAX_WORKERS = 1_000;
 const MAX_TASKS = 2_000;
 const MAX_ASSIGNMENTS = 2_000;
 const MAX_RESULTS = 2_000;
+const MAX_REVIEWS = 2_000;
 const MAX_LIST = 128;
 
 export function validateMultiWorkerDocument(value: unknown): MultiWorkerDocument {
   if (!isRecord(value)
-    || !exactKeys(value, ['schemaVersion', 'generation', 'runs', 'workers', 'tasks', 'assignments', 'results'])
+    || !exactKeys(value, ['schemaVersion', 'generation', 'runs', 'workers', 'tasks', 'assignments', 'results', 'reviews'])
     || value.schemaVersion !== 1
     || !nonNegativeInteger(value.generation)
     || !boundedArray(value.runs, MAX_RUNS)
     || !boundedArray(value.workers, MAX_WORKERS)
     || !boundedArray(value.tasks, MAX_TASKS)
     || !boundedArray(value.assignments, MAX_ASSIGNMENTS)
-    || !boundedArray(value.results, MAX_RESULTS)) {
+    || !boundedArray(value.results, MAX_RESULTS)
+    || !boundedArray(value.reviews, MAX_REVIEWS)) {
     persistenceFailure('Multi-worker orchestration state is invalid');
   }
 
@@ -36,12 +39,14 @@ export function validateMultiWorkerDocument(value: unknown): MultiWorkerDocument
   const tasks = value.tasks as unknown[];
   const assignments = value.assignments as unknown[];
   const results = value.results as unknown[];
+  const reviews = value.reviews as unknown[];
 
   if (!runs.every(isRun)
     || !workers.every(isWorker)
     || !tasks.every(isTask)
     || !assignments.every(isAssignment)
-    || !results.every(isResult)) {
+    || !results.every(isResult)
+    || !reviews.every(isReview)) {
     persistenceFailure('Multi-worker orchestration record is invalid');
   }
 
@@ -50,12 +55,15 @@ export function validateMultiWorkerDocument(value: unknown): MultiWorkerDocument
   const typedTasks = tasks as WorkerTask[];
   const typedAssignments = assignments as WorkerAssignment[];
   const typedResults = results as WorkerResult[];
+  const typedReviews = reviews as WorkerReview[];
 
   ensureUnique(typedRuns.map((entry) => entry.id), 'run');
   ensureUnique(typedWorkers.map((entry) => entry.id), 'worker');
   ensureUnique(typedTasks.map((entry) => entry.id), 'task');
   ensureUnique(typedAssignments.map((entry) => entry.id), 'assignment');
   ensureUnique(typedResults.map((entry) => entry.id), 'result');
+  ensureUnique(typedReviews.map((entry) => entry.id), 'review');
+  ensureUnique(typedReviews.map((entry) => entry.resultId), 'review result');
 
   const runById = new Map(typedRuns.map((entry) => [entry.id, entry]));
   const workerById = new Map(typedWorkers.map((entry) => [entry.id, entry]));
@@ -126,6 +134,24 @@ export function validateMultiWorkerDocument(value: unknown): MultiWorkerDocument
     }
   }
 
+  for (const review of typedReviews) {
+    const run = runById.get(review.orchestrationRunId);
+    const task = taskById.get(review.taskId);
+    const worker = workerById.get(review.workerId);
+    const result = resultById.get(review.resultId);
+    if (run === undefined || task === undefined || worker === undefined || result === undefined
+      || task.orchestrationRunId !== run.id
+      || worker.orchestrationRunId !== run.id
+      || result.orchestrationRunId !== run.id
+      || result.taskId !== task.id
+      || result.workerId !== worker.id
+      || task.resultId !== result.id
+      || review.reviewedByOrchestratorId !== run.parentOrchestratorId
+      || review.basedOnRunRevision >= run.revision) {
+      persistenceFailure('Worker review binding is invalid');
+    }
+  }
+
   for (const run of typedRuns) {
     assertExactMembership(run.taskIds, typedTasks.filter((entry) => entry.orchestrationRunId === run.id).map((entry) => entry.id), 'run task');
     assertExactMembership(run.workerIds, typedWorkers.filter((entry) => entry.orchestrationRunId === run.id).map((entry) => entry.id), 'run worker');
@@ -143,6 +169,11 @@ export function validateWorkerTaskAuthority(value: WorkerTaskAuthorityMetadata):
 
 export function validateWorkerResult(value: WorkerResult): WorkerResult {
   if (!isResult(value)) throw new RuntimeError('INVALID_REQUEST', 'Worker result is invalid or exceeds bounded limits');
+  return value;
+}
+
+export function validateWorkerReview(value: WorkerReview): WorkerReview {
+  if (!isReview(value)) throw new RuntimeError('INVALID_REQUEST', 'Worker review is invalid or exceeds bounded limits');
   return value;
 }
 
@@ -231,6 +262,22 @@ function isResult(value: unknown): value is WorkerResult {
     && boundedStringList(value.blockers, 2_000)
     && boundedStringList(value.recommendedNextActions, 2_000)
     && timestamp(value.createdAt);
+}
+
+function isReview(value: unknown): value is WorkerReview {
+  if (!isRecord(value)
+    || !exactKeys(value, ['id', 'orchestrationRunId', 'taskId', 'workerId', 'resultId', 'decision', 'instruction', 'requestedEvidence', 'reviewedByOrchestratorId', 'basedOnRunRevision', 'createdAt'])
+    || !uuid(value.id) || !uuid(value.orchestrationRunId) || !uuid(value.taskId) || !uuid(value.workerId) || !uuid(value.resultId)
+    || !['ACCEPT', 'RETRY', 'REASSIGN', 'SPLIT_TASK', 'REQUEST_MORE_EVIDENCE', 'CANCEL'].includes(String(value.decision))
+    || !bounded(value.instruction, 4_000)
+    || !boundedStringList(value.requestedEvidence, 2_000)
+    || !bounded(value.reviewedByOrchestratorId, 200)
+    || !positiveInteger(value.basedOnRunRevision)
+    || !timestamp(value.createdAt)) return false;
+
+  const requestedEvidence = value.requestedEvidence as string[];
+  if (value.decision === 'REQUEST_MORE_EVIDENCE') return requestedEvidence.length > 0;
+  return requestedEvidence.length === 0;
 }
 
 function isAuthority(value: unknown): value is WorkerTaskAuthorityMetadata {

@@ -7,6 +7,7 @@ import {
   type Worker,
   type WorkerAssignment,
   type WorkerResult,
+  type WorkerReview,
   type WorkerRuntimeFence,
   type WorkerTask,
   type WorkerTaskAuthorityMetadata,
@@ -23,7 +24,7 @@ import { deriveWorkerAuthorityDigest, workerPathAllowed } from './authority.js';
 import type { MultiWorkerDocument } from './model.js';
 import { assertMutablePathOwnershipAvailable } from './path-ownership.js';
 import { MultiWorkerStore } from './store.js';
-import { validateMultiWorkerDocument, validateWorkerResult, validateWorkerTaskAuthority } from './validation.js';
+import { validateMultiWorkerDocument, validateWorkerResult, validateWorkerReview, validateWorkerTaskAuthority } from './validation.js';
 
 export interface CreateOrchestrationRunInput {
   readonly expectedGeneration: number;
@@ -102,6 +103,17 @@ export interface RecordWorkerResultInput {
   readonly recommendedNextActions: readonly string[];
 }
 
+export interface ReviewWorkerResultInput {
+  readonly expectedGeneration: number;
+  readonly orchestrationRunId: string;
+  readonly resultId: string;
+  readonly parentOrchestratorId: string;
+  readonly basedOnRunRevision: number;
+  readonly decision: WorkerReview['decision'];
+  readonly instruction: string;
+  readonly requestedEvidence: readonly string[];
+}
+
 export interface MultiWorkerRunView {
   readonly generation: number;
   readonly run: OrchestrationRun;
@@ -109,6 +121,7 @@ export interface MultiWorkerRunView {
   readonly tasks: readonly WorkerTask[];
   readonly assignments: readonly WorkerAssignment[];
   readonly results: readonly WorkerResult[];
+  readonly reviews: readonly WorkerReview[];
 }
 
 export class MultiWorkerRoutingService {
@@ -150,6 +163,14 @@ export class MultiWorkerRoutingService {
     return document.results.filter((entry) => entry.orchestrationRunId === orchestrationRunId);
   }
 
+  public async listReviews(orchestrationRunIdInput?: string): Promise<readonly WorkerReview[]> {
+    const document = await this.store.read();
+    if (orchestrationRunIdInput === undefined) return document.reviews;
+    const orchestrationRunId = requireUuid(orchestrationRunIdInput, 'orchestrationRunId');
+    requiredRun(document, orchestrationRunId);
+    return document.reviews.filter((entry) => entry.orchestrationRunId === orchestrationRunId);
+  }
+
   public async getRun(orchestrationRunIdInput: string): Promise<MultiWorkerRunView> {
     const orchestrationRunId = requireUuid(orchestrationRunIdInput, 'orchestrationRunId');
     const document = await this.store.read();
@@ -176,6 +197,13 @@ export class MultiWorkerRoutingService {
     const result = (await this.store.read()).results.find((entry) => entry.id === resultId);
     if (result === undefined) throw new RuntimeError('INVALID_REQUEST', 'Worker result was not found');
     return result;
+  }
+
+  public async getReview(reviewIdInput: string): Promise<WorkerReview> {
+    const reviewId = requireUuid(reviewIdInput, 'reviewId');
+    const review = (await this.store.read()).reviews.find((entry) => entry.id === reviewId);
+    if (review === undefined) throw new RuntimeError('INVALID_REQUEST', 'Worker review was not found');
+    return review;
   }
 
   public createRun(input: CreateOrchestrationRunInput): Promise<MultiWorkerRunView> {
@@ -571,6 +599,75 @@ export class MultiWorkerRoutingService {
     });
   }
 
+  public reviewResult(input: ReviewWorkerResultInput): Promise<WorkerReview> {
+    const runId = requireUuid(input.orchestrationRunId, 'orchestrationRunId');
+    const resultId = requireUuid(input.resultId, 'resultId');
+    const parentOrchestratorId = bounded(input.parentOrchestratorId, 'parentOrchestratorId', 200);
+    if (!Number.isSafeInteger(input.basedOnRunRevision) || input.basedOnRunRevision <= 0) {
+      throw new RuntimeError('INVALID_REQUEST', 'basedOnRunRevision must be a positive integer');
+    }
+    return this.mutate(input.expectedGeneration, async (document) => {
+      const run = requiredActiveRun(document, runId);
+      if (run.parentOrchestratorId !== parentOrchestratorId) {
+        throw new RuntimeError('CONTROL_DENIED', 'Worker result review is not owned by the parent Orchestrator');
+      }
+      if (run.revision !== input.basedOnRunRevision) {
+        throw new RuntimeError('PRECONDITION_FAILED', 'Worker result review is based on a stale orchestration run revision');
+      }
+      const result = requiredResult(document, resultId);
+      if (result.orchestrationRunId !== run.id) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Worker result does not belong to the selected orchestration run');
+      }
+      if (document.reviews.some((entry) => entry.resultId === result.id)) {
+        throw new RuntimeError('INVALID_REQUEST', 'Worker result already has an Orchestrator review');
+      }
+      const task = requiredTask(document, result.taskId);
+      const worker = requiredWorker(document, result.workerId);
+      if (task.resultId !== result.id
+        || task.orchestrationRunId !== run.id
+        || worker.orchestrationRunId !== run.id
+        || !['SUCCEEDED', 'FAILED', 'CANCELLED', 'BLOCKED'].includes(task.state)) {
+        throw new RuntimeError('CONTROL_DENIED', 'Worker result review target is not a terminal bound task/result');
+      }
+      if (input.decision === 'ACCEPT' && result.status !== 'SUCCEEDED') {
+        throw new RuntimeError('INVALID_REQUEST', 'Only a successful worker result can be accepted');
+      }
+
+      const now = this.now();
+      const review = validateWorkerReview({
+        id: randomUUID(),
+        orchestrationRunId: run.id,
+        taskId: task.id,
+        workerId: worker.id,
+        resultId: result.id,
+        decision: input.decision,
+        instruction: input.instruction,
+        requestedEvidence: [...input.requestedEvidence],
+        reviewedByOrchestratorId: run.parentOrchestratorId,
+        basedOnRunRevision: run.revision,
+        createdAt: now,
+      });
+      const reviews = [...document.reviews, review];
+      const runTasks = document.tasks.filter((entry) => entry.orchestrationRunId === run.id);
+      const allAccepted = runTasks.length > 0 && runTasks.every((entry) =>
+        entry.state === 'SUCCEEDED'
+        && entry.resultId !== null
+        && reviews.some((candidate) => candidate.resultId === entry.resultId && candidate.decision === 'ACCEPT'));
+      const nextState: OrchestrationRun['state'] = input.decision === 'ACCEPT'
+        ? (allAccepted ? 'SUCCEEDED' : 'REVIEWING')
+        : 'WAITING';
+      const updatedRun = touchRun(run, now, { state: nextState });
+      return {
+        document: {
+          ...document,
+          runs: replaceById(document.runs, updatedRun),
+          reviews,
+        },
+        value: (next: MultiWorkerDocument) => requiredReview(next, review.id),
+      };
+    });
+  }
+
   private finishTask(input: TransitionWorkerTaskInput, state: 'SUCCEEDED' | 'FAILED'): Promise<WorkerTask> {
     const runId = requireUuid(input.orchestrationRunId, 'orchestrationRunId');
     const taskId = requireUuid(input.taskId, 'taskId');
@@ -669,6 +766,7 @@ function view(document: MultiWorkerDocument, run: OrchestrationRun): MultiWorker
     tasks: document.tasks.filter((entry) => entry.orchestrationRunId === run.id),
     assignments: document.assignments.filter((entry) => entry.orchestrationRunId === run.id),
     results: document.results.filter((entry) => entry.orchestrationRunId === run.id),
+    reviews: document.reviews.filter((entry) => entry.orchestrationRunId === run.id),
   };
 }
 
@@ -712,6 +810,12 @@ function requiredResult(document: MultiWorkerDocument, resultId: string): Worker
   const result = document.results.find((entry) => entry.id === resultId);
   if (result === undefined) throw new RuntimeError('INVALID_REQUEST', 'Worker result was not found');
   return result;
+}
+
+function requiredReview(document: MultiWorkerDocument, reviewId: string): WorkerReview {
+  const review = document.reviews.find((entry) => entry.id === reviewId);
+  if (review === undefined) throw new RuntimeError('INVALID_REQUEST', 'Worker review was not found');
+  return review;
 }
 
 function touchRun(
