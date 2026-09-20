@@ -65,6 +65,10 @@ export async function assertActivationWorkloadReady(root: string): Promise<void>
   }
   await verifyRuntimeDependency(physicalRoot, 'apps/runtime/node_modules/@iris/domain/package.json');
   await verifyRuntimeDependency(physicalRoot, 'apps/runtime/node_modules/@iris/domain/src/index.ts');
+  await verifyRuntimeDependency(physicalRoot, 'apps/runtime/node_modules/@iris/ado/package.json');
+  await verifyRuntimeDependency(physicalRoot, 'apps/runtime/node_modules/@iris/ado/src/index.ts');
+  await verifyRuntimeDependency(physicalRoot, 'packages/ado/node_modules/parse5/package.json');
+  await verifyRuntimePackageDependency(physicalRoot, 'packages/ado/node_modules/parse5', 'entities');
   await verifyRuntimeDependency(physicalRoot, 'apps/web/node_modules/.bin/vite', true);
   await verifyRuntimeDependency(physicalRoot, 'apps/web/node_modules/vite/package.json');
   await verifyRuntimeDependency(physicalRoot, 'apps/web/node_modules/@vitejs/plugin-react/package.json');
@@ -78,28 +82,66 @@ async function verifyRuntimeDependency(root: string, relative: string, executabl
   const physical = await realpath(lexical).catch((error: unknown) => {
     throw new RuntimeError('PRECONDITION_FAILED', `Activation candidate is not runtime-ready: missing ${relative}`, { cause: error });
   });
+  await verifyPhysicalRuntimeDependency(root, physical, relative, executable);
+}
+
+async function verifyRuntimePackageDependency(
+  root: string,
+  packageRelative: string,
+  dependencyName: string,
+): Promise<void> {
+  const lexicalPackage = path.resolve(root, packageRelative);
+  if (!pathIsWithin(root, lexicalPackage)) {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Activation runtime package dependency escapes candidate root');
+  }
+  const physicalPackage = await realpath(lexicalPackage).catch((error: unknown) => {
+    throw new RuntimeError('PRECONDITION_FAILED', `Activation candidate is not runtime-ready: missing ${packageRelative}`, { cause: error });
+  });
+  if (!pathIsWithin(root, physicalPackage)) {
+    throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime package resolves outside candidate root: ${packageRelative}`);
+  }
+  // pnpm places a package's dependencies beside its physical package root in the
+  // virtual store. npm-style layouts resolve through the same sibling shape.
+  const dependency = path.join(path.dirname(physicalPackage), dependencyName, 'package.json');
+  const physicalDependency = await realpath(dependency).catch((error: unknown) => {
+    throw new RuntimeError(
+      'PRECONDITION_FAILED',
+      `Activation candidate is not runtime-ready: missing dependency ${dependencyName} for ${packageRelative}`,
+      { cause: error },
+    );
+  });
+  await verifyPhysicalRuntimeDependency(root, physicalDependency, `${packageRelative} -> ${dependencyName}/package.json`);
+}
+
+async function verifyPhysicalRuntimeDependency(
+  root: string,
+  physical: string,
+  label: string,
+  executable = false,
+): Promise<void> {
   if (!pathIsWithin(root, physical)) {
-    throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency resolves outside candidate root: ${relative}`);
+    throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency resolves outside candidate root: ${label}`);
   }
   const metadata = await lstat(physical).catch((error: unknown) => {
-    throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency metadata is unavailable: ${relative}`, { cause: error });
+    throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency metadata is unavailable: ${label}`, { cause: error });
   });
-  if (!metadata.isFile()) throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency is not a regular file: ${relative}`);
+  if (!metadata.isFile()) throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency is not a regular file: ${label}`);
   if (executable) {
     await access(physical, fsConstants.X_OK).catch((error: unknown) => {
-      throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency is not executable: ${relative}`, { cause: error });
+      throw new RuntimeError('PRECONDITION_FAILED', `Activation runtime dependency is not executable: ${label}`, { cause: error });
     });
   }
 }
 
 async function assertNoUntrackedWorkloadSource(root: string): Promise<void> {
   const untracked = splitNul(await boundedGit(root, [
-    'ls-files', '--others', '--exclude-standard', '-z', '--', 'apps/runtime', 'apps/web', 'packages/domain',
+    'ls-files', '--others', '--exclude-standard', '-z', '--',
+    'apps/runtime', 'apps/web', 'packages/domain', 'packages/ado',
   ]));
   if (untracked.length > 0) {
     throw new RuntimeError(
       'PRECONDITION_FAILED',
-      'Candidate workload source contains untracked files under apps/runtime, apps/web, or packages/domain',
+      'Candidate workload source contains untracked files under apps/runtime, apps/web, packages/domain, or packages/ado',
     );
   }
 }

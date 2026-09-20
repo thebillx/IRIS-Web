@@ -14,12 +14,12 @@ import {
   PHASE8_V230_CATALOG_FIXTURE,
 } from './phase8-catalog-v230-fixture.js';
 
-const ADDITIVE_TOOLS = ['owner_approval_resolve', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git', 'code_review'] as const;
+const ADDITIVE_TOOLS = ['ado_discovery', 'ado_workitem_read', 'ado_hierarchy_read', 'ado_context_search', 'owner_approval_resolve', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git', 'code_review'] as const;
 
 describe('Phase 8 two-version catalog compatibility', () => {
-  it('AC-IRIS-005 + AC-COMPAT-004 preserves the exact 42-tool 2.3.0 legacy schemas in the 2.5.0 catalog', () => {
+  it('AC-IRIS-005 + AC-COMPAT-004 preserves the exact 42-tool 2.3.0 legacy schemas in the 2.6.0 catalog', () => {
     expect(PHASE8_V230_CATALOG_FIXTURE.catalogVersion).toBe('2.3.0');
-    expect(MCP_CATALOG_VERSION).toBe('2.5.0');
+    expect(MCP_CATALOG_VERSION).toBe('2.6.0');
     expect(MCP_SCHEMA_VERSION).toBe(PHASE8_V230_CATALOG_FIXTURE.schemaVersion);
 
     const fullDefinitions = fullMcpToolDefinitionsV21();
@@ -40,7 +40,7 @@ describe('Phase 8 two-version catalog compatibility', () => {
     expect(digest(payload)).toBe(PHASE8_V230_CATALOG_FIXTURE.legacyCompatibilityHash);
 
     const fullNames = catalogToolNames('FULL');
-    expect(fullNames).toHaveLength(50);
+    expect(fullNames).toHaveLength(54);
     expect(fullNames.filter((name) => additive.has(name))).toEqual(ADDITIVE_TOOLS);
     expect(legacyEntries.every((entry) => entry.availability === 'ACTIVE')).toBe(true);
     expect(legacyEntries.every((entry) => !('deprecationVersion' in entry) && !('removalVersion' in entry))).toBe(true);

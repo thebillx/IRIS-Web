@@ -26,6 +26,7 @@ import { DurableJobManager } from './durable-job-manager.js';
 import { MultiWorkerStore } from './multi-worker/store.js';
 import { MultiWorkerRoutingService } from './multi-worker/service.js';
 import { recoverMultiWorkerRuns } from './multi-worker/recovery.js';
+import { AdoRequirementContextService } from './ado/runtime-context.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -151,6 +152,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       resourceRegistry,
       durableJobs,
       multiWorker,
+      new AdoRequirementContextService(dataRoot),
     );
 
     const doctor = async (): Promise<DoctorReport> => {
