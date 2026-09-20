@@ -97,6 +97,7 @@ export interface WorkerStatusReceipt {
 
 export interface WorkerAdapter {
   readonly workerType: string;
+  planStart(input: { readonly operationId: string; readonly missionId: string; readonly projectId: string; readonly goal: string }): WorkerStartReceipt;
   start(input: { readonly operationId: string; readonly missionId: string; readonly projectId: string; readonly goal: string }): Promise<WorkerStartReceipt>;
   checkpoint(input: { readonly operationId: string; readonly missionId: string; readonly projectId: string; readonly binding: WorkerBinding }): Promise<WorkerCheckpointReceipt>;
   resume(input: { readonly operationId: string; readonly missionId: string; readonly projectId: string; readonly binding: WorkerBinding; readonly checkpoint: DurableMissionCheckpoint; readonly directive: DurableSupervisorDirective }): Promise<WorkerStartReceipt>;

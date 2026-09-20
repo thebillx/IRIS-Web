@@ -110,16 +110,17 @@ describe('IRIS multi-worker M04 routing', () => {
     });
     expect(running.state).toBe('RUNNING');
     expect((await f.service.getWorker(worker.id)).adapterWorkerId).toMatch(/^logical-/);
+    expect((await f.store.read()).generation).toBe(6);
 
     const completed = await f.service.completeTask({
-      expectedGeneration: 5,
+      expectedGeneration: 6,
       orchestrationRunId: runView.run.id,
       taskId: task.id,
     });
     expect(completed.state).toBe('SUCCEEDED');
 
     const final = await f.service.getRun(runView.run.id);
-    expect(final.generation).toBe(6);
+    expect(final.generation).toBe(7);
     expect(final.run.state).toBe('REVIEWING');
     expect(final.tasks[0]?.state).toBe('SUCCEEDED');
     expect(final.workers[0]?.state).toBe('SUCCEEDED');
@@ -268,7 +269,7 @@ describe('IRIS multi-worker M04 routing', () => {
       taskId: task.id,
       requestId: randomUUID(),
     });
-    const cancelled = await f.service.cancelRun({ expectedGeneration: 5, orchestrationRunId: run.id });
+    const cancelled = await f.service.cancelRun({ expectedGeneration: 6, orchestrationRunId: run.id });
     expect(cancelled.run.state).toBe('CANCELLED');
     expect(cancelled.tasks[0]?.state).toBe('CANCELLED');
     expect(cancelled.workers[0]?.state).toBe('CANCELLED');
@@ -405,7 +406,7 @@ describe('IRIS multi-worker M07 structured worker results', () => {
       requestId: randomUUID(),
     });
     await f.service.completeTask({
-      expectedGeneration: 5,
+      expectedGeneration: 6,
       orchestrationRunId: run.id,
       taskId: task.id,
     });
@@ -415,7 +416,7 @@ describe('IRIS multi-worker M07 structured worker results', () => {
   it('persists a bounded structured result and links it to run/task/worker without completing the parent Mission', async () => {
     const f = await completedReadOnlyTask();
     const result = await f.service.recordResult({
-      expectedGeneration: 6,
+      expectedGeneration: 7,
       orchestrationRunId: f.run.id,
       taskId: f.task.id,
       workerId: f.worker.id,
@@ -439,7 +440,7 @@ describe('IRIS multi-worker M07 structured worker results', () => {
       filesRead: ['apps/runtime/src/state.ts'],
     });
     const final = await f.service.getRun(f.run.id);
-    expect(final.generation).toBe(7);
+    expect(final.generation).toBe(8);
     expect(final.run.resultIds).toEqual([result.id]);
     expect(final.tasks[0]?.resultId).toBe(result.id);
     expect(final.results).toEqual([result]);
@@ -451,7 +452,7 @@ describe('IRIS multi-worker M07 structured worker results', () => {
   it('rejects result path escalation and status mismatch without publishing a generation', async () => {
     const f = await completedReadOnlyTask();
     const base = {
-      expectedGeneration: 6,
+      expectedGeneration: 7,
       orchestrationRunId: f.run.id,
       taskId: f.task.id,
       workerId: f.worker.id,
@@ -486,13 +487,13 @@ describe('IRIS multi-worker M07 structured worker results', () => {
       filesChanged: ['apps/runtime/src/state.ts'],
     })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
 
-    expect((await f.store.read()).generation).toBe(6);
+    expect((await f.store.read()).generation).toBe(7);
   });
 
   it('rejects invented artifact references and duplicate result publication', async () => {
     const f = await completedReadOnlyTask();
     const input = {
-      expectedGeneration: 6,
+      expectedGeneration: 7,
       orchestrationRunId: f.run.id,
       taskId: f.task.id,
       workerId: f.worker.id,
@@ -513,15 +514,15 @@ describe('IRIS multi-worker M07 structured worker results', () => {
       ...input,
       artifactIds: [randomUUID()],
     })).rejects.toMatchObject({ code: 'ARTIFACT_NOT_FOUND' });
-    expect((await f.store.read()).generation).toBe(6);
+    expect((await f.store.read()).generation).toBe(7);
 
     const result = await f.service.recordResult(input);
     await expect(f.service.recordResult({
       ...input,
-      expectedGeneration: 7,
+      expectedGeneration: 8,
       summary: 'Second result',
     })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
-    expect((await f.store.read()).generation).toBe(7);
+    expect((await f.store.read()).generation).toBe(8);
     expect((await f.service.getTask(f.task.id)).resultId).toBe(result.id);
   });
 });
@@ -562,12 +563,12 @@ describe('IRIS multi-worker M08 Orchestrator review loop', () => {
       requestId: randomUUID(),
     });
     await f.service.completeTask({
-      expectedGeneration: 5,
+      expectedGeneration: 6,
       orchestrationRunId: run.id,
       taskId: task.id,
     });
     const result = await f.service.recordResult({
-      expectedGeneration: 6,
+      expectedGeneration: 7,
       orchestrationRunId: run.id,
       taskId: task.id,
       workerId: worker.id,
@@ -589,10 +590,10 @@ describe('IRIS multi-worker M08 Orchestrator review loop', () => {
   it('accepts one successful result, finalizes only the orchestration run, and leaves the parent Mission untouched', async () => {
     const f = await reviewableResult();
     const before = await f.service.getRun(f.run.id);
-    expect(before.run.revision).toBe(7);
+    expect(before.run.revision).toBe(8);
 
     const review = await f.service.reviewResult({
-      expectedGeneration: 7,
+      expectedGeneration: 8,
       orchestrationRunId: f.run.id,
       resultId: f.result.id,
       parentOrchestratorId: f.session.agentId,
@@ -608,10 +609,10 @@ describe('IRIS multi-worker M08 Orchestrator review loop', () => {
       workerId: f.worker.id,
       decision: 'ACCEPT',
       reviewedByOrchestratorId: f.session.agentId,
-      basedOnRunRevision: 7,
+      basedOnRunRevision: 8,
     });
     const final = await f.service.getRun(f.run.id);
-    expect(final.generation).toBe(8);
+    expect(final.generation).toBe(9);
     expect(final.run.state).toBe('SUCCEEDED');
     expect(final.reviews).toEqual([review]);
     expect(await f.service.getReview(review.id)).toEqual(review);
@@ -629,7 +630,7 @@ describe('IRIS multi-worker M08 Orchestrator review loop', () => {
     const f = await reviewableResult();
     const before = await f.service.getRun(f.run.id);
     const review = await f.service.reviewResult({
-      expectedGeneration: 7,
+      expectedGeneration: 8,
       orchestrationRunId: f.run.id,
       resultId: f.result.id,
       parentOrchestratorId: f.session.agentId,
@@ -650,7 +651,7 @@ describe('IRIS multi-worker M08 Orchestrator review loop', () => {
     const before = await f.service.getRun(f.run.id);
 
     await expect(f.service.reviewResult({
-      expectedGeneration: 7,
+      expectedGeneration: 8,
       orchestrationRunId: f.run.id,
       resultId: f.result.id,
       parentOrchestratorId: 'foreign-orchestrator',
@@ -661,7 +662,7 @@ describe('IRIS multi-worker M08 Orchestrator review loop', () => {
     })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
 
     await expect(f.service.reviewResult({
-      expectedGeneration: 7,
+      expectedGeneration: 8,
       orchestrationRunId: f.run.id,
       resultId: f.result.id,
       parentOrchestratorId: f.session.agentId,
@@ -672,7 +673,7 @@ describe('IRIS multi-worker M08 Orchestrator review loop', () => {
     })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
 
     await expect(f.service.reviewResult({
-      expectedGeneration: 7,
+      expectedGeneration: 8,
       orchestrationRunId: f.run.id,
       resultId: f.result.id,
       parentOrchestratorId: f.session.agentId,
@@ -683,7 +684,7 @@ describe('IRIS multi-worker M08 Orchestrator review loop', () => {
     })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
 
     const first = await f.service.reviewResult({
-      expectedGeneration: 7,
+      expectedGeneration: 8,
       orchestrationRunId: f.run.id,
       resultId: f.result.id,
       parentOrchestratorId: f.session.agentId,
@@ -695,15 +696,15 @@ describe('IRIS multi-worker M08 Orchestrator review loop', () => {
     expect(first.decision).toBe('RETRY');
 
     await expect(f.service.reviewResult({
-      expectedGeneration: 8,
+      expectedGeneration: 9,
       orchestrationRunId: f.run.id,
       resultId: f.result.id,
       parentOrchestratorId: f.session.agentId,
-      basedOnRunRevision: 8,
+      basedOnRunRevision: 9,
       decision: 'REASSIGN',
       instruction: 'Reassign',
       requestedEvidence: [],
     })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
-    expect((await f.store.read()).generation).toBe(8);
+    expect((await f.store.read()).generation).toBe(9);
   });
 });

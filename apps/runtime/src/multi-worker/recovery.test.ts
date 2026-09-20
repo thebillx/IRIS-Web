@@ -27,14 +27,21 @@ class RecoveryAdapter implements WorkerAdapter {
   public statuses = 0;
   public statusState: WorkerStatusReceipt['state'] = 'RUNNING';
   public throwStatus = false;
+  public throwAfterStart = false;
 
-  public async start(input: Parameters<WorkerAdapter['start']>[0]): Promise<WorkerStartReceipt> {
-    this.starts += 1;
+  public planStart(input: Parameters<WorkerAdapter['planStart']>[0]): WorkerStartReceipt {
     return {
       workerId: `logical-${input.operationId}`,
       resumeToken: input.operationId,
       resumable: true,
     };
+  }
+
+  public async start(input: Parameters<WorkerAdapter['start']>[0]): Promise<WorkerStartReceipt> {
+    this.starts += 1;
+    const receipt = this.planStart(input);
+    if (this.throwAfterStart) throw new Error('START_RESULT_LOST_AFTER_SIDE_EFFECT');
+    return receipt;
   }
 
   public async checkpoint(input: Parameters<WorkerAdapter['checkpoint']>[0]): Promise<WorkerCheckpointReceipt> {
@@ -63,7 +70,7 @@ class RecoveryAdapter implements WorkerAdapter {
   }
 }
 
-async function fixture() {
+async function fixture(startWorker = true) {
   const sourceRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-mw-m09-source-'));
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-mw-m09-data-'));
   roots.push(sourceRoot, dataRoot);
@@ -135,12 +142,14 @@ async function fixture() {
     workerId: worker.id,
     runtimeFence,
   });
-  await service.startTask({
-    expectedGeneration: 4,
-    orchestrationRunId: run.id,
-    taskId: task.id,
-    requestId: randomUUID(),
-  });
+  if (startWorker) {
+    await service.startTask({
+      expectedGeneration: 4,
+      orchestrationRunId: run.id,
+      taskId: task.id,
+      requestId: randomUUID(),
+    });
+  }
 
   return { dataRoot, state, project, session, mission, resources, workspace, store, adapter, registry, service, run, worker, task };
 }
@@ -162,11 +171,52 @@ describe('IRIS multi-worker M09 durable worker recovery', () => {
     expect(recovered.replayedWorkerStarts).toBe(0);
     expect(f.adapter.starts).toBe(1);
     expect(f.adapter.statuses).toBe(1);
-    expect(recovered.document.generation).toBe(6);
+    expect(recovered.document.generation).toBe(7);
     expect(recovered.document.tasks[0]?.state).toBe('RUNNING');
     expect(recovered.document.workers[0]?.state).toBe('RUNNING');
     expect(recovered.document.runs[0]?.state).toBe('RUNNING');
     expect(recovered.recoveredRunningWorkerIds).toEqual([f.worker.id]);
+  });
+
+  it('recovers a durably planned STARTING worker without replaying worker start', async () => {
+    const f = await fixture(false);
+    const requestId = randomUUID();
+    f.adapter.throwAfterStart = true;
+
+    await expect(f.service.startTask({
+      expectedGeneration: 4,
+      orchestrationRunId: f.run.id,
+      taskId: f.task.id,
+      requestId,
+    })).rejects.toMatchObject({ code: 'AGENT_EXECUTION_FAILED' });
+
+    const starting = await f.store.read();
+    expect(starting.generation).toBe(5);
+    expect(starting.tasks[0]?.state).toBe('STARTING');
+    expect(starting.workers[0]).toMatchObject({
+      state: 'STARTING',
+      adapterWorkerId: `logical-${requestId}`,
+      resumeToken: requestId,
+      resumable: true,
+    });
+    expect(f.adapter.starts).toBe(1);
+
+    f.adapter.throwAfterStart = false;
+    f.adapter.statusState = 'RUNNING';
+    const recovered = await recoverMultiWorkerRuns(
+      f.state,
+      f.resources,
+      f.store,
+      f.registry,
+      () => '2026-09-20T01:30:00.000Z',
+    );
+
+    expect(recovered.replayedWorkerStarts).toBe(0);
+    expect(f.adapter.starts).toBe(1);
+    expect(f.adapter.statuses).toBe(1);
+    expect(recovered.document.generation).toBe(6);
+    expect(recovered.document.tasks[0]?.state).toBe('RUNNING');
+    expect(recovered.document.workers[0]?.state).toBe('RUNNING');
   });
 
   it('moves resumable or unknown workers to WAITING without releasing their assignment authority', async () => {

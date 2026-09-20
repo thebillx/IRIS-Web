@@ -20,7 +20,7 @@ import {
   WorkerAdapterRegistry,
   normalizeWorkerStartReceipt,
 } from '../durable-mission-workers.js';
-import type { WorkerBinding } from '../durable-mission-lifecycle.js';
+import type { WorkerBinding, WorkerStartReceipt } from '../durable-mission-lifecycle.js';
 import {
   authorizeWorkerCapability,
   deriveWorkerAuthorityDigest,
@@ -475,50 +475,133 @@ export class MultiWorkerRoutingService {
   }
 
   public startTask(input: StartWorkerTaskInput): Promise<WorkerTask> {
+    const expectedGeneration = requireGeneration(input.expectedGeneration);
     const runId = requireUuid(input.orchestrationRunId, 'orchestrationRunId');
     const taskId = requireUuid(input.taskId, 'taskId');
     const requestId = requireUuid(input.requestId, 'requestId');
-    return this.mutate(input.expectedGeneration, async (document) => {
-      const run = requiredActiveRun(document, runId);
-      const task = requiredTask(document, taskId);
-      const assignment = task.assignmentId === null ? null : document.assignments.find((entry) => entry.id === task.assignmentId) ?? null;
+
+    const execute = async (): Promise<WorkerTask> => {
+      const current = await this.store.read();
+      if (current.generation !== expectedGeneration) {
+        throw new RuntimeError('PRECONDITION_FAILED', 'Multi-worker orchestration generation is stale');
+      }
+
+      const run = requiredActiveRun(current, runId);
+      const task = requiredTask(current, taskId);
+      const assignment = task.assignmentId === null ? null : current.assignments.find((entry) => entry.id === task.assignmentId) ?? null;
       if (task.orchestrationRunId !== run.id || task.state !== 'ASSIGNED' || assignment === null || assignment.releasedAt !== null) {
         throw new RuntimeError('INVALID_REQUEST', 'Worker task is not ready to start');
       }
-      const worker = requiredWorker(document, assignment.workerId);
+      const worker = requiredWorker(current, assignment.workerId);
       if (worker.state !== 'ASSIGNED' || worker.workerType !== 'IRIS_LOGICAL') {
         throw new RuntimeError('CAPABILITY_DENIED', 'M04 starts only the bounded IRIS_LOGICAL worker adapter');
       }
-      if (!task.dependencyTaskIds.every((dependencyId) => requiredTask(document, dependencyId).state === 'SUCCEEDED')) {
+      if (!task.dependencyTaskIds.every((dependencyId) => requiredTask(current, dependencyId).state === 'SUCCEEDED')) {
         throw new RuntimeError('CONTROL_DENIED', 'Worker task dependencies are not complete');
       }
-      const receipt = normalizeWorkerStartReceipt(await this.workers.get(worker.workerType).start({
+
+      const adapter = this.workers.get(worker.workerType);
+      const startInput = {
         operationId: requestId,
         missionId: task.missionId,
         projectId: run.projectId,
         goal: task.title,
-      }));
-      const now = this.now();
-      const updatedTask: WorkerTask = { ...task, state: 'RUNNING', updatedAt: now };
-      const updatedWorker: Worker = {
+      };
+      const planned = normalizeWorkerStartReceipt(adapter.planStart(startInput));
+      const startingAt = this.now();
+      const startingTask: WorkerTask = { ...task, state: 'STARTING', updatedAt: startingAt };
+      const startingWorker: Worker = {
         ...worker,
-        state: 'RUNNING',
-        adapterWorkerId: receipt.workerId,
-        resumeToken: receipt.resumeToken,
-        resumable: receipt.resumable,
-        updatedAt: now,
+        state: 'STARTING',
+        adapterWorkerId: planned.workerId,
+        resumeToken: planned.resumeToken,
+        resumable: planned.resumable,
+        updatedAt: startingAt,
       };
-      const updatedRun = touchRun(run, now, { state: 'RUNNING' });
-      return {
-        document: {
-          ...document,
-          runs: replaceById(document.runs, updatedRun),
-          workers: replaceById(document.workers, updatedWorker),
-          tasks: replaceById(document.tasks, updatedTask),
-        },
-        value: (next: MultiWorkerDocument) => requiredTask(next, task.id),
+      const startingRun = touchRun(run, startingAt, { state: 'RUNNING' });
+      const starting = validateMultiWorkerDocument({
+        ...current,
+        generation: current.generation + 1,
+        runs: replaceById(current.runs, startingRun),
+        workers: replaceById(current.workers, startingWorker),
+        tasks: replaceById(current.tasks, startingTask),
+      });
+      await this.store.write(starting, current.generation);
+
+      let receipt: WorkerStartReceipt;
+      try {
+        receipt = normalizeWorkerStartReceipt(await adapter.start(startInput));
+      } catch (error) {
+        throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Worker start failed after durable STARTING publication', { cause: error });
+      }
+
+      if (!sameWorkerStartReceipt(planned, receipt)) {
+        const actualBinding: WorkerBinding = {
+          workerType: worker.workerType,
+          workerId: receipt.workerId,
+          resumeToken: receipt.resumeToken,
+          missionId: task.missionId,
+          projectId: run.projectId,
+          createdAt: worker.createdAt,
+          lastSeenAt: startingAt,
+          resumable: receipt.resumable,
+        };
+        await adapter.cancel({
+          operationId: randomUUID(),
+          missionId: task.missionId,
+          projectId: run.projectId,
+          binding: actualBinding,
+        }).catch(() => undefined);
+        throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Worker start receipt does not match the durable planned binding');
+      }
+
+      const latest = await this.store.read();
+      if (latest.generation !== starting.generation) {
+        throw new RuntimeError('PRECONDITION_FAILED', 'Multi-worker orchestration changed before worker start finalization');
+      }
+      const latestRun = requiredActiveRun(latest, runId);
+      const latestTask = requiredTask(latest, taskId);
+      const latestAssignment = latestTask.assignmentId === null
+        ? null
+        : latest.assignments.find((entry) => entry.id === latestTask.assignmentId) ?? null;
+      const latestWorker = latestAssignment === null
+        ? null
+        : latest.workers.find((entry) => entry.id === latestAssignment.workerId) ?? null;
+      if (latestTask.state !== 'STARTING'
+        || latestAssignment === null
+        || latestAssignment.releasedAt !== null
+        || latestWorker === null
+        || latestWorker.state !== 'STARTING'
+        || latestWorker.adapterWorkerId === null) {
+        throw new RuntimeError('PERSISTENCE_FAILURE', 'Durable worker STARTING state changed before finalization');
+      }
+      const persisted: WorkerStartReceipt = {
+        workerId: latestWorker.adapterWorkerId,
+        resumeToken: latestWorker.resumeToken,
+        resumable: latestWorker.resumable,
       };
-    });
+      if (!sameWorkerStartReceipt(planned, persisted)) {
+        throw new RuntimeError('PERSISTENCE_FAILURE', 'Durable planned worker binding changed before finalization');
+      }
+
+      const runningAt = this.now();
+      const runningTask: WorkerTask = { ...latestTask, state: 'RUNNING', updatedAt: runningAt };
+      const runningWorker: Worker = { ...latestWorker, state: 'RUNNING', updatedAt: runningAt };
+      const runningRun = touchRun(latestRun, runningAt, { state: 'RUNNING' });
+      const running = validateMultiWorkerDocument({
+        ...latest,
+        generation: latest.generation + 1,
+        runs: replaceById(latest.runs, runningRun),
+        workers: replaceById(latest.workers, runningWorker),
+        tasks: replaceById(latest.tasks, runningTask),
+      });
+      await this.store.write(running, latest.generation);
+      return requiredTask(running, taskId);
+    };
+
+    const result = this.mutationTail.then(execute, execute);
+    this.mutationTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   public completeTask(input: TransitionWorkerTaskInput): Promise<WorkerTask> {
@@ -887,6 +970,12 @@ function touchRun(
   changes: Partial<Pick<OrchestrationRun, 'state' | 'taskIds' | 'workerIds' | 'assignmentIds' | 'resultIds'>>,
 ): OrchestrationRun {
   return { ...run, ...changes, revision: run.revision + 1, updatedAt: now };
+}
+
+function sameWorkerStartReceipt(left: WorkerStartReceipt, right: WorkerStartReceipt): boolean {
+  return left.workerId === right.workerId
+    && left.resumeToken === right.resumeToken
+    && left.resumable === right.resumable;
 }
 
 function replaceById<T extends { readonly id: string }>(items: readonly T[], replacement: T): T[] {

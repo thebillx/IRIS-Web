@@ -43,7 +43,7 @@ function task(
     state,
     dependencyTaskIds: dependencies,
     authority,
-    assignmentId: state === 'ASSIGNED' || state === 'RUNNING' ? randomUUID() : null,
+    assignmentId: state === 'ASSIGNED' || state === 'STARTING' || state === 'RUNNING' ? randomUUID() : null,
     resultId: state === 'SUCCEEDED' ? randomUUID() : null,
     createdAt,
     updatedAt: createdAt,
@@ -76,6 +76,16 @@ describe('IRIS multi-worker M05 DAG scheduler', () => {
     const c = task(runId, 'ASSIGNED', [], randomUUID(), '2026-09-20T01:00:02.000Z');
 
     expect(planWorkerTaskSchedule([a, b, c], 2).readyTaskIds).toEqual([b.id, c.id]);
+  });
+
+  it('counts STARTING tasks against concurrency without requeueing them', () => {
+    const runId = randomUUID();
+    const starting = task(runId, 'STARTING', [], randomUUID(), '2026-09-20T01:00:00.000Z');
+    const ready = task(runId, 'ASSIGNED', [], randomUUID(), '2026-09-20T01:00:01.000Z');
+
+    const plan = planWorkerTaskSchedule([starting, ready], 1);
+    expect(plan.runningTaskIds).toEqual([starting.id]);
+    expect(plan.readyTaskIds).toEqual([]);
   });
 
   it('supports a fan-out/fan-in DAG A → (B,C) → D', () => {

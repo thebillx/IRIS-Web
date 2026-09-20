@@ -27,7 +27,7 @@ export function findMutablePathConflicts(
     const ownerTask = document.tasks.find((task) => task.id === assignment.taskId);
     if (ownerTask === undefined) throw new RuntimeError('PERSISTENCE_FAILURE', 'Active path owner task is missing');
     if (ownerTask.authority.workspaceId !== candidateTask.authority.workspaceId
-      || !['ASSIGNED', 'RUNNING', 'WAITING'].includes(ownerTask.state)) continue;
+      || !['ASSIGNED', 'STARTING', 'RUNNING', 'WAITING'].includes(ownerTask.state)) continue;
 
     for (const candidateGrant of candidateTask.authority.mutablePaths) {
       for (const ownerGrant of ownerTask.authority.mutablePaths) {

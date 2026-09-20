@@ -300,9 +300,9 @@ export interface MissionBrokerSnapshot {
   readonly updatedAt: string;
 }
 
-export type WorkerTaskState = 'PENDING' | 'ASSIGNED' | 'RUNNING' | 'WAITING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
+export type WorkerTaskState = 'PENDING' | 'ASSIGNED' | 'STARTING' | 'RUNNING' | 'WAITING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
 export type OrchestrationRunState = 'PLANNING' | 'RUNNING' | 'WAITING' | 'REVIEWING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED';
-export type WorkerState = 'IDLE' | 'ASSIGNED' | 'RUNNING' | 'WAITING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
+export type WorkerState = 'IDLE' | 'ASSIGNED' | 'STARTING' | 'RUNNING' | 'WAITING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
 
 export interface WorkerResourceBudget {
   readonly maxRuntimeMs: number;

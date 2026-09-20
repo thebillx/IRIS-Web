@@ -249,7 +249,7 @@ function cancelRunState(
 }
 
 function isRecoverableTask(task: WorkerTask): boolean {
-  return task.state === 'ASSIGNED' || task.state === 'RUNNING' || task.state === 'WAITING';
+  return task.state === 'ASSIGNED' || task.state === 'STARTING' || task.state === 'RUNNING' || task.state === 'WAITING';
 }
 
 function isTerminalTask(state: WorkerTask['state']): boolean {

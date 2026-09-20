@@ -54,7 +54,7 @@ export function planWorkerTaskSchedule(
   if (runIds.size !== 1) throw new RuntimeError('INVALID_REQUEST', 'Worker scheduler requires exactly one orchestration run');
   const orchestrationRunId = tasks[0]!.orchestrationRunId;
   const byId = new Map(tasks.map((task) => [task.id, task]));
-  const running = tasks.filter((task) => task.state === 'RUNNING').sort(taskOrder);
+  const running = tasks.filter((task) => task.state === 'STARTING' || task.state === 'RUNNING').sort(taskOrder);
   const capacity = Math.max(0, maxConcurrency - running.length);
   const blocked: WorkerTask[] = [];
   const waiting: WorkerTask[] = [];
@@ -73,7 +73,7 @@ export function planWorkerTaskSchedule(
       blocked.push(task);
       continue;
     }
-    if (task.state === 'RUNNING') continue;
+    if (task.state === 'STARTING' || task.state === 'RUNNING') continue;
     if (!dependencies.every((dependency) => dependency.state === 'SUCCEEDED')) {
       waiting.push(task);
       continue;
@@ -104,7 +104,7 @@ export function propagateDependencyBlocks(tasksInput: readonly WorkerTask[]): re
     changed = false;
     const byId = new Map(tasks.map((task) => [task.id, task]));
     tasks = tasks.map((task) => {
-      if (isTerminal(task.state) || task.state === 'RUNNING') return task;
+      if (isTerminal(task.state) || task.state === 'STARTING' || task.state === 'RUNNING') return task;
       const dependencies = task.dependencyTaskIds.map((id) => byId.get(id)!);
       if (dependencies.some((dependency) => dependency.state === 'FAILED'
         || dependency.state === 'CANCELLED'
