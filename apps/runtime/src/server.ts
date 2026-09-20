@@ -7,6 +7,7 @@ import type { CapabilityOutcome, CapabilityService, OwnerApprovalChoice } from '
 import type { RuntimeState } from './state.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import type { DurableMissionLifecycleService } from './durable-mission-service.js';
+import type { MultiWorkerRoutingService } from './multi-worker/service.js';
 import { handleV21OwnerRoute } from './server-v21-routes.js';
 import { handleHermesMcpRequest } from './hermes-mcp.js';
 import type { McpCatalogRuntimeContext } from './mcp-catalog.js';
@@ -30,6 +31,7 @@ export interface RuntimeServerContext {
   readonly capabilities: CapabilityService;
   readonly missionBroker: MissionBrokerService;
   readonly missionLifecycle?: DurableMissionLifecycleService;
+  readonly multiWorker?: MultiWorkerRoutingService;
   readonly health: () => RuntimeHealth;
   readonly doctor: () => Promise<DoctorReport>;
   readonly isShuttingDown: () => boolean;
@@ -260,6 +262,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
         ...mission,
         broker: brokerByMission.get(mission.id) ?? null,
         lifecycle: lifecycleByMission.get(mission.id) ?? null,
+        multiWorker: context.multiWorker === undefined ? null : await context.multiWorker.observabilityForMission(mission.id),
         orchestratorHandoff: await context.missionBroker.orchestratorHandoffStatus(mission.id),
       }))),
     });

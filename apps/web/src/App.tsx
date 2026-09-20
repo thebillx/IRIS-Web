@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
 import { V21MissionLifecyclePanel, type V21MissionLifecycle } from './mission-control-v21.js';
+import { MultiWorkerObservabilityPanel, type MultiWorkerObservability } from './multi-worker-observability.js';
 
 type Health = {
   status: string;
@@ -90,6 +91,7 @@ type Mission = {
   timeline: Array<{ id: string; timestamp: string; kind: string; taskId: string | null; actionId: string | null; message: string }>;
   broker: MissionBroker | null;
   lifecycle?: V21MissionLifecycle | null;
+  multiWorker?: MultiWorkerObservability | null;
 };
 type PermissionMode = 'ASK_EVERY_TIME' | 'AUTO_APPROVE_LOW_RISK' | 'AUTO_APPROVE_PROJECT_SCOPED' | 'FULL_LOCAL_OWNER';
 type RiskClass = 'LOW' | 'MODERATE' | 'HIGH' | 'SYSTEM';
@@ -634,6 +636,10 @@ function MissionControl(props: {
             missionTitle={mission.title}
             onResume={() => props.onRequestLifecycleAction?.(mission, 'resume')}
             onCancel={() => props.onRequestLifecycleAction?.(mission, 'cancel')}
+          />
+          <MultiWorkerObservabilityPanel
+            observability={mission.multiWorker ?? null}
+            missionTitle={mission.title}
           />
           <div className="mission-tasks">{mission.tasks.map((task) => <article key={task.id}>
             <header><strong>{task.title}</strong><span>{task.state}</span></header>

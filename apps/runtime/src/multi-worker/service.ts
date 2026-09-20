@@ -22,6 +22,7 @@ import {
 import type { WorkerBinding } from '../durable-mission-lifecycle.js';
 import { deriveWorkerAuthorityDigest, workerPathAllowed } from './authority.js';
 import type { MultiWorkerDocument } from './model.js';
+import { projectMultiWorkerObservability, type MultiWorkerObservabilityTree } from './observability.js';
 import { assertMutablePathOwnershipAvailable } from './path-ownership.js';
 import { MultiWorkerStore } from './store.js';
 import { validateMultiWorkerDocument, validateWorkerResult, validateWorkerReview, validateWorkerTaskAuthority } from './validation.js';
@@ -169,6 +170,14 @@ export class MultiWorkerRoutingService {
     const orchestrationRunId = requireUuid(orchestrationRunIdInput, 'orchestrationRunId');
     requiredRun(document, orchestrationRunId);
     return document.reviews.filter((entry) => entry.orchestrationRunId === orchestrationRunId);
+  }
+
+  public async observabilityForMission(missionIdInput: string): Promise<MultiWorkerObservabilityTree | null> {
+    const missionId = requireUuid(missionIdInput, 'missionId');
+    const document = await this.store.read();
+    const run = document.runs.find((entry) => entry.missionId === missionId);
+    if (run === undefined) return null;
+    return projectMultiWorkerObservability(document, run.id, this.now());
   }
 
   public async getRun(orchestrationRunIdInput: string): Promise<MultiWorkerRunView> {

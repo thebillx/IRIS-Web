@@ -12,6 +12,9 @@ import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { FoundationStateStore } from './persistence.js';
 import { startRuntimeServer, type RuntimeServerHandle } from './server.js';
 import { RuntimeState } from './state.js';
+import { VNextResourceRegistry } from './resource-registry.js';
+import { MultiWorkerStore } from './multi-worker/store.js';
+import { MultiWorkerRoutingService } from './multi-worker/service.js';
 
 const roots: string[] = [];
 let handle: RuntimeServerHandle | undefined;
@@ -30,12 +33,52 @@ describe('V2.1 live server integration', () => {
     const session = state.createSession('client-v21', 'owner-v21', 'owner');
     await state.setSessionCurrentProject(session.id, session.clientId, project.id);
     const broker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
+    const lifecycleWorkers = new WorkerAdapterRegistry();
     const lifecycle = new DurableMissionLifecycleService(
       state,
       new DurableMissionLifecycleStore(dataRoot),
-      new WorkerAdapterRegistry(),
+      lifecycleWorkers,
+    );
+    const resources = new VNextResourceRegistry(state, dataRoot);
+    const multiWorker = new MultiWorkerRoutingService(
+      state,
+      resources,
+      new MultiWorkerStore(dataRoot),
+      lifecycleWorkers,
+      () => '2026-09-08T15:00:00.000Z',
     );
     const mission = await state.createMission(session.clientId, session.id, 'Live V2.1 mission', 'CHATGPT');
+    const run = (await multiWorker.createRun({
+      expectedGeneration: 0,
+      missionId: mission.id,
+      parentOrchestratorId: session.agentId,
+    })).run;
+    await multiWorker.createWorker({
+      expectedGeneration: 1,
+      orchestrationRunId: run.id,
+      principalId: 'server-v21-worker',
+      workerType: 'IRIS_LOGICAL',
+      role: 'RESEARCH',
+    });
+    const workspace = await resources.primaryWorkspace(project.id);
+    await multiWorker.createTask({
+      expectedGeneration: 2,
+      orchestrationRunId: run.id,
+      missionTaskId: null,
+      title: 'Visible read-only worker task',
+      dependencyTaskIds: [],
+      workspaceId: workspace.workspaceId,
+      principalId: 'server-v21-worker',
+      allowedCapabilities: ['project.search', 'fs.read'],
+      allowedPaths: ['apps/runtime/**'],
+      readOnlyPaths: ['apps/runtime/**'],
+      mutablePaths: [],
+      allowedProcesses: [],
+      approvalPolicy: 'INHERIT_MISSION',
+      resourceBudget: { maxRuntimeMs: 60_000, maxJobs: 0, maxArtifacts: 2, maxOutputBytes: 1_048_576 },
+      concurrencyPolicy: { maxParallelCapabilities: 1, mutablePathOwnership: 'READ_ONLY', allowParallelReads: true },
+      expiresAt: '2026-09-08T16:00:00.000Z',
+    });
     let durable = await lifecycle.ensureMission(mission.id, 'Prove live server lifecycle integration.');
     durable = await lifecycle.start({
       missionId: mission.id,
@@ -68,6 +111,7 @@ describe('V2.1 live server integration', () => {
       capabilities: {} as CapabilityService,
       missionBroker: broker,
       missionLifecycle: lifecycle,
+      multiWorker,
       health: () => ({
         status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid,
         uptimeMs: 1, authority: 'owned', connectedClients: 1, connectedSessions: 1,
@@ -118,7 +162,14 @@ describe('V2.1 live server integration', () => {
     const missions = await fetch(`${handle.apiUrl}/missions`, { headers: ownerHeaders(ownerAccessSecret) });
     expect(missions.status).toBe(200);
     expect(await missions.json()).toMatchObject({
-      missions: [{ id: mission.id, lifecycle: { missionId: mission.id, state: 'WAITING_FOR_SUPERVISOR', revision: 6 } }],
+      missions: [{
+        id: mission.id,
+        lifecycle: { missionId: mission.id, state: 'WAITING_FOR_SUPERVISOR', revision: 6 },
+        multiWorker: {
+          run: { id: run.id, missionId: mission.id, state: 'PLANNING', taskCount: 1, workerCount: 1 },
+          tasks: [expect.objectContaining({ title: 'Visible read-only worker task', state: 'PENDING' })],
+        },
+      }],
     });
 
     const lifecycleResponse = await fetch(`${handle.apiUrl}/missions/${mission.id}/lifecycle`, { headers: ownerHeaders(ownerAccessSecret) });
