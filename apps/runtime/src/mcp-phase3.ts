@@ -33,6 +33,9 @@ export function phase3GroupedToolDefinitions(): readonly Record<string, unknown>
         required: ['operation','projectId','workspaceId','executable','argv','cwd','executionProfile','envOverrides','timeoutMs','expectedEffects'],
         properties: {
           ...sessionId, ...projectId, ...workspaceId,
+          missionId: { type: 'string', description: 'Optional prepared CHATGPT mission identity; missionId/taskId/actionId must be supplied together.' },
+          taskId: { type: 'string' },
+          actionId: { type: 'string' },
           operation: { enum: ['run','start'] },
           executable: { type: 'string', minLength: 1, maxLength: 120 },
           argv: { type: 'array', maxItems: 128, items: { type: 'string', maxLength: 4096 } },
@@ -97,9 +100,11 @@ async function executeShell(
   const envOverrides = requiredStringMap(args, 'envOverrides', 32, 8192);
   const timeoutMs = requiredInteger(args, 'timeoutMs', 100, 3_600_000);
   const stdinArtifactId = optionalBoundedString(args, 'stdinArtifactId', 200);
+  const mission = optionalMissionAssociation(args);
   const common = {
     ...identity, projectId, workspaceId, executable, argv, cwd, executionProfile, envOverrides, timeoutMs, expectedEffects,
     ...(stdinArtifactId === undefined ? {} : { stdinArtifactId }),
+    ...(mission === undefined ? {} : { mission }),
   };
   if (operation === 'run') return capabilities.execute({ capabilityId: 'shell.run', ...common });
   return capabilities.execute({ capabilityId: 'shell.start', ...common, requestId: requiredBoundedString(args, 'requestId', 200) });
@@ -125,7 +130,7 @@ async function executeJob(
 
 interface SessionIdentity { readonly clientId: string; readonly sessionId: string }
 
-const SHELL_KEYS = new Set(['operation','sessionId','projectId','workspaceId','executable','argv','cwd','executionProfile','envOverrides','timeoutMs','requestId','stdinArtifactId','expectedEffects']);
+const SHELL_KEYS = new Set(['operation','sessionId','projectId','workspaceId','missionId','taskId','actionId','executable','argv','cwd','executionProfile','envOverrides','timeoutMs','requestId','stdinArtifactId','expectedEffects']);
 const JOB_KEYS = new Set(['operation','sessionId','projectId','jobId','stream','cursor','maxBytes','expectedEffects']);
 
 function assertOnlyPhase3Keys(name: Phase3GroupedToolName, args: Record<string, unknown>): void {
@@ -145,6 +150,20 @@ function resolveSessionIdentity(args: Record<string, unknown>, request: Request,
   if (state === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session validation is unavailable');
   state.getSessionForClient(sessionId, clientId);
   return { clientId, sessionId };
+}
+
+function optionalMissionAssociation(args: Record<string, unknown>) {
+  const values = [args.missionId, args.taskId, args.actionId];
+  if (values.every((value) => value === undefined)) return undefined;
+  if (!values.every((value) => typeof value === 'string' && value.length > 0)) {
+    throw new RuntimeError('INVALID_REQUEST', 'missionId, taskId, and actionId must be supplied together');
+  }
+  return {
+    missionId: String(args.missionId),
+    taskId: String(args.taskId),
+    actionId: String(args.actionId),
+    orchestratorMode: 'CHATGPT' as const,
+  };
 }
 
 function optionalExpectedEffects(args: Record<string, unknown>): readonly CapabilityEffect[] | undefined {

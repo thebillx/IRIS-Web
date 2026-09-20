@@ -16,12 +16,12 @@ export async function executeV21LifecycleTool(
   lifecycle: DurableMissionLifecycleService,
   principal: McpPrincipal = 'owner',
 ): Promise<CapabilityOutcome | unknown> {
+  void principal;
   if (name === 'mission_create') return createLifecycleMission(args, request, capabilities, state, lifecycle);
 
   const identity = resolveSessionIdentity(args, request, state);
   const missionId = requiredBoundedString(args, 'missionId', 200);
   if (name === 'mission_rebind') {
-    if (principal !== 'owner') throw new RuntimeError('CONTROL_DENIED', 'Only the authenticated IRIS owner may rebind a durable mission session');
     return state.rebindMissionSession({
       missionId,
       clientId: identity.clientId,
@@ -34,7 +34,7 @@ export async function executeV21LifecycleTool(
   try {
     await lifecycle.assertSessionControl(missionId, identity.clientId, identity.sessionId);
   } catch (error) {
-    if (principal === 'owner' && error instanceof RuntimeError && error.code === 'CONTROL_DENIED') {
+    if (error instanceof RuntimeError && error.code === 'CONTROL_DENIED') {
       const mission = await state.getMission(missionId).catch(() => null);
       if (mission !== null && mission.state !== 'COMPLETED' && mission.state !== 'FAILED' && mission.state !== 'CANCELLED'
         && (mission.clientId !== identity.clientId || mission.sessionId !== identity.sessionId)) {
