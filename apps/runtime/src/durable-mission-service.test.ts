@@ -22,6 +22,11 @@ class CountingWorker implements WorkerAdapter {
   public cancels = 0;
   public statuses = 0;
 
+  public planStart(): WorkerStartReceipt {
+    const next = this.starts + 1;
+    return { workerId: `worker-start-${next}`, resumeToken: `start-token-${next}`, resumable: true };
+  }
+
   public async start(): Promise<WorkerStartReceipt> {
     this.starts += 1;
     return { workerId: `worker-start-${this.starts}`, resumeToken: `start-token-${this.starts}`, resumable: true };

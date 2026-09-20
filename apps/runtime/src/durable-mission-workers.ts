@@ -30,8 +30,12 @@ export class WorkerAdapterRegistry {
 export class LogicalWorkerAdapter implements WorkerAdapter {
   public readonly workerType = 'IRIS_LOGICAL';
 
-  public async start(input: Parameters<WorkerAdapter['start']>[0]): Promise<WorkerStartReceipt> {
+  public planStart(input: Parameters<WorkerAdapter['planStart']>[0]): WorkerStartReceipt {
     return { workerId: `logical-${input.operationId}`, resumeToken: input.operationId, resumable: true };
+  }
+
+  public async start(input: Parameters<WorkerAdapter['start']>[0]): Promise<WorkerStartReceipt> {
+    return this.planStart(input);
   }
 
   public async checkpoint(input: Parameters<WorkerAdapter['checkpoint']>[0]): Promise<WorkerCheckpointReceipt> {

@@ -152,6 +152,15 @@ export interface MissionExecutionAssociation {
   readonly orchestratorMode: OrchestratorMode;
 }
 
+export interface WorkerExecutionAssociation {
+  readonly missionId: string;
+  readonly orchestrationRunId: string;
+  readonly workerTaskId: string;
+  readonly assignmentId: string;
+  readonly workerId: string;
+  readonly authorityDigest: string;
+}
+
 export interface MissionOrchestratorHandoff {
   readonly handoffId: string;
   readonly expectedVersion: number;
@@ -291,6 +300,158 @@ export interface MissionBrokerSnapshot {
   readonly updatedAt: string;
 }
 
+export type WorkerTaskState = 'PENDING' | 'ASSIGNED' | 'STARTING' | 'RUNNING' | 'WAITING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
+export type OrchestrationRunState = 'PLANNING' | 'RUNNING' | 'WAITING' | 'REVIEWING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED';
+export type WorkerState = 'IDLE' | 'ASSIGNED' | 'STARTING' | 'RUNNING' | 'WAITING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
+
+export interface WorkerResourceBudget {
+  readonly maxRuntimeMs: number;
+  readonly maxJobs: number;
+  readonly maxArtifacts: number;
+  readonly maxOutputBytes: number;
+}
+
+export interface WorkerConcurrencyPolicy {
+  readonly maxParallelCapabilities: number;
+  readonly mutablePathOwnership: 'EXCLUSIVE' | 'READ_ONLY';
+  readonly allowParallelReads: boolean;
+}
+
+export interface WorkerTaskAuthorityMetadata {
+  readonly schemaVersion: 1;
+  readonly missionId: string;
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly projectId: string;
+  readonly workspaceId: WorkspaceId;
+  readonly principalId: string;
+  readonly parentOrchestratorId: string;
+  readonly allowedCapabilities: readonly CapabilityId[];
+  readonly allowedPaths: readonly string[];
+  readonly readOnlyPaths: readonly string[];
+  readonly mutablePaths: readonly string[];
+  readonly allowedProcesses: readonly string[];
+  readonly approvalPolicy: 'INHERIT_MISSION' | 'OWNER_REQUIRED';
+  readonly resourceBudget: WorkerResourceBudget;
+  readonly concurrencyPolicy: WorkerConcurrencyPolicy;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+}
+
+export interface OrchestrationRun {
+  readonly id: string;
+  readonly missionId: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly parentOrchestratorId: string;
+  readonly state: OrchestrationRunState;
+  readonly revision: number;
+  readonly taskIds: readonly string[];
+  readonly workerIds: readonly string[];
+  readonly assignmentIds: readonly string[];
+  readonly resultIds: readonly string[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface Worker {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly principalId: string;
+  readonly workerType: string;
+  readonly role: 'CODE' | 'QA' | 'RESEARCH' | 'DOCS' | 'GENERIC';
+  readonly state: WorkerState;
+  readonly parentOrchestratorId: string;
+  readonly adapterWorkerId: string | null;
+  readonly resumeToken: string | null;
+  readonly resumable: boolean;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface WorkerTask {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly missionId: string;
+  readonly missionTaskId: string | null;
+  readonly title: string;
+  readonly state: WorkerTaskState;
+  readonly dependencyTaskIds: readonly string[];
+  readonly authority: WorkerTaskAuthorityMetadata;
+  readonly assignmentId: string | null;
+  readonly resultId: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface WorkerRuntimeFence {
+  readonly machineId: string;
+  readonly runtimeId: string;
+  readonly instanceId: string;
+  readonly deploymentEpoch: number;
+  readonly connectorProfile: 'FULL';
+  readonly catalogHash: string;
+}
+
+export interface WorkerAssignment {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly taskId: string;
+  readonly workerId: string;
+  readonly authorityTaskId: string;
+  readonly runtimeFence: WorkerRuntimeFence;
+  readonly authorityDigest: string;
+  readonly assignedAt: string;
+  readonly releasedAt: string | null;
+}
+
+export interface WorkerValidationResult {
+  readonly name: string;
+  readonly status: 'PASSED' | 'FAILED' | 'SKIPPED';
+  readonly summary: string;
+}
+
+export interface WorkerResult {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly taskId: string;
+  readonly workerId: string;
+  readonly status: 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
+  readonly summary: string;
+  readonly evidenceRefs: readonly string[];
+  readonly artifactIds: readonly ArtifactId[];
+  readonly filesRead: readonly string[];
+  readonly filesChanged: readonly string[];
+  readonly commandsExecuted: readonly string[];
+  readonly validationResults: readonly WorkerValidationResult[];
+  readonly risks: readonly string[];
+  readonly blockers: readonly string[];
+  readonly recommendedNextActions: readonly string[];
+  readonly createdAt: string;
+}
+
+export type WorkerReviewDecision =
+  | 'ACCEPT'
+  | 'RETRY'
+  | 'REASSIGN'
+  | 'SPLIT_TASK'
+  | 'REQUEST_MORE_EVIDENCE'
+  | 'CANCEL';
+
+export interface WorkerReview {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly taskId: string;
+  readonly workerId: string;
+  readonly resultId: string;
+  readonly decision: WorkerReviewDecision;
+  readonly instruction: string;
+  readonly requestedEvidence: readonly string[];
+  readonly reviewedByOrchestratorId: string;
+  readonly basedOnRunRevision: number;
+  readonly createdAt: string;
+}
+
 export interface RuntimeClientState {
   readonly clientId: string;
   readonly connected: boolean;
@@ -390,6 +551,9 @@ export type CapabilityId =
   | 'job.logs'
   | 'job.result'
   | 'job.cancel'
+  | 'code_review.start'
+  | 'code_review.status'
+  | 'code_review.result'
   | 'project.command.run'
   | 'project.validation.discover'
   | 'project.validation.start'
@@ -438,6 +602,11 @@ export interface PermissionDecisionRecord {
   readonly missionId?: string | null;
   readonly taskId?: string | null;
   readonly actionId?: string | null;
+  readonly orchestrationRunId?: string | null;
+  readonly workerTaskId?: string | null;
+  readonly workerId?: string | null;
+  readonly assignmentId?: string | null;
+  readonly authorityDigest?: string | null;
   readonly capabilityId: CapabilityId | string;
   readonly riskClass: RiskClass;
   readonly projectId: string | null;

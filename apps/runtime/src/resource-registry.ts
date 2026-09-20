@@ -176,6 +176,15 @@ export class VNextResourceRegistry {
     return repository;
   }
 
+  public async verifiedRepositoryForWorkspace(projectId: string, workspaceId: string): Promise<RepositoryRecord | null> {
+    const workspace = await this.getActiveWorkspace(projectId, workspaceId);
+    if (workspace.repositoryId === null) return null;
+    const repository = await this.findRepository(projectId, workspace.repositoryId);
+    if (repository === null) throw new RuntimeError('CAPABILITY_DENIED', 'Workspace repository binding is no longer registered');
+    await verifyRepositoryDirectoryIdentity(repository.commonGitDir, repository.commonGitDirDevice, repository.commonGitDirInode);
+    return repository;
+  }
+
   public ensureRepository(input: RepositoryRegistrationInput): Promise<RepositoryRecord> {
     return this.serializeMutation(async () => {
       assertUuid(input.projectId, 'projectId');

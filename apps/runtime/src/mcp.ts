@@ -5,6 +5,9 @@ import type { MissionBrokerService } from './mission-broker.js';
 import type { RuntimeState } from './state.js';
 
 export const MCP_PROTOCOL_VERSION = '2026-07-28' as const;
+export const LEGACY_MCP_PROTOCOL_VERSION = '2025-11-25' as const;
+export const TUNNEL_CLIENT_MCP_PROTOCOL_VERSION = '2025-06-18' as const;
+const INITIALIZE_PROTOCOL_VERSIONS = new Set<string>([LEGACY_MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION]);
 const CLIENT_ID_HEADER = 'x-iris-client-id';
 const SESSION_ID_HEADER = 'x-iris-session-id';
 
@@ -74,8 +77,26 @@ async function handleMcpTransportRequest(
       });
   }
 
-  if (request.headers.get('MCP-Protocol-Version') !== MCP_PROTOCOL_VERSION) {
-    return jsonRpcError(rpc.id ?? null, -32600, `MCP-Protocol-Version must be ${MCP_PROTOCOL_VERSION}`, 400);
+  if (rpc.method === 'initialize') {
+    const params = isRecord(rpc.params) ? rpc.params : null;
+    const clientInfo = params !== null && isRecord(params.clientInfo) ? params.clientInfo : null;
+    if (typeof params?.protocolVersion !== 'string'
+      || !INITIALIZE_PROTOCOL_VERSIONS.has(params.protocolVersion)
+      || !isRecord(params.capabilities)
+      || typeof clientInfo?.name !== 'string'
+      || typeof clientInfo.version !== 'string') {
+      return jsonRpcError(rpc.id ?? null, -32602, 'Invalid initialize parameters', 400);
+    }
+    return jsonRpcResult(rpc.id ?? null, {
+      protocolVersion: params.protocolVersion,
+      capabilities: { tools: {} },
+      serverInfo: { name: profile === 'pro' ? 'IRIS Pro Read Only' : 'IRIS', version: '0.0.0' },
+    });
+  }
+
+  const protocolVersion = request.headers.get('MCP-Protocol-Version');
+  if (protocolVersion !== MCP_PROTOCOL_VERSION && !INITIALIZE_PROTOCOL_VERSIONS.has(protocolVersion ?? '')) {
+    return jsonRpcError(rpc.id ?? null, -32600, 'Unsupported MCP-Protocol-Version', 400);
   }
   const methodHeader = request.headers.get('Mcp-Method');
   if (methodHeader !== null && methodHeader !== rpc.method) return jsonRpcError(rpc.id ?? null, -32600, 'Mcp-Method does not match JSON-RPC method', 400);

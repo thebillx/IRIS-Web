@@ -21,6 +21,9 @@ describe('IRIS vNext Phase 1 capability effects', () => {
     expect(deriveCapabilityEffects('file.read')).toEqual(['READ']);
     expect(deriveCapabilityEffects('file.edit')).toEqual(['READ', 'WRITE', 'DESTRUCTIVE']);
     expect(deriveCapabilityEffects('project.validation.start')).toEqual(['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE']);
+    expect(deriveCapabilityEffects('code_review.start')).toEqual(['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE']);
+    expect(deriveCapabilityEffects('code_review.status')).toEqual(['READ']);
+    expect(deriveCapabilityEffects('code_review.result')).toEqual(['READ', 'WRITE']);
     expect(deriveCapabilityEffects('git.local', { operation: 'status' })).toEqual(['READ', 'EXECUTE']);
     expect(deriveCapabilityEffects('git.local', { operation: 'commit' })).toEqual(['READ', 'WRITE', 'EXECUTE']);
   });

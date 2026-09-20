@@ -1,8 +1,11 @@
-import { access, lstat, realpath } from 'node:fs/promises';
+import { access, chmod, copyFile, lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { homedir, tmpdir, userInfo } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { constants } from 'node:fs';
 import { RuntimeError, type CapabilityEffect, type WorkspaceRecord } from '@iris/domain';
 import { canonicalNodeRuntime, node24Path } from './node-runtime.js';
+import { parseAndVerifyReviewLaunchSpec } from './code-review-launch.js';
 
 export interface ExecutionProfilePlan {
   readonly profileId: string;
@@ -14,6 +17,7 @@ export interface ExecutionProfilePlan {
   readonly timeoutMs: number;
   readonly effectEnvelope: readonly CapabilityEffect[];
   readonly stdinPath: string | null;
+  readonly cleanupPaths: readonly string[];
 }
 
 export interface ResolveExecutionInput {
@@ -35,7 +39,8 @@ interface ProfileDefinition {
   readonly maxTimeoutMs: number;
   readonly envAllowlist: readonly string[];
   readonly effectEnvelope: readonly CapabilityEffect[];
-  readonly argvPolicy: 'NODE_SCRIPT' | 'PYTHON_SCRIPT' | 'ROBOT_SCRIPT' | 'PNPM_SCRIPT' | 'NPM_SCRIPT' | 'FFMPEG' | 'FFPROBE';
+  readonly argvPolicy: 'NODE_SCRIPT' | 'PYTHON_SCRIPT' | 'ROBOT_SCRIPT' | 'PNPM_SCRIPT' | 'NPM_SCRIPT' | 'FFMPEG' | 'FFPROBE' | 'CODEX_REVIEW';
+  readonly serverOnly?: boolean;
 }
 
 const MAX_ARGV = 128;
@@ -44,24 +49,48 @@ const MAX_ENV_OVERRIDES = 32;
 const MAX_ENV_VALUE = 8 * 1024;
 const SCRIPT_NAME = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,99}$/;
 const CONSERVATIVE_EFFECTS = ['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE'] as const satisfies readonly CapabilityEffect[];
+const CODE_REVIEW_EFFECTS = ['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE'] as const satisfies readonly CapabilityEffect[];
+const CODE_REVIEW_RUNNER_CANDIDATES = [
+  fileURLToPath(new URL('./code-review-runner.mjs', import.meta.url)),
+  fileURLToPath(new URL('./code-review-runner.mts', import.meta.url)),
+] as const;
 
 const PROFILES: readonly ProfileDefinition[] = [
   { id: 'node-script', executable: 'node', candidates: () => [canonicalNodeRuntime().path], minTimeoutMs: 100, maxTimeoutMs: 30 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'NODE_SCRIPT' },
   { id: 'python3-script', executable: 'python3', candidates: () => ['/usr/bin/python3','/opt/homebrew/bin/python3','/usr/local/bin/python3'], minTimeoutMs: 100, maxTimeoutMs: 30 * 60_000, envAllowlist: ['CI','PYTHONUNBUFFERED','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'PYTHON_SCRIPT' },
   { id: 'robot', executable: 'robot', candidates: () => ['/opt/homebrew/bin/robot','/usr/local/bin/robot'], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'ROBOT_SCRIPT' },
-  { id: 'pnpm-script', executable: 'pnpm', candidates: () => ['/opt/homebrew/bin/pnpm','/usr/local/bin/pnpm'], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'PNPM_SCRIPT' },
-  { id: 'npm-script', executable: 'npm', candidates: () => ['/opt/homebrew/bin/npm','/usr/local/bin/npm','/usr/bin/npm'], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'NPM_SCRIPT' },
+  { id: 'pnpm-script', executable: 'pnpm', candidates: () => nodePackageManagerCandidates('pnpm', ['/opt/homebrew/bin/pnpm','/usr/local/bin/pnpm']), minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'PNPM_SCRIPT' },
+  { id: 'npm-script', executable: 'npm', candidates: () => nodePackageManagerCandidates('npm', ['/opt/homebrew/bin/npm','/usr/local/bin/npm','/usr/bin/npm']), minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'NPM_SCRIPT' },
   { id: 'ffmpeg', executable: 'ffmpeg', candidates: () => ['/opt/homebrew/bin/ffmpeg','/usr/local/bin/ffmpeg'], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'FFMPEG' },
   { id: 'ffprobe', executable: 'ffprobe', candidates: () => ['/opt/homebrew/bin/ffprobe','/usr/local/bin/ffprobe'], minTimeoutMs: 100, maxTimeoutMs: 30 * 60_000, envAllowlist: ['CI'], effectEnvelope: ['READ','EXECUTE'], argvPolicy: 'FFPROBE' },
+  { id: 'codex-review', executable: 'node', candidates: () => [canonicalNodeRuntime().path], minTimeoutMs: 10_000, maxTimeoutMs: 30 * 60_000, envAllowlist: [], effectEnvelope: CODE_REVIEW_EFFECTS, argvPolicy: 'CODEX_REVIEW', serverOnly: true },
 ] as const;
 
+function nodePackageManagerCandidates(name: 'pnpm' | 'npm', fallbacks: readonly string[]): readonly string[] {
+  return [path.join(path.dirname(canonicalNodeRuntime().path), name), ...fallbacks];
+}
+
 export function executionProfileEffects(profileId: string): readonly CapabilityEffect[] | null {
-  return PROFILES.find((profile) => profile.id === profileId)?.effectEnvelope ?? null;
+  const profile = PROFILES.find((candidate) => candidate.id === profileId);
+  return profile === undefined || profile.serverOnly === true ? null : profile.effectEnvelope;
+}
+
+export function codeReviewExecutionEffects(): readonly CapabilityEffect[] {
+  return CODE_REVIEW_EFFECTS;
 }
 
 export async function resolveExecutionProfile(input: ResolveExecutionInput): Promise<ExecutionProfilePlan> {
+  return resolveExecutionProfileInternal(input, false);
+}
+
+export async function resolveServerOwnedCodeReviewExecutionProfile(input: ResolveExecutionInput): Promise<ExecutionProfilePlan> {
+  if (input.executionProfile !== 'codex-review') throw new RuntimeError('CAPABILITY_DENIED', 'Server-owned code-review resolver accepts only codex-review');
+  return resolveExecutionProfileInternal(input, true);
+}
+
+async function resolveExecutionProfileInternal(input: ResolveExecutionInput, allowServerOnly: boolean): Promise<ExecutionProfilePlan> {
   const profile = PROFILES.find((candidate) => candidate.id === input.executionProfile);
-  if (profile === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'UNKNOWN_EXECUTION_PROFILE: execution profile is not server-approved');
+  if (profile === undefined || (profile.serverOnly === true && !allowServerOnly)) throw new RuntimeError('CAPABILITY_DENIED', 'UNKNOWN_EXECUTION_PROFILE: execution profile is not caller-selectable');
   if (input.executable !== profile.executable) throw new RuntimeError('CAPABILITY_DENIED', 'UNKNOWN_EXECUTABLE: executable does not match the selected server-owned profile');
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < profile.minTimeoutMs || input.timeoutMs > profile.maxTimeoutMs) {
     throw new RuntimeError('INVALID_REQUEST', `timeoutMs must be from ${profile.minTimeoutMs} through ${profile.maxTimeoutMs} for this profile`);
@@ -70,7 +99,24 @@ export async function resolveExecutionProfile(input: ResolveExecutionInput): Pro
   const executableIdentity = await resolveExecutable(profile.candidates());
   const cwd = await resolveWorkspaceDirectory(input.workspace, input.cwd);
   await validateArgvPolicy(profile.argvPolicy, input.argv, input.workspace, cwd);
-  const { environment, redactionValues } = buildEnvironment(profile, input.workspace, input.envOverrides);
+  const codexExecutableIdentity = profile.argvPolicy === 'CODEX_REVIEW' ? await resolveCodexExecutable() : null;
+  const codeReviewRuntime = profile.argvPolicy === 'CODEX_REVIEW'
+    ? await prepareCodeReviewRuntimeHome(input.workspace, input.stdinPath ?? null)
+    : null;
+  let environment: Readonly<Record<string, string>>;
+  let redactionValues: readonly string[];
+  try {
+    ({ environment, redactionValues } = buildEnvironment(
+      profile,
+      input.workspace,
+      input.envOverrides,
+      codexExecutableIdentity,
+      codeReviewRuntime?.codexHome ?? null,
+    ));
+  } catch (error) {
+    if (codeReviewRuntime !== null) await cleanupPreparedCodeReviewDirectory(codeReviewRuntime.codexHome, 'CODEX_HOME');
+    throw error;
+  }
   return {
     profileId: profile.id,
     executableIdentity,
@@ -81,6 +127,7 @@ export async function resolveExecutionProfile(input: ResolveExecutionInput): Pro
     timeoutMs: input.timeoutMs,
     effectEnvelope: profile.effectEnvelope,
     stdinPath: input.stdinPath ?? null,
+    cleanupPaths: codeReviewRuntime === null ? [] : [codeReviewRuntime.codexHome],
   };
 }
 
@@ -129,6 +176,17 @@ async function resolveWorkspaceDirectory(workspace: WorkspaceRecord, relativeCwd
 
 async function validateArgvPolicy(policy: ProfileDefinition['argvPolicy'], argv: readonly string[], workspace: WorkspaceRecord, cwd: string): Promise<void> {
   rejectInlineInterpreterForms(argv);
+  if (policy === 'CODEX_REVIEW') {
+    if (argv.length !== 1) throw new RuntimeError('CAPABILITY_DENIED', 'codex-review accepts only the server-owned review runner');
+    let physical: string;
+    try { physical = await realpath(argv[0]!); } catch (error) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Server-owned code-review runner is unavailable', { cause: error });
+    }
+    if (physical !== await resolveCodeReviewRunnerPath()) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'codex-review runner identity is not server-owned');
+    }
+    return;
+  }
   if (policy === 'NODE_SCRIPT') {
     if (argv.length < 1 || argv[0]!.startsWith('-')) throw new RuntimeError('CAPABILITY_DENIED', 'node-script requires a physical project script as argv[0]');
     await verifyPhysicalScript(workspace, cwd, argv[0]!, ['.js','.mjs','.cjs']);
@@ -200,20 +258,179 @@ async function verifyPhysicalScript(workspace: WorkspaceRecord, cwd: string, scr
   }
 }
 
-function buildEnvironment(profile: ProfileDefinition, workspace: WorkspaceRecord, overrides: Readonly<Record<string, string>>) {
+export async function resolveCodeReviewRunnerPath(): Promise<string> {
+  for (const candidate of CODE_REVIEW_RUNNER_CANDIDATES) {
+    try {
+      const physical = await realpath(candidate);
+      const metadata = await lstat(physical);
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) continue;
+      return physical;
+    } catch {
+      // Source runtime resolves .mts; built runtime resolves emitted .mjs.
+    }
+  }
+  throw new RuntimeError('CAPABILITY_DENIED', 'Server-owned code-review runner is unavailable');
+}
+
+async function resolveCodexExecutable(): Promise<string> {
+  const configured = process.env.IRIS_CODEX_EXECUTABLE?.trim();
+  const home = homedir();
+  const candidates = [
+    ...(configured && path.isAbsolute(configured) ? [configured] : []),
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+    '/usr/bin/codex',
+    path.join(home, '.local', 'bin', 'codex'),
+    path.join(home, '.npm-global', 'bin', 'codex'),
+    path.join(home, '.volta', 'bin', 'codex'),
+  ];
+  return resolveExecutable(candidates);
+}
+
+async function resolveCodexAuthSource(): Promise<string> {
+  const configured = process.env.IRIS_CODEX_AUTH_FILE?.trim();
+  let candidate: string;
+  if (configured !== undefined && configured.length > 0) {
+    if (!path.isAbsolute(configured) || configured.includes('\0') || path.resolve(configured) !== configured) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Configured Codex auth source path is invalid');
+    }
+    candidate = configured;
+  } else {
+    let ownerHome: string;
+    try {
+      ownerHome = userInfo().homedir;
+    } catch (error) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Operating-system owner home could not be resolved for Codex auth', { cause: error });
+    }
+    if (!path.isAbsolute(ownerHome) || path.resolve(ownerHome) !== ownerHome) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Operating-system owner home is invalid for Codex auth');
+    }
+    candidate = path.join(ownerHome, '.codex', 'auth.json');
+  }
+
+  let lexicalMetadata;
+  let physical: string;
+  try {
+    lexicalMetadata = await lstat(candidate);
+    physical = await realpath(candidate);
+  } catch (error) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Codex auth source is unavailable', { cause: error });
+  }
+  if (!lexicalMetadata.isFile() || lexicalMetadata.isSymbolicLink() || lexicalMetadata.nlink !== 1
+    || lexicalMetadata.size < 1 || lexicalMetadata.size > 1024 * 1024
+    || (typeof process.getuid === 'function' && lexicalMetadata.uid !== process.getuid())
+    || (lexicalMetadata.mode & 0o077) !== 0
+    || physical !== candidate) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Codex auth source is not a private physical owner file');
+  }
+  return physical;
+}
+
+async function prepareCodeReviewRuntimeHome(workspace: WorkspaceRecord, stdinPath: string | null): Promise<{ readonly codexHome: string }> {
+  if (stdinPath === null) throw new RuntimeError('CAPABILITY_DENIED', 'Native code review requires a server-generated launch spec');
+  let raw: string;
+  try { raw = await readFile(stdinPath, 'utf8'); }
+  catch (error) { throw new RuntimeError('CAPABILITY_DENIED', 'Native code-review launch spec is unavailable', { cause: error }); }
+  const launch = await parseAndVerifyReviewLaunchSpec(raw.trim(), workspace.physicalRoot);
+  const tempRoot = await realpath(tmpdir());
+  const created = await mkdtemp(path.join(tempRoot, 'iris-code-review-'));
+  let codexHome = created;
+  try {
+    codexHome = await realpath(created);
+    if (codexHome !== created) throw new RuntimeError('PERSISTENCE_FAILURE', 'Native code-review CODEX_HOME changed through an alias');
+    await chmod(codexHome, 0o700);
+    const authPhysical = await resolveCodexAuthSource();
+    await copyFile(authPhysical, path.join(codexHome, 'auth.json'));
+    await chmod(path.join(codexHome, 'auth.json'), 0o600);
+    const gitMetadataReadRoot = launch.gitMetadata !== null && !pathIsWithin(workspace.physicalRoot, launch.gitMetadata.root)
+      ? launch.gitMetadata.root
+      : null;
+    await writeFile(path.join(codexHome, 'config.toml'), permissionConfig(gitMetadataReadRoot), { mode: 0o600, flag: 'wx' });
+    return { codexHome };
+  } catch (error) {
+    await cleanupPreparedCodeReviewDirectory(codexHome, 'CODEX_HOME');
+    throw error;
+  }
+}
+
+async function cleanupPreparedCodeReviewDirectory(candidate: string, label: string): Promise<void> {
+  const tempRoot = await realpath(tmpdir());
+  if (!path.isAbsolute(candidate) || candidate.includes('\0') || path.resolve(candidate) !== candidate
+    || candidate === tempRoot || !pathIsWithin(tempRoot, candidate) || !path.basename(candidate).startsWith('iris-code-review-')) {
+    throw new RuntimeError('PERSISTENCE_FAILURE', `${label} cleanup path is outside the native-review temp namespace`);
+  }
+  try {
+    const metadata = await lstat(candidate);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', `${label} cleanup target is not a physical directory`);
+    }
+    if (await realpath(candidate) !== candidate) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', `${label} cleanup target changed through an alias`);
+    }
+    await rm(candidate, { recursive: true, force: false });
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    if (error instanceof RuntimeError) throw error;
+    throw new RuntimeError('PERSISTENCE_FAILURE', `${label} cleanup failed`, { cause: error });
+  }
+}
+
+function permissionConfig(gitMetadataRoot: string | null): string {
+  const lines = [
+    'approval_policy = "never"',
+    'default_permissions = "iris-review"',
+    '',
+    '[permissions.iris-review]',
+    'description = "IRIS exact-worktree read-only LOCAL_NATIVE review"',
+    '',
+    '[permissions.iris-review.filesystem]',
+    '":root" = "deny"',
+    '":minimal" = "read"',
+  ];
+  if (gitMetadataRoot !== null) lines.push(`${JSON.stringify(gitMetadataRoot)} = "read"`);
+  lines.push(
+    '',
+    '[permissions.iris-review.filesystem.":workspace_roots"]',
+    '"." = "read"',
+    '',
+    '[permissions.iris-review.network]',
+    'enabled = false',
+    '',
+  );
+  return lines.join('\n');
+}
+
+function buildEnvironment(
+  profile: ProfileDefinition,
+  workspace: WorkspaceRecord,
+  overrides: Readonly<Record<string, string>>,
+  codexExecutableIdentity: string | null = null,
+  codexHome: string | null = null,
+) {
   const entries = Object.entries(overrides);
   if (entries.length > MAX_ENV_OVERRIDES) throw new RuntimeError('INVALID_REQUEST', 'envOverrides exceeds the bounded entry count');
-  const environment: Record<string, string> = {
-    PATH: node24Path(),
-    HOME: workspace.physicalRoot,
-    TMPDIR: '/tmp',
-    LANG: 'en_US.UTF-8',
-    LC_ALL: '',
-    CI: '1',
-    ...((profile.argvPolicy === 'PNPM_SCRIPT' || profile.argvPolicy === 'NPM_SCRIPT')
-      ? { npm_config_ignore_scripts: 'true' }
-      : {}),
-  };
+  const environment: Record<string, string> = profile.argvPolicy === 'CODEX_REVIEW'
+    ? {
+        PATH: node24Path(),
+        HOME: codexHome ?? '',
+        CODEX_HOME: codexHome ?? '',
+        TMPDIR: '/tmp',
+        LANG: 'en_US.UTF-8',
+        LC_ALL: '',
+        CI: '1',
+        IRIS_CODEX_EXECUTABLE: codexExecutableIdentity ?? '',
+      }
+    : {
+        PATH: node24Path(),
+        HOME: workspace.physicalRoot,
+        TMPDIR: '/tmp',
+        LANG: 'en_US.UTF-8',
+        LC_ALL: '',
+        CI: '1',
+        ...((profile.argvPolicy === 'PNPM_SCRIPT' || profile.argvPolicy === 'NPM_SCRIPT')
+          ? { npm_config_ignore_scripts: 'true' }
+          : {}),
+      };
   const redactionValues: string[] = [];
   for (const [key, value] of entries) {
     if (!profile.envAllowlist.includes(key)) throw new RuntimeError('CAPABILITY_DENIED', `Environment override ${key} is not allowlisted by the execution profile`);

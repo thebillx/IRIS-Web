@@ -23,6 +23,9 @@ import { assertSupportedNodeVersion } from './node-runtime.js';
 import { ProjectValidationJobManager } from './project-test.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { DurableJobManager } from './durable-job-manager.js';
+import { MultiWorkerStore } from './multi-worker/store.js';
+import { MultiWorkerRoutingService } from './multi-worker/service.js';
+import { recoverMultiWorkerRuns } from './multi-worker/recovery.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -38,6 +41,7 @@ export interface DaemonHandle {
   readonly capabilities: CapabilityService;
   readonly missionBroker: MissionBrokerService;
   readonly missionLifecycle: DurableMissionLifecycleService;
+  readonly multiWorker: MultiWorkerRoutingService;
   readonly apiUrl: string;
   readonly mcpUrl: string;
   health(): RuntimeHealth;
@@ -132,8 +136,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     });
 
     const resourceRegistry = new VNextResourceRegistry(state, dataRoot);
+    const multiWorkerStore = new MultiWorkerStore(dataRoot);
+    const multiWorker = new MultiWorkerRoutingService(state, resourceRegistry, multiWorkerStore, lifecycleWorkers);
+    await recoverMultiWorkerRuns(state, resourceRegistry, multiWorkerStore, lifecycleWorkers);
     const durableJobs = new DurableJobManager(dataRoot, resourceRegistry);
     await durableJobs.recover();
+    missionLifecycle.setCompletionGuard((missionId) => durableJobs.assertMissionCodeReviewsFinalized(missionId));
     const capabilities = new CapabilityService(
       state,
       permissionPolicy,
@@ -142,6 +150,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       new ProjectValidationJobManager(dataRoot),
       resourceRegistry,
       durableJobs,
+      multiWorker,
     );
 
     const doctor = async (): Promise<DoctorReport> => {
@@ -171,6 +180,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         capabilities,
         missionBroker,
         missionLifecycle,
+        multiWorker,
         health,
         doctor,
         isShuttingDown: () => shuttingDown,
@@ -215,6 +225,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       capabilities,
       missionBroker,
       missionLifecycle,
+      multiWorker,
       apiUrl: server.apiUrl,
       mcpUrl: server.mcpUrl,
       health,

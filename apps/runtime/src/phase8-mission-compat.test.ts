@@ -28,6 +28,15 @@ class CompatibilityWorker implements WorkerAdapter {
   public resumes = 0;
   public statuses = 0;
 
+  public planStart(): WorkerStartReceipt {
+    const next = this.starts + 1;
+    return {
+      workerId: `phase8-start-${next}`,
+      resumeToken: `phase8-start-token-${next}`,
+      resumable: true,
+    };
+  }
+
   public async start(): Promise<WorkerStartReceipt> {
     this.starts += 1;
     return {

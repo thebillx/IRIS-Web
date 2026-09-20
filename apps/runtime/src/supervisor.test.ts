@@ -32,6 +32,21 @@ describe('IRIS supervisor', () => {
     await expect(import('node:fs/promises').then(({ access }) => access(path.join(dataRoot, 'supervisor')))).rejects.toThrow();
   });
 
+  it('does not misclassify a stopped runtime as an MCP authentication failure', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-stopped-'));
+    roots.push(dataRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    });
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot: '/Users/example/iris' });
+
+    expect((await supervisor.localReadiness()).status.code).toBe('RUNTIME_NOT_RUNNING');
+    expect((await supervisor.status()).localRuntime.code).toBe('RUNTIME_NOT_RUNNING');
+    expect((await supervisor.doctor()).CODE).toBe('RUNTIME_NOT_RUNNING');
+  });
+
   it('propagates the protected reference root into the persistent admin child environment', () => {
     expect(supervisorAdminChildEnvironment('/private/tmp/iris-data', 43_111, '/Users/example/iris')).toEqual({
       IRIS_RUNTIME_DATA_ROOT: '/private/tmp/iris-data',
@@ -984,7 +999,7 @@ setInterval(() => undefined, 1000);
     const candidateRoot = await alternateCatalogSource(fakeRoot);
     const candidateCatalogPath = path.join(candidateRoot, 'apps', 'runtime', 'src', 'mcp-catalog.ts');
     const candidateCatalog = await readFile(candidateCatalogPath, 'utf8');
-    const currentVersion = "export const MCP_CATALOG_VERSION = '2.4.0' as const;";
+    const currentVersion = "export const MCP_CATALOG_VERSION = '2.5.0' as const;";
     if (!candidateCatalog.includes(currentVersion)) throw new Error('candidate catalog version marker not found');
     await writeFile(candidateCatalogPath, candidateCatalog.replace(
       currentVersion,

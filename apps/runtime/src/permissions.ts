@@ -23,6 +23,11 @@ export interface PolicyRequest {
   readonly missionId?: string | null | undefined;
   readonly taskId?: string | null | undefined;
   readonly actionId?: string | null | undefined;
+  readonly orchestrationRunId?: string | null | undefined;
+  readonly workerTaskId?: string | null | undefined;
+  readonly workerId?: string | null | undefined;
+  readonly assignmentId?: string | null | undefined;
+  readonly authorityDigest?: string | null | undefined;
   readonly projectId?: string | null | undefined;
   readonly targetPath?: string | null | undefined;
   readonly effectiveEffects?: readonly CapabilityEffect[] | undefined;
@@ -340,6 +345,11 @@ function record(
     missionId: input.missionId?.trim() || null,
     taskId: input.taskId?.trim() || null,
     actionId: input.actionId?.trim() || null,
+    orchestrationRunId: input.orchestrationRunId?.trim() || null,
+    workerTaskId: input.workerTaskId?.trim() || null,
+    workerId: input.workerId?.trim() || null,
+    assignmentId: input.assignmentId?.trim() || null,
+    authorityDigest: input.authorityDigest?.trim() || null,
     capabilityId: input.capabilityId,
     riskClass,
     projectId,
