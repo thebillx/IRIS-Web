@@ -368,3 +368,160 @@ describe('IRIS multi-worker M06 routing ownership integration', () => {
     expect((await f.store.read()).generation).toBe(8);
   });
 });
+
+describe('IRIS multi-worker M07 structured worker results', () => {
+  async function completedReadOnlyTask() {
+    const f = await fixture();
+    const run = (await f.service.createRun({
+      expectedGeneration: 0,
+      missionId: f.mission.id,
+      parentOrchestratorId: f.session.agentId,
+    })).run;
+    const worker = await f.service.createWorker({
+      expectedGeneration: 1,
+      orchestrationRunId: run.id,
+      principalId: 'worker-result-1',
+      workerType: 'IRIS_LOGICAL',
+      role: 'RESEARCH',
+    });
+    const task = await f.service.createTask(taskInput(
+      2,
+      run.id,
+      f.mission.tasks[0]!.id,
+      f.workspace.workspaceId,
+      'worker-result-1',
+    ));
+    await f.service.assignTask({
+      expectedGeneration: 3,
+      orchestrationRunId: run.id,
+      taskId: task.id,
+      workerId: worker.id,
+      runtimeFence: f.runtimeFence,
+    });
+    await f.service.startTask({
+      expectedGeneration: 4,
+      orchestrationRunId: run.id,
+      taskId: task.id,
+      requestId: randomUUID(),
+    });
+    await f.service.completeTask({
+      expectedGeneration: 5,
+      orchestrationRunId: run.id,
+      taskId: task.id,
+    });
+    return { ...f, run, worker, task };
+  }
+
+  it('persists a bounded structured result and links it to run/task/worker without completing the parent Mission', async () => {
+    const f = await completedReadOnlyTask();
+    const result = await f.service.recordResult({
+      expectedGeneration: 6,
+      orchestrationRunId: f.run.id,
+      taskId: f.task.id,
+      workerId: f.worker.id,
+      status: 'SUCCEEDED',
+      summary: 'Runtime routing evidence collected',
+      evidenceRefs: ['evidence:runtime-routing'],
+      artifactIds: [],
+      filesRead: ['apps/runtime/src/state.ts'],
+      filesChanged: [],
+      commandsExecuted: [],
+      validationResults: [{ name: 'focused-review', status: 'PASSED', summary: 'Read-only checks passed' }],
+      risks: ['No mutation was performed'],
+      blockers: [],
+      recommendedNextActions: ['Review the structured evidence'],
+    });
+
+    expect(result).toMatchObject({
+      taskId: f.task.id,
+      workerId: f.worker.id,
+      status: 'SUCCEEDED',
+      filesRead: ['apps/runtime/src/state.ts'],
+    });
+    const final = await f.service.getRun(f.run.id);
+    expect(final.generation).toBe(7);
+    expect(final.run.resultIds).toEqual([result.id]);
+    expect(final.tasks[0]?.resultId).toBe(result.id);
+    expect(final.results).toEqual([result]);
+    expect(await f.service.getResult(result.id)).toEqual(result);
+    expect(await f.service.listResults(f.run.id)).toEqual([result]);
+    expect((await f.state.getMission(f.mission.id)).state).not.toBe('COMPLETED');
+  });
+
+  it('rejects result path escalation and status mismatch without publishing a generation', async () => {
+    const f = await completedReadOnlyTask();
+    const base = {
+      expectedGeneration: 6,
+      orchestrationRunId: f.run.id,
+      taskId: f.task.id,
+      workerId: f.worker.id,
+      summary: 'Result',
+      evidenceRefs: [] as string[],
+      artifactIds: [] as string[],
+      commandsExecuted: [] as string[],
+      validationResults: [],
+      risks: [] as string[],
+      blockers: [] as string[],
+      recommendedNextActions: [] as string[],
+    };
+
+    await expect(f.service.recordResult({
+      ...base,
+      status: 'FAILED',
+      filesRead: ['apps/runtime/src/state.ts'],
+      filesChanged: [],
+    })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+
+    await expect(f.service.recordResult({
+      ...base,
+      status: 'SUCCEEDED',
+      filesRead: ['docs/outside.md'],
+      filesChanged: [],
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+
+    await expect(f.service.recordResult({
+      ...base,
+      status: 'SUCCEEDED',
+      filesRead: ['apps/runtime/src/state.ts'],
+      filesChanged: ['apps/runtime/src/state.ts'],
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+
+    expect((await f.store.read()).generation).toBe(6);
+  });
+
+  it('rejects invented artifact references and duplicate result publication', async () => {
+    const f = await completedReadOnlyTask();
+    const input = {
+      expectedGeneration: 6,
+      orchestrationRunId: f.run.id,
+      taskId: f.task.id,
+      workerId: f.worker.id,
+      status: 'SUCCEEDED' as const,
+      summary: 'Result',
+      evidenceRefs: [] as string[],
+      artifactIds: [] as string[],
+      filesRead: ['apps/runtime/src/state.ts'],
+      filesChanged: [] as string[],
+      commandsExecuted: [] as string[],
+      validationResults: [],
+      risks: [] as string[],
+      blockers: [] as string[],
+      recommendedNextActions: [] as string[],
+    };
+
+    await expect(f.service.recordResult({
+      ...input,
+      artifactIds: [randomUUID()],
+    })).rejects.toMatchObject({ code: 'ARTIFACT_NOT_FOUND' });
+    expect((await f.store.read()).generation).toBe(6);
+
+    const result = await f.service.recordResult(input);
+    await expect(f.service.recordResult({
+      ...input,
+      expectedGeneration: 7,
+      summary: 'Second result',
+    })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    expect((await f.store.read()).generation).toBe(7);
+    expect((await f.service.getTask(f.task.id)).resultId).toBe(result.id);
+  });
+});

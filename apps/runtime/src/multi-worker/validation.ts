@@ -141,6 +141,11 @@ export function validateWorkerTaskAuthority(value: WorkerTaskAuthorityMetadata):
   return value;
 }
 
+export function validateWorkerResult(value: WorkerResult): WorkerResult {
+  if (!isResult(value)) throw new RuntimeError('INVALID_REQUEST', 'Worker result is invalid or exceeds bounded limits');
+  return value;
+}
+
 function isRun(value: unknown): value is OrchestrationRun {
   return isRecord(value)
     && exactKeys(value, ['id', 'missionId', 'projectId', 'sessionId', 'parentOrchestratorId', 'state', 'revision', 'taskIds', 'workerIds', 'assignmentIds', 'resultIds', 'createdAt', 'updatedAt'])

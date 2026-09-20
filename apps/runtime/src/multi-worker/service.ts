@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import {
   RuntimeError,
+  type ArtifactId,
   type CapabilityId,
   type OrchestrationRun,
   type Worker,
   type WorkerAssignment,
+  type WorkerResult,
   type WorkerRuntimeFence,
   type WorkerTask,
   type WorkerTaskAuthorityMetadata,
@@ -17,11 +19,11 @@ import {
   normalizeWorkerStartReceipt,
 } from '../durable-mission-workers.js';
 import type { WorkerBinding } from '../durable-mission-lifecycle.js';
-import { deriveWorkerAuthorityDigest } from './authority.js';
+import { deriveWorkerAuthorityDigest, workerPathAllowed } from './authority.js';
 import type { MultiWorkerDocument } from './model.js';
 import { assertMutablePathOwnershipAvailable } from './path-ownership.js';
 import { MultiWorkerStore } from './store.js';
-import { validateMultiWorkerDocument, validateWorkerTaskAuthority } from './validation.js';
+import { validateMultiWorkerDocument, validateWorkerResult, validateWorkerTaskAuthority } from './validation.js';
 
 export interface CreateOrchestrationRunInput {
   readonly expectedGeneration: number;
@@ -82,12 +84,31 @@ export interface CancelOrchestrationRunInput {
   readonly orchestrationRunId: string;
 }
 
+export interface RecordWorkerResultInput {
+  readonly expectedGeneration: number;
+  readonly orchestrationRunId: string;
+  readonly taskId: string;
+  readonly workerId: string;
+  readonly status: WorkerResult['status'];
+  readonly summary: string;
+  readonly evidenceRefs: readonly string[];
+  readonly artifactIds: readonly string[];
+  readonly filesRead: readonly string[];
+  readonly filesChanged: readonly string[];
+  readonly commandsExecuted: readonly string[];
+  readonly validationResults: WorkerResult['validationResults'];
+  readonly risks: readonly string[];
+  readonly blockers: readonly string[];
+  readonly recommendedNextActions: readonly string[];
+}
+
 export interface MultiWorkerRunView {
   readonly generation: number;
   readonly run: OrchestrationRun;
   readonly workers: readonly Worker[];
   readonly tasks: readonly WorkerTask[];
   readonly assignments: readonly WorkerAssignment[];
+  readonly results: readonly WorkerResult[];
 }
 
 export class MultiWorkerRoutingService {
@@ -121,6 +142,14 @@ export class MultiWorkerRoutingService {
     return document.tasks.filter((entry) => entry.orchestrationRunId === orchestrationRunId);
   }
 
+  public async listResults(orchestrationRunIdInput?: string): Promise<readonly WorkerResult[]> {
+    const document = await this.store.read();
+    if (orchestrationRunIdInput === undefined) return document.results;
+    const orchestrationRunId = requireUuid(orchestrationRunIdInput, 'orchestrationRunId');
+    requiredRun(document, orchestrationRunId);
+    return document.results.filter((entry) => entry.orchestrationRunId === orchestrationRunId);
+  }
+
   public async getRun(orchestrationRunIdInput: string): Promise<MultiWorkerRunView> {
     const orchestrationRunId = requireUuid(orchestrationRunIdInput, 'orchestrationRunId');
     const document = await this.store.read();
@@ -140,6 +169,13 @@ export class MultiWorkerRoutingService {
     const task = (await this.store.read()).tasks.find((entry) => entry.id === taskId);
     if (task === undefined) throw new RuntimeError('INVALID_REQUEST', 'Worker task was not found');
     return task;
+  }
+
+  public async getResult(resultIdInput: string): Promise<WorkerResult> {
+    const resultId = requireUuid(resultIdInput, 'resultId');
+    const result = (await this.store.read()).results.find((entry) => entry.id === resultId);
+    if (result === undefined) throw new RuntimeError('INVALID_REQUEST', 'Worker result was not found');
+    return result;
   }
 
   public createRun(input: CreateOrchestrationRunInput): Promise<MultiWorkerRunView> {
@@ -459,6 +495,82 @@ export class MultiWorkerRoutingService {
     });
   }
 
+  public recordResult(input: RecordWorkerResultInput): Promise<WorkerResult> {
+    const runId = requireUuid(input.orchestrationRunId, 'orchestrationRunId');
+    const taskId = requireUuid(input.taskId, 'taskId');
+    const workerId = requireUuid(input.workerId, 'workerId');
+    return this.mutate(input.expectedGeneration, async (document) => {
+      const run = requiredActiveRun(document, runId);
+      const task = requiredTask(document, taskId);
+      const worker = requiredWorker(document, workerId);
+      if (task.orchestrationRunId !== run.id || worker.orchestrationRunId !== run.id) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Worker result does not belong to the selected orchestration run');
+      }
+      if (!['SUCCEEDED', 'FAILED', 'CANCELLED', 'BLOCKED'].includes(task.state)
+        || input.status !== task.state
+        || worker.state !== task.state
+        || task.assignmentId === null) {
+        throw new RuntimeError('INVALID_REQUEST', 'Worker result must match one terminal assigned task and worker state');
+      }
+      if (task.resultId !== null) throw new RuntimeError('INVALID_REQUEST', 'Worker task already has a result');
+      const assignment = requiredAssignment(document, task.assignmentId);
+      if (assignment.workerId !== worker.id || assignment.releasedAt === null) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Worker result assignment is not the released assignment for this task');
+      }
+
+      const now = this.now();
+      const result = validateWorkerResult({
+        id: randomUUID(),
+        orchestrationRunId: run.id,
+        taskId: task.id,
+        workerId: worker.id,
+        status: input.status,
+        summary: input.summary,
+        evidenceRefs: [...input.evidenceRefs],
+        artifactIds: input.artifactIds.map((artifactId) => artifactId as ArtifactId),
+        filesRead: [...input.filesRead],
+        filesChanged: [...input.filesChanged],
+        commandsExecuted: [...input.commandsExecuted],
+        validationResults: input.validationResults.map((entry) => ({ ...entry })),
+        risks: [...input.risks],
+        blockers: [...input.blockers],
+        recommendedNextActions: [...input.recommendedNextActions],
+        createdAt: now,
+      });
+
+      if (result.filesRead.some((candidate) => !workerPathAllowed(task.authority.allowedPaths, candidate))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Worker result claims a read path outside immutable task authority');
+      }
+      if (result.filesChanged.length > 0 && task.authority.concurrencyPolicy.mutablePathOwnership === 'READ_ONLY') {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Read-only worker result cannot claim changed files');
+      }
+      if (result.filesChanged.some((candidate) => !workerPathAllowed(task.authority.mutablePaths, candidate))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Worker result claims a changed path outside immutable task authority');
+      }
+      if (result.artifactIds.length > task.authority.resourceBudget.maxArtifacts) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Worker result exceeds its artifact resource budget');
+      }
+      for (const artifactId of result.artifactIds) {
+        const artifact = await this.resources.getArtifact(run.projectId, artifactId);
+        if (artifact.workspaceId !== task.authority.workspaceId) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'Worker result artifact does not belong to the task workspace');
+        }
+      }
+
+      const updatedTask: WorkerTask = { ...task, resultId: result.id, updatedAt: now };
+      const updatedRun = touchRun(run, now, { resultIds: [...run.resultIds, result.id] });
+      return {
+        document: {
+          ...document,
+          runs: replaceById(document.runs, updatedRun),
+          tasks: replaceById(document.tasks, updatedTask),
+          results: [...document.results, result],
+        },
+        value: (next: MultiWorkerDocument) => requiredResult(next, result.id),
+      };
+    });
+  }
+
   private finishTask(input: TransitionWorkerTaskInput, state: 'SUCCEEDED' | 'FAILED'): Promise<WorkerTask> {
     const runId = requireUuid(input.orchestrationRunId, 'orchestrationRunId');
     const taskId = requireUuid(input.taskId, 'taskId');
@@ -556,6 +668,7 @@ function view(document: MultiWorkerDocument, run: OrchestrationRun): MultiWorker
     workers: document.workers.filter((entry) => entry.orchestrationRunId === run.id),
     tasks: document.tasks.filter((entry) => entry.orchestrationRunId === run.id),
     assignments: document.assignments.filter((entry) => entry.orchestrationRunId === run.id),
+    results: document.results.filter((entry) => entry.orchestrationRunId === run.id),
   };
 }
 
@@ -593,6 +706,12 @@ function requiredAssignment(document: MultiWorkerDocument, assignmentId: string)
   const assignment = document.assignments.find((entry) => entry.id === assignmentId);
   if (assignment === undefined) throw new RuntimeError('INVALID_REQUEST', 'Worker assignment was not found');
   return assignment;
+}
+
+function requiredResult(document: MultiWorkerDocument, resultId: string): WorkerResult {
+  const result = document.results.find((entry) => entry.id === resultId);
+  if (result === undefined) throw new RuntimeError('INVALID_REQUEST', 'Worker result was not found');
+  return result;
 }
 
 function touchRun(

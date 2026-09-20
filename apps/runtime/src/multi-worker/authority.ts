@@ -219,6 +219,11 @@ function assertBudget(envelope: WorkerExecutionEnvelope, usage: WorkerResourceUs
   }
 }
 
+export function workerPathAllowed(grants: readonly string[], targetInput: string): boolean {
+  const target = normalizeRelativeTarget(targetInput);
+  return grants.some((grant) => pathMatches(grant, target));
+}
+
 function pathMatches(grantInput: string, target: string): boolean {
   const grant = normalizeGrant(grantInput);
   if (grant === '**') return true;
