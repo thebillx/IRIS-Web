@@ -155,12 +155,15 @@ function isRun(value: unknown): value is OrchestrationRun {
 
 function isWorker(value: unknown): value is Worker {
   return isRecord(value)
-    && exactKeys(value, ['id', 'orchestrationRunId', 'principalId', 'workerType', 'role', 'state', 'parentOrchestratorId', 'createdAt', 'updatedAt'])
+    && exactKeys(value, ['id', 'orchestrationRunId', 'principalId', 'workerType', 'role', 'state', 'parentOrchestratorId', 'adapterWorkerId', 'resumeToken', 'resumable', 'createdAt', 'updatedAt'])
     && uuid(value.id) && uuid(value.orchestrationRunId)
     && bounded(value.principalId, 200) && bounded(value.workerType, 200)
     && ['CODE', 'QA', 'RESEARCH', 'DOCS', 'GENERIC'].includes(String(value.role))
     && ['IDLE', 'ASSIGNED', 'RUNNING', 'WAITING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'BLOCKED'].includes(String(value.state))
     && bounded(value.parentOrchestratorId, 200)
+    && (value.adapterWorkerId === null || bounded(value.adapterWorkerId, 200))
+    && (value.resumeToken === null || bounded(value.resumeToken, 200))
+    && typeof value.resumable === 'boolean'
     && timestamp(value.createdAt) && timestamp(value.updatedAt)
     && String(value.updatedAt) >= String(value.createdAt);
 }

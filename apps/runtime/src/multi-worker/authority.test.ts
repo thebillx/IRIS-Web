@@ -88,6 +88,9 @@ function fixture() {
     role: 'CODE',
     state: 'ASSIGNED',
     parentOrchestratorId,
+    adapterWorkerId: null,
+    resumeToken: null,
+    resumable: false,
     createdAt: '2026-09-20T01:00:00.000Z',
     updatedAt: '2026-09-20T01:00:00.000Z',
   };

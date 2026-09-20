@@ -353,6 +353,9 @@ export interface Worker {
   readonly role: 'CODE' | 'QA' | 'RESEARCH' | 'DOCS' | 'GENERIC';
   readonly state: WorkerState;
   readonly parentOrchestratorId: string;
+  readonly adapterWorkerId: string | null;
+  readonly resumeToken: string | null;
+  readonly resumable: boolean;
   readonly createdAt: string;
   readonly updatedAt: string;
 }

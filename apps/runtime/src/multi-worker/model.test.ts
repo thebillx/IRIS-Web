@@ -67,6 +67,9 @@ function fixture(generation = 1): MultiWorkerDocument {
     role: 'CODE',
     state: 'SUCCEEDED',
     parentOrchestratorId: 'chatgpt-orchestrator',
+    adapterWorkerId: 'logical-worker-finished',
+    resumeToken: null,
+    resumable: false,
     createdAt: now,
     updatedAt: now,
   };
