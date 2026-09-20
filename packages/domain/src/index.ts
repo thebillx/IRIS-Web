@@ -291,6 +291,122 @@ export interface MissionBrokerSnapshot {
   readonly updatedAt: string;
 }
 
+export type WorkerTaskState = 'PENDING' | 'ASSIGNED' | 'RUNNING' | 'WAITING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
+export type OrchestrationRunState = 'PLANNING' | 'RUNNING' | 'WAITING' | 'REVIEWING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED';
+export type WorkerState = 'IDLE' | 'ASSIGNED' | 'RUNNING' | 'WAITING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
+
+export interface WorkerResourceBudget {
+  readonly maxRuntimeMs: number;
+  readonly maxJobs: number;
+  readonly maxArtifacts: number;
+  readonly maxOutputBytes: number;
+}
+
+export interface WorkerConcurrencyPolicy {
+  readonly maxParallelCapabilities: number;
+  readonly mutablePathOwnership: 'EXCLUSIVE' | 'READ_ONLY';
+  readonly allowParallelReads: boolean;
+}
+
+export interface WorkerTaskAuthorityMetadata {
+  readonly schemaVersion: 1;
+  readonly missionId: string;
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly projectId: string;
+  readonly workspaceId: WorkspaceId;
+  readonly principalId: string;
+  readonly parentOrchestratorId: string;
+  readonly allowedCapabilities: readonly CapabilityId[];
+  readonly allowedPaths: readonly string[];
+  readonly readOnlyPaths: readonly string[];
+  readonly mutablePaths: readonly string[];
+  readonly allowedProcesses: readonly string[];
+  readonly approvalPolicy: 'INHERIT_MISSION' | 'OWNER_REQUIRED';
+  readonly resourceBudget: WorkerResourceBudget;
+  readonly concurrencyPolicy: WorkerConcurrencyPolicy;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+}
+
+export interface OrchestrationRun {
+  readonly id: string;
+  readonly missionId: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly parentOrchestratorId: string;
+  readonly state: OrchestrationRunState;
+  readonly revision: number;
+  readonly taskIds: readonly string[];
+  readonly workerIds: readonly string[];
+  readonly assignmentIds: readonly string[];
+  readonly resultIds: readonly string[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface Worker {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly principalId: string;
+  readonly workerType: string;
+  readonly role: 'CODE' | 'QA' | 'RESEARCH' | 'DOCS' | 'GENERIC';
+  readonly state: WorkerState;
+  readonly parentOrchestratorId: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface WorkerTask {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly missionId: string;
+  readonly missionTaskId: string | null;
+  readonly title: string;
+  readonly state: WorkerTaskState;
+  readonly dependencyTaskIds: readonly string[];
+  readonly authority: WorkerTaskAuthorityMetadata;
+  readonly assignmentId: string | null;
+  readonly resultId: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface WorkerAssignment {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly taskId: string;
+  readonly workerId: string;
+  readonly authorityTaskId: string;
+  readonly assignedAt: string;
+  readonly releasedAt: string | null;
+}
+
+export interface WorkerValidationResult {
+  readonly name: string;
+  readonly status: 'PASSED' | 'FAILED' | 'SKIPPED';
+  readonly summary: string;
+}
+
+export interface WorkerResult {
+  readonly id: string;
+  readonly orchestrationRunId: string;
+  readonly taskId: string;
+  readonly workerId: string;
+  readonly status: 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
+  readonly summary: string;
+  readonly evidenceRefs: readonly string[];
+  readonly artifactIds: readonly ArtifactId[];
+  readonly filesRead: readonly string[];
+  readonly filesChanged: readonly string[];
+  readonly commandsExecuted: readonly string[];
+  readonly validationResults: readonly WorkerValidationResult[];
+  readonly risks: readonly string[];
+  readonly blockers: readonly string[];
+  readonly recommendedNextActions: readonly string[];
+  readonly createdAt: string;
+}
+
 export interface RuntimeClientState {
   readonly clientId: string;
   readonly connected: boolean;
