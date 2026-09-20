@@ -274,4 +274,25 @@ describe('IRIS multi-worker M04 routing', () => {
     expect(cancelled.workers[0]?.state).toBe('CANCELLED');
     expect((await f.state.getMission(f.mission.id)).state).not.toBe('COMPLETED');
   });
+
+  it('rejects a forged parent orchestrator identity before creating durable run state', async () => {
+    const f = await fixture();
+    await expect(f.service.createRun({
+      expectedGeneration: 0,
+      missionId: f.mission.id,
+      parentOrchestratorId: 'foreign-orchestrator',
+    })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect((await f.store.read()).generation).toBe(0);
+  });
+
+  it('rejects creation from a terminal parent Mission', async () => {
+    const f = await fixture();
+    await f.state.setMissionState(f.mission.id, f.session.clientId, f.session.id, 'COMPLETED');
+    await expect(f.service.createRun({
+      expectedGeneration: 0,
+      missionId: f.mission.id,
+      parentOrchestratorId: f.session.agentId,
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    expect((await f.store.read()).generation).toBe(0);
+  });
 });

@@ -150,8 +150,18 @@ export class MultiWorkerRoutingService {
       }
       const mission = await this.state.getMission(missionId);
       if (mission.projectId === null) throw new RuntimeError('CAPABILITY_DENIED', 'Multi-worker orchestration requires an explicit project');
+      if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(mission.state)) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Terminal Mission cannot create a multi-worker orchestration run');
+      }
       if (!(await this.state.listProjects()).some((project) => project.id === mission.projectId)) {
         throw new RuntimeError('PROJECT_NOT_FOUND', 'Mission project is not registered');
+      }
+      const session = this.state.getSessionForClient(mission.sessionId, mission.clientId);
+      if (session.agentId !== parentOrchestratorId) {
+        throw new RuntimeError('CONTROL_DENIED', 'parentOrchestratorId does not match the authoritative Mission session agent');
+      }
+      if (session.currentProjectId !== mission.projectId) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Mission session is not selected on the durable Mission project');
       }
       const now = this.now();
       const run: OrchestrationRun = {
