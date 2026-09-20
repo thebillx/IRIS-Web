@@ -152,6 +152,15 @@ export interface MissionExecutionAssociation {
   readonly orchestratorMode: OrchestratorMode;
 }
 
+export interface WorkerExecutionAssociation {
+  readonly missionId: string;
+  readonly orchestrationRunId: string;
+  readonly workerTaskId: string;
+  readonly assignmentId: string;
+  readonly workerId: string;
+  readonly authorityDigest: string;
+}
+
 export interface MissionOrchestratorHandoff {
   readonly handoffId: string;
   readonly expectedVersion: number;
@@ -590,6 +599,11 @@ export interface PermissionDecisionRecord {
   readonly missionId?: string | null;
   readonly taskId?: string | null;
   readonly actionId?: string | null;
+  readonly orchestrationRunId?: string | null;
+  readonly workerTaskId?: string | null;
+  readonly workerId?: string | null;
+  readonly assignmentId?: string | null;
+  readonly authorityDigest?: string | null;
   readonly capabilityId: CapabilityId | string;
   readonly riskClass: RiskClass;
   readonly projectId: string | null;

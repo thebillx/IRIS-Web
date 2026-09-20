@@ -149,6 +149,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       new ProjectValidationJobManager(dataRoot),
       resourceRegistry,
       durableJobs,
+      multiWorker,
     );
 
     const doctor = async (): Promise<DoctorReport> => {

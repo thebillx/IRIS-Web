@@ -6,6 +6,7 @@ import {
   type OrchestrationRun,
   type Worker,
   type WorkerAssignment,
+  type WorkerExecutionAssociation,
   type WorkerResult,
   type WorkerReview,
   type WorkerRuntimeFence,
@@ -20,7 +21,14 @@ import {
   normalizeWorkerStartReceipt,
 } from '../durable-mission-workers.js';
 import type { WorkerBinding } from '../durable-mission-lifecycle.js';
-import { deriveWorkerAuthorityDigest, workerPathAllowed } from './authority.js';
+import {
+  authorizeWorkerCapability,
+  deriveWorkerAuthorityDigest,
+  resolveWorkerExecutionEnvelope,
+  workerPathAllowed,
+  type WorkerCapabilityRequest,
+  type WorkerExecutionEnvelope,
+} from './authority.js';
 import type { MultiWorkerDocument } from './model.js';
 import { projectMultiWorkerObservability, type MultiWorkerObservabilityTree } from './observability.js';
 import { assertMutablePathOwnershipAvailable } from './path-ownership.js';
@@ -115,6 +123,16 @@ export interface ReviewWorkerResultInput {
   readonly requestedEvidence: readonly string[];
 }
 
+export interface AuthorizeWorkerExecutionInput {
+  readonly association: WorkerExecutionAssociation;
+  readonly sessionId: string;
+  readonly projectId: string;
+  readonly workspaceId?: string;
+  readonly capabilityId: string;
+  readonly runtimeFence: WorkerRuntimeFence;
+  readonly request?: WorkerCapabilityRequest;
+}
+
 export interface MultiWorkerRunView {
   readonly generation: number;
   readonly run: OrchestrationRun;
@@ -178,6 +196,42 @@ export class MultiWorkerRoutingService {
     const run = document.runs.find((entry) => entry.missionId === missionId);
     if (run === undefined) return null;
     return projectMultiWorkerObservability(document, run.id, this.now());
+  }
+
+  public async authorizeExecution(input: AuthorizeWorkerExecutionInput): Promise<WorkerExecutionEnvelope> {
+    const document = await this.store.read();
+    const task = requiredTask(document, input.association.workerTaskId);
+    const run = requiredRun(document, task.orchestrationRunId);
+    if (input.association.missionId !== run.missionId
+      || input.association.orchestrationRunId !== run.id
+      || input.association.assignmentId !== task.assignmentId) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker execution association does not match durable run/task state');
+    }
+    const selectedWorkspaceId = input.workspaceId ?? String(task.authority.workspaceId);
+    if (selectedWorkspaceId !== String(task.authority.workspaceId)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker execution workspace does not match immutable task authority');
+    }
+    await this.resources.getActiveWorkspace(run.projectId, task.authority.workspaceId);
+
+    const envelope = resolveWorkerExecutionEnvelope(document, {
+      missionId: input.association.missionId,
+      taskId: input.association.workerTaskId,
+      workerId: input.association.workerId,
+      assignmentId: input.association.assignmentId,
+      authorityDigest: input.association.authorityDigest,
+    }, {
+      sessionId: input.sessionId,
+      projectId: input.projectId,
+      workspaceId: selectedWorkspaceId,
+      parentOrchestratorId: run.parentOrchestratorId,
+      runtimeFence: input.runtimeFence,
+      now: this.now(),
+    });
+    authorizeWorkerCapability(envelope, input.capabilityId, input.request);
+    if (input.capabilityId === 'project.search' && !workerPathAllowed(envelope.allowedPaths, '**')) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker project.search requires whole-project read authority');
+    }
+    return envelope;
   }
 
   public async getRun(orchestrationRunIdInput: string): Promise<MultiWorkerRunView> {

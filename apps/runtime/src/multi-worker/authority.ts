@@ -33,6 +33,7 @@ export interface WorkerAuthorityServerContext {
 
 export interface WorkerExecutionEnvelope extends WorkerTaskAuthorityMetadata {
   readonly orchestrationRunId: string;
+  readonly missionTaskId: string | null;
   readonly assignmentId: string;
   readonly workerId: string;
   readonly authorityDigest: string;
@@ -157,6 +158,7 @@ export function resolveWorkerExecutionEnvelope(
     resourceBudget: Object.freeze({ ...task.authority.resourceBudget }),
     concurrencyPolicy: Object.freeze({ ...task.authority.concurrencyPolicy }),
     orchestrationRunId: run.id,
+    missionTaskId: task.missionTaskId,
     assignmentId: assignment.id,
     workerId: worker.id,
     authorityDigest: expectedDigest,
