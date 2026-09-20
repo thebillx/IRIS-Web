@@ -4,6 +4,7 @@ import {
   type Worker,
   type WorkerAssignment,
   type WorkerResult,
+  type WorkerRuntimeFence,
   type WorkerTask,
   type WorkerTaskAuthorityMetadata,
 } from '@iris/domain';
@@ -181,10 +182,24 @@ function isTask(value: unknown): value is WorkerTask {
 
 function isAssignment(value: unknown): value is WorkerAssignment {
   return isRecord(value)
-    && exactKeys(value, ['id', 'orchestrationRunId', 'taskId', 'workerId', 'authorityTaskId', 'assignedAt', 'releasedAt'])
+    && exactKeys(value, ['id', 'orchestrationRunId', 'taskId', 'workerId', 'authorityTaskId', 'runtimeFence', 'authorityDigest', 'assignedAt', 'releasedAt'])
     && uuid(value.id) && uuid(value.orchestrationRunId) && uuid(value.taskId) && uuid(value.workerId) && uuid(value.authorityTaskId)
+    && isRuntimeFence(value.runtimeFence)
+    && typeof value.authorityDigest === 'string' && /^[a-f0-9]{64}$/.test(value.authorityDigest)
     && timestamp(value.assignedAt)
     && (value.releasedAt === null || (timestamp(value.releasedAt) && String(value.releasedAt) >= String(value.assignedAt)));
+}
+
+function isRuntimeFence(value: unknown): value is WorkerRuntimeFence {
+  return isRecord(value)
+    && exactKeys(value, ['machineId', 'runtimeId', 'instanceId', 'deploymentEpoch', 'connectorProfile', 'catalogHash'])
+    && uuid(value.machineId)
+    && uuid(value.runtimeId)
+    && uuid(value.instanceId)
+    && positiveInteger(value.deploymentEpoch)
+    && value.connectorProfile === 'FULL'
+    && typeof value.catalogHash === 'string'
+    && /^sha256:[a-f0-9]{64}$/.test(value.catalogHash);
 }
 
 function isResult(value: unknown): value is WorkerResult {
@@ -227,10 +242,28 @@ function isAuthority(value: unknown): value is WorkerTaskAuthorityMetadata {
     || !timestamp(value.createdAt) || !timestamp(value.expiresAt)
     || String(value.expiresAt) <= String(value.createdAt)) return false;
 
-  const allowed = new Set(value.allowedPaths as string[]);
-  if (!(value.readOnlyPaths as string[]).every((entry) => allowed.has(entry))
-    || !(value.mutablePaths as string[]).every((entry) => allowed.has(entry))) return false;
+  const allowedPaths = value.allowedPaths as string[];
+  const readOnlyPaths = value.readOnlyPaths as string[];
+  const mutablePaths = value.mutablePaths as string[];
+  if (![...allowedPaths, ...readOnlyPaths, ...mutablePaths].every(validAuthorityPathPattern)) return false;
+  if (!readOnlyPaths.every((entry) => allowedPaths.some((allowed) => authorityPathGrantContains(allowed, entry)))
+    || !mutablePaths.every((entry) => allowedPaths.some((allowed) => authorityPathGrantContains(allowed, entry)))) return false;
   return true;
+}
+
+function validAuthorityPathPattern(value: string): boolean {
+  if (value === '**') return true;
+  if (value.startsWith('/') || value.includes('\\') || value.includes('\0') || value === '.' || value === '..' || value.startsWith('../')) return false;
+  const wildcardIndex = value.indexOf('*');
+  return wildcardIndex === -1 || (value.endsWith('/**') && wildcardIndex === value.length - 2);
+}
+
+function authorityPathGrantContains(parent: string, child: string): boolean {
+  if (parent === '**' || parent === child) return true;
+  if (!parent.endsWith('/**')) return false;
+  const parentBase = parent.slice(0, -3);
+  const childBase = child.endsWith('/**') ? child.slice(0, -3) : child;
+  return childBase === parentBase || childBase.startsWith(`${parentBase}/`);
 }
 
 function isResourceBudget(value: unknown): boolean {

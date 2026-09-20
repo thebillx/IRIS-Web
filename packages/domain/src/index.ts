@@ -372,12 +372,23 @@ export interface WorkerTask {
   readonly updatedAt: string;
 }
 
+export interface WorkerRuntimeFence {
+  readonly machineId: string;
+  readonly runtimeId: string;
+  readonly instanceId: string;
+  readonly deploymentEpoch: number;
+  readonly connectorProfile: 'FULL';
+  readonly catalogHash: string;
+}
+
 export interface WorkerAssignment {
   readonly id: string;
   readonly orchestrationRunId: string;
   readonly taskId: string;
   readonly workerId: string;
   readonly authorityTaskId: string;
+  readonly runtimeFence: WorkerRuntimeFence;
+  readonly authorityDigest: string;
   readonly assignedAt: string;
   readonly releasedAt: string | null;
 }

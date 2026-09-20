@@ -90,6 +90,15 @@ function fixture(generation = 1): MultiWorkerDocument {
     taskId,
     workerId,
     authorityTaskId: taskId,
+    runtimeFence: {
+      machineId: randomUUID(),
+      runtimeId: randomUUID(),
+      instanceId: randomUUID(),
+      deploymentEpoch: 1,
+      connectorProfile: 'FULL',
+      catalogHash: `sha256:${'0'.repeat(64)}`,
+    },
+    authorityDigest: 'a'.repeat(64),
     assignedAt: now,
     releasedAt: '2026-09-20T01:10:00.000Z',
   };
