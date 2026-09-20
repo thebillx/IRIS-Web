@@ -59,12 +59,16 @@ const PROFILES: readonly ProfileDefinition[] = [
   { id: 'node-script', executable: 'node', candidates: () => [canonicalNodeRuntime().path], minTimeoutMs: 100, maxTimeoutMs: 30 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'NODE_SCRIPT' },
   { id: 'python3-script', executable: 'python3', candidates: () => ['/usr/bin/python3','/opt/homebrew/bin/python3','/usr/local/bin/python3'], minTimeoutMs: 100, maxTimeoutMs: 30 * 60_000, envAllowlist: ['CI','PYTHONUNBUFFERED','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'PYTHON_SCRIPT' },
   { id: 'robot', executable: 'robot', candidates: () => ['/opt/homebrew/bin/robot','/usr/local/bin/robot'], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'ROBOT_SCRIPT' },
-  { id: 'pnpm-script', executable: 'pnpm', candidates: () => ['/opt/homebrew/bin/pnpm','/usr/local/bin/pnpm'], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'PNPM_SCRIPT' },
-  { id: 'npm-script', executable: 'npm', candidates: () => ['/opt/homebrew/bin/npm','/usr/local/bin/npm','/usr/bin/npm'], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'NPM_SCRIPT' },
+  { id: 'pnpm-script', executable: 'pnpm', candidates: () => nodePackageManagerCandidates('pnpm', ['/opt/homebrew/bin/pnpm','/usr/local/bin/pnpm']), minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'PNPM_SCRIPT' },
+  { id: 'npm-script', executable: 'npm', candidates: () => nodePackageManagerCandidates('npm', ['/opt/homebrew/bin/npm','/usr/local/bin/npm','/usr/bin/npm']), minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'NPM_SCRIPT' },
   { id: 'ffmpeg', executable: 'ffmpeg', candidates: () => ['/opt/homebrew/bin/ffmpeg','/usr/local/bin/ffmpeg'], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'FFMPEG' },
   { id: 'ffprobe', executable: 'ffprobe', candidates: () => ['/opt/homebrew/bin/ffprobe','/usr/local/bin/ffprobe'], minTimeoutMs: 100, maxTimeoutMs: 30 * 60_000, envAllowlist: ['CI'], effectEnvelope: ['READ','EXECUTE'], argvPolicy: 'FFPROBE' },
   { id: 'codex-review', executable: 'node', candidates: () => [canonicalNodeRuntime().path], minTimeoutMs: 10_000, maxTimeoutMs: 30 * 60_000, envAllowlist: [], effectEnvelope: CODE_REVIEW_EFFECTS, argvPolicy: 'CODEX_REVIEW', serverOnly: true },
 ] as const;
+
+function nodePackageManagerCandidates(name: 'pnpm' | 'npm', fallbacks: readonly string[]): readonly string[] {
+  return [path.join(path.dirname(canonicalNodeRuntime().path), name), ...fallbacks];
+}
 
 export function executionProfileEffects(profileId: string): readonly CapabilityEffect[] | null {
   const profile = PROFILES.find((candidate) => candidate.id === profileId);
