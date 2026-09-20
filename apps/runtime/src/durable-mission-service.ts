@@ -55,12 +55,17 @@ type WorkerOperationResult = {
 
 export class DurableMissionLifecycleService {
   private mutationTail: Promise<void> = Promise.resolve();
+  private completionGuard: (missionId: string) => Promise<void> = async () => undefined;
 
   public constructor(
     private readonly state: RuntimeState,
     private readonly store: DurableMissionLifecycleStore,
     private readonly workers: WorkerAdapterRegistry = new WorkerAdapterRegistry(),
   ) {}
+
+  public setCompletionGuard(guard: (missionId: string) => Promise<void>): void {
+    this.completionGuard = guard;
+  }
 
   public async list(): Promise<readonly DurableMissionLifecycleSnapshot[]> {
     const records: DurableMissionLifecycleSnapshot[] = [];
@@ -303,6 +308,8 @@ export class DurableMissionLifecycleService {
       if (record.state !== 'RUNNING' && record.state !== 'WAITING_FOR_SUPERVISOR' && record.state !== 'CHECKPOINTED') {
         throw new RuntimeError('INVALID_REQUEST', `Mission cannot complete from state ${record.state}`);
       }
+      await this.state.assertMissionReviewActionsFinalized(missionId);
+      await this.completionGuard(missionId);
       if (record.operations.length >= MAX_OPERATIONS) throw new RuntimeError('CAPABILITY_DENIED', 'Mission lifecycle operation capacity has been reached');
       const now = new Date().toISOString();
       const resultRevision = record.revision + 1;

@@ -83,6 +83,10 @@ export class RuntimeState {
     return mission;
   }
 
+  public async assertMissionReviewActionsFinalized(missionIdInput: string): Promise<void> {
+    assertMissionReviewActionsFinalized(await this.getMission(missionIdInput));
+  }
+
   public rebindMissionSession(input: MissionRebindInput): Promise<MissionSnapshot> {
     const missionId = normalizeUuidIdentity(input.missionId, 'missionId');
     const clientId = normalizeClientId(input.clientId);
@@ -216,12 +220,15 @@ export class RuntimeState {
     sessionIdInput: string,
     state: MissionState,
   ): Promise<MissionSnapshot> {
-    return this.updateControlledMission(missionIdInput, clientIdInput, sessionIdInput, (mission, now) => ({
-      ...mission,
-      state,
-      updatedAt: now,
-      timeline: appendMissionEvent(mission.timeline, missionEvent('MISSION_STATE_CHANGED', `Mission state recorded as ${state}`, null, null, now)),
-    }));
+    return this.updateControlledMission(missionIdInput, clientIdInput, sessionIdInput, (mission, now) => {
+      if (state === 'COMPLETED') assertMissionReviewActionsFinalized(mission);
+      return {
+        ...mission,
+        state,
+        updatedAt: now,
+        timeline: appendMissionEvent(mission.timeline, missionEvent('MISSION_STATE_CHANGED', `Mission state recorded as ${state}`, null, null, now)),
+      };
+    });
   }
 
   public createMissionTask(
@@ -537,6 +544,9 @@ export class RuntimeState {
       if (existingByReference !== undefined) {
         if (JSON.stringify(existingByReference) === JSON.stringify(evidence)) return;
         throw new RuntimeError('PRECONDITION_FAILED', 'Mission action evidence reference is already bound to different content');
+      }
+      if (mission.state === 'COMPLETED' || mission.state === 'FAILED' || mission.state === 'CANCELLED') {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Terminal mission cannot accept new action evidence');
       }
       if (action.result.evidence.length >= 64) throw new RuntimeError('CAPABILITY_DENIED', 'Mission action evidence capacity has been reached');
       const now = new Date().toISOString();
@@ -916,6 +926,16 @@ function normalizeMissionAssociation(value: MissionExecutionAssociation): Missio
 function assertMissionControlIdentity(mission: MissionSnapshot, clientId: string, sessionId: string): void {
   if (mission.clientId !== clientId || mission.sessionId !== sessionId) {
     throw new RuntimeError('CONTROL_DENIED', 'Mission does not belong to this client/session identity');
+  }
+}
+
+function assertMissionReviewActionsFinalized(mission: MissionSnapshot): void {
+  const pending = mission.tasks.flatMap((task) => task.actions).filter((action) =>
+    action.capabilityId === 'code_review.start'
+    && !action.result?.evidence.some((item) => item.label === 'code_review.receipt'
+      && typeof item.reference === 'string' && item.reference.startsWith('iris-review-job:')));
+  if (pending.length > 0) {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Mission has unfinalized native code review actions');
   }
 }
 

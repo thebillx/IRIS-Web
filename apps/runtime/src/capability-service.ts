@@ -645,7 +645,13 @@ export class CapabilityService {
     if (operation.capabilityId === 'mission.list') return { missions: await this.state.listMissions() };
     if (operation.capabilityId === 'mission.get') return this.state.getMission(operation.missionId);
     if (operation.capabilityId === 'mission.create') return this.state.createMission(operation.clientId, operation.sessionId, operation.title, operation.orchestratorMode ?? 'HERMES');
-    if (operation.capabilityId === 'mission.state.set') return this.state.setMissionState(operation.missionId, operation.clientId, operation.sessionId, operation.state);
+    if (operation.capabilityId === 'mission.state.set') {
+      if (operation.state === 'COMPLETED') {
+        await this.state.assertMissionReviewActionsFinalized(operation.missionId);
+        await this.jobManager().assertMissionCodeReviewsFinalized(operation.missionId);
+      }
+      return this.state.setMissionState(operation.missionId, operation.clientId, operation.sessionId, operation.state);
+    }
     if (operation.capabilityId === 'mission.task.create') return this.state.createMissionTask(operation.missionId, operation.clientId, operation.sessionId, operation.title);
     if (operation.capabilityId === 'mission.task.state.set') return this.state.setMissionTaskState(operation.missionId, operation.taskId, operation.clientId, operation.sessionId, operation.state);
     if (operation.capabilityId === 'mission.action.prepare') {

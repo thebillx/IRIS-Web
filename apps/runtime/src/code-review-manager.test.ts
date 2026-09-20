@@ -8,6 +8,9 @@ import { PermissionAuditStore } from './audit.js';
 import { CapabilityService, type CapabilityOutcome } from './capability-service.js';
 import { parseNativeCodeReviewOutput } from './code-review-manager.js';
 import { DurableJobManager } from './durable-job-manager.js';
+import { DurableMissionLifecycleStore } from './durable-mission-store.js';
+import { DurableMissionLifecycleService } from './durable-mission-service.js';
+import { WorkerAdapterRegistry } from './durable-mission-workers.js';
 import { codeReviewGroupedToolDefinitions, executeCodeReviewGroupedTool } from './mcp-code-review.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
 import { proMcpToolDefinitions } from './mcp.js';
@@ -202,6 +205,116 @@ describe('native Ponytail code-review capability', () => {
     expect(JSON.stringify(await fixture.audit.recent(100))).not.toContain(context);
   }, 20_000);
 
+  it('blocks legacy and durable mission completion until the native review receipt is finalized', async () => {
+    const fixture = await reviewFixture();
+    const fakeCodex = await fakeCodexExecutable(await temp('iris-fake-codex-completion-'));
+    process.env.IRIS_CODEX_EXECUTABLE = fakeCodex;
+
+    const primary = await fixture.resources.primaryWorkspace(fixture.project.id);
+    const association = await preparedReviewAction(fixture, 'completion must wait for review');
+    const contextArtifact = await textArtifact(fixture, '# completion gate review context');
+    const start = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'code_review.start',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      workspaceId: primary.workspaceId,
+      contextArtifactId: contextArtifact.artifactId,
+      requestId: `review-${randomUUID()}`,
+      mission: association,
+      expectedEffects: REVIEW_START_EFFECTS,
+    }));
+    const jobId = String(start.jobId);
+
+    const lifecycle = new DurableMissionLifecycleService(
+      fixture.state,
+      new DurableMissionLifecycleStore(fixture.dataRoot),
+      new WorkerAdapterRegistry(),
+    );
+    lifecycle.setCompletionGuard((missionId) => fixture.jobs.assertMissionCodeReviewsFinalized(missionId));
+    let durable = await lifecycle.ensureMission(association.missionId, 'Completion waits for terminal native review receipt.');
+    durable = await lifecycle.start({
+      missionId: association.missionId,
+      expectedRevision: durable.revision,
+      requestId: randomUUID(),
+      workerType: 'IRIS_LOGICAL',
+    });
+
+    await expect(fixture.service.execute({
+      capabilityId: 'mission.state.set',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      missionId: association.missionId,
+      state: 'COMPLETED',
+      expectedEffects: ['WRITE'],
+    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    await expect(lifecycle.complete({
+      missionId: association.missionId,
+      expectedRevision: durable.revision,
+      requestId: randomUUID(),
+    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    await waitForReviewTerminal(fixture, jobId);
+    await expect(fixture.jobs.assertMissionCodeReviewsFinalized(association.missionId))
+      .rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'code_review.result',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      jobId,
+      expectedEffects: REVIEW_RESULT_EFFECTS,
+    }));
+    await expect(fixture.jobs.assertMissionCodeReviewsFinalized(association.missionId)).resolves.toBeUndefined();
+
+    durable = await lifecycle.complete({
+      missionId: association.missionId,
+      expectedRevision: durable.revision,
+      requestId: randomUUID(),
+    });
+    expect(durable.state).toBe('COMPLETED');
+
+    const completed = executedValue<Awaited<ReturnType<RuntimeState['getMission']>>>(await fixture.service.execute({
+      capabilityId: 'mission.state.set',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      missionId: association.missionId,
+      state: 'COMPLETED',
+      expectedEffects: ['WRITE'],
+    }));
+    expect(completed.state).toBe('COMPLETED');
+
+    await expect(fixture.state.appendMissionActionEvidence(
+      association.missionId,
+      association.taskId,
+      association.actionId,
+      'code_review.start',
+      {
+        id: randomUUID(),
+        kind: 'AUDIT',
+        label: 'late-evidence',
+        summary: 'Terminal missions must reject new review evidence',
+        reference: `iris-review-job:${jobId}:late`,
+        data: {},
+      },
+    )).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+
+    const repeated = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'code_review.result',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      jobId,
+      expectedEffects: REVIEW_RESULT_EFFECTS,
+    }));
+    expect(repeated).toMatchObject({
+      reviewDecision: 'APPROVED',
+      terminalReceipt: 'REVIEW_DECISION: APPROVED',
+    });
+  }, 20_000);
+
   it('derives linked-worktree Git metadata read access only from the verified IRIS repository binding', async () => {
     const fixture = await reviewFixture();
     const commonGitDir = path.join(fixture.projectRoot, '.git');
@@ -280,7 +393,6 @@ describe('native Ponytail code-review capability', () => {
 
   it('ignores project-visible log/context tampering, hides review jobs from generic job surfaces, and cleans terminal secrets before result', async () => {
     const fixture = await reviewFixture();
-    const baselineTemps = await reviewTempDirs();
     const fakeCodex = await fakeCodexExecutable(await temp('iris-fake-codex-tamper-'), null, 'CHANGES_REQUIRED');
     process.env.IRIS_CODEX_EXECUTABLE = fakeCodex;
     const primary = await fixture.resources.primaryWorkspace(fixture.project.id);
@@ -298,9 +410,10 @@ describe('native Ponytail code-review capability', () => {
       expectedEffects: REVIEW_START_EFFECTS,
     }));
     const jobId = String(start.jobId);
+    const cleanupPaths = await persistedReviewCleanupPaths(fixture.dataRoot, jobId);
     const terminal = await waitForReviewTerminal(fixture, jobId);
     expect(terminal).toMatchObject({ state: 'SUCCEEDED', terminalReady: true, reviewDecision: null, terminalReceipt: null });
-    expect(await reviewTempDirs()).toEqual(baselineTemps);
+    await expectPathsMissing(cleanupPaths);
 
     for (const operation of [
       () => fixture.jobs.status(fixture.project.id, jobId),
@@ -470,7 +583,6 @@ describe('native Ponytail code-review capability', () => {
 
   it('cleans private auth/input before terminal publication and remains restart-safe without code_review.result polling', async () => {
     const fixture = await reviewFixture();
-    const baselineTemps = await reviewTempDirs();
     const fakeCodex = await fakeCodexExecutable(await temp('iris-fake-codex-restart-'));
     process.env.IRIS_CODEX_EXECUTABLE = fakeCodex;
     const primary = await fixture.resources.primaryWorkspace(fixture.project.id);
@@ -479,15 +591,16 @@ describe('native Ponytail code-review capability', () => {
     const requestId = `review-restart-${randomUUID()}`;
     const start = await fixture.jobs.start(direct.prepared, requestId, REVIEW_START_EFFECTS, association);
     const jobId = String(start.jobId);
+    const cleanupPaths = await persistedReviewCleanupPaths(fixture.dataRoot, jobId);
 
     await waitForPrivateRunnerResult(fixture.dataRoot, jobId);
-    expect(await reviewTempDirs()).toEqual(baselineTemps);
+    await expectPathsMissing(cleanupPaths);
 
     const restarted = new DurableJobManager(fixture.dataRoot, fixture.resources);
     await restarted.recover();
     const snapshot = await restarted.codeReviewStatusSnapshot(fixture.project.id, jobId);
     expect(snapshot).toMatchObject({ state: 'SUCCEEDED', terminalReady: true });
-    expect(await reviewTempDirs()).toEqual(baselineTemps);
+    await expectPathsMissing(cleanupPaths);
   }, 20_000);
 
   it('cleans newly prepared private state when an exact duplicate requestId reuses the existing job', async () => {
@@ -849,6 +962,22 @@ function validRunnerOutput(decision: 'APPROVED' | 'CHANGES_REQUIRED') {
 function executedValue<T>(outcome: CapabilityOutcome): T {
   if (outcome.status !== 'executed') throw new Error(`Expected executed outcome, received ${outcome.status}: ${'reason' in outcome ? outcome.reason : ''}`);
   return outcome.value as T;
+}
+
+async function persistedReviewCleanupPaths(dataRoot: string, jobId: string): Promise<string[]> {
+  const document = JSON.parse(await readFile(path.join(dataRoot, 'vnext-jobs.json'), 'utf8')) as {
+    jobs: Array<{ jobId: string; cleanupPaths?: string[] }>;
+  };
+  const job = document.jobs.find((candidate) => candidate.jobId === jobId);
+  if (job === undefined) throw new Error('review job was not persisted');
+  return [...(job.cleanupPaths ?? [])];
+}
+
+async function expectPathsMissing(paths: readonly string[]): Promise<void> {
+  expect(paths.length).toBeGreaterThan(0);
+  for (const candidate of paths) {
+    await expect(lstat(candidate)).rejects.toMatchObject({ code: 'ENOENT' });
+  }
 }
 
 async function reviewTempDirs(): Promise<string[]> {

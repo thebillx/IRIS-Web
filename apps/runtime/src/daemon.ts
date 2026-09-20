@@ -141,6 +141,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     await recoverMultiWorkerRuns(state, resourceRegistry, multiWorkerStore, lifecycleWorkers);
     const durableJobs = new DurableJobManager(dataRoot, resourceRegistry);
     await durableJobs.recover();
+    missionLifecycle.setCompletionGuard((missionId) => durableJobs.assertMissionCodeReviewsFinalized(missionId));
     const capabilities = new CapabilityService(
       state,
       permissionPolicy,

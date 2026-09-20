@@ -517,6 +517,16 @@ export class DurableJobManager {
     await this.replaceJob({ ...job, reviewFinalizedAt: new Date().toISOString() });
   }
 
+  public async assertMissionCodeReviewsFinalized(missionId: string): Promise<void> {
+    const pending = (await this.readDocument()).jobs.filter((job) =>
+      job.executionProfile === 'codex-review'
+      && job.missionId === missionId
+      && (job.reviewFinalizedAt === null || job.reviewFinalizedAt === undefined));
+    if (pending.length > 0) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Mission has unfinalized native code review jobs');
+    }
+  }
+
   private async readPrivateCodeReviewOutput(job: DurableJobRecord, expectedSha256: string, expectedBytes: number): Promise<string> {
     const filename = job.reviewOutputPath;
     if (filename === null || filename === undefined) throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review private output path is missing');
