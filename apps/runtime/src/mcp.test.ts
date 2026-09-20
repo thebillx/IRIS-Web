@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { PermissionAuditStore } from './audit.js';
 import { CapabilityService } from './capability-service.js';
 import { DurableJobManager } from './durable-job-manager.js';
-import { handleMcpProRequest, handleMcpRequest, MCP_PROTOCOL_VERSION } from './mcp.js';
+import { handleMcpProRequest, handleMcpRequest, MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
@@ -22,6 +22,56 @@ const execFileAsync = promisify(execFile);
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('local MCP transport and permission boundary', () => {
+  it('accepts the tunnel-client v0.0.12 Streamable HTTP initialize contract', async () => {
+    const initialize = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+          protocolVersion: TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+          capabilities: { roots: { listChanged: true } },
+          clientInfo: { name: 'tunnel-client', version: '0.0.12' },
+        },
+      }),
+    }), {} as CapabilityService, undefined, undefined, 'tunnel-service');
+
+    expect(initialize.status).toBe(200);
+    expect(initialize.headers.get('content-type')).toContain('application/json');
+    expect(initialize.headers.get('Mcp-Session-Id')).toBeNull();
+    expect(await initialize.json()).toMatchObject({ result: {
+      protocolVersion: TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+      capabilities: { tools: {} },
+      serverInfo: { name: 'IRIS' },
+    } });
+
+    const initialized = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json', accept: 'application/json, text/event-stream',
+        'MCP-Protocol-Version': TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }),
+    }), {} as CapabilityService, undefined, undefined, 'tunnel-service');
+    expect(initialized.status).toBe(202);
+
+    const listed = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json', accept: 'application/json, text/event-stream',
+        'MCP-Protocol-Version': TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+    }), {} as CapabilityService, undefined, undefined, 'tunnel-service');
+    expect(listed.status).toBe(200);
+    expect((await listed.json() as { result: { tools: unknown[] } }).result.tools.length).toBeGreaterThan(0);
+
+    const stream = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
+      method: 'GET', headers: { accept: 'text/event-stream' },
+    }), {} as CapabilityService, undefined, undefined, 'tunnel-service');
+    expect(stream.status).toBe(405);
+    expect(stream.headers.get('allow')).toBe('POST');
+  });
+
   it('exposes only the dedicated sessionless read tools on the Pro endpoint', async () => {
     const fixture = await serviceFixture();
     await Promise.all([

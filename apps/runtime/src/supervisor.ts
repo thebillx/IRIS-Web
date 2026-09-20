@@ -865,7 +865,7 @@ export class Supervisor {
     const credentials = await readTunnelServiceSecret(this.dataRoot);
     const observed = await runtimeStatus(this.dataRoot);
     if (registry === null || credentials === null || observed.state !== 'running' || observed.endpoint === null) {
-      return { status: layer('FAILED', registry === null ? 'MIGRATION_REQUIRED' : credentials === null ? 'CREDENTIAL_MISSING' : 'LOCAL_MCP_AUTH_FAILED', 'Local runtime prerequisites are not ready'), connectors: [], catalogs: [] };
+      return { status: layer('FAILED', registry === null ? 'MIGRATION_REQUIRED' : credentials === null ? 'CREDENTIAL_MISSING' : 'RUNTIME_NOT_RUNNING', 'Local runtime prerequisites are not ready'), connectors: [], catalogs: [] };
     }
     const state = await this.readState();
     return probeLocalRuntime(observed.endpoint.apiUrl, credentials, registry, sameSourceRoot(state.workloadSourceRoot, this.sourceRoot));
@@ -996,7 +996,7 @@ export class Supervisor {
     const nativeControlLayer = isolatedAdminRequired
       ? await this.probeNativeControl()
       : layer('READY', 'LEGACY_ADMIN_TRANSPORT', 'Native supervisor control is required only for the persistent native supervisor daemon');
-    const local = runtimeLayer.state === 'READY' ? await this.localReadiness() : { status: layer('FAILED', 'LOCAL_MCP_AUTH_FAILED', 'L1 requires a ready runtime'), connectors: [], catalogs: [] };
+    const local = runtimeLayer.state === 'READY' ? await this.localReadiness() : { status: layer('FAILED', runtimeLayer.code, 'L1 requires a ready runtime'), connectors: [], catalogs: [] };
     const controlPlaneParts = [...tunnelResults, adminLayer, adminTunnelLayer, nativeControlLayer];
     const controlPlane = controlPlaneParts.every((result) => result.state === 'READY')
       ? layer('READY', 'READY', 'Workload tunnels, isolated admin tunnel, and persistent supervisor-admin endpoint are healthy')
