@@ -296,3 +296,75 @@ describe('IRIS multi-worker M04 routing', () => {
     expect((await f.store.read()).generation).toBe(0);
   });
 });
+
+
+describe('IRIS multi-worker M06 routing ownership integration', () => {
+  it('rejects overlapping mutable assignment until the current owner is explicitly released', async () => {
+    const f = await fixture();
+    const run = (await f.service.createRun({
+      expectedGeneration: 0,
+      missionId: f.mission.id,
+      parentOrchestratorId: f.session.agentId,
+    })).run;
+    const workerA = await f.service.createWorker({
+      expectedGeneration: 1,
+      orchestrationRunId: run.id,
+      principalId: 'worker-a',
+      workerType: 'IRIS_LOGICAL',
+      role: 'CODE',
+    });
+    const workerB = await f.service.createWorker({
+      expectedGeneration: 2,
+      orchestrationRunId: run.id,
+      principalId: 'worker-b',
+      workerType: 'IRIS_LOGICAL',
+      role: 'CODE',
+    });
+    const baseA = taskInput(3, run.id, f.mission.tasks[0]!.id, f.workspace.workspaceId, 'worker-a');
+    const taskA = await f.service.createTask({
+      ...baseA,
+      allowedCapabilities: ['fs.read', 'fs.write'] as const,
+      mutablePaths: ['apps/runtime/**'],
+      concurrencyPolicy: { ...baseA.concurrencyPolicy, mutablePathOwnership: 'EXCLUSIVE' as const },
+    });
+    const baseB = taskInput(4, run.id, f.mission.tasks[0]!.id, f.workspace.workspaceId, 'worker-b');
+    const taskB = await f.service.createTask({
+      ...baseB,
+      allowedCapabilities: ['fs.read', 'fs.write'] as const,
+      mutablePaths: ['apps/runtime/src/state.ts'],
+      concurrencyPolicy: { ...baseB.concurrencyPolicy, mutablePathOwnership: 'EXCLUSIVE' as const },
+    });
+
+    await f.service.assignTask({
+      expectedGeneration: 5,
+      orchestrationRunId: run.id,
+      taskId: taskA.id,
+      workerId: workerA.id,
+      runtimeFence: f.runtimeFence,
+    });
+
+    await expect(f.service.assignTask({
+      expectedGeneration: 6,
+      orchestrationRunId: run.id,
+      taskId: taskB.id,
+      workerId: workerB.id,
+      runtimeFence: f.runtimeFence,
+    })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect((await f.store.read()).generation).toBe(6);
+
+    await f.service.cancelTask({
+      expectedGeneration: 6,
+      orchestrationRunId: run.id,
+      taskId: taskA.id,
+    });
+    const assigned = await f.service.assignTask({
+      expectedGeneration: 7,
+      orchestrationRunId: run.id,
+      taskId: taskB.id,
+      workerId: workerB.id,
+      runtimeFence: f.runtimeFence,
+    });
+    expect(assigned.taskId).toBe(taskB.id);
+    expect((await f.store.read()).generation).toBe(8);
+  });
+});

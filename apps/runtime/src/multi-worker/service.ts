@@ -19,6 +19,7 @@ import {
 import type { WorkerBinding } from '../durable-mission-lifecycle.js';
 import { deriveWorkerAuthorityDigest } from './authority.js';
 import type { MultiWorkerDocument } from './model.js';
+import { assertMutablePathOwnershipAvailable } from './path-ownership.js';
 import { MultiWorkerStore } from './store.js';
 import { validateMultiWorkerDocument, validateWorkerTaskAuthority } from './validation.js';
 
@@ -311,6 +312,7 @@ export class MultiWorkerRoutingService {
         throw new RuntimeError('CAPABILITY_DENIED', 'Worker principal does not match immutable task authority');
       }
       await this.resources.getActiveWorkspace(run.projectId, task.authority.workspaceId);
+      assertMutablePathOwnershipAvailable(document, task);
       const now = this.now();
       const base: WorkerAssignment = {
         id: randomUUID(),
