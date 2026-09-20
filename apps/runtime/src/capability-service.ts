@@ -35,6 +35,7 @@ import { CodeReviewManager } from './code-review-manager.js';
 import { GovernedGitEngine, type GitCompatibilityOperation, type Phase4GitOperationName, type Phase4GitRequest } from './governed-git-engine.js';
 import type { RuntimeState } from './state.js';
 import type { MultiWorkerRoutingService } from './multi-worker/service.js';
+import type { AdoRequirementContextService } from './ado/runtime-context.js';
 
 type Phase4GitCapabilityId = Exclude<Extract<CapabilityId, `git.${string}`>, 'git.local'>;
 type Phase4GitOperationCore = Phase4GitRequest & {
@@ -53,6 +54,10 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'project.info'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string }
   | { readonly capabilityId: 'project.git_status'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'project.search'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string; readonly query: string }
+  | { readonly capabilityId: 'ado.discovery'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly requestId: string }
+  | { readonly capabilityId: 'ado.workitem.read'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly requestId: string; readonly workItemId: number; readonly includeComments: boolean; readonly includeLinks: boolean }
+  | { readonly capabilityId: 'ado.hierarchy.read'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly requestId: string; readonly rootWorkItemId: number; readonly maxDepth: number; readonly maxItems: number }
+  | { readonly capabilityId: 'ado.context.search'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly requestId: string; readonly query: string; readonly limit: number }
   | { readonly capabilityId: 'project.test.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'project.command.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly scriptName: string }
   | { readonly capabilityId: 'project.validation.discover'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string }
@@ -142,6 +147,7 @@ export class CapabilityService {
   private jobs: DurableJobManager | undefined;
   private multiWorker: MultiWorkerRoutingService | undefined;
   private codeReviews: CodeReviewManager | undefined;
+  private readonly adoContext: AdoRequirementContextService | undefined;
 
   public constructor(
     private readonly state: RuntimeState,
@@ -152,10 +158,12 @@ export class CapabilityService {
     resources?: VNextResourceRegistry,
     jobs?: DurableJobManager,
     multiWorker?: MultiWorkerRoutingService,
+    adoContext?: AdoRequirementContextService,
   ) {
     this.resources = resources;
     this.jobs = jobs;
     this.multiWorker = multiWorker;
+    this.adoContext = adoContext;
   }
 
   public permissionSnapshot() {
@@ -588,6 +596,39 @@ export class CapabilityService {
       const workspace = await resources.primaryWorkspace(project.id);
       return new WorkspaceFilesystemEngine(resources).compatibilityTextSearch(project.id, workspace.workspaceId, operation.query);
     }
+    if (operation.capabilityId === 'ado.discovery') {
+      const project = await this.authorizedProject(operation);
+      return this.adoContextService().discovery(project.id, operation.requestId);
+    }
+    if (operation.capabilityId === 'ado.workitem.read') {
+      const project = await this.authorizedProject(operation);
+      return this.adoContextService().workItemRead({
+        projectId: project.id,
+        requestId: operation.requestId,
+        workItemId: operation.workItemId,
+        includeComments: operation.includeComments,
+        includeLinks: operation.includeLinks,
+      });
+    }
+    if (operation.capabilityId === 'ado.hierarchy.read') {
+      const project = await this.authorizedProject(operation);
+      return this.adoContextService().hierarchyRead({
+        projectId: project.id,
+        requestId: operation.requestId,
+        rootWorkItemId: operation.rootWorkItemId,
+        maxDepth: operation.maxDepth,
+        maxItems: operation.maxItems,
+      });
+    }
+    if (operation.capabilityId === 'ado.context.search') {
+      const project = await this.authorizedProject(operation);
+      return this.adoContextService().contextSearch({
+        projectId: project.id,
+        requestId: operation.requestId,
+        query: operation.query,
+        limit: operation.limit,
+      });
+    }
     if (operation.capabilityId === 'project.test.run') {
       const project = await this.authorizedProject(operation);
       return this.validationCompatibility().run(project, 'test', decision.effectiveEffects ?? [], operation.mission);
@@ -831,6 +872,11 @@ export class CapabilityService {
     return this.codeReviews;
   }
 
+  private adoContextService(): AdoRequirementContextService {
+    if (this.adoContext === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'ADO runtime context service is unavailable');
+    return this.adoContext;
+  }
+
   private validationCompatibility(): ValidationCompatibilityAdapter {
     this.validationCompatibilityAdapter ??= new ValidationCompatibilityAdapter(
       this.jobManager(),
@@ -988,7 +1034,7 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
-  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.discover' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'project.validation.job.read' || operation.capabilityId === 'code_review.start' || operation.capabilityId === 'code_review.status' || operation.capabilityId === 'code_review.result' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish') {
+  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'ado.discovery' || operation.capabilityId === 'ado.workitem.read' || operation.capabilityId === 'ado.hierarchy.read' || operation.capabilityId === 'ado.context.search' || operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.discover' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'project.validation.job.read' || operation.capabilityId === 'code_review.start' || operation.capabilityId === 'code_review.status' || operation.capabilityId === 'code_review.result' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'mission.get') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId };
@@ -1109,6 +1155,10 @@ function describeOperation(operation: CapabilityOperation): string {
   if (operation.capabilityId === 'project.info') return `project.info projectId=${operation.projectId}`;
   if (operation.capabilityId === 'project.git_status') return `project.git_status projectId=${operation.projectId}`;
   if (operation.capabilityId === 'project.search') return `project.search projectId=${operation.projectId} queryLength=${operation.query.length}`;
+  if (operation.capabilityId === 'ado.discovery') return `ado.discovery projectId=${operation.projectId} requestId=${operation.requestId}`;
+  if (operation.capabilityId === 'ado.workitem.read') return `ado.workitem.read projectId=${operation.projectId} workItemId=${operation.workItemId} comments=${operation.includeComments} links=${operation.includeLinks} requestId=${operation.requestId}`;
+  if (operation.capabilityId === 'ado.hierarchy.read') return `ado.hierarchy.read projectId=${operation.projectId} rootWorkItemId=${operation.rootWorkItemId} maxDepth=${operation.maxDepth} maxItems=${operation.maxItems} requestId=${operation.requestId}`;
+  if (operation.capabilityId === 'ado.context.search') return `ado.context.search projectId=${operation.projectId} queryLength=${operation.query.length} querySha256=${createHash('sha256').update(operation.query).digest('hex')} limit=${operation.limit} requestId=${operation.requestId}`;
   if (operation.capabilityId === 'project.test.run') return `project.test.run projectId=${operation.projectId ?? 'session-current'} declared-script=test`;
   if (operation.capabilityId === 'project.command.run') return `project.command.run projectId=${operation.projectId ?? 'session-current'} declared-script=${operation.scriptName}`;
   if (operation.capabilityId === 'project.validation.discover') return `project.validation.discover projectId=${operation.projectId}`;

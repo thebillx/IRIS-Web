@@ -1,10 +1,62 @@
-# ADO M1/M2 isolated foundation
+# ADO requirement context foundation and runtime V1
 
-This directory is a domain/adapter foundation, not a registered capability or
-live Azure DevOps client. It has no network, persistence, credential-store,
-CapabilityService, MCP, or barrel-export integration. All identities are external
-configuration. No additional dependency is required.
+The original M1/M2 domain/adapter foundation remains the authority for Azure
+DevOps read semantics and scope governance. `IRIS_ADO_REQUIREMENT_CONTEXT_V1`
+adds a bounded production runtime integration around that foundation without
+adding any ADO write authority.
 
+Source catalog 2.6.0 adds four **FULL-only** read tools:
+
+- `ado_discovery`
+- `ado_workitem_read`
+- `ado_hierarchy_read`
+- `ado_context_search`
+
+PRO remains the exact five-tool read-only surface and exposes no ADO tool.
+All four ADO capabilities are LOW / PROJECT / non-mutating and derive
+`READ + NETWORK` server-side. They require a live IRIS session whose selected
+project has an exact protected ADO binding. Raw URL, HTTP method, headers, raw
+WIQL and credentials are never accepted from MCP callers.
+
+This source integration is not proof that the currently running 2.4 live
+runtime has been activated to 2.6.0. Merge and controlled activation remain a
+separate release step.
+
+## Protected runtime binding
+
+Production binding state is intentionally separate from the FULL/PRO connector
+registry:
+
+- binding metadata: `<IRIS_RUNTIME_DATA_ROOT>/integrations/ado/bindings/<iris-project-id>.json`
+- credential: `<IRIS_RUNTIME_DATA_ROOT>/credentials/ado/<credential-ref>.json`
+- directories are private and files must be private regular files;
+- binding metadata contains only opaque credential/session references, exact
+  ADO organization/project/team/board identity, allowlisted resources and
+  bounded limits;
+- the credential record is resolved only inside the trusted runtime transport;
+- binding manifests reject unknown fields so a token cannot be smuggled into
+  binding metadata.
+
+Owner-local provisioning is available through:
+
+```sh
+# Store PAT/Bearer material from hidden stdin only.
+printf '%s' "$ADO_TOKEN" | pnpm --filter @iris/runtime ado:binding -- \
+  credential-set --credential-ref <ref> --kind PAT --token-stdin
+
+# Store the non-secret exact binding manifest from stdin.
+cat binding.json | pnpm --filter @iris/runtime ado:binding -- \
+  binding-set --manifest-stdin
+
+# Inspect non-secret binding readiness.
+pnpm --filter @iris/runtime ado:binding -- \
+  status --iris-project-id <registered-iris-project-id>
+```
+
+The CLI never accepts the secret in argv and never prints it. The V1 production
+reader supports PAT or Bearer material behind the same opaque credential
+reference; provider identity acquisition/rotation policy remains an owner
+operation outside the MCP read surface.
 ## Contracts and authority
 
 `AzureDevOpsAdapter` exposes eight named read operations only. It deliberately

@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { IdentityCoherenceState, TunnelBindingDiagnostic } from '@iris/domain';
 
-export const MCP_CATALOG_VERSION = '2.5.0' as const;
+export const MCP_CATALOG_VERSION = '2.6.0' as const;
 export const MCP_SCHEMA_VERSION = '2026-07-28' as const;
-export type McpCatalogVersion = '2.3.0' | '2.4.0' | typeof MCP_CATALOG_VERSION;
-export const MCP_SUPPORTED_CATALOG_VERSIONS = ['2.3.0', '2.4.0', MCP_CATALOG_VERSION] as const satisfies readonly McpCatalogVersion[];
+export type McpCatalogVersion = '2.3.0' | '2.4.0' | '2.5.0' | typeof MCP_CATALOG_VERSION;
+export const MCP_SUPPORTED_CATALOG_VERSIONS = ['2.3.0', '2.4.0', '2.5.0', MCP_CATALOG_VERSION] as const satisfies readonly McpCatalogVersion[];
 
 export type McpCatalogProfile = 'FULL' | 'PRO';
 export type McpMutationClass = 'READ_ONLY' | 'ORCHESTRATION' | 'PROJECT_MUTATION' | 'OWNER_MUTATION';
@@ -48,6 +48,10 @@ const FULL_CATALOG = [
   entry('project_info', 'READ_ONLY', 'project.info', '2.0.0'),
   entry('git_status', 'READ_ONLY', 'project.git_status', '2.0.0'),
   entry('search', 'READ_ONLY', 'project.search', '2.0.0'),
+  entry('ado_discovery', 'READ_ONLY', 'ado.discovery', '2.6.0'),
+  entry('ado_workitem_read', 'READ_ONLY', 'ado.workitem.read', '2.6.0'),
+  entry('ado_hierarchy_read', 'READ_ONLY', 'ado.hierarchy.read', '2.6.0'),
+  entry('ado_context_search', 'READ_ONLY', 'ado.context.search', '2.6.0'),
   entry('mission_list', 'READ_ONLY', 'mission.list', '2.0.0'),
   entry('session_open', 'READ_ONLY', 'session.create', '2.0.0'),
   entry('session_get', 'READ_ONLY', null, '2.0.0'),

@@ -8,6 +8,7 @@ import { executePhase2GroupedTool, isPhase2GroupedTool } from './mcp-phase2.js';
 import { executePhase3GroupedTool, isPhase3GroupedTool } from './mcp-phase3.js';
 import { executePhase4GroupedTool, isPhase4GroupedTool } from './mcp-phase4.js';
 import { executeCodeReviewGroupedTool, isCodeReviewGroupedTool } from './mcp-code-review.js';
+import { executeAdoTool, isAdoTool } from './mcp-ado.js';
 import { augmentV21ToolDefinitions, V21_LIFECYCLE_TOOL_NAMES } from './mcp-v21-definitions.js';
 import { executeV21LifecycleTool, isCapabilityOutcome, toolError, toolOutcome, toolResult } from './mcp-v21-tools.js';
 import type { RuntimeState } from './state.js';
@@ -54,7 +55,8 @@ export async function handleMcpV21Request(
   const phase3Grouped = isPhase3GroupedTool(name);
   const phase4Grouped = isPhase4GroupedTool(name);
   const codeReviewGrouped = isCodeReviewGroupedTool(name);
-  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity && !phase2Grouped && !phase3Grouped && !phase4Grouped && !codeReviewGrouped) {
+  const adoTool = isAdoTool(name);
+  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity && !phase2Grouped && !phase3Grouped && !phase4Grouped && !codeReviewGrouped && !adoTool) {
     return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
   }
 
@@ -75,7 +77,9 @@ export async function handleMcpV21Request(
             ? await executePhase4GroupedTool(name, args, request, capabilities, state)
             : codeReviewGrouped
               ? await executeCodeReviewGroupedTool(args, request, capabilities, state)
-              : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal);
+              : adoTool
+                ? await executeAdoTool(name, args, request, capabilities, state)
+                : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal);
     return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
   } catch (error) {
     const runtimeError = error instanceof RuntimeError

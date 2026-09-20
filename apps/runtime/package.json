@@ -9,6 +9,7 @@
     "v2-acceptance": "node ../../scripts/node24.mjs src/v2-acceptance.ts",
     "v2-orchestrator-acceptance": "node ../../scripts/node24.mjs src/v2-orchestrator-acceptance.ts",
     "ado:live-acceptance": "node ../../scripts/node24.mjs src/ado/live-acceptance-cli.ts",
+    "ado:binding": "node ../../scripts/node24.mjs src/ado/runtime-binding-cli.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.build.json"

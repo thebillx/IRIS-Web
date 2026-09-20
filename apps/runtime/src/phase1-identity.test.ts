@@ -134,9 +134,9 @@ describe('IRIS vNext Phase 1 identity and fencing', () => {
 
   it('AC-IRIS-006 preserves every legacy FULL tool, adds Phase 2/3/4 grouped tools, and keeps PRO at the exact read-only five', () => {
     const fullNames = catalogToolNames('FULL');
-    expect(fullNames).toHaveLength(50);
+    expect(fullNames).toHaveLength(54);
     for (const legacyName of LEGACY_FULL_TOOL_NAMES) expect(fullNames).toContain(legacyName);
-    expect(fullNames.filter((name) => !LEGACY_FULL_TOOL_NAMES.includes(name as (typeof LEGACY_FULL_TOOL_NAMES)[number]))).toEqual(['owner_approval_resolve', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git', 'code_review']);
+    expect(fullNames.filter((name) => !LEGACY_FULL_TOOL_NAMES.includes(name as (typeof LEGACY_FULL_TOOL_NAMES)[number]))).toEqual(['ado_discovery', 'ado_workitem_read', 'ado_hierarchy_read', 'ado_context_search', 'owner_approval_resolve', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git', 'code_review']);
     expect(fullMcpToolDefinitionsV21().map((definition) => definition.name)).toEqual(fullNames);
     expect(catalogToolNames('PRO')).toEqual(['list_projects', 'project_info', 'git_status', 'file_read', 'search']);
     expect(proMcpToolDefinitions().map((definition) => definition.name)).toEqual(catalogToolNames('PRO'));
