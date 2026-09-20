@@ -984,7 +984,7 @@ setInterval(() => undefined, 1000);
     const candidateRoot = await alternateCatalogSource(fakeRoot);
     const candidateCatalogPath = path.join(candidateRoot, 'apps', 'runtime', 'src', 'mcp-catalog.ts');
     const candidateCatalog = await readFile(candidateCatalogPath, 'utf8');
-    const currentVersion = "export const MCP_CATALOG_VERSION = '2.4.0' as const;";
+    const currentVersion = "export const MCP_CATALOG_VERSION = '2.5.0' as const;";
     if (!candidateCatalog.includes(currentVersion)) throw new Error('candidate catalog version marker not found');
     await writeFile(candidateCatalogPath, candidateCatalog.replace(
       currentVersion,

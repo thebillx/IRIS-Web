@@ -505,6 +505,59 @@ export class RuntimeState {
     }));
   }
 
+  public appendMissionActionEvidence(
+    missionIdInput: string,
+    taskIdInput: string,
+    actionIdInput: string,
+    capabilityId: CapabilityId,
+    evidence: MissionEvidence,
+  ): Promise<void> {
+    const missionId = normalizeUuidIdentity(missionIdInput, 'missionId');
+    const taskId = normalizeUuidIdentity(taskIdInput, 'taskId');
+    const actionId = normalizeUuidIdentity(actionIdInput, 'actionId');
+    if (evidence.id.length === 0 || evidence.id.length > 200 || evidence.id.includes('\0')
+      || evidence.label.length === 0 || evidence.label.length > 120 || evidence.label.includes('\0')
+      || evidence.summary.length === 0 || evidence.summary.length > 500 || evidence.summary.includes('\0')
+      || (evidence.reference !== null && (evidence.reference.length > 2_048 || evidence.reference.includes('\0')))) {
+      throw new RuntimeError('INVALID_REQUEST', 'Mission action evidence is invalid');
+    }
+    return this.serializeMissionMutation(async () => {
+      const document = await this.missionStore.read();
+      const missionIndex = document.missions.findIndex((mission) => mission.id === missionId);
+      if (missionIndex < 0) throw new RuntimeError('MISSION_NOT_FOUND', 'Mission was not found');
+      const mission = document.missions[missionIndex]!;
+      const task = mission.tasks.find((candidate) => candidate.id === taskId);
+      if (task === undefined) throw new RuntimeError('MISSION_NOT_FOUND', 'Mission task was not found');
+      const action = task.actions.find((candidate) => candidate.id === actionId);
+      if (action === undefined) throw new RuntimeError('MISSION_NOT_FOUND', 'Mission action was not found');
+      if (action.capabilityId !== capabilityId || action.state !== 'SUCCEEDED' || action.result?.status !== 'SUCCEEDED') {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Mission action is not eligible for terminal evidence attachment');
+      }
+      const existingByReference = evidence.reference === null ? undefined : action.result.evidence.find((item) => item.reference === evidence.reference);
+      if (existingByReference !== undefined) {
+        if (JSON.stringify(existingByReference) === JSON.stringify(evidence)) return;
+        throw new RuntimeError('PRECONDITION_FAILED', 'Mission action evidence reference is already bound to different content');
+      }
+      if (action.result.evidence.length >= 64) throw new RuntimeError('CAPABILITY_DENIED', 'Mission action evidence capacity has been reached');
+      const now = new Date().toISOString();
+      const tasks = mission.tasks.map((candidateTask) => candidateTask.id !== taskId ? candidateTask : {
+        ...candidateTask,
+        updatedAt: now,
+        actions: candidateTask.actions.map((candidateAction) => candidateAction.id !== actionId ? candidateAction : {
+          ...candidateAction,
+          updatedAt: now,
+          result: {
+            ...candidateAction.result!,
+            evidence: [...candidateAction.result!.evidence, evidence],
+          },
+        }),
+      });
+      const missions = [...document.missions];
+      missions[missionIndex] = { ...mission, tasks, updatedAt: now };
+      await this.missionStore.write({ schemaVersion: 1, missions });
+    });
+  }
+
   public markMissionActionDenied(association: MissionExecutionAssociation, summary = 'Governed capability was denied'): Promise<void> {
     return this.updateMissionAction(association, (mission, task, action, now) => ({
       mission: {

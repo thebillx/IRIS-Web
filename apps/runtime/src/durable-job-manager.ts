@@ -1,13 +1,14 @@
 import { spawn, execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { RuntimeError, type CapabilityEffect, type JobId, type MissionExecutionAssociation, type WorkspaceId } from '@iris/domain';
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
-import { resolveExecutionProfile, type ExecutionProfilePlan } from './execution-profiles.js';
+import { resolveExecutionProfile, resolveServerOwnedCodeReviewExecutionProfile, type ExecutionProfilePlan } from './execution-profiles.js';
 import { boundedTail, StreamingRedactor } from './output-redaction.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { observeProcessStart } from './macos-safety.js';
@@ -35,10 +36,22 @@ export interface ShellExecutionInput {
   readonly stdinArtifactId?: string | undefined;
 }
 
+export interface CodeReviewBinding {
+  readonly contextArtifactId: string;
+  readonly contextArtifactSha256: string;
+  readonly contextSha256: string;
+  readonly workspaceSha256: string;
+  readonly reviewerProfileSha256: string;
+  readonly repositoryIdentity: Readonly<{ root: string; device: string; inode: string }> | null;
+  readonly repositoryIdentitySha256: string;
+}
+
 export interface PreparedShellExecution {
   readonly input: ShellExecutionInput;
   readonly plan: ExecutionProfilePlan;
   readonly workspaceId: WorkspaceId;
+  readonly stdinArtifactSha256: string | null;
+  readonly codeReviewBinding?: CodeReviewBinding | null;
 }
 
 export interface DurableJobRecord {
@@ -52,6 +65,7 @@ export interface DurableJobRecord {
   readonly executionProfile: string;
   readonly executableIdentity: string;
   readonly argvDigest: string;
+  readonly requestFingerprint?: string | null;
   readonly effectiveEffects: readonly CapabilityEffect[];
   readonly runnerIdentity: string;
   readonly runnerPid: number | null;
@@ -70,6 +84,11 @@ export interface DurableJobRecord {
   readonly claimPath: string;
   readonly resultPath: string;
   readonly cancelPath: string;
+  readonly cleanupPaths?: readonly string[];
+  readonly reviewBinding?: CodeReviewBinding | null;
+  readonly reviewLaunchSha256?: string | null;
+  readonly reviewOutputPath?: string | null;
+  readonly reviewFinalizedAt?: string | null;
   readonly logArtifactIds: readonly string[];
   readonly artifactIds: readonly string[];
 }
@@ -88,6 +107,8 @@ interface RunnerResult {
   readonly schemaVersion: 1; readonly jobId: string; readonly runnerIdentity: string;
   readonly state: 'SUCCEEDED' | 'FAILED' | 'CANCELLED'; readonly exitCode: number | null; readonly signal: string | null;
   readonly timedOut: boolean; readonly cancelled: boolean; readonly error: string | null; readonly finishedAt: string;
+  readonly reviewOutputSha256?: string | null;
+  readonly reviewOutputBytes?: number | null;
 }
 
 export class DurableJobManager {
@@ -96,10 +117,64 @@ export class DurableJobManager {
   public constructor(private readonly dataRoot: string, private readonly resources: VNextResourceRegistry) {}
 
   public async prepare(input: ShellExecutionInput): Promise<PreparedShellExecution> {
+    return this.prepareWithResolver(input, resolveExecutionProfile);
+  }
+
+  public async prepareServerOwnedCodeReview(
+    input: Omit<ShellExecutionInput, 'stdinArtifactId'>,
+    launchSpecBytes: Buffer,
+    binding: CodeReviewBinding,
+  ): Promise<PreparedShellExecution> {
+    if (input.executionProfile !== 'codex-review') throw new RuntimeError('CAPABILITY_DENIED', 'Server-owned reviewer preparation accepts only codex-review');
+    if (launchSpecBytes.length < 1 || launchSpecBytes.length > 320 * 1024) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Native code-review launch spec exceeds the bounded private-input size');
+    }
+    const tempRoot = await realpath(tmpdir());
+    const created = await mkdtemp(path.join(tempRoot, 'iris-code-review-input-'));
+    let privateInputRoot = created;
+    try {
+      privateInputRoot = await realpath(created);
+      if (privateInputRoot !== created) throw new RuntimeError('PERSISTENCE_FAILURE', 'Native code-review launch directory changed through an alias');
+      await chmod(privateInputRoot, 0o700);
+      const launchPath = path.join(privateInputRoot, 'launch.json');
+      await writeFile(launchPath, launchSpecBytes, { mode: 0o600, flag: 'wx' });
+      const workspace = await this.resources.getActiveWorkspace(input.projectId, input.workspaceId);
+      const plan = await resolveServerOwnedCodeReviewExecutionProfile({
+        workspace,
+        executable: input.executable,
+        argv: input.argv,
+        cwd: input.cwd,
+        executionProfile: input.executionProfile,
+        envOverrides: input.envOverrides,
+        timeoutMs: input.timeoutMs,
+        stdinPath: launchPath,
+      });
+      return {
+        input,
+        plan: { ...plan, cleanupPaths: [privateInputRoot, ...plan.cleanupPaths] },
+        workspaceId: workspace.workspaceId,
+        stdinArtifactSha256: createHash('sha256').update(launchSpecBytes).digest('hex'),
+        codeReviewBinding: binding,
+      };
+    } catch (error) {
+      await cleanupServerOwnedPaths([privateInputRoot]);
+      throw error;
+    }
+  }
+
+  private async prepareWithResolver(
+    input: ShellExecutionInput,
+    resolver: (input: Parameters<typeof resolveExecutionProfile>[0]) => Promise<ExecutionProfilePlan>,
+  ): Promise<PreparedShellExecution> {
     const workspace = await this.resources.getActiveWorkspace(input.projectId, input.workspaceId);
     let stdinPath: string | null = null;
-    if (input.stdinArtifactId !== undefined) stdinPath = (await this.resources.getArtifact(input.projectId, input.stdinArtifactId)).physicalPath;
-    const plan = await resolveExecutionProfile({
+    let stdinArtifactSha256: string | null = null;
+    if (input.stdinArtifactId !== undefined) {
+      const artifact = await this.resources.getArtifact(input.projectId, input.stdinArtifactId);
+      stdinPath = artifact.physicalPath;
+      stdinArtifactSha256 = artifact.sha256;
+    }
+    const plan = await resolver({
       workspace,
       executable: input.executable,
       argv: input.argv,
@@ -109,7 +184,7 @@ export class DurableJobManager {
       timeoutMs: input.timeoutMs,
       stdinPath,
     });
-    return { input, plan, workspaceId: workspace.workspaceId };
+    return { input, plan, workspaceId: workspace.workspaceId, stdinArtifactSha256 };
   }
 
   public async run(prepared: PreparedShellExecution, effects: readonly CapabilityEffect[], mission?: MissionExecutionAssociation): Promise<Record<string, unknown>> {
@@ -201,97 +276,147 @@ export class DurableJobManager {
   }
 
   public async start(prepared: PreparedShellExecution, requestId: string, effects: readonly CapabilityEffect[], mission?: MissionExecutionAssociation): Promise<Record<string, unknown>> {
-    if (!REQUEST_ID.test(requestId)) throw new RuntimeError('INVALID_REQUEST', 'requestId is invalid');
+    if (!REQUEST_ID.test(requestId)) {
+      await cleanupServerOwnedPaths(prepared.plan.cleanupPaths);
+      throw new RuntimeError('INVALID_REQUEST', 'requestId is invalid');
+    }
     const digest = argvDigest(prepared.plan.argv);
+    const requestFingerprint = durableRequestFingerprint(prepared, effects, mission);
     const existing = (await this.readDocument()).jobs.find((job) => job.requestId === requestId && job.projectId === prepared.input.projectId);
     if (existing !== undefined) {
-      if (existing.workspaceId !== prepared.workspaceId || existing.executionProfile !== prepared.plan.profileId || existing.executableIdentity !== prepared.plan.executableIdentity || existing.argvDigest !== digest) {
-        throw new RuntimeError('PRECONDITION_FAILED', 'requestId already belongs to a different execution request');
+      const legacyCompatible = existing.requestFingerprint == null
+        && prepared.plan.profileId !== 'codex-review'
+        && existing.workspaceId === prepared.workspaceId
+        && existing.executionProfile === prepared.plan.profileId
+        && existing.executableIdentity === prepared.plan.executableIdentity
+        && existing.argvDigest === digest;
+      if (!legacyCompatible && existing.requestFingerprint !== requestFingerprint) {
+        await cleanupServerOwnedPaths(prepared.plan.cleanupPaths);
+        throw new RuntimeError('PRECONDITION_FAILED', 'requestId already belongs to a different exact execution request');
       }
+      await cleanupServerOwnedPaths(prepared.plan.cleanupPaths);
       const recovered = await this.reconcile(existing);
       return startView(recovered);
     }
 
-    const jobId = randomUUID() as JobId;
-    const runnerIdentity = randomUUID();
-    const logWorkspace = await this.resources.createScratch(prepared.input.projectId, mission?.actionId ?? null);
-    const stdoutPath = path.join(logWorkspace.physicalRoot, 'stdout.log');
-    const stderrPath = path.join(logWorkspace.physicalRoot, 'stderr.log');
-    await writeFile(stdoutPath, '', { mode: 0o600, flag: 'wx' });
-    await writeFile(stderrPath, '', { mode: 0o600, flag: 'wx' });
-    const runtimeDir = await this.ensureJobDirectory(jobId);
-    const runnerClaimPath = path.join(runtimeDir, 'runner-claim.json');
-    const permitPath = path.join(runtimeDir, 'start-permit.json');
-    const claimPath = path.join(runtimeDir, 'claim.json');
-    const resultPath = path.join(runtimeDir, 'result.json');
-    const cancelPath = path.join(runtimeDir, 'cancel.json');
-    const specPath = path.join(runtimeDir, 'spec.json');
-    const startedAt = new Date().toISOString();
-    const queued: DurableJobRecord = {
-      jobId, requestId, projectId: prepared.input.projectId, workspaceId: prepared.workspaceId,
-      missionId: mission?.missionId ?? null, taskId: mission?.taskId ?? null, actionId: mission?.actionId ?? null,
-      executionProfile: prepared.plan.profileId, executableIdentity: prepared.plan.executableIdentity, argvDigest: digest,
-      effectiveEffects: [...effects], runnerIdentity, runnerPid: null, runnerStartMarker: null, pid: null,
-      processStartMarker: null, processGroupId: null, state: 'QUEUED', startedAt, finishedAt: null,
-      exitCode: null, signal: null, logWorkspaceId: logWorkspace.workspaceId,
-      stdoutPath, stderrPath, claimPath, resultPath, cancelPath, logArtifactIds: [], artifactIds: [],
-    };
-    await this.appendJob(queued);
-    await writeFile(specPath, `${JSON.stringify({
-      schemaVersion: 1, jobId, runnerIdentity, executableIdentity: prepared.plan.executableIdentity, argv: prepared.plan.argv,
-      cwd: prepared.plan.cwd, environment: prepared.plan.environment, redactionValues: prepared.plan.redactionValues,
-      timeoutMs: prepared.plan.timeoutMs, stdinPath: prepared.plan.stdinPath,
-      stdoutPath, stderrPath, runnerClaimPath, permitPath, claimPath, resultPath, cancelPath,
-    }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
-    const runner = spawn(process.execPath, [RUNNER_PATH, '--spec', specPath, '--job', jobId, '--runner', runnerIdentity], {
-      cwd: this.dataRoot,
-      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: this.dataRoot, TMPDIR: '/tmp', LANG: 'en_US.UTF-8' },
-      detached: true,
-      stdio: 'ignore',
-    });
-    if (runner.pid === undefined) {
-      const lost = { ...queued, state: 'LOST' as const, finishedAt: new Date().toISOString() };
-      await this.replaceJob(lost);
-      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not expose a PID');
-    }
-    const spawnedRunnerPid = runner.pid;
-    runner.unref();
-    const runnerClaim = await waitForRunnerClaim(runnerClaimPath, resultPath, jobId, runnerIdentity, spawnedRunnerPid);
-    if (!(await verifyRunnerClaim(runnerClaim, jobId, runnerIdentity, spawnedRunnerPid))) {
-      const lost = { ...queued, state: 'LOST' as const, finishedAt: new Date().toISOString() };
-      await this.replaceJob(lost);
-      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner identity could not be verified before target spawn');
-    }
-    await writeFile(permitPath, `${JSON.stringify({ jobId, runnerIdentity, permittedAt: new Date().toISOString() })}\n`, { mode: 0o600, flag: 'wx' });
-    const claim = await waitForClaim(claimPath, resultPath, jobId, runnerIdentity);
-    const verified = await verifyClaim(claim, jobId, runnerIdentity);
-    if (!verified || claim.runnerPid !== spawnedRunnerPid) {
-      if (claim.runnerPid === spawnedRunnerPid) {
-        const terminal = await waitForTrustedTerminalResult(resultPath, jobId, runnerIdentity, 1_000);
-        if (terminal !== null) {
-          const finished = await this.finishFromRunner(queued, terminal);
-          return startView(finished);
-        }
+    let queued: DurableJobRecord | null = null;
+    let persisted = false;
+    let spawnedRunnerPid: number | null = null;
+    try {
+      const jobId = randomUUID() as JobId;
+      const runnerIdentity = randomUUID();
+      const logWorkspace = await this.resources.createScratch(prepared.input.projectId, mission?.actionId ?? null);
+      const stdoutPath = path.join(logWorkspace.physicalRoot, 'stdout.log');
+      const stderrPath = path.join(logWorkspace.physicalRoot, 'stderr.log');
+      await writeFile(stdoutPath, '', { mode: 0o600, flag: 'wx' });
+      await writeFile(stderrPath, '', { mode: 0o600, flag: 'wx' });
+      const runtimeDir = await this.ensureJobDirectory(jobId);
+      const runnerClaimPath = path.join(runtimeDir, 'runner-claim.json');
+      const permitPath = path.join(runtimeDir, 'start-permit.json');
+      const claimPath = path.join(runtimeDir, 'claim.json');
+      const resultPath = path.join(runtimeDir, 'result.json');
+      const cancelPath = path.join(runtimeDir, 'cancel.json');
+      const reviewOutputPath = prepared.plan.profileId === 'codex-review' ? path.join(runtimeDir, 'review-output.json') : null;
+      const specPath = path.join(runtimeDir, 'spec.json');
+      const startedAt = new Date().toISOString();
+      queued = {
+        jobId, requestId, projectId: prepared.input.projectId, workspaceId: prepared.workspaceId,
+        missionId: mission?.missionId ?? null, taskId: mission?.taskId ?? null, actionId: mission?.actionId ?? null,
+        executionProfile: prepared.plan.profileId, executableIdentity: prepared.plan.executableIdentity, argvDigest: digest,
+        requestFingerprint, effectiveEffects: [...effects], runnerIdentity, runnerPid: null, runnerStartMarker: null, pid: null,
+        processStartMarker: null, processGroupId: null, state: 'QUEUED', startedAt, finishedAt: null,
+        exitCode: null, signal: null, logWorkspaceId: logWorkspace.workspaceId,
+        stdoutPath, stderrPath, claimPath, resultPath, cancelPath,
+        cleanupPaths: [...prepared.plan.cleanupPaths],
+        reviewBinding: prepared.codeReviewBinding ?? null,
+        reviewLaunchSha256: prepared.plan.profileId === 'codex-review' ? prepared.stdinArtifactSha256 : null,
+        reviewOutputPath,
+        reviewFinalizedAt: null,
+        logArtifactIds: [], artifactIds: [],
+      };
+      await this.appendJob(queued);
+      persisted = true;
+
+      const targetEnvironment = reviewOutputPath === null
+        ? prepared.plan.environment
+        : { ...prepared.plan.environment, IRIS_CODE_REVIEW_OUTPUT_PATH: reviewOutputPath };
+      await writeFile(specPath, `${JSON.stringify({
+        schemaVersion: 1, jobId, runnerIdentity, executableIdentity: prepared.plan.executableIdentity, argv: prepared.plan.argv,
+        cwd: prepared.plan.cwd, environment: targetEnvironment, redactionValues: prepared.plan.redactionValues,
+        timeoutMs: prepared.plan.timeoutMs, stdinPath: prepared.plan.stdinPath, reviewOutputPath,
+        cleanupPaths: prepared.plan.cleanupPaths,
+        stdoutPath, stderrPath, runnerClaimPath, permitPath, claimPath, resultPath, cancelPath,
+      }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+
+      const runner = spawn(process.execPath, [RUNNER_PATH, '--spec', specPath, '--job', jobId, '--runner', runnerIdentity], {
+        cwd: this.dataRoot,
+        env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: this.dataRoot, TMPDIR: '/tmp', LANG: 'en_US.UTF-8' },
+        detached: true,
+        stdio: 'ignore',
+      });
+      if (runner.pid === undefined) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not expose a PID');
+      spawnedRunnerPid = runner.pid;
+      runner.unref();
+
+      const runnerClaim = await waitForRunnerClaim(runnerClaimPath, resultPath, jobId, runnerIdentity, spawnedRunnerPid);
+      if (!(await verifyRunnerClaim(runnerClaim, jobId, runnerIdentity, spawnedRunnerPid))) {
+        throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner identity could not be verified before target spawn');
       }
-      const lost = { ...queued, state: 'LOST' as const, finishedAt: new Date().toISOString() };
-      await this.replaceJob(lost);
-      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable target identity could not be verified after permitted spawn');
+      await writeFile(permitPath, `${JSON.stringify({ jobId, runnerIdentity, permittedAt: new Date().toISOString() })}\n`, { mode: 0o600, flag: 'wx' });
+      let claim: RunnerClaim;
+      try {
+        claim = await waitForClaim(claimPath, resultPath, jobId, runnerIdentity);
+      } catch (error) {
+        const terminal = await waitForTrustedTerminalResult(resultPath, jobId, runnerIdentity, 2_000);
+        if (terminal !== null) return startView(await this.finishFromRunner(queued, terminal));
+        throw error;
+      }
+      const verified = await verifyClaim(claim, jobId, runnerIdentity);
+      if (!verified || claim.runnerPid !== spawnedRunnerPid) {
+        if (claim.runnerPid === spawnedRunnerPid) {
+          const terminal = await waitForTrustedTerminalResult(resultPath, jobId, runnerIdentity, 2_000);
+          if (terminal !== null) {
+            return startView(await this.finishFromRunner(queued, terminal));
+          }
+        }
+        throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable target identity could not be verified after permitted spawn');
+      }
+
+      const running: DurableJobRecord = {
+        ...queued, state: 'RUNNING', runnerPid: claim.runnerPid, runnerStartMarker: claim.runnerStartMarker,
+        pid: claim.targetPid, processStartMarker: claim.targetStartMarker, processGroupId: claim.targetProcessGroupId,
+      };
+      await this.replaceJob(running);
+      return startView(running);
+    } catch (error) {
+      if (persisted && queued !== null) {
+        const claim = await readClaim(queued.claimPath).catch(() => null);
+        if (claim !== null && await verifyClaim(claim, queued.jobId, queued.runnerIdentity).catch(() => false)) {
+          safeKillGroup(claim.targetProcessGroupId, 'SIGTERM');
+          setTimeout(() => safeKillGroup(claim.targetProcessGroupId, 'SIGKILL'), 1000).unref();
+        }
+        if (spawnedRunnerPid !== null) {
+          safeKillGroup(spawnedRunnerPid, 'SIGTERM');
+          setTimeout(() => safeKillGroup(spawnedRunnerPid!, 'SIGKILL'), 1000).unref();
+        }
+        await this.markLost(queued).catch((cleanupError) => {
+          throw cleanupError;
+        });
+      } else {
+        await cleanupServerOwnedPaths(prepared.plan.cleanupPaths);
+      }
+      throw error;
     }
-    const running: DurableJobRecord = {
-      ...queued, state: 'RUNNING', runnerPid: claim.runnerPid, runnerStartMarker: claim.runnerStartMarker,
-      pid: claim.targetPid, processStartMarker: claim.targetStartMarker, processGroupId: claim.targetProcessGroupId,
-    };
-    await this.replaceJob(running);
-    return startView(running);
   }
 
   public async status(projectId: string, jobId: string): Promise<Record<string, unknown>> {
-    return statusView(await this.reconcile(await this.getOwnedJob(projectId, jobId)));
+    const job = await this.getOwnedNonReviewJob(projectId, jobId);
+    return statusView(await this.reconcile(job));
   }
 
   public async logs(projectId: string, jobId: string, stream: 'stdout' | 'stderr', cursor?: string, maxBytes = 16 * 1024): Promise<Record<string, unknown>> {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > LOG_WINDOW_MAX) throw new RuntimeError('INVALID_REQUEST', 'maxBytes is outside the bounded log window');
-    const job = await this.reconcile(await this.getOwnedJob(projectId, jobId));
+    const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId));
     const offset = decodeCursor(cursor, stream);
     const filename = stream === 'stdout' ? job.stdoutPath : job.stderrPath;
     const handle = await open(filename, 'r');
@@ -307,14 +432,119 @@ export class DurableJobManager {
   }
 
   public async result(projectId: string, jobId: string): Promise<Record<string, unknown>> {
-    return resultView(await this.reconcile(await this.getOwnedJob(projectId, jobId)));
+    return resultView(await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId)));
+  }
+
+  public async codeReviewStatusSnapshot(projectId: string, jobId: string): Promise<Readonly<{
+    jobId: string;
+    state: DurableJobState;
+    exitCode: number | null;
+    timedOut: boolean;
+    workspaceId: WorkspaceId;
+    missionId: string | null;
+    taskId: string | null;
+    actionId: string | null;
+    terminalReady: boolean;
+  }>> {
+    const job = await this.reconcile(await this.getOwnedCodeReviewJob(projectId, jobId));
+    const runnerResult = await readRunnerResult(job.resultPath);
+    const terminalReady = job.state === 'SUCCEEDED'
+      && runnerResult?.jobId === job.jobId
+      && runnerResult.runnerIdentity === job.runnerIdentity
+      && typeof runnerResult.reviewOutputSha256 === 'string'
+      && typeof runnerResult.reviewOutputBytes === 'number';
+    return {
+      jobId: job.jobId,
+      state: job.state,
+      exitCode: job.exitCode,
+      timedOut: runnerResult?.timedOut ?? false,
+      workspaceId: job.workspaceId,
+      missionId: job.missionId,
+      taskId: job.taskId,
+      actionId: job.actionId,
+      terminalReady,
+    };
+  }
+
+  public async codeReviewResultSnapshot(projectId: string, jobId: string): Promise<Readonly<{
+    jobId: string;
+    state: DurableJobState;
+    exitCode: number | null;
+    timedOut: boolean;
+    workspaceId: WorkspaceId;
+    missionId: string | null;
+    taskId: string | null;
+    actionId: string | null;
+    reviewOutput: string | null;
+    reviewOutputSha256: string | null;
+    reviewBinding: CodeReviewBinding | null;
+    reviewLaunchSha256: string | null;
+    logArtifactIds: readonly string[];
+  }>> {
+    const job = await this.reconcile(await this.getOwnedCodeReviewJob(projectId, jobId));
+    const runnerResult = await readRunnerResult(job.resultPath);
+    let reviewOutput: string | null = null;
+    let reviewOutputSha256: string | null = null;
+    if (job.state === 'SUCCEEDED') {
+      if (runnerResult === null || runnerResult.jobId !== job.jobId || runnerResult.runnerIdentity !== job.runnerIdentity
+        || typeof runnerResult.reviewOutputSha256 !== 'string' || typeof runnerResult.reviewOutputBytes !== 'number') {
+        throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review terminal payload is not bound to the trusted runner result');
+      }
+      reviewOutput = await this.readPrivateCodeReviewOutput(job, runnerResult.reviewOutputSha256, runnerResult.reviewOutputBytes);
+      reviewOutputSha256 = runnerResult.reviewOutputSha256;
+    }
+    return {
+      jobId: job.jobId,
+      state: job.state,
+      exitCode: job.exitCode,
+      timedOut: runnerResult?.timedOut ?? false,
+      workspaceId: job.workspaceId,
+      missionId: job.missionId,
+      taskId: job.taskId,
+      actionId: job.actionId,
+      reviewOutput,
+      reviewOutputSha256,
+      reviewBinding: job.reviewBinding ?? null,
+      reviewLaunchSha256: job.reviewLaunchSha256 ?? null,
+      logArtifactIds: job.logArtifactIds,
+    };
+  }
+
+  public async markCodeReviewFinalized(projectId: string, jobId: string): Promise<void> {
+    const job = await this.getOwnedCodeReviewJob(projectId, jobId);
+    if (!isTerminal(job.state)) throw new RuntimeError('PRECONDITION_FAILED', 'Native code review is not terminal');
+    if (job.reviewFinalizedAt !== null && job.reviewFinalizedAt !== undefined) return;
+    await this.replaceJob({ ...job, reviewFinalizedAt: new Date().toISOString() });
+  }
+
+  private async readPrivateCodeReviewOutput(job: DurableJobRecord, expectedSha256: string, expectedBytes: number): Promise<string> {
+    const filename = job.reviewOutputPath;
+    if (filename === null || filename === undefined) throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review private output path is missing');
+    const expectedParent = path.join(this.dataRoot, JOB_DIR, job.jobId);
+    if (path.dirname(filename) !== expectedParent || path.basename(filename) !== 'review-output.json') {
+      throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review private output path escaped the job runtime');
+    }
+    let metadata;
+    try { metadata = await lstat(filename); }
+    catch (error) { throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review private output is unavailable', { cause: error }); }
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || metadata.size !== expectedBytes
+      || metadata.size < 1 || metadata.size > 64 * 1024) {
+      throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review private output metadata does not match the trusted runner result');
+    }
+    const physical = await realpath(filename);
+    if (physical !== filename) throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review private output changed through an alias');
+    const payload = await readFile(filename);
+    if (payload.length !== expectedBytes || createHash('sha256').update(payload).digest('hex') !== expectedSha256) {
+      throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review private output bytes do not match the trusted runner result');
+    }
+    return payload.toString('utf8');
   }
 
   public async compatibilitySnapshot(projectId: string, jobId: string, maxLogBytes = INLINE_OUTPUT_BYTES): Promise<Record<string, unknown>> {
     if (!Number.isSafeInteger(maxLogBytes) || maxLogBytes < 1 || maxLogBytes > LOG_WINDOW_MAX) {
       throw new RuntimeError('INVALID_REQUEST', 'Compatibility log bound is outside the durable-job limit');
     }
-    const job = await this.reconcile(await this.getOwnedJob(projectId, jobId));
+    const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId));
     const [stdout, stderr, runnerResult] = await Promise.all([
       readLogTail(job.stdoutPath, maxLogBytes),
       readLogTail(job.stderrPath, maxLogBytes),
@@ -339,7 +569,7 @@ export class DurableJobManager {
   }
 
   public async cancel(projectId: string, jobId: string): Promise<Record<string, unknown>> {
-    const job = await this.reconcile(await this.getOwnedJob(projectId, jobId));
+    const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId));
     if (job.state !== 'RUNNING') return { jobId, state: job.state, cancelRequested: false };
     const claim = await readClaim(job.claimPath);
     if (claim === null || !(await verifyClaim(claim, job.jobId, job.runnerIdentity)) || claim.targetPid !== job.pid || claim.targetStartMarker !== job.processStartMarker || claim.targetProcessGroupId !== job.processGroupId) {
@@ -376,19 +606,38 @@ export class DurableJobManager {
     }
     const retry = await readRunnerResult(job.resultPath);
     if (retry !== null) return this.finishFromRunner(job, retry);
+    if (job.executionProfile === 'codex-review') {
+      const terminal = await waitForTrustedTerminalResult(job.resultPath, job.jobId, job.runnerIdentity, 1_000);
+      if (terminal !== null) return this.finishFromRunner(job, terminal);
+    }
     return this.markLost(job);
   }
 
   private async finishFromRunner(job: DurableJobRecord, runner: RunnerResult): Promise<DurableJobRecord> {
     if (runner.jobId !== job.jobId || runner.runnerIdentity !== job.runnerIdentity) return this.markLost(job);
     const logArtifactIds = job.logArtifactIds.length > 0 ? job.logArtifactIds : await this.registerLogArtifacts(job.projectId, job.logWorkspaceId, job.jobId, job.actionId, job.stdoutPath, job.stderrPath);
-    const finished: DurableJobRecord = { ...job, state: runner.state, finishedAt: runner.finishedAt, exitCode: runner.exitCode, signal: runner.signal, logArtifactIds };
+    await cleanupServerOwnedPaths(job.cleanupPaths ?? []);
+    const finished: DurableJobRecord = {
+      ...job,
+      state: runner.state,
+      finishedAt: runner.finishedAt,
+      exitCode: runner.exitCode,
+      signal: runner.signal,
+      cleanupPaths: [],
+      logArtifactIds,
+    };
     await this.replaceJob(finished);
     return finished;
   }
 
   private async markLost(job: DurableJobRecord): Promise<DurableJobRecord> {
-    const lost: DurableJobRecord = { ...job, state: job.state === 'QUEUED' ? 'INTERRUPTED' : 'LOST', finishedAt: job.finishedAt ?? new Date().toISOString() };
+    await cleanupServerOwnedPaths(job.cleanupPaths ?? []);
+    const lost: DurableJobRecord = {
+      ...job,
+      state: job.state === 'QUEUED' ? 'INTERRUPTED' : 'LOST',
+      finishedAt: job.finishedAt ?? new Date().toISOString(),
+      cleanupPaths: [],
+    };
     await this.replaceJob(lost);
     return lost;
   }
@@ -415,6 +664,22 @@ export class DurableJobManager {
     return job;
   }
 
+  private async getOwnedNonReviewJob(projectId: string, jobId: string): Promise<DurableJobRecord> {
+    const job = await this.getOwnedJob(projectId, jobId);
+    if (job.executionProfile === 'codex-review') {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Native code-review jobs are observable only through the code_review surface');
+    }
+    return job;
+  }
+
+  private async getOwnedCodeReviewJob(projectId: string, jobId: string): Promise<DurableJobRecord> {
+    const job = await this.getOwnedJob(projectId, jobId);
+    if (job.executionProfile !== 'codex-review') {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Job is not a native code-review job');
+    }
+    return job;
+  }
+
   private async ensureJobDirectory(jobId: string): Promise<string> {
     const root = path.join(this.dataRoot, JOB_DIR);
     await mkdir(root, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error; });
@@ -437,7 +702,21 @@ export class DurableJobManager {
   }
 
   private appendJob(job: DurableJobRecord): Promise<void> {
-    return this.serialized(async () => { const document = await this.readDocument(); await this.writeDocument({ schemaVersion: 1, jobs: [...document.jobs, job].slice(-MAX_JOBS) }); });
+    return this.serialized(async () => {
+      const document = await this.readDocument();
+      const jobs = [...document.jobs];
+      if (jobs.length >= MAX_JOBS) {
+        const evictable = jobs.findIndex((candidate) =>
+          isTerminal(candidate.state)
+          && (candidate.executionProfile !== 'codex-review' || (candidate.reviewFinalizedAt !== null && candidate.reviewFinalizedAt !== undefined)));
+        if (evictable < 0) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'Durable job capacity is full of nonterminal or unfinalized review jobs');
+        }
+        jobs.splice(evictable, 1);
+      }
+      jobs.push(job);
+      await this.writeDocument({ schemaVersion: 1, jobs });
+    });
   }
   private replaceJob(job: DurableJobRecord): Promise<void> {
     return this.serialized(async () => { const document = await this.readDocument(); await this.writeDocument({ schemaVersion: 1, jobs: document.jobs.map((candidate) => candidate.jobId === job.jobId ? job : candidate) }); });
@@ -450,6 +729,71 @@ export class DurableJobManager {
     try { await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600, flag: 'wx' }); await rename(temporary, filename); }
     catch (error) { await rm(temporary, { force: true }).catch(() => undefined); throw new RuntimeError('PERSISTENCE_FAILURE', 'vNext job state publication failed', { cause: error }); }
   }
+}
+
+function durableRequestFingerprint(
+  prepared: PreparedShellExecution,
+  effects: readonly CapabilityEffect[],
+  mission?: MissionExecutionAssociation,
+): string {
+  const identity = {
+    projectId: prepared.input.projectId,
+    workspaceId: prepared.workspaceId,
+    executionProfile: prepared.plan.profileId,
+    executableIdentity: prepared.plan.executableIdentity,
+    argvDigest: argvDigest(prepared.plan.argv),
+    cwd: prepared.plan.cwd,
+    timeoutMs: prepared.plan.timeoutMs,
+    stdinArtifactSha256: prepared.stdinArtifactSha256,
+    codeReviewBinding: prepared.codeReviewBinding ?? null,
+    envOverridesDigest: createHash('sha256').update(JSON.stringify(Object.entries(prepared.input.envOverrides).sort(([a], [b]) => a.localeCompare(b)))).digest('hex'),
+    effectiveEffects: [...effects],
+    mission: mission === undefined ? null : {
+      missionId: mission.missionId,
+      taskId: mission.taskId,
+      actionId: mission.actionId,
+      orchestratorMode: mission.orchestratorMode,
+    },
+  };
+  return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+}
+
+async function cleanupServerOwnedPaths(paths: readonly string[]): Promise<void> {
+  if (paths.length === 0) return;
+  const tempRoot = await realpath(tmpdir());
+  for (const candidate of [...new Set(paths)]) {
+    if (!path.isAbsolute(candidate) || candidate.includes('\0') || path.resolve(candidate) !== candidate) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Server-owned cleanup path is invalid');
+    }
+    const base = path.basename(candidate);
+    if (candidate === tempRoot || !pathIsWithin(tempRoot, candidate) || !base.startsWith('iris-code-review-')) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Server-owned cleanup path escapes the native-review temp namespace');
+    }
+    try {
+      const metadata = await lstat(candidate);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        throw new RuntimeError('PERSISTENCE_FAILURE', 'Server-owned cleanup target is no longer a physical directory');
+      }
+      const physical = await realpath(candidate);
+      if (physical !== candidate) {
+        throw new RuntimeError('PERSISTENCE_FAILURE', 'Server-owned cleanup target changed through an alias');
+      }
+      await rm(candidate, { recursive: true, force: false });
+    } catch (error) {
+      if (isErrno(error, 'ENOENT')) continue;
+      if (error instanceof RuntimeError) throw error;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Server-owned native-review cleanup failed', { cause: error });
+    }
+  }
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as NodeJS.ErrnoException).code === code;
+}
+
+function pathIsWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
 }
 
 function argvDigest(argv: readonly string[]): string { return createHash('sha256').update(JSON.stringify(argv)).digest('hex'); }
@@ -524,6 +868,34 @@ async function waitForTrustedTerminalResult(filename: string, jobId: string, run
 }
 async function readRunnerClaim(filename: string): Promise<RunnerOnlyClaim | null> { try { const value = JSON.parse(await readFile(filename, 'utf8')) as RunnerOnlyClaim; return value.schemaVersion === 1 ? value : null; } catch { return null; } }
 async function readClaim(filename: string): Promise<RunnerClaim | null> { try { const value = JSON.parse(await readFile(filename, 'utf8')) as RunnerClaim; return value.schemaVersion === 1 ? value : null; } catch { return null; } }
-async function readRunnerResult(filename: string): Promise<RunnerResult | null> { try { const value = JSON.parse(await readFile(filename, 'utf8')) as RunnerResult; return value.schemaVersion === 1 ? value : null; } catch { return null; } }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+async function readRunnerResult(filename: string): Promise<RunnerResult | null> {
+  try {
+    const value = JSON.parse(await readFile(filename, 'utf8')) as unknown;
+    if (!isRecord(value) || value.schemaVersion !== 1
+      || typeof value.jobId !== 'string' || typeof value.runnerIdentity !== 'string'
+      || (value.state !== 'SUCCEEDED' && value.state !== 'FAILED' && value.state !== 'CANCELLED')
+      || (value.exitCode !== null && (typeof value.exitCode !== 'number' || !Number.isInteger(value.exitCode)))
+      || (value.signal !== null && typeof value.signal !== 'string')
+      || typeof value.timedOut !== 'boolean' || typeof value.cancelled !== 'boolean'
+      || (value.error !== null && typeof value.error !== 'string')
+      || typeof value.finishedAt !== 'string') {
+      return null;
+    }
+    const digest = value.reviewOutputSha256;
+    const bytes = value.reviewOutputBytes;
+    if (!(((digest === undefined && bytes === undefined) || (digest === null && bytes === null))
+      || (typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest)
+        && typeof bytes === 'number' && Number.isSafeInteger(bytes) && bytes >= 1 && bytes <= 64 * 1024))) {
+      return null;
+    }
+    return value as unknown as RunnerResult;
+  } catch {
+    return null;
+  }
+}
 function encodeCursor(stream: 'stdout' | 'stderr', offset: number): string { return Buffer.from(JSON.stringify({ stream, offset }), 'utf8').toString('base64url'); }
 function decodeCursor(cursor: string | undefined, stream: 'stdout' | 'stderr'): number { if (cursor === undefined) return 0; try { const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as { stream?: unknown; offset?: unknown }; if (parsed.stream !== stream || typeof parsed.offset !== 'number' || !Number.isSafeInteger(parsed.offset) || parsed.offset < 0) throw new Error('bad'); return parsed.offset; } catch { throw new RuntimeError('INVALID_REQUEST', 'Log cursor is invalid for the selected stream'); } }
