@@ -7,6 +7,7 @@ import { MCP_PROTOCOL_VERSION, fullMcpToolDefinitions, handleMcpRequest, type Mc
 import { executePhase2GroupedTool, isPhase2GroupedTool } from './mcp-phase2.js';
 import { executePhase3GroupedTool, isPhase3GroupedTool } from './mcp-phase3.js';
 import { executePhase4GroupedTool, isPhase4GroupedTool } from './mcp-phase4.js';
+import { executeCodeReviewGroupedTool, isCodeReviewGroupedTool } from './mcp-code-review.js';
 import { augmentV21ToolDefinitions, V21_LIFECYCLE_TOOL_NAMES } from './mcp-v21-definitions.js';
 import { executeV21LifecycleTool, isCapabilityOutcome, toolError, toolOutcome, toolResult } from './mcp-v21-tools.js';
 import type { RuntimeState } from './state.js';
@@ -52,7 +53,8 @@ export async function handleMcpV21Request(
   const phase2Grouped = isPhase2GroupedTool(name);
   const phase3Grouped = isPhase3GroupedTool(name);
   const phase4Grouped = isPhase4GroupedTool(name);
-  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity && !phase2Grouped && !phase3Grouped && !phase4Grouped) {
+  const codeReviewGrouped = isCodeReviewGroupedTool(name);
+  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity && !phase2Grouped && !phase3Grouped && !phase4Grouped && !codeReviewGrouped) {
     return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
   }
 
@@ -71,7 +73,9 @@ export async function handleMcpV21Request(
           ? await executePhase3GroupedTool(name, args, request, capabilities, state)
           : phase4Grouped
             ? await executePhase4GroupedTool(name, args, request, capabilities, state)
-            : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal);
+            : codeReviewGrouped
+              ? await executeCodeReviewGroupedTool(args, request, capabilities, state)
+              : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal);
     return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
   } catch (error) {
     const runtimeError = error instanceof RuntimeError

@@ -31,6 +31,7 @@ import { assertExpectedEffects, deriveCapabilityEffects } from './capability-eff
 import { WorkspaceFilesystemEngine, type FsFindMode, type FsIgnoreMode, type FsReadMode, type FsWriteMode } from './filesystem-engine.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { DurableJobManager } from './durable-job-manager.js';
+import { CodeReviewManager } from './code-review-manager.js';
 import { GovernedGitEngine, type GitCompatibilityOperation, type Phase4GitOperationName, type Phase4GitRequest } from './governed-git-engine.js';
 import type { RuntimeState } from './state.js';
 import type { MultiWorkerRoutingService } from './multi-worker/service.js';
@@ -102,6 +103,9 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'job.logs'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly jobId: string; readonly stream: 'stdout' | 'stderr'; readonly cursor?: string | undefined; readonly maxBytes?: number | undefined }
   | { readonly capabilityId: 'job.result'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly jobId: string }
   | { readonly capabilityId: 'job.cancel'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly jobId: string }
+  | { readonly capabilityId: 'code_review.start'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly workspaceId: string; readonly contextArtifactId: string; readonly requestId: string }
+  | { readonly capabilityId: 'code_review.status'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly jobId: string }
+  | { readonly capabilityId: 'code_review.result'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly jobId: string }
   | Phase4GitOperationCore
   | { readonly capabilityId: 'policy.mode.set'; readonly mode: PermissionMode; readonly clientId?: string | undefined; readonly sessionId?: string | undefined };
 
@@ -137,6 +141,7 @@ export class CapabilityService {
   private resources: VNextResourceRegistry | undefined;
   private jobs: DurableJobManager | undefined;
   private multiWorker: MultiWorkerRoutingService | undefined;
+  private codeReviews: CodeReviewManager | undefined;
 
   public constructor(
     private readonly state: RuntimeState,
@@ -600,6 +605,29 @@ export class CapabilityService {
       const project = await this.authorizedProject(operation);
       return this.validationCompatibility().read(project, operation.jobId, operation.view);
     }
+    if (operation.capabilityId === 'code_review.start') {
+      await this.authorizedProject(operation);
+      if (operation.mission === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Native code review start requires a prepared mission action');
+      return this.codeReviewManager().start({
+        projectId: operation.projectId,
+        workspaceId: operation.workspaceId,
+        contextArtifactId: operation.contextArtifactId,
+        requestId: operation.requestId,
+      }, operation.mission);
+    }
+    if (operation.capabilityId === 'code_review.status') {
+      await this.authorizedProject(operation);
+      return this.codeReviewManager().status({ projectId: operation.projectId, jobId: operation.jobId });
+    }
+    if (operation.capabilityId === 'code_review.result') {
+      await this.authorizedProject(operation);
+      return this.codeReviewManager().result({
+        projectId: operation.projectId,
+        jobId: operation.jobId,
+        clientId: operation.clientId,
+        sessionId: operation.sessionId,
+      });
+    }
     if (operation.capabilityId === 'git.local') {
       const project = await this.authorizedProject(operation);
       const workspace = await this.resourceRegistry().primaryWorkspace(project.id);
@@ -792,6 +820,11 @@ export class CapabilityService {
     throw new RuntimeError('CAPABILITY_DENIED', 'Phase 2 capability execution is not implemented');
   }
 
+  private codeReviewManager(): CodeReviewManager {
+    this.codeReviews ??= new CodeReviewManager(this.state, this.resourceRegistry(), this.jobManager());
+    return this.codeReviews;
+  }
+
   private validationCompatibility(): ValidationCompatibilityAdapter {
     this.validationCompatibilityAdapter ??= new ValidationCompatibilityAdapter(
       this.jobManager(),
@@ -949,7 +982,7 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
-  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.discover' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'project.validation.job.read' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish') {
+  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.discover' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'project.validation.job.read' || operation.capabilityId === 'code_review.start' || operation.capabilityId === 'code_review.status' || operation.capabilityId === 'code_review.result' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'mission.get') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId };
@@ -1012,11 +1045,11 @@ function workerCapabilityRequest(operation: CapabilityOperation): {
 }
 
 function isMissionExecutableOperation(operation: CapabilityOperation): operation is CapabilityOperation & { readonly clientId: string; readonly sessionId: string; readonly mission: MissionExecutionAssociation } {
-  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'git.local' || operation.capabilityId === 'git.push' || operation.capabilityId === 'remote.publish' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete' || operation.capabilityId === 'file.edit' || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
+  return operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'code_review.start' || operation.capabilityId === 'git.local' || operation.capabilityId === 'git.push' || operation.capabilityId === 'remote.publish' || operation.capabilityId === 'file.read' || operation.capabilityId === 'file.write' || operation.capabilityId === 'file.delete' || operation.capabilityId === 'file.edit' || operation.capabilityId === 'directory.create' || operation.capabilityId === 'directory.delete';
 }
 
-function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'project.command.run' | 'project.validation.start' | 'git.local' | 'git.push' | 'remote.publish' | 'file.read' | 'file.write' | 'file.edit' | 'file.delete' | 'directory.create' | 'directory.delete' {
-  return capabilityId === 'project.test.run' || capabilityId === 'project.command.run' || capabilityId === 'project.validation.start' || capabilityId === 'git.local' || capabilityId === 'git.push' || capabilityId === 'remote.publish' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete' || capabilityId === 'file.edit' || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
+function missionExecutionCapability(capabilityId: CapabilityId): capabilityId is 'project.test.run' | 'project.command.run' | 'project.validation.start' | 'code_review.start' | 'git.local' | 'git.push' | 'remote.publish' | 'file.read' | 'file.write' | 'file.edit' | 'file.delete' | 'directory.create' | 'directory.delete' {
+  return capabilityId === 'project.test.run' || capabilityId === 'project.command.run' || capabilityId === 'project.validation.start' || capabilityId === 'code_review.start' || capabilityId === 'git.local' || capabilityId === 'git.push' || capabilityId === 'remote.publish' || capabilityId === 'file.read' || capabilityId === 'file.write' || capabilityId === 'file.delete' || capabilityId === 'file.edit' || capabilityId === 'directory.create' || capabilityId === 'directory.delete';
 }
 
 function describeWorkerAssociation(operation: CapabilityOperation): string {
@@ -1075,6 +1108,9 @@ function describeOperation(operation: CapabilityOperation): string {
   if (operation.capabilityId === 'project.validation.discover') return `project.validation.discover projectId=${operation.projectId}`;
   if (operation.capabilityId === 'project.validation.start') return `project.validation.start projectId=${operation.projectId ?? 'session-current'} declared-script=${operation.scriptName} requestId=${operation.requestId}`;
   if (operation.capabilityId === 'project.validation.job.read') return `project.validation.job.read projectId=${operation.projectId} jobId=${operation.jobId} view=${operation.view}`;
+  if (operation.capabilityId === 'code_review.start') return `code_review.start projectId=${operation.projectId} workspaceId=${operation.workspaceId} contextArtifactId=${operation.contextArtifactId} requestId=${operation.requestId}`;
+  if (operation.capabilityId === 'code_review.status') return `code_review.status projectId=${operation.projectId} jobId=${operation.jobId}`;
+  if (operation.capabilityId === 'code_review.result') return `code_review.result projectId=${operation.projectId} jobId=${operation.jobId}`;
   if (operation.capabilityId === 'git.local') return `git.local projectId=${operation.projectId ?? 'session-current'} operation=${operation.operation} paths=${operation.paths?.length ?? 0}`;
   if (operation.capabilityId === 'remote.publish') return `remote.publish projectId=${operation.projectId ?? 'session-current'} configured-origin-current-feature-branch`;
   if (operation.capabilityId === 'mission.get') return `mission.get missionId=${operation.missionId}`;
