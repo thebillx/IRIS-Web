@@ -112,6 +112,9 @@ type AuditEvent = {
   result: string;
 };
 export type PendingApproval = Omit<AuditEvent, 'result'> & {
+  missionId?: string | null;
+  taskId?: string | null;
+  actionId?: string | null;
   exactAction: string;
   canAlwaysAllowProject: boolean;
 };
@@ -674,7 +677,7 @@ function PermissionsPage(props: { permissions: PermissionSnapshot | null; onRequ
 
 function ApprovalCenter(props: { approvals: PendingApproval[]; selectedSession: Session | null; onReview(approval: PendingApproval): void }): ReactElement {
   return <>
-    <div className="page-heading"><div><p className="eyebrow">Owner decisions</p><h1>Approval Center</h1><p>{props.selectedSession === null ? 'Showing machine or browser-client decisions that are not tied to another session.' : 'Showing decisions for the current session plus machine-level decisions for this browser client.'}</p></div></div>
+    <div className="page-heading"><div><p className="eyebrow">Owner decisions</p><h1>Approval Center</h1><p>{props.selectedSession === null ? 'Showing machine, browser-client, and mission-bound owner decisions available to this authenticated owner.' : 'Showing decisions for the current session plus machine, browser-client, and mission-bound owner decisions.'}</p></div></div>
     <section>{props.approvals.length === 0 ? <p>No pending owner decisions in this session context.</p> : <div className="approval-list">{props.approvals.map((approval) => <article key={approval.id} className="approval-row">
       <div><strong>{humanCapability(approval.capabilityId)}</strong><span className={`risk risk-${approval.riskClass.toLowerCase()}`}>{approval.riskClass}</span><p>{approval.reason}</p><code>{approval.target ?? 'No filesystem target'}</code></div>
       <button onClick={() => props.onReview(approval)}>Review exact action</button>
@@ -734,6 +737,8 @@ export function approvalBelongsToSessionContext(
   clientId: string,
   selectedSessionId: string | null,
 ): boolean {
+  const missionBound = approval.missionId != null && approval.taskId != null && approval.actionId != null;
+  if (missionBound) return true;
   if (approval.sessionId !== null) {
     return selectedSessionId !== null
       && approval.sessionId === selectedSessionId

@@ -237,16 +237,68 @@ describe('daily workspace session experience', () => {
     expect(document.body.textContent).toContain('session-b-action');
   });
 
-  it('associates pending approvals only with the selected session or current browser-client machine context', () => {
+  it('surfaces a mission-bound approval from a ChatGPT session to the authenticated owner web context', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    const missionApproval = approval({
+      id: 'mission-approval',
+      clientId: 'chatgpt',
+      sessionId: 'e501b5b3-ae5f-413a-bfbe-a8b1a55255b8',
+      agentId: 'iris-tunnel-service',
+      missionId: '11111111-1111-4111-8111-111111111111',
+      taskId: '22222222-2222-4222-8222-222222222222',
+      actionId: '33333333-3333-4333-8333-333333333333',
+      capabilityId: 'git.push',
+      riskClass: 'HIGH',
+      target: '/Users/RARW/iris/.git',
+      exactAction: 'git.push remote=origin branch=codex/multi-worker-orchestration-v1',
+    });
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = String(input);
+      const method = init.method ?? 'GET';
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects' && method === 'GET') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/sessions' && method === 'GET') return jsonResponse({ sessions: [] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([missionApproval]));
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    }));
+
+    await mountApp();
+    await settleApp();
+    await clickButton('Approval Center (1)');
+    expect(document.body.textContent).toContain('mission-bound owner decisions');
+    expect(document.body.textContent).toContain('git · push');
+    await clickButton('Review exact action');
+    expect(document.body.textContent).toContain('git.push remote=origin branch=codex/multi-worker-orchestration-v1');
+    expect(document.body.textContent).toContain('Allow once');
+  });
+
+  it('associates pending approvals only with the selected session, current browser-client machine context, or a complete mission handoff identity', () => {
     const sessionApproval = approval({ sessionId: sessionA.id, clientId: 'web-client' });
     const otherSessionApproval = approval({ sessionId: sessionB.id, clientId: 'web-client' });
     const browserClientApproval = approval({ sessionId: null, clientId: 'web-client' });
     const otherClientApproval = approval({ sessionId: null, clientId: 'other-client' });
+    const missionApproval = approval({
+      sessionId: sessionB.id,
+      clientId: 'chatgpt',
+      missionId: '11111111-1111-4111-8111-111111111111',
+      taskId: '22222222-2222-4222-8222-222222222222',
+      actionId: '33333333-3333-4333-8333-333333333333',
+    });
+    const incompleteMissionApproval = approval({
+      sessionId: sessionB.id,
+      clientId: 'chatgpt',
+      missionId: '11111111-1111-4111-8111-111111111111',
+    });
 
     expect(approvalBelongsToSessionContext(sessionApproval, 'web-client', sessionA.id)).toBe(true);
     expect(approvalBelongsToSessionContext(otherSessionApproval, 'web-client', sessionA.id)).toBe(false);
     expect(approvalBelongsToSessionContext(browserClientApproval, 'web-client', sessionA.id)).toBe(true);
     expect(approvalBelongsToSessionContext(otherClientApproval, 'web-client', sessionA.id)).toBe(false);
+    expect(approvalBelongsToSessionContext(missionApproval, 'web-client', sessionA.id)).toBe(true);
+    expect(approvalBelongsToSessionContext(incompleteMissionApproval, 'web-client', sessionA.id)).toBe(false);
   });
 
   it('renders mission control state, approval association, evidence count, and recent timeline read-only', () => {

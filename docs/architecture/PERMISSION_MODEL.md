@@ -60,7 +60,7 @@ Permission settings are persisted privately in `permissions.json`. First initial
 
 ## Approval Center
 
-`OWNER_REQUIRED` creates an in-memory, bounded, expiring pending approval and executes nothing. The Web Approval Center can deny, allow the exact action once, or—only for eligible MODERATE project capabilities—persist an always-allow project/capability override.
+`OWNER_REQUIRED` creates an in-memory, bounded, expiring pending approval and executes nothing. The Web Approval Center can deny, allow the exact action once, or—only for eligible MODERATE project capabilities—persist an always-allow project/capability override. An owner-authenticated Web client may also review a complete mission-bound approval (`missionId` + `taskId` + `actionId`) from another orchestrator session; this is a decision handoff only, not a session or mission rebind. Execution remains bound to the originating operation and is revalidated against its original client/session/project/action identity before mutation.
 
 A FULL owner-authenticated MCP session may resolve a pending approval only when it is the exact originating session for a prepared `CHATGPT` mission action. The `owner_approval_resolve` continuation requires the pending approval ID plus the original mission/task/action/capability/exact-action identity, supports only `ALLOW_ONCE` or `DENY`, never creates an `ALWAYS_ALLOW_PROJECT` override, and consumes the approval at most once. A different client/session, stale mission binding, changed exact action, non-owner session, non-CHATGPT mission, or replay fails closed without widening authority.
 
