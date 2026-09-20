@@ -30,6 +30,7 @@ const LOG_DIRECTORY = 'logs';
 const MAX_RECOVERY_ATTEMPTS = 3;
 const RECOVERY_WINDOW_MS = 60_000;
 const RECOVERY_BACKOFF_MS = [1_000, 2_000, 4_000] as const;
+const CONTROLLED_ACTIVATION_SHUTDOWN_DEADLINE_MS = 60_000;
 const DEFAULT_WEB_PORT = 5_173;
 const DEFAULT_ADMIN_PORT = 43_111;
 const DEFAULT_SUPERVISOR_CONTROL_PORT = 43_112;
@@ -424,7 +425,7 @@ export class Supervisor {
     if (state.runtime !== null) {
       if (observed.state === 'running') {
         assertRuntimeOwnership(state.runtime, observed);
-        await stopRuntime(this.dataRoot);
+        await stopRuntime(this.dataRoot, CONTROLLED_ACTIVATION_SHUTDOWN_DEADLINE_MS);
       } else {
         await this.retireRuntime(state.runtime, observed);
       }
