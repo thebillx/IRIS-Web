@@ -315,6 +315,113 @@ describe('native Ponytail code-review capability', () => {
     });
   }, 20_000);
 
+  it('finalizes terminal reviewer execution failure without fabricating a decision and unblocks mission completion', async () => {
+    const fixture = await reviewFixture();
+    const fakeCodex = await fakeCodexExecutable(await temp('iris-fake-codex-terminal-failure-'));
+    process.env.IRIS_CODEX_EXECUTABLE = fakeCodex;
+    await writeFile(path.join(fixture.projectRoot, '.codex', 'config.toml'), 'forbidden = true\n');
+
+    const primary = await fixture.resources.primaryWorkspace(fixture.project.id);
+    const association = await preparedReviewAction(fixture, 'terminal review failure must finalize');
+    const contextArtifact = await textArtifact(fixture, '# terminal review failure context');
+    const start = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'code_review.start',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      workspaceId: primary.workspaceId,
+      contextArtifactId: contextArtifact.artifactId,
+      requestId: `review-failure-${randomUUID()}`,
+      mission: association,
+      expectedEffects: REVIEW_START_EFFECTS,
+    }));
+    const jobId = String(start.jobId);
+
+    const terminal = await waitForReviewTerminal(fixture, jobId);
+    expect(terminal).toMatchObject({
+      state: 'FAILED',
+      terminalValid: false,
+      reviewDecision: null,
+      terminalReceipt: null,
+    });
+    await expect(fixture.jobs.assertMissionCodeReviewsFinalized(association.missionId))
+      .rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    const finalized = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'code_review.result',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      jobId,
+      expectedEffects: REVIEW_RESULT_EFFECTS,
+    }));
+    expect(finalized).toMatchObject({
+      state: 'FAILED',
+      terminalValid: false,
+      lifecycleOutcome: 'EXECUTION_FAILED',
+      reviewDecision: null,
+      terminalReceipt: null,
+    });
+    await expect(fixture.jobs.assertMissionCodeReviewsFinalized(association.missionId)).resolves.toBeUndefined();
+
+    let mission = await fixture.state.getMission(association.missionId);
+    let action = mission.tasks.find((task) => task.id === association.taskId)?.actions.find((item) => item.id === association.actionId);
+    let receipts = action?.result?.evidence.filter((item) => item.label === 'code_review.failure_receipt') ?? [];
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({
+      kind: 'AUDIT',
+      reference: `iris-review-job:${jobId}`,
+      data: {
+        lifecycleOutcome: 'EXECUTION_FAILED',
+        jobState: 'FAILED',
+        reviewDecision: null,
+        terminalReceipt: null,
+      },
+    });
+
+    const repeated = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'code_review.result',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      jobId,
+      expectedEffects: REVIEW_RESULT_EFFECTS,
+    }));
+    expect(repeated).toMatchObject({
+      lifecycleOutcome: 'EXECUTION_FAILED',
+      reviewDecision: null,
+      terminalReceipt: null,
+    });
+    mission = await fixture.state.getMission(association.missionId);
+    action = mission.tasks.find((task) => task.id === association.taskId)?.actions.find((item) => item.id === association.actionId);
+    receipts = action?.result?.evidence.filter((item) => item.label === 'code_review.failure_receipt') ?? [];
+    expect(receipts).toHaveLength(1);
+
+    const completed = executedValue<Awaited<ReturnType<RuntimeState['getMission']>>>(await fixture.service.execute({
+      capabilityId: 'mission.state.set',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      missionId: association.missionId,
+      state: 'COMPLETED',
+      expectedEffects: ['WRITE'],
+    }));
+    expect(completed.state).toBe('COMPLETED');
+
+    const repeatedAfterCompletion = executedValue<Record<string, unknown>>(await fixture.service.execute({
+      capabilityId: 'code_review.result',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      projectId: fixture.project.id,
+      jobId,
+      expectedEffects: REVIEW_RESULT_EFFECTS,
+    }));
+    expect(repeatedAfterCompletion).toMatchObject({
+      lifecycleOutcome: 'EXECUTION_FAILED',
+      reviewDecision: null,
+      terminalReceipt: null,
+    });
+  }, 20_000);
+
   it('derives linked-worktree Git metadata read access only from the verified IRIS repository binding', async () => {
     const fixture = await reviewFixture();
     const commonGitDir = path.join(fixture.projectRoot, '.git');
@@ -509,14 +616,21 @@ describe('native Ponytail code-review capability', () => {
     }));
     const status = await waitForReviewTerminal(fixture, String(start.jobId));
     expect(status).toMatchObject({ state: 'FAILED', terminalValid: false, reviewDecision: null, terminalReceipt: null });
-    await expect(fixture.service.execute({
+    const finalized = executedValue<Record<string, unknown>>(await fixture.service.execute({
       capabilityId: 'code_review.result',
       clientId: fixture.session.clientId,
       sessionId: fixture.session.id,
       projectId: fixture.project.id,
       jobId: String(start.jobId),
       expectedEffects: REVIEW_RESULT_EFFECTS,
-    })).rejects.toMatchObject({ code: 'AGENT_EXECUTION_FAILED' });
+    }));
+    expect(finalized).toMatchObject({
+      state: 'FAILED',
+      terminalValid: false,
+      lifecycleOutcome: 'EXECUTION_FAILED',
+      reviewDecision: null,
+      terminalReceipt: null,
+    });
   }, 20_000);
 
   it('refuses capacity instead of evicting live review jobs and cleans newly prepared private auth/input state', async () => {
@@ -675,6 +789,16 @@ describe('native Ponytail code-review capability', () => {
     const failedMission = await fixture.state.getMission(association2.missionId);
     const failedAction = failedMission.tasks.find((task) => task.id === association2.taskId)?.actions.find((item) => item.id === association2.actionId);
     expect(failedAction?.state).toBe('FAILED');
+
+    const completedAfterStartFailure = executedValue<Awaited<ReturnType<RuntimeState['getMission']>>>(await fixture.service.execute({
+      capabilityId: 'mission.state.set',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      missionId: association2.missionId,
+      state: 'COMPLETED',
+      expectedEffects: ['WRITE'],
+    }));
+    expect(completedAfterStartFailure.state).toBe('COMPLETED');
   });
 });
 

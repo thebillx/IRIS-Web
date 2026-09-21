@@ -158,8 +158,80 @@ export class CodeReviewManager {
     if (snapshot.state === 'QUEUED' || snapshot.state === 'RUNNING') {
       throw new RuntimeError('PRECONDITION_FAILED', 'Native code review job is not terminal yet');
     }
+    if (snapshot.missionId === null || snapshot.taskId === null || snapshot.actionId === null) {
+      throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review job is missing its mission action binding');
+    }
+    const mission = await this.state.getMission(snapshot.missionId);
+    if (mission.clientId !== input.clientId || mission.sessionId !== input.sessionId || mission.projectId !== input.projectId) {
+      throw new RuntimeError('CONTROL_DENIED', 'Native code review result belongs to a different mission/session binding');
+    }
+
     if (snapshot.state !== 'SUCCEEDED' || snapshot.exitCode !== 0 || snapshot.timedOut) {
-      throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review job did not complete successfully');
+      if (snapshot.reviewBinding === null) {
+        throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review failure is missing its expected identity binding');
+      }
+      const binding = snapshot.reviewBinding;
+      const evidence: MissionEvidence = {
+        id: randomUUID(),
+        kind: 'AUDIT',
+        label: 'code_review.failure_receipt',
+        summary: `Ponytail LOCAL_NATIVE review execution ended ${snapshot.state} without a review decision`,
+        reference: `iris-review-job:${snapshot.jobId}`,
+        data: {
+          reviewJobId: snapshot.jobId,
+          lifecycleOutcome: 'EXECUTION_FAILED',
+          jobState: snapshot.state,
+          exitCode: snapshot.exitCode,
+          timedOut: snapshot.timedOut,
+          reviewDecision: null,
+          terminalReceipt: null,
+          launchSpecSha256: snapshot.reviewLaunchSha256,
+          contextArtifactId: binding.contextArtifactId,
+          contextArtifactSha256: binding.contextArtifactSha256,
+          contextSha256: binding.contextSha256,
+          reviewerProfileSha256: binding.reviewerProfileSha256,
+          workspaceSha256: binding.workspaceSha256,
+          repositoryIdentitySha256: binding.repositoryIdentitySha256,
+        },
+      };
+      await this.state.appendMissionActionEvidence(
+        snapshot.missionId,
+        snapshot.taskId,
+        snapshot.actionId,
+        'code_review.start',
+        evidence,
+      ).catch(async (error) => {
+        if (!(error instanceof RuntimeError) || error.code !== 'PRECONDITION_FAILED') throw error;
+        const currentMission = await this.state.getMission(snapshot.missionId!);
+        const action = currentMission.tasks.find((task) => task.id === snapshot.taskId)?.actions.find((item) => item.id === snapshot.actionId);
+        const existing = action?.result?.evidence.find((item) =>
+          item.label === 'code_review.failure_receipt' && item.reference === evidence.reference);
+        if (existing?.data.lifecycleOutcome !== 'EXECUTION_FAILED'
+          || existing.data.jobState !== snapshot.state
+          || existing.data.exitCode !== snapshot.exitCode
+          || existing.data.timedOut !== snapshot.timedOut
+          || existing.data.contextArtifactId !== binding.contextArtifactId
+          || existing.data.contextArtifactSha256 !== binding.contextArtifactSha256
+          || existing.data.contextSha256 !== binding.contextSha256
+          || existing.data.reviewerProfileSha256 !== binding.reviewerProfileSha256
+          || existing.data.workspaceSha256 !== binding.workspaceSha256
+          || existing.data.repositoryIdentitySha256 !== binding.repositoryIdentitySha256) {
+          throw error;
+        }
+      });
+      await this.jobs.markCodeReviewFinalized(input.projectId, snapshot.jobId);
+      return {
+        jobId: snapshot.jobId,
+        state: snapshot.state,
+        workspaceId: snapshot.workspaceId,
+        terminalValid: false,
+        lifecycleOutcome: 'EXECUTION_FAILED',
+        reviewDecision: null,
+        terminalReceipt: null,
+        exitCode: snapshot.exitCode,
+        timedOut: snapshot.timedOut,
+        logArtifactIds: snapshot.logArtifactIds,
+      };
     }
     if (snapshot.reviewOutput === null || snapshot.reviewOutputSha256 === null || snapshot.reviewBinding === null) {
       throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review private terminal payload or expected identity binding is missing');
@@ -171,13 +243,6 @@ export class CodeReviewManager {
       || parsed.reviewerProfileSha256 !== binding.reviewerProfileSha256
       || parsed.repositoryIdentitySha256 !== binding.repositoryIdentitySha256) {
       throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review terminal identities do not match the server-retained review binding');
-    }
-    if (snapshot.missionId === null || snapshot.taskId === null || snapshot.actionId === null) {
-      throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Native code review job is missing its mission action binding');
-    }
-    const mission = await this.state.getMission(snapshot.missionId);
-    if (mission.clientId !== input.clientId || mission.sessionId !== input.sessionId || mission.projectId !== input.projectId) {
-      throw new RuntimeError('CONTROL_DENIED', 'Native code review result belongs to a different mission/session binding');
     }
 
     const reportCanonical = JSON.stringify(parsed.reviewReport);
