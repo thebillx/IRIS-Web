@@ -932,7 +932,8 @@ function assertMissionControlIdentity(mission: MissionSnapshot, clientId: string
 function assertMissionReviewActionsFinalized(mission: MissionSnapshot): void {
   const pending = mission.tasks.flatMap((task) => task.actions).filter((action) =>
     action.capabilityId === 'code_review.start'
-    && !action.result?.evidence.some((item) => item.label === 'code_review.receipt'
+    && !action.result?.evidence.some((item) =>
+      (item.label === 'code_review.receipt' || item.label === 'code_review.failure_receipt')
       && typeof item.reference === 'string' && item.reference.startsWith('iris-review-job:')));
   if (pending.length > 0) {
     throw new RuntimeError('PRECONDITION_FAILED', 'Mission has unfinalized native code review actions');
