@@ -220,6 +220,15 @@ describe('local MCP transport and permission boundary', () => {
     }, true, 'mission_get'), fixture.service);
     const missionBody = await readMission.json() as { result: { structuredContent: { tasks: Array<{ actions: Array<{ state: string; result: { evidence: unknown[] } }> }> } } };
     expect(missionBody.result.structuredContent.tasks[0]!.actions[0]).toMatchObject({ state: 'SUCCEEDED', result: { evidence: [expect.objectContaining({ kind: 'CAPABILITY_RESULT' })] } });
+
+    const events = await handleMcpRequest(rpc('tools/call', 15, {
+      name: 'mission_events', arguments: { missionId },
+    }, true, 'mission_events'), fixture.service, fixture.state, fixture.broker);
+    const eventsBody = await events.json() as { result: { isError: boolean; structuredContent: { events: Array<{ type: string; event?: { kind: string } }> } } };
+    expect(eventsBody.result.isError).toBe(false);
+    expect(eventsBody.result.structuredContent.events.some((entry) =>
+      entry.type === 'MISSION_EVENT' && entry.event?.kind === 'MISSION_CREATED')).toBe(true);
+
     await expect(readFile(targetPath, 'utf8')).resolves.toBe('mission-evidence');
   });
 
