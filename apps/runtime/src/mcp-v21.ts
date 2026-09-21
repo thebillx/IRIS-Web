@@ -70,11 +70,11 @@ export async function handleMcpV21Request(
     const result = catalogIdentity
       ? catalogIdentityPayload('FULL', fullMcpToolDefinitionsV21(), runtimeContext)
       : phase2Grouped
-        ? await executePhase2GroupedTool(name, args, request, capabilities, state)
+        ? await executePhase2GroupedTool(name, args, request, capabilities, state, principal)
         : phase3Grouped
-          ? await executePhase3GroupedTool(name, args, request, capabilities, state)
+          ? await executePhase3GroupedTool(name, args, request, capabilities, state, principal)
           : phase4Grouped
-            ? await executePhase4GroupedTool(name, args, request, capabilities, state)
+            ? await executePhase4GroupedTool(name, args, request, capabilities, state, principal)
             : codeReviewGrouped
               ? await executeCodeReviewGroupedTool(args, request, capabilities, state)
               : adoTool

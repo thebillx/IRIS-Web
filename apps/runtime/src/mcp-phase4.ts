@@ -1,10 +1,10 @@
 import type { CapabilityEffect, MissionExecutionAssociation } from '@iris/domain';
 import { RuntimeError } from '@iris/domain';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
+import { resolveDirectSessionIdentity, type DirectSessionIdentity } from './mcp-direct-context.js';
+import type { McpPrincipal } from './mcp.js';
 import type { RuntimeState } from './state.js';
 
-const CLIENT_ID_HEADER = 'x-iris-client-id';
-const SESSION_ID_HEADER = 'x-iris-session-id';
 const EFFECTS = ['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE'] as const satisfies readonly CapabilityEffect[];
 const OPERATIONS = [
   'status','head','diff','log','show','cat_file','merge_base','ancestry','refs','branch_list','worktree_list',
@@ -32,8 +32,8 @@ export function phase4GroupedToolDefinitions(): readonly Record<string, unknown>
       type: 'object',
       required: ['operation','projectId','workspaceId'],
       properties: {
-        sessionId: { type: 'string', description: 'IRIS runtime session UUID. May be omitted when x-iris-session-id is supplied.' },
-        projectId: { type: 'string', description: 'Registered project UUID; must equal the live session project.' },
+        sessionId: { type: 'string', description: 'Optional explicit IRIS runtime session UUID. Authenticated tunnel connectors may omit it and use project-bound direct context.' },
+        projectId: { type: 'string', description: 'Registered project UUID; direct context is isolated to this project.' },
         workspaceId: { type: 'string', description: 'Opaque ACTIVE IRIS PRIMARY or WORKTREE workspace UUID.' },
         missionId: { type: 'string', description: 'Optional prepared CHATGPT mission identity; missionId/taskId/actionId must be supplied together.' },
         taskId: { type: 'string', description: 'Optional prepared CHATGPT task identity; missionId/taskId/actionId must be supplied together.' },
@@ -71,10 +71,11 @@ export async function executePhase4GroupedTool(
   request: Request,
   capabilities: CapabilityService,
   state: RuntimeState | undefined,
+  principal: McpPrincipal = 'owner',
 ): Promise<CapabilityOutcome> {
   assertOnlyGitKeys(args);
-  const identity = resolveSessionIdentity(args, request, state);
   const projectId = requiredBoundedString(args, 'projectId', 200);
+  const identity = await resolveDirectSessionIdentity(args, request, state, projectId, principal);
   const workspaceId = requiredBoundedString(args, 'workspaceId', 200);
   const operation = requiredEnum(args, 'operation', OPERATIONS);
   const repositoryId = optionalBoundedString(args, 'repositoryId', 200);
@@ -114,30 +115,16 @@ export async function executePhase4GroupedTool(
   return capabilities.execute({ capabilityId: 'git.push', operation, ...common, repositoryId: requiredRepositoryId, remote: requiredBoundedString(args, 'remote', 100), branch: requiredBoundedString(args, 'branch', 200) });
 }
 
-interface SessionIdentity { readonly clientId: string; readonly sessionId: string }
-
 function assertOnlyGitKeys(args: Record<string, unknown>): void {
   for (const key of Object.keys(args)) {
     if (!GIT_KEYS.has(key)) throw new RuntimeError('INVALID_REQUEST', `Unsupported git field: ${key}`);
   }
 }
 
-function resolveSessionIdentity(args: Record<string, unknown>, request: Request, state: RuntimeState | undefined): SessionIdentity {
-  const clientId = requiredHeader(request, CLIENT_ID_HEADER);
-  const argumentSessionId = optionalBoundedString(args, 'sessionId', 200);
-  const headerSessionId = optionalHeader(request, SESSION_ID_HEADER);
-  if (argumentSessionId !== undefined && headerSessionId !== undefined && argumentSessionId !== headerSessionId) throw new RuntimeError('CONTROL_DENIED', 'sessionId argument does not match x-iris-session-id');
-  const sessionId = argumentSessionId ?? headerSessionId;
-  if (sessionId === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session is required; call session_open first.');
-  if (state === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session validation is unavailable');
-  state.getSessionForClient(sessionId, clientId);
-  return { clientId, sessionId };
-}
-
 async function optionalMissionAssociation(
   args: Record<string, unknown>,
   state: RuntimeState | undefined,
-  identity: SessionIdentity,
+  identity: DirectSessionIdentity,
 ): Promise<MissionExecutionAssociation | undefined> {
   const missionId = optionalBoundedString(args, 'missionId', 200);
   const taskId = optionalBoundedString(args, 'taskId', 200);
@@ -172,17 +159,6 @@ function optionalExpectedEffects(args: Record<string, unknown>): readonly Capabi
   return effects;
 }
 
-function requiredHeader(request: Request, name: string): string {
-  const value = optionalHeader(request, name);
-  if (value === undefined) throw new RuntimeError('INVALID_REQUEST', `${name} is required`);
-  return value;
-}
-function optionalHeader(request: Request, name: string): string | undefined {
-  const value = request.headers.get(name)?.trim();
-  if (value === undefined || value.length === 0) return undefined;
-  if (value.length > 200 || value.includes('\0')) throw new RuntimeError('INVALID_REQUEST', `${name} is invalid`);
-  return value;
-}
 function requiredBoundedString(record: Record<string, unknown>, name: string, maxLength: number): string {
   const value = record[name];
   if (typeof value !== 'string' || value.length === 0 || value.length > maxLength || value.includes('\0')) throw new RuntimeError('INVALID_REQUEST', `${name} must be a bounded non-empty string`);

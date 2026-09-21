@@ -228,7 +228,7 @@ export interface MissionRebindAuditEvent {
   readonly oldSessionId: string;
   readonly newClientId: string;
   readonly newSessionId: string;
-  readonly principal: 'owner';
+  readonly principal: 'owner' | 'tunnel-service';
   readonly projectId: string;
   readonly timestamp: string;
   readonly reason: string;

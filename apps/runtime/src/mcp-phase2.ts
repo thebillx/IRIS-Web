@@ -1,10 +1,10 @@
 import type { ArtifactRetentionPolicy, ArtifactSensitivity, CapabilityEffect } from '@iris/domain';
 import { RuntimeError } from '@iris/domain';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
+import { resolveDirectSessionIdentity, type DirectSessionIdentity } from './mcp-direct-context.js';
+import type { McpPrincipal } from './mcp.js';
 import type { RuntimeState } from './state.js';
 
-const CLIENT_ID_HEADER = 'x-iris-client-id';
-const SESSION_ID_HEADER = 'x-iris-session-id';
 const EFFECTS = ['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE'] as const satisfies readonly CapabilityEffect[];
 
 export const PHASE2_GROUPED_TOOL_NAMES = ['workspace', 'fs', 'artifact'] as const;
@@ -15,8 +15,8 @@ export function isPhase2GroupedTool(name: string): name is Phase2GroupedToolName
 }
 
 export function phase2GroupedToolDefinitions(): readonly Record<string, unknown>[] {
-  const sessionId = { sessionId: { type: 'string', description: 'IRIS runtime session UUID returned by session_open. May be omitted when x-iris-session-id is supplied.' } };
-  const projectId = { projectId: { type: 'string', description: 'Registered project UUID; must equal the live session project.' } };
+  const sessionId = { sessionId: { type: 'string', description: 'Optional explicit IRIS runtime session UUID. Authenticated tunnel connectors may omit it and use project-bound direct context.' } };
+  const projectId = { projectId: { type: 'string', description: 'Registered project UUID; direct context is isolated to this project.' } };
   const workspaceId = { workspaceId: { type: 'string', description: 'Opaque IRIS workspace UUID, never a raw path.' } };
   const expectedEffects = {
     expectedEffects: {
@@ -108,9 +108,10 @@ export async function executePhase2GroupedTool(
   request: Request,
   capabilities: CapabilityService,
   state: RuntimeState | undefined,
+  principal: McpPrincipal = 'owner',
 ): Promise<CapabilityOutcome> {
-  const identity = resolveSessionIdentity(args, request, state);
   const projectId = requiredBoundedString(args, 'projectId', 200);
+  const identity = await resolveDirectSessionIdentity(args, request, state, projectId, principal);
   const expectedEffects = optionalExpectedEffects(args);
   if (name === 'workspace') return executeWorkspace(args, identity, projectId, expectedEffects, capabilities);
   if (name === 'fs') return executeFs(args, identity, projectId, expectedEffects, capabilities);
@@ -118,7 +119,7 @@ export async function executePhase2GroupedTool(
 }
 
 async function executeWorkspace(
-  args: Record<string, unknown>, identity: SessionIdentity, projectId: string,
+  args: Record<string, unknown>, identity: DirectSessionIdentity, projectId: string,
   expectedEffects: readonly CapabilityEffect[] | undefined, capabilities: CapabilityService,
 ): Promise<CapabilityOutcome> {
   const operation = requiredEnum(args, 'operation', ['list', 'get', 'create_scratch', 'revoke_scratch'] as const);
@@ -131,7 +132,7 @@ async function executeWorkspace(
 }
 
 async function executeFs(
-  args: Record<string, unknown>, identity: SessionIdentity, projectId: string,
+  args: Record<string, unknown>, identity: DirectSessionIdentity, projectId: string,
   expectedEffects: readonly CapabilityEffect[] | undefined, capabilities: CapabilityService,
 ): Promise<CapabilityOutcome> {
   const operation = requiredEnum(args, 'operation', ['list', 'stat', 'read', 'write', 'edit', 'mkdir', 'delete', 'hash', 'find'] as const);
@@ -219,7 +220,7 @@ async function executeFs(
 }
 
 async function executeArtifact(
-  args: Record<string, unknown>, identity: SessionIdentity, projectId: string,
+  args: Record<string, unknown>, identity: DirectSessionIdentity, projectId: string,
   expectedEffects: readonly CapabilityEffect[] | undefined, capabilities: CapabilityService,
 ): Promise<CapabilityOutcome> {
   const operation = requiredEnum(args, 'operation', ['stat', 'open_ref', 'register_existing', 'release'] as const);
@@ -238,20 +239,6 @@ async function executeArtifact(
   return capabilities.execute({ capabilityId: 'artifact.release', ...identity, projectId, artifactId, ...effects });
 }
 
-interface SessionIdentity { readonly clientId: string; readonly sessionId: string }
-
-function resolveSessionIdentity(args: Record<string, unknown>, request: Request, state: RuntimeState | undefined): SessionIdentity {
-  const clientId = requiredHeader(request, CLIENT_ID_HEADER);
-  const argumentSessionId = optionalBoundedString(args, 'sessionId', 200);
-  const headerSessionId = optionalHeader(request, SESSION_ID_HEADER);
-  if (argumentSessionId !== undefined && headerSessionId !== undefined && argumentSessionId !== headerSessionId) throw new RuntimeError('CONTROL_DENIED', 'sessionId argument does not match x-iris-session-id');
-  const sessionId = argumentSessionId ?? headerSessionId;
-  if (sessionId === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session is required; call session_open first.');
-  if (state === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session validation is unavailable');
-  state.getSessionForClient(sessionId, clientId);
-  return { clientId, sessionId };
-}
-
 function optionalExpectedEffects(args: Record<string, unknown>): readonly CapabilityEffect[] | undefined {
   const value = args.expectedEffects;
   if (value === undefined) return undefined;
@@ -265,17 +252,6 @@ function optionalExpectedEffects(args: Record<string, unknown>): readonly Capabi
   return effects;
 }
 
-function requiredHeader(request: Request, name: string): string {
-  const value = optionalHeader(request, name);
-  if (value === undefined) throw new RuntimeError('INVALID_REQUEST', `${name} is required`);
-  return value;
-}
-function optionalHeader(request: Request, name: string): string | undefined {
-  const value = request.headers.get(name)?.trim();
-  if (value === undefined || value.length === 0) return undefined;
-  if (value.length > 200 || value.includes('\0')) throw new RuntimeError('INVALID_REQUEST', `${name} is invalid`);
-  return value;
-}
 function requiredText(record: Record<string, unknown>, name: string): string {
   const value = record[name];
   if (typeof value !== 'string') throw new RuntimeError('INVALID_REQUEST', `${name} must be a string`);

@@ -1,10 +1,10 @@
 import type { CapabilityEffect } from '@iris/domain';
 import { RuntimeError } from '@iris/domain';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
+import { resolveDirectSessionIdentity, type DirectSessionIdentity } from './mcp-direct-context.js';
+import type { McpPrincipal } from './mcp.js';
 import type { RuntimeState } from './state.js';
 
-const CLIENT_ID_HEADER = 'x-iris-client-id';
-const SESSION_ID_HEADER = 'x-iris-session-id';
 const EFFECTS = ['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE'] as const satisfies readonly CapabilityEffect[];
 
 export const PHASE3_GROUPED_TOOL_NAMES = ['shell', 'job'] as const;
@@ -15,8 +15,8 @@ export function isPhase3GroupedTool(name: string): name is Phase3GroupedToolName
 }
 
 export function phase3GroupedToolDefinitions(): readonly Record<string, unknown>[] {
-  const sessionId = { sessionId: { type: 'string', description: 'IRIS runtime session UUID returned by session_open. May be omitted when x-iris-session-id is supplied.' } };
-  const projectId = { projectId: { type: 'string', description: 'Registered project UUID; must equal the live session project.' } };
+  const sessionId = { sessionId: { type: 'string', description: 'Optional explicit IRIS runtime session UUID. Authenticated tunnel connectors may omit it and use project-bound direct context.' } };
+  const projectId = { projectId: { type: 'string', description: 'Registered project UUID; direct context is isolated to this project.' } };
   const workspaceId = { workspaceId: { type: 'string', description: 'Opaque ACTIVE IRIS workspace UUID.' } };
   const expectedEffects = {
     expectedEffects: {
@@ -30,7 +30,7 @@ export function phase3GroupedToolDefinitions(): readonly Record<string, unknown>
       description: 'Governed vNext local process execution using server-owned execution profiles, explicit executable+argv, ACTIVE workspace cwd, bounded/redacted output, and no implicit shell string.',
       inputSchema: {
         type: 'object',
-        required: ['operation','projectId','workspaceId','executable','argv','cwd','executionProfile','envOverrides','timeoutMs','expectedEffects'],
+        required: ['operation','projectId','workspaceId','executable','argv','cwd','executionProfile','envOverrides','timeoutMs'],
         properties: {
           ...sessionId, ...projectId, ...workspaceId,
           operation: { enum: ['run','start'] },
@@ -74,21 +74,21 @@ export async function executePhase3GroupedTool(
   request: Request,
   capabilities: CapabilityService,
   state: RuntimeState | undefined,
+  principal: McpPrincipal = 'owner',
 ): Promise<CapabilityOutcome> {
   assertOnlyPhase3Keys(name, args);
-  const identity = resolveSessionIdentity(args, request, state);
   const projectId = requiredBoundedString(args, 'projectId', 200);
+  const identity = await resolveDirectSessionIdentity(args, request, state, projectId, principal);
   const expectedEffects = optionalExpectedEffects(args);
   if (name === 'shell') return executeShell(args, identity, projectId, expectedEffects, capabilities);
   return executeJob(args, identity, projectId, expectedEffects, capabilities);
 }
 
 async function executeShell(
-  args: Record<string, unknown>, identity: SessionIdentity, projectId: string,
+  args: Record<string, unknown>, identity: DirectSessionIdentity, projectId: string,
   expectedEffects: readonly CapabilityEffect[] | undefined, capabilities: CapabilityService,
 ): Promise<CapabilityOutcome> {
   const operation = requiredEnum(args, 'operation', ['run','start'] as const);
-  if (expectedEffects === undefined) throw new RuntimeError('INVALID_REQUEST', 'shell requires expectedEffects as an explicit surprise-prevention assertion');
   const workspaceId = requiredBoundedString(args, 'workspaceId', 200);
   const executable = requiredBoundedString(args, 'executable', 120);
   const argv = requiredStringArray(args, 'argv', 128, 4096);
@@ -106,7 +106,7 @@ async function executeShell(
 }
 
 async function executeJob(
-  args: Record<string, unknown>, identity: SessionIdentity, projectId: string,
+  args: Record<string, unknown>, identity: DirectSessionIdentity, projectId: string,
   expectedEffects: readonly CapabilityEffect[] | undefined, capabilities: CapabilityService,
 ): Promise<CapabilityOutcome> {
   const operation = requiredEnum(args, 'operation', ['status','logs','result','cancel'] as const);
@@ -123,8 +123,6 @@ async function executeJob(
   });
 }
 
-interface SessionIdentity { readonly clientId: string; readonly sessionId: string }
-
 const SHELL_KEYS = new Set(['operation','sessionId','projectId','workspaceId','executable','argv','cwd','executionProfile','envOverrides','timeoutMs','requestId','stdinArtifactId','expectedEffects']);
 const JOB_KEYS = new Set(['operation','sessionId','projectId','jobId','stream','cursor','maxBytes','expectedEffects']);
 
@@ -133,18 +131,6 @@ function assertOnlyPhase3Keys(name: Phase3GroupedToolName, args: Record<string, 
   for (const key of Object.keys(args)) {
     if (!allowed.has(key)) throw new RuntimeError('INVALID_REQUEST', `Unsupported ${name} field: ${key}`);
   }
-}
-
-function resolveSessionIdentity(args: Record<string, unknown>, request: Request, state: RuntimeState | undefined): SessionIdentity {
-  const clientId = requiredHeader(request, CLIENT_ID_HEADER);
-  const argumentSessionId = optionalBoundedString(args, 'sessionId', 200);
-  const headerSessionId = optionalHeader(request, SESSION_ID_HEADER);
-  if (argumentSessionId !== undefined && headerSessionId !== undefined && argumentSessionId !== headerSessionId) throw new RuntimeError('CONTROL_DENIED', 'sessionId argument does not match x-iris-session-id');
-  const sessionId = argumentSessionId ?? headerSessionId;
-  if (sessionId === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session is required; call session_open first.');
-  if (state === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session validation is unavailable');
-  state.getSessionForClient(sessionId, clientId);
-  return { clientId, sessionId };
 }
 
 function optionalExpectedEffects(args: Record<string, unknown>): readonly CapabilityEffect[] | undefined {
@@ -160,15 +146,6 @@ function optionalExpectedEffects(args: Record<string, unknown>): readonly Capabi
   return effects;
 }
 
-function requiredHeader(request: Request, name: string): string {
-  const value = optionalHeader(request, name); if (value === undefined) throw new RuntimeError('INVALID_REQUEST', `${name} is required`); return value;
-}
-function optionalHeader(request: Request, name: string): string | undefined {
-  const value = request.headers.get(name)?.trim();
-  if (value === undefined || value.length === 0) return undefined;
-  if (value.length > 200 || value.includes('\0')) throw new RuntimeError('INVALID_REQUEST', `${name} is invalid`);
-  return value;
-}
 function requiredBoundedString(record: Record<string, unknown>, name: string, maxLength: number): string {
   const value = record[name];
   if (typeof value !== 'string' || value.length === 0 || value.length > maxLength || value.includes('\0')) throw new RuntimeError('INVALID_REQUEST', `${name} must be a bounded non-empty string`);

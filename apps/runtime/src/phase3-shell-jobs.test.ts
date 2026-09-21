@@ -74,6 +74,85 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
   });
 
+  it('DT-M02 + DT-M05 runs project-tool without session/effect ceremony and enforces macOS workspace confinement', async () => {
+    const fixture = await serviceFixture({ homeSource: true });
+    const primary = await fixture.resources.primaryWorkspace(fixture.projectA.id);
+    const inside = path.join(fixture.projectARoot, 'inside.txt');
+    const outside = path.join(fixture.projectBRoot, 'outside.txt');
+    const insideOut = path.join(fixture.projectARoot, 'inside-out.txt');
+    const tempOutsideRoot = await temp('iris-phase3-project-tool-outside-');
+    const tempOutside = path.join(tempOutsideRoot, 'outside-temp.txt');
+    await writeFile(inside, 'INSIDE');
+    await writeFile(outside, 'OUTSIDE');
+    await writeFile(tempOutside, 'TEMP_OUTSIDE');
+    await writeFile(path.join(fixture.projectARoot, 'project-tool.mjs'), [
+      "import { readFile, writeFile } from 'node:fs/promises';",
+      "const [insideRead,outsideRead,insideWrite,outsideWrite,tempRead,tempWrite] = process.argv.slice(2);",
+      "const results = {};",
+      "for (const [key,op] of [",
+      " ['insideRead',()=>readFile(insideRead,'utf8')],",
+      " ['outsideRead',()=>readFile(outsideRead,'utf8')],",
+      " ['insideWrite',async()=>{await writeFile(insideWrite,'OK');return 'OK'}],",
+      " ['outsideWrite',async()=>{await writeFile(outsideWrite,'NO');return 'NO'}],",
+      " ['tempRead',()=>readFile(tempRead,'utf8')],",
+      " ['tempWrite',async()=>{await writeFile(tempWrite,'NO_TEMP');return 'NO_TEMP'}],",
+      "]) { try { results[key]={ok:true,value:await op()} } catch(error) { results[key]={ok:false,code:error?.code ?? null} } }",
+      "console.log(JSON.stringify(results));",
+    ].join('\n') + '\n');
+
+    const request = new Request('http://127.0.0.1/mcp', { headers: { 'x-iris-client-id': 'phase3-direct-client' } });
+    const outcome = await executePhase3GroupedTool('shell', {
+      operation: 'run',
+      projectId: fixture.projectA.id,
+      workspaceId: primary.workspaceId,
+      executable: 'node',
+      argv: ['project-tool.mjs', inside, outside, insideOut, outside, tempOutside, tempOutside],
+      cwd: '.',
+      executionProfile: 'project-tool',
+      envOverrides: {},
+      timeoutMs: 5000,
+    }, request, fixture.service, fixture.state, 'tunnel-service');
+    const value = executedValue<Record<string, unknown>>(outcome);
+    expect(value).toMatchObject({ exitCode: 0, timedOut: false, effectiveEffects: ['READ','WRITE','EXECUTE','DESTRUCTIVE'] });
+    const proof = JSON.parse(String(value.stdoutTail).trim()) as Record<string, { ok: boolean; code?: string; value?: string }>;
+    expect(proof.insideRead).toMatchObject({ ok: true, value: 'INSIDE' });
+    expect(proof.insideWrite).toMatchObject({ ok: true, value: 'OK' });
+    expect(proof.outsideRead).toMatchObject({ ok: false, code: 'EPERM' });
+    expect(proof.outsideWrite).toMatchObject({ ok: false, code: 'EPERM' });
+    expect(proof.tempRead).toMatchObject({ ok: false, code: 'EPERM' });
+    expect(proof.tempWrite).toMatchObject({ ok: false, code: 'EPERM' });
+    await expect(readFile(insideOut, 'utf8')).resolves.toBe('OK');
+    await expect(readFile(outside, 'utf8')).resolves.toBe('OUTSIDE');
+    await expect(readFile(tempOutside, 'utf8')).resolves.toBe('TEMP_OUTSIDE');
+
+    await mkdir(path.join(fixture.projectARoot, 'node_modules', '.bin'), { recursive: true });
+    await writeFile(path.join(fixture.projectARoot, 'node_modules', '.bin', 'local-proof'), "#!/usr/bin/env node\nconsole.log('PROJECT_LOCAL_TOOL_OK')\n", { mode: 0o755 });
+    const local = executedValue<Record<string, unknown>>(await executePhase3GroupedTool('shell', {
+      operation: 'run',
+      projectId: fixture.projectA.id,
+      workspaceId: primary.workspaceId,
+      executable: 'local-proof',
+      argv: [],
+      cwd: '.',
+      executionProfile: 'project-tool',
+      envOverrides: {},
+      timeoutMs: 5000,
+    }, request, fixture.service, fixture.state, 'tunnel-service'));
+    expect(local.stdoutTail).toContain('PROJECT_LOCAL_TOOL_OK');
+    expect(fixture.state.listSessionsForClient('phase3-direct-client').filter((session) => session.agentId === 'iris-tunnel-service')).toHaveLength(1);
+
+    await expect(fixture.service.execute({
+      capabilityId: 'shell.run', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
+      projectId: fixture.projectA.id, workspaceId: primary.workspaceId, executable: 'node', argv: ['-e','console.log(1)'], cwd: '.',
+      executionProfile: 'project-tool', envOverrides: {}, timeoutMs: 5000,
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    await expect(fixture.service.execute({
+      capabilityId: 'shell.run', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
+      projectId: fixture.projectA.id, workspaceId: primary.workspaceId, executable: 'git', argv: ['status'], cwd: '.',
+      executionProfile: 'project-tool', envOverrides: {}, timeoutMs: 5000,
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+  }, 20_000);
+
   it('AC-SEC-010 redacts explicit secrets, excludes ambient secret inheritance, bounds inline output, and keeps audit/artifact metadata secret-free', async () => {
     const fixture = await serviceFixture();
     const primary = await fixture.resources.primaryWorkspace(fixture.projectA.id);
@@ -257,8 +336,8 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
   }, 15_000);
 });
 
-async function serviceFixture() {
-  const sourceRoot = await realpath(await temp('iris-phase3-source-'));
+async function serviceFixture(options: { readonly homeSource?: boolean } = {}) {
+  const sourceRoot = await realpath(options.homeSource === true ? await homeTemp('iris-phase3-source-') : await temp('iris-phase3-source-'));
   const dataRoot = await realpath(await temp('iris-phase3-data-'));
   const legacyRoot = await realpath(await temp('iris-phase3-legacy-'));
   const projectARoot = path.join(sourceRoot, 'project-a');
@@ -313,3 +392,4 @@ function processAlive(pid: number): boolean {
 }
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
 async function temp(prefix: string): Promise<string> { const root = await mkdtemp(path.join(os.tmpdir(), prefix)); roots.push(root); return root; }
+async function homeTemp(prefix: string): Promise<string> { const root = await mkdtemp(path.join(os.homedir(), prefix)); roots.push(root); return root; }

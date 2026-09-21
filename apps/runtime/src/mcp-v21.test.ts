@@ -141,11 +141,16 @@ describe('IRIS V2.1 Full MCP lifecycle transport', () => {
     });
     expect(stale.result).toMatchObject({ isError: true, structuredContent: { code: 'INVALID_REQUEST' } });
 
+    const tunnelSession = f.state.createSession('chatgpt-session-tunnel', 'iris-tunnel-service', 'other');
+    await f.state.setSessionCurrentProject(tunnelSession.id, tunnelSession.clientId, f.project.id);
     const tunnelAttempt = await handleMcpV21Request(
-      rpc('tools/call', 23, { name: 'mission_rebind', arguments: { missionId: mission.id, projectId: f.project.id, expectedBindingRevision: 2 } }, replacement.clientId, replacement.id, 'mission_rebind'),
+      rpc('tools/call', 23, { name: 'mission_rebind', arguments: { missionId: mission.id, projectId: f.project.id, expectedBindingRevision: 2 } }, tunnelSession.clientId, tunnelSession.id, 'mission_rebind'),
       f.service, f.state, f.broker, f.lifecycle, 'tunnel-service',
     );
-    expect(await tunnelAttempt.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'CONTROL_DENIED' } } });
+    expect(await tunnelAttempt.json()).toMatchObject({
+      result: { isError: false, structuredContent: { id: mission.id, sessionId: tunnelSession.id, bindingRevision: 3 } },
+    });
+    expect((await f.state.getMission(mission.id)).rebindAudit.at(-1)).toMatchObject({ principal: 'tunnel-service', newSessionId: tunnelSession.id });
   });
 
   it('allows exactly one winner for concurrent rebind claims and fails closed on project mismatch', async () => {
