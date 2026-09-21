@@ -12,6 +12,7 @@ import { WorkerAdapterRegistry } from './durable-mission-workers.js';
 import { handleMcpProRequest, MCP_PROTOCOL_VERSION } from './mcp.js';
 import { handleMcpV21Request } from './mcp-v21.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
+import { MissionLedgerStore } from './mission-store.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
 import { FoundationStateStore } from './persistence.js';
@@ -174,6 +175,77 @@ describe('IRIS V2.1 Full MCP lifecycle transport', () => {
       f.service, f.state, f.broker, f.lifecycle,
     );
     expect(await mismatch.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'CAPABILITY_DENIED' } } });
+  });
+
+  it('reclaims archived lifecycle capacity through mission_create without leaving another partial mission', async () => {
+    const f = await fixture();
+    const archivedMission = await f.state.createMission(
+      f.session.clientId,
+      f.session.id,
+      'Archived lifecycle MCP capacity proof',
+      'CHATGPT',
+    );
+    const archivedLifecycle = await f.lifecycle.ensureMission(
+      archivedMission.id,
+      'Archive the lifecycle record only after authoritative mission archival.',
+    );
+    const completed = await f.state.setMissionState(
+      archivedMission.id,
+      f.session.clientId,
+      f.session.id,
+      'COMPLETED',
+    );
+    const missionStore = new MissionLedgerStore(f.dataRoot);
+    await missionStore.archiveForCapacity(completed);
+    await missionStore.write({ schemaVersion: 1, missions: [] });
+
+    const lifecycleStore = new DurableMissionLifecycleStore(f.dataRoot);
+    const fillers = Array.from({ length: 99 }, (_, index) => ({
+      ...archivedLifecycle,
+      missionId: randomUUID(),
+      title: `Synthetic MCP lifecycle filler ${index}`,
+      goal: `Synthetic MCP lifecycle filler ${index}`,
+    }));
+    await lifecycleStore.write({ schemaVersion: 1, records: [archivedLifecycle, ...fillers] });
+
+    const response = await handleMcpV21Request(
+      rpc('tools/call', 39, {
+        name: 'mission_create',
+        arguments: {
+          title: 'Replacement mission after lifecycle reclaim',
+          goal: 'Mission creation must reclaim the archived lifecycle slot atomically enough to return success.',
+          orchestratorMode: 'CHATGPT',
+        },
+      }, f.session.clientId, f.session.id, 'mission_create'),
+      f.service,
+      f.state,
+      f.broker,
+      f.lifecycle,
+    );
+    const body = await response.json() as {
+      result: {
+        isError: boolean;
+        structuredContent: Record<string, unknown> & {
+          lifecycle?: { missionId?: string; state?: string; revision?: number };
+        };
+      };
+    };
+
+    expect(body.result.isError).toBe(false);
+    const missionId = String(body.result.structuredContent.id);
+    expect(body.result.structuredContent.lifecycle).toMatchObject({
+      missionId,
+      state: 'CREATED',
+      revision: 1,
+    });
+
+    const lifecycleAfter = await lifecycleStore.read();
+    expect(lifecycleAfter.records).toHaveLength(100);
+    expect(lifecycleAfter.records.some((record) => record.missionId === archivedMission.id)).toBe(false);
+    expect(lifecycleAfter.records.some((record) => record.missionId === missionId)).toBe(true);
+    await expect(lifecycleStore.readArchived(archivedMission.id)).resolves.toEqual(archivedLifecycle);
+    await expect(f.state.getMission(archivedMission.id)).resolves.toMatchObject({ id: archivedMission.id, state: 'COMPLETED' });
+    expect((await f.state.listMissions()).map((mission) => mission.id)).toEqual([missionId]);
   });
 
   it('starts a declared validation job through the mission contract and reads it without a session', async () => {

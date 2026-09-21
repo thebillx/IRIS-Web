@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FoundationStateStore } from './persistence.js';
+import { MissionLedgerStore } from './mission-store.js';
 import { RuntimeState } from './state.js';
 import { DurableMissionLifecycleStore } from './durable-mission-store.js';
 import { DurableMissionLifecycleService } from './durable-mission-service.js';
@@ -138,5 +139,172 @@ describe('IRIS V2.1 durable supervisor mission lifecycle', () => {
     const unboundSession = f.state.createSession('chatgpt-unbound', 'owner', 'owner');
     const unboundMission = await f.state.createMission(unboundSession.clientId, unboundSession.id, 'No project mission', 'CHATGPT');
     await expect(f.service.ensureMission(unboundMission.id)).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+  });
+
+  it('reclaims one archived completed lifecycle record at capacity without restoring execution authority', async () => {
+    const f = await fixture();
+    const lifecycle = await f.service.ensureMission(f.mission.id, 'Archived lifecycle capacity proof.');
+    const completed = await f.state.setMissionState(f.mission.id, f.session.clientId, f.session.id, 'COMPLETED');
+    const missionStore = new MissionLedgerStore(f.dataRoot);
+    await missionStore.archiveForCapacity(completed);
+    await missionStore.write({ schemaVersion: 1, missions: [] });
+
+    await expect(f.state.getMission(f.mission.id)).resolves.toMatchObject({ id: f.mission.id, state: 'COMPLETED' });
+    await expect(f.service.assertSessionControl(f.mission.id, f.session.clientId, f.session.id))
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+
+    const filler = Array.from({ length: 99 }, (_, index) => ({
+      ...lifecycle,
+      missionId: randomUUID(),
+      title: `Synthetic lifecycle filler ${index}`,
+      goal: `Synthetic lifecycle filler ${index}`,
+    }));
+    await f.store.write({ schemaVersion: 1, records: [lifecycle, ...filler] });
+
+    const replacementMission = await f.state.createMission(
+      f.session.clientId,
+      f.session.id,
+      'Replacement mission after authoritative archive',
+      'CHATGPT',
+    );
+    const replacementLifecycle = await f.service.ensureMission(replacementMission.id, 'Replacement lifecycle after capacity reclaim.');
+    expect(replacementLifecycle).toMatchObject({
+      missionId: replacementMission.id,
+      projectId: f.projectA.id,
+      state: 'CREATED',
+      revision: 1,
+    });
+
+    const active = await f.store.read();
+    expect(active.records).toHaveLength(100);
+    expect(active.records.some((record) => record.missionId === f.mission.id)).toBe(false);
+    expect(active.records.some((record) => record.missionId === replacementMission.id)).toBe(true);
+    await expect(f.store.readArchived(f.mission.id)).resolves.toEqual(lifecycle);
+    await expect(f.store.archiveForCapacity(lifecycle)).resolves.toBeUndefined();
+    await expect(f.store.archiveForCapacity({ ...lifecycle, goal: 'Different archived content must fail closed.' }))
+      .rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    await expect(f.service.get(f.mission.id)).rejects.toMatchObject({ code: 'MISSION_NOT_FOUND' });
+    await expect(f.service.ensureMission(f.mission.id))
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+  });
+
+  it('reclaims a completed non-resumable worker binding without treating it as live execution authority', async () => {
+    const f = await fixture();
+    const created = await f.service.ensureMission(f.mission.id, 'Completed worker binding reclaim proof.');
+    const running = await f.service.start({
+      missionId: f.mission.id,
+      expectedRevision: created.revision,
+      requestId: randomUUID(),
+      workerType: 'COUNTING',
+    });
+    const lifecycleCompleted = await f.service.complete({
+      missionId: f.mission.id,
+      expectedRevision: running.revision,
+      requestId: randomUUID(),
+    });
+    expect(lifecycleCompleted).toMatchObject({
+      state: 'COMPLETED',
+      workerBinding: { resumable: false },
+    });
+
+    const authoritativeCompleted = await f.state.setMissionState(
+      f.mission.id,
+      f.session.clientId,
+      f.session.id,
+      'COMPLETED',
+    );
+    const missionStore = new MissionLedgerStore(f.dataRoot);
+    await missionStore.archiveForCapacity(authoritativeCompleted);
+    await missionStore.write({ schemaVersion: 1, missions: [] });
+
+    const filler = Array.from({ length: 99 }, (_, index) => ({
+      ...created,
+      missionId: randomUUID(),
+      title: `Synthetic completed-binding filler ${index}`,
+      goal: `Synthetic completed-binding filler ${index}`,
+    }));
+    await f.store.write({ schemaVersion: 1, records: [lifecycleCompleted, ...filler] });
+
+    const replacementMission = await f.state.createMission(
+      f.session.clientId,
+      f.session.id,
+      'Replacement after completed worker lifecycle',
+      'CHATGPT',
+    );
+    await expect(f.service.ensureMission(replacementMission.id))
+      .resolves.toMatchObject({ missionId: replacementMission.id, state: 'CREATED' });
+    await expect(f.store.readArchived(f.mission.id)).resolves.toEqual(lifecycleCompleted);
+  });
+
+  it('validates the replacement mission before reclaiming any archived lifecycle capacity', async () => {
+    const f = await fixture();
+    const lifecycle = await f.service.ensureMission(f.mission.id, 'Capacity must not mutate for an invalid target.');
+    const authoritativeCompleted = await f.state.setMissionState(
+      f.mission.id,
+      f.session.clientId,
+      f.session.id,
+      'COMPLETED',
+    );
+    const missionStore = new MissionLedgerStore(f.dataRoot);
+    await missionStore.archiveForCapacity(authoritativeCompleted);
+    await missionStore.write({ schemaVersion: 1, missions: [] });
+
+    const filler = Array.from({ length: 99 }, (_, index) => ({
+      ...lifecycle,
+      missionId: randomUUID(),
+      title: `Synthetic validation-order filler ${index}`,
+      goal: `Synthetic validation-order filler ${index}`,
+    }));
+    await f.store.write({ schemaVersion: 1, records: [lifecycle, ...filler] });
+
+    const unboundSession = f.state.createSession('chatgpt-unbound-capacity', 'owner', 'owner');
+    const unboundMission = await f.state.createMission(
+      unboundSession.clientId,
+      unboundSession.id,
+      'Invalid capacity replacement without project',
+      'CHATGPT',
+    );
+    await expect(f.service.ensureMission(unboundMission.id))
+      .rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    await expect(f.store.readArchived(f.mission.id)).resolves.toBeNull();
+    expect((await f.store.read()).records.some((record) => record.missionId === f.mission.id)).toBe(true);
+  });
+
+  it('does not reclaim an archived lifecycle record that still carries worker authority', async () => {
+    const f = await fixture();
+    const created = await f.service.ensureMission(f.mission.id, 'Worker authority must remain fail-closed.');
+    const running = await f.service.start({
+      missionId: f.mission.id,
+      expectedRevision: created.revision,
+      requestId: randomUUID(),
+      workerType: 'COUNTING',
+    });
+    expect(running.workerBinding).not.toBeNull();
+
+    const completed = await f.state.setMissionState(f.mission.id, f.session.clientId, f.session.id, 'COMPLETED');
+    const missionStore = new MissionLedgerStore(f.dataRoot);
+    await missionStore.archiveForCapacity(completed);
+    await missionStore.write({ schemaVersion: 1, missions: [] });
+    await expect(f.service.assertSessionControl(f.mission.id, f.session.clientId, f.session.id))
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+
+    const filler = Array.from({ length: 99 }, (_, index) => ({
+      ...created,
+      missionId: randomUUID(),
+      title: `Synthetic active filler ${index}`,
+      goal: `Synthetic active filler ${index}`,
+    }));
+    await f.store.write({ schemaVersion: 1, records: [running, ...filler] });
+
+    const replacementMission = await f.state.createMission(
+      f.session.clientId,
+      f.session.id,
+      'Replacement must fail while worker authority is retained',
+      'CHATGPT',
+    );
+    await expect(f.service.ensureMission(replacementMission.id))
+      .rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    await expect(f.store.readArchived(f.mission.id)).resolves.toBeNull();
+    expect((await f.store.read()).records.some((record) => record.missionId === f.mission.id)).toBe(true);
   });
 });
