@@ -95,6 +95,38 @@ describe('ADO runtime requirement context', () => {
     expect(JSON.stringify(result.item)).not.toContain('must-not-project');
   });
 
+  it('keeps the bounded SAFE_FIELDS request when relation expansion is not requested', async () => {
+    const calls: RequestRecord[] = [];
+    const service = new AdoRequirementContextService(provider, fakeFetch(calls));
+
+    await service.workItemRead({
+      projectId: 'iris-project',
+      requestId: 'req-item-no-links',
+      workItemId: 101,
+      includeComments: false,
+      includeLinks: false,
+    });
+
+    const workItemCall = calls.find((call) => call.url.pathname.endsWith('/_apis/wit/workitems/101'));
+    expect(workItemCall?.url.searchParams.get('$expand')).toBe('None');
+    expect(workItemCall?.url.searchParams.get('fields')).toBe(
+      [
+        'System.WorkItemType',
+        'System.Title',
+        'System.State',
+        'System.Description',
+        'Microsoft.VSTS.Common.AcceptanceCriteria',
+        'System.AreaPath',
+        'System.IterationPath',
+        'System.Parent',
+        'System.Tags',
+        'System.BoardColumn',
+        'System.CreatedDate',
+        'System.ChangedDate',
+      ].join(','),
+    );
+  });
+
   it('walks only hierarchy-forward links and keeps every node inside team Area Path scope', async () => {
     const service = new AdoRequirementContextService(provider, fakeFetch([]));
 
