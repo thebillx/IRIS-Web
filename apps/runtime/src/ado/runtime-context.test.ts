@@ -69,7 +69,8 @@ describe('ADO runtime requirement context', () => {
   });
 
   it('returns sanitized canonical work item, comments, links, revision and changed time', async () => {
-    const service = new AdoRequirementContextService(provider, fakeFetch([]));
+    const calls: RequestRecord[] = [];
+    const service = new AdoRequirementContextService(provider, fakeFetch(calls));
 
     const result = await service.workItemRead({
       projectId: 'iris-project',
@@ -88,6 +89,10 @@ describe('ADO runtime requirement context', () => {
     expect(result.comments).toEqual([{ id: '1', text: 'Reviewed comment' }]);
     expect(result.provenance.revision).toBe(7);
     expect(result.provenance.changedDate).toBe('2026-09-20T12:00:00Z');
+    const workItemCall = calls.find((call) => call.url.pathname.endsWith('/_apis/wit/workitems/101'));
+    expect(workItemCall?.url.searchParams.get('$expand')).toBe('Relations');
+    expect(workItemCall?.url.searchParams.has('fields')).toBe(false);
+    expect(JSON.stringify(result.item)).not.toContain('must-not-project');
   });
 
   it('walks only hierarchy-forward links and keeps every node inside team Area Path scope', async () => {
@@ -258,6 +263,7 @@ function rawWorkItem(id: number, areaPath: string, child: boolean) {
       'System.BoardColumn': 'Doing',
       'System.CreatedDate': '2026-09-01T10:00:00Z',
       'System.ChangedDate': id === 101 ? '2026-09-20T12:00:00Z' : '2026-09-20T12:30:00Z',
+      'Custom.PrivateField': 'must-not-project',
     },
     relations: child ? [{
       rel: 'System.LinkTypes.Hierarchy-Forward',

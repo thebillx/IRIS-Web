@@ -337,11 +337,16 @@ export class AdoRequirementContextService {
       binding,
       'GET',
       `/${encodeURIComponent(binding.identity.project.id)}/_apis/wit/workitems/${id}`,
-      {
-        fields: SAFE_FIELDS.join(','),
-        '$expand': includeLinks ? 'Relations' : 'None',
-        'api-version': '7.1',
-      },
+      includeLinks
+        ? {
+            '$expand': 'Relations',
+            'api-version': '7.1',
+          }
+        : {
+            fields: SAFE_FIELDS.join(','),
+            '$expand': 'None',
+            'api-version': '7.1',
+          },
     );
     const raw = parseWorkItem(result.body);
     if (raw.id !== id) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO returned a different work-item identity');
