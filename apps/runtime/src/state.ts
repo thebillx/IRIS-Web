@@ -21,7 +21,7 @@ import {
 } from '@iris/domain';
 import { LocalDevelopmentAgentExecutor, type AgentExecutor } from './agent-executor.js';
 import { FoundationStateStore } from './persistence.js';
-import { MissionLedgerStore } from './mission-store.js';
+import { MissionLedgerStore, missionArchiveEligible } from './mission-store.js';
 import { inspectRegistrationRoot } from './project-path.js';
 
 const MAX_INSTRUCTION_CHARS = 8_000;
@@ -79,8 +79,10 @@ export class RuntimeState {
   public async getMission(missionIdInput: string): Promise<MissionSnapshot> {
     const missionId = normalizeUuidIdentity(missionIdInput, 'missionId');
     const mission = (await this.listMissions()).find((candidate) => candidate.id === missionId);
-    if (mission === undefined) throw new RuntimeError('MISSION_NOT_FOUND', 'Mission was not found');
-    return mission;
+    if (mission !== undefined) return mission;
+    const archived = await this.missionStore.readArchived(missionId);
+    if (archived === null) throw new RuntimeError('MISSION_NOT_FOUND', 'Mission was not found');
+    return archived;
   }
 
   public async assertMissionReviewActionsFinalized(missionIdInput: string): Promise<void> {
@@ -186,8 +188,23 @@ export class RuntimeState {
     const title = normalizeMissionText(titleInput, 'mission title', 240);
     const session = this.getSessionForClient(sessionId, clientId);
     return this.serializeMissionMutation(async () => {
-      const document = await this.missionStore.read();
-      if (document.missions.length >= 100) throw new RuntimeError('CAPABILITY_DENIED', 'Mission ledger capacity has been reached');
+      let document = await this.missionStore.read();
+      if (document.missions.length >= 100) {
+        const candidate = [...document.missions]
+          .filter(missionArchiveEligible)
+          .sort((left, right) =>
+            left.updatedAt !== right.updatedAt
+              ? left.updatedAt.localeCompare(right.updatedAt)
+              : left.id.localeCompare(right.id))[0];
+        if (candidate === undefined) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'Mission ledger capacity has been reached and no safely archivable completed mission exists');
+        }
+        await this.missionStore.archiveForCapacity(candidate);
+        document = {
+          schemaVersion: 1,
+          missions: document.missions.filter((mission) => mission.id !== candidate.id),
+        };
+      }
       const now = new Date().toISOString();
       const mission: MissionSnapshot = {
         id: randomUUID(),

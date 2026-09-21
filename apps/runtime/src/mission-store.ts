@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { open, rename, rm } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, mkdir, open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { RuntimeError, type MissionRebindAuditEvent, type MissionSnapshot } from '@iris/domain';
 import { capabilityDefinition } from './capability-registry.js';
-import { inspectPrivateRegularFile } from './private-fs.js';
+import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
 
 const MISSION_FILE = 'missions.json';
+const MISSION_ARCHIVE_DIR = 'mission-archive';
 const MAX_MISSIONS = 100;
 const MAX_TASKS = 200;
 const MAX_ACTIONS_PER_TASK = 200;
@@ -16,6 +18,13 @@ const MAX_DATA_ENTRIES = 24;
 export interface MissionLedgerDocument {
   readonly schemaVersion: 1;
   readonly missions: readonly MissionSnapshot[];
+}
+
+export interface ArchivedMissionRecord {
+  readonly schemaVersion: 1;
+  readonly archivedAt: string;
+  readonly reason: 'ACTIVE_LEDGER_CAPACITY';
+  readonly mission: MissionSnapshot;
 }
 
 export class MissionLedgerStore {
@@ -41,6 +50,133 @@ export class MissionLedgerStore {
     if (!isMissionLedgerDocument(document)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing to write invalid mission ledger');
     await writeJsonAtomic(path.join(this.dataRoot, MISSION_FILE), document);
   }
+
+  public async readArchived(missionId: string): Promise<MissionSnapshot | null> {
+    if (!isUuid(missionId)) throw new RuntimeError('INVALID_REQUEST', 'Archived mission identity is invalid');
+    const directory = path.join(this.dataRoot, MISSION_ARCHIVE_DIR);
+    try {
+      await lstat(directory);
+    } catch (error) {
+      if (isNodeErrorCode(error, 'ENOENT')) return null;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Mission archive directory metadata is unreadable', { cause: error });
+    }
+    const directoryProblem = await privateDirectoryProblem(directory, 'Mission archive directory');
+    if (directoryProblem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', directoryProblem);
+    const inspected = await inspectPrivateRegularFile(
+      path.join(directory, `${missionId}.json`),
+      'Archived mission record',
+    );
+    if (inspected.state === 'missing') return null;
+    if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(inspected.content) as unknown;
+    } catch (error) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Archived mission record is invalid JSON', { cause: error });
+    }
+    const record = normalizeArchivedMissionRecord(parsed);
+    if (record === null || record.mission.id !== missionId) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Archived mission record is invalid');
+    }
+    return record.mission;
+  }
+
+  public async archiveForCapacity(mission: MissionSnapshot): Promise<void> {
+    if (!isMissionSnapshot(mission) || !missionArchiveEligible(mission)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Mission is not eligible for capacity archival');
+    }
+    const directory = path.join(this.dataRoot, MISSION_ARCHIVE_DIR);
+    await ensurePrivateArchiveDirectory(directory);
+    const filename = path.join(directory, `${mission.id}.json`);
+    const existing = await inspectPrivateRegularFile(filename, 'Archived mission record');
+    if (existing.state === 'ok') {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(existing.content) as unknown;
+      } catch (error) {
+        throw new RuntimeError('PERSISTENCE_FAILURE', 'Archived mission record is invalid JSON', { cause: error });
+      }
+      const record = normalizeArchivedMissionRecord(parsed);
+      if (record === null
+        || record.reason !== 'ACTIVE_LEDGER_CAPACITY'
+        || JSON.stringify(record.mission) !== JSON.stringify(mission)) {
+        throw new RuntimeError('PRECONDITION_FAILED', 'Archived mission identity is already bound to different content');
+      }
+      return;
+    }
+    if (existing.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', existing.reason);
+
+    const record: ArchivedMissionRecord = {
+      schemaVersion: 1,
+      archivedAt: new Date().toISOString(),
+      reason: 'ACTIVE_LEDGER_CAPACITY',
+      mission,
+    };
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      handle = await open(filename, flags, 0o600);
+      await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, 'utf8');
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+    } catch (error) {
+      await handle?.close().catch(() => undefined);
+      const raced = await inspectPrivateRegularFile(filename, 'Archived mission record');
+      if (raced.state === 'ok') {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raced.content) as unknown;
+        } catch {
+          throw new RuntimeError('PERSISTENCE_FAILURE', 'Archived mission record became invalid during publication');
+        }
+        const normalized = normalizeArchivedMissionRecord(parsed);
+        if (normalized !== null && JSON.stringify(normalized.mission) === JSON.stringify(mission)) return;
+      }
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Immutable mission archive publication failed', { cause: error });
+    }
+  }
+}
+
+function normalizeArchivedMissionRecord(value: unknown): ArchivedMissionRecord | null {
+  if (!isRecord(value)
+    || value.schemaVersion !== 1
+    || !timestamp(value.archivedAt)
+    || value.reason !== 'ACTIVE_LEDGER_CAPACITY'
+    || !isMissionSnapshot(value.mission)) return null;
+  return value as unknown as ArchivedMissionRecord;
+}
+
+export function missionArchiveEligible(mission: MissionSnapshot): boolean {
+  if (mission.state !== 'COMPLETED') return false;
+  return mission.tasks.every((task) => task.actions.every((action) => {
+    if (action.state === 'CANCELLED') return true;
+    if (action.state === 'DENIED') return action.result?.status === 'DENIED';
+    if (action.state === 'FAILED') return action.result?.status === 'FAILED';
+    if (action.state !== 'SUCCEEDED' || action.result?.status !== 'SUCCEEDED') return false;
+    if (action.capabilityId !== 'code_review.start') return true;
+    return action.result.evidence.some((evidence) =>
+      (evidence.label === 'code_review.receipt' || evidence.label === 'code_review.failure_receipt')
+      && typeof evidence.reference === 'string'
+      && evidence.reference.startsWith('iris-review-job:'));
+  }));
+}
+
+async function ensurePrivateArchiveDirectory(directory: string): Promise<void> {
+  try {
+    await mkdir(directory, { mode: 0o700 });
+  } catch (error) {
+    if (!isNodeErrorCode(error, 'EEXIST')) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Mission archive directory could not be created safely', { cause: error });
+    }
+  }
+  const problem = await privateDirectoryProblem(directory, 'Mission archive directory');
+  if (problem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', problem);
+}
+
+function isNodeErrorCode(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error
+    && (error as NodeJS.ErrnoException).code === code;
 }
 
 async function writeJsonAtomic(filename: string, value: unknown): Promise<void> {

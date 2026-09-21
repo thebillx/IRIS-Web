@@ -1,9 +1,11 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rm, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { RuntimeError } from '@iris/domain';
+import { RuntimeError, type MissionSnapshot } from '@iris/domain';
 import type { AgentExecutor } from './agent-executor.js';
+import { MissionLedgerStore, missionArchiveEligible } from './mission-store.js';
 import { FoundationStateStore } from './persistence.js';
 import { RuntimeState } from './state.js';
 
@@ -206,6 +208,118 @@ describe('runtime machine, client, and session state', () => {
     expect((await state.registerProject('Duplicate name ignored', projectRoot)).id).toBe(project.id);
   });
 
+  it('publishes mission archive records idempotently without rewriting the first immutable receipt', async () => {
+    const dataRoot = await temp('iris-mission-archive-idempotent-');
+    const store = new MissionLedgerStore(dataRoot);
+    const mission = seededMission(randomUUID(), 0, 'COMPLETED');
+
+    await store.archiveForCapacity(mission);
+    const filename = path.join(dataRoot, 'mission-archive', `${mission.id}.json`);
+    const first = await readFile(filename, 'utf8');
+    await store.archiveForCapacity(mission);
+    const second = await readFile(filename, 'utf8');
+
+    expect(second).toBe(first);
+    await expect(store.readArchived(mission.id)).resolves.toMatchObject({ id: mission.id, state: 'COMPLETED' });
+  });
+
+  it('fails closed when the mission archive parent is replaced by a symlink', async () => {
+    const dataRoot = await temp('iris-mission-archive-symlink-');
+    const external = await temp('iris-mission-archive-external-');
+    await symlink(external, path.join(dataRoot, 'mission-archive'));
+    const store = new MissionLedgerStore(dataRoot);
+
+    await expect(store.readArchived(randomUUID())).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+  });
+
+  it('does not archive a completed native code-review action until terminal review evidence is attached', () => {
+    const base = seededMission(randomUUID(), 0, 'COMPLETED');
+    const timestamp = base.updatedAt;
+    const candidate: MissionSnapshot = {
+      ...base,
+      tasks: [{
+        id: randomUUID(),
+        title: 'Native review',
+        state: 'COMPLETED',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        actions: [{
+          id: randomUUID(),
+          capabilityId: 'code_review.start',
+          summary: 'Review without finalized receipt',
+          state: 'SUCCEEDED',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          approvalId: null,
+          result: {
+            status: 'SUCCEEDED',
+            summary: 'Governed capability executed successfully',
+            approvalId: null,
+            completedAt: timestamp,
+            evidence: [{
+              id: randomUUID(),
+              kind: 'CAPABILITY_RESULT',
+              label: 'code_review.start',
+              summary: 'Review job started',
+              reference: null,
+              data: {},
+            }],
+          },
+        }],
+      }],
+    };
+    expect(missionArchiveEligible(candidate)).toBe(false);
+  });
+
+  it('archives one safe completed mission when the active ledger reaches capacity and preserves retrieval by id', async () => {
+    const dataRoot = await temp('iris-mission-capacity-archive-');
+    const store = new MissionLedgerStore(dataRoot);
+    const state = new RuntimeState(new FoundationStateStore(dataRoot), undefined, store);
+    const session = state.createSession('client-a', 'owner-web', 'owner');
+    const archived = seededMission(session.id, 0, 'COMPLETED');
+    const active = Array.from({ length: 99 }, (_, index) => seededMission(session.id, index + 1, 'PLANNED'));
+    await store.write({ schemaVersion: 1, missions: [archived, ...active] });
+
+    const created = await state.createMission(session.clientId, session.id, 'Mission after capacity archival', 'CHATGPT');
+
+    const missions = await state.listMissions();
+    expect(missions).toHaveLength(100);
+    expect(missions.some((mission) => mission.id === archived.id)).toBe(false);
+    expect(missions.some((mission) => mission.id === created.id)).toBe(true);
+    await expect(state.getMission(archived.id)).resolves.toMatchObject({
+      id: archived.id,
+      title: archived.title,
+      state: 'COMPLETED',
+    });
+    const record = JSON.parse(await readFile(path.join(dataRoot, 'mission-archive', `${archived.id}.json`), 'utf8')) as {
+      reason: string;
+      mission: { id: string };
+    };
+    expect(record).toMatchObject({
+      reason: 'ACTIVE_LEDGER_CAPACITY',
+      mission: { id: archived.id },
+    });
+  });
+
+  it('fails closed at mission capacity when the only completed record still has pending execution authority', async () => {
+    const dataRoot = await temp('iris-mission-capacity-no-safe-archive-');
+    const store = new MissionLedgerStore(dataRoot);
+    const state = new RuntimeState(new FoundationStateStore(dataRoot), undefined, store);
+    const session = state.createSession('client-a', 'owner-web', 'owner');
+    const unsafeCompleted = seededMission(session.id, 0, 'COMPLETED', true);
+    const active = Array.from({ length: 99 }, (_, index) => seededMission(session.id, index + 1, 'PLANNED'));
+    await store.write({ schemaVersion: 1, missions: [unsafeCompleted, ...active] });
+
+    await expect(state.createMission(session.clientId, session.id, 'Must remain blocked', 'CHATGPT'))
+      .rejects.toMatchObject({
+        code: 'CAPABILITY_DENIED',
+        message: 'Mission ledger capacity has been reached and no safely archivable completed mission exists',
+      });
+    expect(await state.listMissions()).toHaveLength(100);
+    await expect(readFile(path.join(dataRoot, 'mission-archive', `${unsafeCompleted.id}.json`), 'utf8'))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('serializes concurrent machine-shared registry mutations without lost updates', async () => {
     const dataRoot = await temp('iris-state-data-');
     const firstRoot = await temp('iris-concurrent-project-a-');
@@ -218,6 +332,67 @@ describe('runtime machine, client, and session state', () => {
     expect(new Set((await state.listProjects()).map((project) => project.id))).toEqual(new Set([first.id, second.id]));
   });
 });
+
+function seededMission(
+  sessionId: string,
+  index: number,
+  state: MissionSnapshot['state'],
+  pendingAuthority = false,
+): MissionSnapshot {
+  const timestamp = new Date(Date.UTC(2026, 8, 1, 0, 0, index)).toISOString();
+  const taskId = randomUUID();
+  const actionId = randomUUID();
+  const approvalId = randomUUID();
+  return {
+    id: randomUUID(),
+    title: `Seed mission ${index}`,
+    state,
+    orchestratorMode: 'CHATGPT',
+    orchestratorVersion: 1,
+    lastOrchestratorHandoff: null,
+    orchestratorHandoffIds: [],
+    ownerClientId: 'client-a',
+    bindingRevision: 1,
+    rebindAudit: [],
+    clientId: 'client-a',
+    sessionId,
+    projectId: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    supervisorGate: { state: 'NOT_REQUIRED', reason: null, updatedAt: timestamp },
+    tasks: pendingAuthority ? [{
+      id: taskId,
+      title: 'Pending authority',
+      state: 'COMPLETED',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      actions: [{
+        id: actionId,
+        capabilityId: 'file.write',
+        summary: 'Pending owner-approved mutation',
+        state: 'OWNER_APPROVAL_REQUIRED',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        approvalId,
+        result: {
+          status: 'OWNER_REQUIRED',
+          summary: 'Owner approval required',
+          approvalId,
+          completedAt: null,
+          evidence: [],
+        },
+      }],
+    }] : [],
+    timeline: [{
+      id: randomUUID(),
+      timestamp,
+      kind: 'MISSION_CREATED',
+      taskId: null,
+      actionId: null,
+      message: 'Seed mission',
+    }],
+  };
+}
 
 async function temp(prefix: string): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), prefix));

@@ -247,8 +247,15 @@ async function executeTool(
     const supervisor = requireBrokerContext(state, broker);
     const missionId = requiredString(args, 'missionId');
     const mission = await supervisor.state.getMission(missionId);
-    const mapping = await supervisor.broker.get(missionId);
-    return { missionId, events: supervisorEvents(mission.timeline, mapping.checkpoints, mapping.directives) };
+    const mapping = await brokerSnapshotOrNull(supervisor.broker, missionId);
+    return {
+      missionId,
+      events: supervisorEvents(
+        mission.timeline,
+        mapping?.checkpoints ?? [],
+        mapping?.directives ?? [],
+      ),
+    };
   }
   if (name === 'mission_directive') {
     const supervisor = requireBrokerContext(state, broker);
