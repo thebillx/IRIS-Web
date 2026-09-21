@@ -789,6 +789,16 @@ describe('native Ponytail code-review capability', () => {
     const failedMission = await fixture.state.getMission(association2.missionId);
     const failedAction = failedMission.tasks.find((task) => task.id === association2.taskId)?.actions.find((item) => item.id === association2.actionId);
     expect(failedAction?.state).toBe('FAILED');
+
+    const completedAfterStartFailure = executedValue<Awaited<ReturnType<RuntimeState['getMission']>>>(await fixture.service.execute({
+      capabilityId: 'mission.state.set',
+      clientId: fixture.session.clientId,
+      sessionId: fixture.session.id,
+      missionId: association2.missionId,
+      state: 'COMPLETED',
+      expectedEffects: ['WRITE'],
+    }));
+    expect(completedAfterStartFailure.state).toBe('COMPLETED');
   });
 });
 
