@@ -123,6 +123,12 @@ export interface SupervisorOptions {
   readonly supervisorControlPort?: number;
   readonly adminTunnelHealthPort?: number;
   readonly protectedReferenceRoot?: string;
+  readonly e2eProbe?: SupervisorE2eProbe;
+}
+
+export interface SupervisorE2eProbe {
+  readonly fullUrl: string;
+  readonly proUrl: string;
 }
 
 interface SupervisorOperationLock {
@@ -198,6 +204,7 @@ export async function createSupervisor(options: SupervisorOptions = {}): Promise
     options.supervisorControlPort ?? DEFAULT_SUPERVISOR_CONTROL_PORT,
     options.adminTunnelHealthPort ?? DEFAULT_ADMIN_TUNNEL_HEALTH_PORT,
     protectedReferenceRoot,
+    options.e2eProbe,
   );
 }
 
@@ -213,6 +220,7 @@ export class Supervisor {
     private readonly supervisorControlPort: number,
     private readonly adminTunnelHealthPort: number,
     private readonly protectedReferenceRoot?: string,
+    private readonly e2eProbe?: SupervisorE2eProbe,
   ) {
     for (const [label, port] of [
       ['Supervisor admin', adminPort],
@@ -1003,7 +1011,7 @@ export class Supervisor {
       ? layer('READY', 'READY', 'Workload tunnels, isolated admin tunnel, and persistent supervisor-admin endpoint are healthy')
       : combineLayers(controlPlaneParts, 'CONTROL_PLANE_UNREACHABLE', 'Control-plane readiness is not proven for workload and isolated admin transport');
     const connectorStatuses = registry.connectors.map((binding) => connectorStatus(binding, local.connectors.find((entry) => entry.connectorId === binding.connectorId), tunnelResults[binding.connectorId === 'iris-full' ? 0 : 1]));
-    const e2e = layer('UNKNOWN', 'E2E_PROBE_UNAVAILABLE', 'No safe remote connector probe is configured; /readyz is not treated as end-to-end proof');
+    const e2e = await this.probeEndToEnd(registry, connectorStatuses);
     const stateValue = runtimeLayer.state === 'FAILED' || local.status.state === 'FAILED' || tunnelLayer.state === 'FAILED' ? 'FAILED'
       : e2e.state === 'UNKNOWN' || webLayer.state !== 'READY' ? 'DEGRADED' : 'READY';
     return { state: stateValue, runtime: runtimeLayer, web: webLayer, tunnel: tunnelLayer, controlPlane, localRuntime: local.status, endToEnd: e2e, connectors: connectorStatuses, credentials, registryPresent: true, recovery: recoveryView((await this.readState()).recovery) };
@@ -1284,6 +1292,41 @@ export class Supervisor {
     } catch (error) {
       return layer('FAILED', runtimeErrorCode(error), `${binding.label} tunnel readiness failed`);
     }
+  }
+
+  private async probeEndToEnd(registry: ConnectorRegistryDocument, connectors: readonly ConnectorStatus[]): Promise<LayerStatus> {
+    if (this.e2eProbe === undefined) {
+      return layer('UNKNOWN', 'E2E_PROBE_UNAVAILABLE', 'No safe remote connector probe is configured; /readyz is not treated as end-to-end proof');
+    }
+    if (connectors.some((connector) => connector.state !== 'READY')) {
+      return layer('FAILED', 'CONTROL_PLANE_UNREACHABLE', 'Remote connector probing requires ready local connector identity and catalog state');
+    }
+    const credentials = await readTunnelServiceSecret(this.dataRoot);
+    if (credentials === null) return layer('FAILED', 'CREDENTIAL_MISSING', 'Remote connector probing requires the tunnel service credential');
+    const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
+    const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
+    if (full === undefined || pro === undefined) return layer('FAILED', 'CONNECTOR_BINDING_MISMATCH', 'Remote connector probing requires FULL and PRO connector bindings');
+    const probe = async (url: string, binding: ConnectorBinding, clientId: string): Promise<boolean> => {
+      const listed = await postJson(url, { jsonrpc: '2.0', id: 1, method: 'tools/list' }, {
+        authorization: `Bearer ${credentials}`,
+        'content-type': 'application/json',
+        'MCP-Protocol-Version': '2026-07-28',
+        'x-iris-connector-profile': binding.mode,
+        'x-iris-deployment-epoch': String(registry.deploymentEpoch),
+        'x-iris-runtime-id': binding.runtimeId ?? '',
+        'x-iris-client-id': clientId,
+      });
+      const names = toolNames(listed);
+      return names.length === binding.expectedToolNames.length
+        && names.every((name, index) => name === binding.expectedToolNames[index]);
+    };
+    const [fullReady, proReady] = await Promise.all([
+      probe(this.e2eProbe.fullUrl, full, 'iris-supervisor-e2e-full'),
+      probe(this.e2eProbe.proUrl, pro, 'iris-supervisor-e2e-pro'),
+    ]);
+    return fullReady && proReady
+      ? layer('READY', 'READY', 'Configured remote FULL and PRO connector probes returned the bound tool catalogs')
+      : layer('FAILED', 'CONTROL_PLANE_UNREACHABLE', 'Configured remote connector probe did not return the bound tool catalogs');
   }
 
   private async probeNativeControl(): Promise<LayerStatus> {

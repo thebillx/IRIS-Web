@@ -32,6 +32,19 @@ describe('IRIS supervisor', () => {
     await expect(import('node:fs/promises').then(({ access }) => access(path.join(dataRoot, 'supervisor')))).rejects.toThrow();
   });
 
+  it('keeps L3 unknown unless an explicit safe remote probe is configured', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-e2e-unconfigured-'));
+    roots.push(dataRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    });
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot: '/Users/example/iris' });
+    const status = await supervisor.status();
+    expect(status.endToEnd).toMatchObject({ state: 'UNKNOWN', code: 'E2E_PROBE_UNAVAILABLE' });
+  });
+
   it('does not misclassify a stopped runtime as an MCP authentication failure', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-stopped-'));
     roots.push(dataRoot);
