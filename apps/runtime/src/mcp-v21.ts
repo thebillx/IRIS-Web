@@ -8,6 +8,8 @@ import { executePhase2GroupedTool, isPhase2GroupedTool } from './mcp-phase2.js';
 import { executePhase3GroupedTool, isPhase3GroupedTool } from './mcp-phase3.js';
 import { executePhase4GroupedTool, isPhase4GroupedTool } from './mcp-phase4.js';
 import { executeCodeReviewGroupedTool, isCodeReviewGroupedTool } from './mcp-code-review.js';
+import { executeSecurityAuditTool, isSecurityAuditTool } from './mcp-security-audit.js';
+import type { SecurityAuditService } from './security-audit/service.js';
 import { executeAdoTool, isAdoTool } from './mcp-ado.js';
 import { augmentV21ToolDefinitions, V21_LIFECYCLE_TOOL_NAMES } from './mcp-v21-definitions.js';
 import { executeV21LifecycleTool, isCapabilityOutcome, toolError, toolOutcome, toolResult } from './mcp-v21-tools.js';
@@ -28,6 +30,7 @@ export async function handleMcpV21Request(
   lifecycle: DurableMissionLifecycleService,
   principal: McpPrincipal = 'owner',
   runtimeContext: McpCatalogRuntimeContext = {},
+  securityAudit?: SecurityAuditService,
 ): Promise<Response> {
   if (request.method !== 'POST') return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
 
@@ -55,8 +58,9 @@ export async function handleMcpV21Request(
   const phase3Grouped = isPhase3GroupedTool(name);
   const phase4Grouped = isPhase4GroupedTool(name);
   const codeReviewGrouped = isCodeReviewGroupedTool(name);
+  const securityAuditTool = isSecurityAuditTool(name);
   const adoTool = isAdoTool(name);
-  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity && !phase2Grouped && !phase3Grouped && !phase4Grouped && !codeReviewGrouped && !adoTool) {
+  if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity && !phase2Grouped && !phase3Grouped && !phase4Grouped && !codeReviewGrouped && !securityAuditTool && !adoTool) {
     return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
   }
 
@@ -77,7 +81,9 @@ export async function handleMcpV21Request(
             ? await executePhase4GroupedTool(name, args, request, capabilities, state, principal)
             : codeReviewGrouped
               ? await executeCodeReviewGroupedTool(args, request, capabilities, state)
-              : adoTool
+              : securityAuditTool
+                ? await executeSecurityAuditTool(args, request, state, requireSecurityAudit(securityAudit), principal)
+                : adoTool
                 ? await executeAdoTool(name, args, request, capabilities, state)
                 : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal);
     return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
@@ -124,6 +130,11 @@ function json(value: unknown, status = 200): Response {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' },
   });
+}
+
+function requireSecurityAudit(service: SecurityAuditService | undefined): SecurityAuditService {
+  if (service === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Security Audit Engine is unavailable');
+  return service;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

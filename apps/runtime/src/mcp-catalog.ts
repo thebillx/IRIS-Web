@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { IdentityCoherenceState, TunnelBindingDiagnostic } from '@iris/domain';
 
-export const MCP_CATALOG_VERSION = '2.6.0' as const;
+export const MCP_CATALOG_VERSION = '2.7.0' as const;
 export const MCP_SCHEMA_VERSION = '2026-07-28' as const;
-export type McpCatalogVersion = '2.3.0' | '2.4.0' | '2.5.0' | typeof MCP_CATALOG_VERSION;
-export const MCP_SUPPORTED_CATALOG_VERSIONS = ['2.3.0', '2.4.0', '2.5.0', MCP_CATALOG_VERSION] as const satisfies readonly McpCatalogVersion[];
+export type McpCatalogVersion = '2.3.0' | '2.4.0' | '2.5.0' | '2.6.0' | typeof MCP_CATALOG_VERSION;
+export const MCP_SUPPORTED_CATALOG_VERSIONS = ['2.3.0', '2.4.0', '2.5.0', '2.6.0', MCP_CATALOG_VERSION] as const satisfies readonly McpCatalogVersion[];
 
 export type McpCatalogProfile = 'FULL' | 'PRO';
 export type McpMutationClass = 'READ_ONLY' | 'ORCHESTRATION' | 'PROJECT_MUTATION' | 'OWNER_MUTATION';
@@ -96,6 +96,7 @@ const FULL_CATALOG = [
   entry('job', 'PROJECT_MUTATION', null, 'vNext-phase3'),
   entry('git', 'PROJECT_MUTATION', null, 'vNext-phase4'),
   entry('code_review', 'PROJECT_MUTATION', null, '2.5.0'),
+  entry('security_audit', 'ORCHESTRATION', null, '2.7.0'),
   entry('catalog_identity', 'READ_ONLY', null, '2.3.0'),
 ] as const satisfies readonly McpCatalogEntry[];
 
