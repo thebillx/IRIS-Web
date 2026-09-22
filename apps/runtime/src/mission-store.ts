@@ -342,7 +342,7 @@ function isRebindAuditEvent(value: unknown): value is MissionRebindAuditEvent {
     && boundedIdentity(value.oldSessionId)
     && boundedIdentity(value.newClientId)
     && boundedIdentity(value.newSessionId)
-    && value.principal === 'owner'
+    && (value.principal === 'owner' || value.principal === 'tunnel-service')
     && isUuid(value.projectId)
     && timestamp(value.timestamp)
     && boundedText(value.reason, 500)

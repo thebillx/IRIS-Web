@@ -78,14 +78,14 @@ const DEFINITIONS: readonly CapabilityDefinition[] = [
   { id: 'git.add', title: 'Stage explicit bounded governed Git paths', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'git.commit', title: 'Commit explicit bounded governed Git paths', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'git.fetch', title: 'Fetch configured governed Git remote', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
-  { id: 'git.push', title: 'Push governed safe feature branch to configured remote', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: true },
+  { id: 'git.push', title: 'Push governed safe feature branch to configured remote', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'git.local', title: 'Bounded local project Git operation', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'runtime.lifecycle', title: 'Local runtime lifecycle', riskClass: 'MODERATE', requiredScope: 'RUNTIME_DATA', mutation: true, implemented: true },
   { id: 'web.lifecycle', title: 'Local Web development lifecycle', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: false },
   { id: 'package.project', title: 'Project package-manager operation', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: false },
   { id: 'policy.mode.set', title: 'Change machine permission mode', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: true },
   { id: 'credential.mutate', title: 'Create or change credentials', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: false },
-  { id: 'remote.publish', title: 'Push current feature branch to configured origin', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: true },
+  { id: 'remote.publish', title: 'Push current feature branch to configured origin', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'system.sudo', title: 'System privilege escalation', riskClass: 'SYSTEM', requiredScope: 'OWNER', mutation: true, implemented: false },
 ] as const;
 

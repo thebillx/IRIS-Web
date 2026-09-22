@@ -94,6 +94,12 @@ export interface CancelOrchestrationRunInput {
   readonly orchestrationRunId: string;
 }
 
+export interface RebindOrchestrationRunSessionInput {
+  readonly expectedGeneration: number;
+  readonly orchestrationRunId: string;
+  readonly sessionId: string;
+}
+
 export interface RecordWorkerResultInput {
   readonly expectedGeneration: number;
   readonly orchestrationRunId: string;
@@ -153,6 +159,10 @@ export class MultiWorkerRoutingService {
     private readonly workers: WorkerAdapterRegistry = new WorkerAdapterRegistry(),
     private readonly clock: () => string = () => new Date().toISOString(),
   ) {}
+
+  public async currentGeneration(): Promise<number> {
+    return (await this.store.read()).generation;
+  }
 
   public async listRuns(): Promise<readonly OrchestrationRun[]> {
     return (await this.store.read()).runs;
@@ -309,6 +319,52 @@ export class MultiWorkerRoutingService {
       };
       return {
         document: { ...document, runs: [...document.runs, run] },
+        value: (next: MultiWorkerDocument) => view(next, runById(next, run.id)),
+      };
+    });
+  }
+
+  public rebindRunSession(input: RebindOrchestrationRunSessionInput): Promise<MultiWorkerRunView> {
+    const runId = requireUuid(input.orchestrationRunId, 'orchestrationRunId');
+    const sessionId = requireUuid(input.sessionId, 'sessionId');
+    return this.mutate(input.expectedGeneration, async (document) => {
+      const run = requiredActiveRun(document, runId);
+      if (run.sessionId === sessionId) return { document, value: (next: MultiWorkerDocument) => view(next, runById(next, run.id)) };
+      const mission = await this.state.getMission(run.missionId);
+      if (mission.sessionId !== sessionId || mission.projectId !== run.projectId) {
+        throw new RuntimeError('CONTROL_DENIED', 'Multi-worker run rebind must match the authoritative mission binding');
+      }
+      const session = this.state.getSessionForClient(sessionId, mission.clientId);
+      if (session.currentProjectId !== run.projectId || session.agentId !== run.parentOrchestratorId) {
+        throw new RuntimeError('CONTROL_DENIED', 'Multi-worker run rebind session does not preserve project/orchestrator authority');
+      }
+      const runTasks = document.tasks.filter((entry) => entry.orchestrationRunId === run.id);
+      if (runTasks.some((task) => task.authority.mutablePaths.length > 0 || task.authority.concurrencyPolicy.mutablePathOwnership !== 'READ_ONLY')) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Only read-only multi-worker runs may rebind session authority');
+      }
+      const now = this.now();
+      const tasks = document.tasks.map((task) => task.orchestrationRunId === run.id
+        ? { ...task, authority: { ...task.authority, sessionId }, updatedAt: now }
+        : task);
+      const taskById = new Map(tasks.map((task) => [task.id, task]));
+      const workerById = new Map(document.workers.map((worker) => [worker.id, worker]));
+      const assignments = document.assignments.map((assignment) => {
+        if (assignment.orchestrationRunId !== run.id) return assignment;
+        const task = taskById.get(assignment.taskId);
+        const worker = workerById.get(assignment.workerId);
+        if (task === undefined || worker === undefined) throw new RuntimeError('PERSISTENCE_FAILURE', 'Multi-worker rebind assignment binding is invalid');
+        return { ...assignment, authorityDigest: deriveWorkerAuthorityDigest(task, worker, assignment) };
+      });
+      const updatedRun = { ...run, sessionId, updatedAt: now, revision: run.revision + 1 };
+      const candidate = validateMultiWorkerDocument({
+        ...document,
+        generation: document.generation,
+        runs: replaceById(document.runs, updatedRun),
+        tasks,
+        assignments,
+      });
+      return {
+        document: candidate,
         value: (next: MultiWorkerDocument) => view(next, runById(next, run.id)),
       };
     });

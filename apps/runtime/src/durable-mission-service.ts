@@ -1,7 +1,11 @@
 import { RuntimeError } from '@iris/domain';
 import type { MissionEvidence } from '@iris/domain';
 import type { RuntimeState } from './state.js';
-import { DurableMissionLifecycleStore, type DurableMissionLifecycleDocument } from './durable-mission-store.js';
+import {
+  DurableMissionLifecycleStore,
+  lifecycleCapacityArchiveEligible,
+  type DurableMissionLifecycleDocument,
+} from './durable-mission-store.js';
 import type {
   AppendMissionEvidenceInput,
   CancelMissionInput,
@@ -89,7 +93,7 @@ export class DurableMissionLifecycleService {
   public ensureMission(missionIdInput: string, goalInput?: string): Promise<DurableMissionLifecycleSnapshot> {
     const missionId = uuid(missionIdInput, 'missionId');
     return this.serialize(async () => {
-      const document = await this.store.read();
+      let document = await this.store.read();
       const existing = document.records.find((candidate) => candidate.missionId === missionId);
       if (existing !== undefined) {
         const record = validateLifecycleRecord(existing);
@@ -99,16 +103,25 @@ export class DurableMissionLifecycleService {
         }
         return record;
       }
-      if (document.records.length >= MAX_RECORDS) throw new RuntimeError('CAPABILITY_DENIED', 'Durable mission lifecycle capacity has been reached');
       const mission = await this.state.getMission(missionId);
+      if (mission.state === 'COMPLETED' || mission.state === 'FAILED' || mission.state === 'CANCELLED') {
+        throw new RuntimeError('CONTROL_DENIED', 'Terminal or archived missions cannot create durable lifecycle execution state');
+      }
       if (mission.projectId === null) throw new RuntimeError('CAPABILITY_DENIED', 'Durable mission lifecycle requires an explicit registered project');
       await this.assertRegisteredProject(mission.projectId);
+      const goal = goalInput === undefined ? mission.title : boundedText(goalInput, 'goal', 4_000);
+      if (document.records.length >= MAX_RECORDS) {
+        document = await this.reclaimArchivedCapacity(document);
+      }
+      if (document.records.length >= MAX_RECORDS) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Durable mission lifecycle capacity has been reached');
+      }
       const now = new Date().toISOString();
       const record: DurableMissionLifecycleSnapshot = validateLifecycleRecord({
         missionId: mission.id,
         projectId: mission.projectId,
         title: mission.title,
-        goal: goalInput === undefined ? mission.title : boundedText(goalInput, 'goal', 4_000),
+        goal,
         state: 'CREATED',
         revision: 1,
         workerBinding: null,
@@ -127,6 +140,9 @@ export class DurableMissionLifecycleService {
   public async assertSessionControl(missionIdInput: string, clientId: string, sessionId: string): Promise<DurableMissionLifecycleSnapshot> {
     const record = await this.get(missionIdInput);
     const mission = await this.state.getMission(record.missionId);
+    if (mission.state === 'COMPLETED' || mission.state === 'FAILED' || mission.state === 'CANCELLED') {
+      throw new RuntimeError('CONTROL_DENIED', 'Terminal or archived missions cannot grant durable lifecycle execution authority');
+    }
     if (mission.clientId !== clientId || mission.sessionId !== sessionId) {
       throw new RuntimeError('CONTROL_DENIED', 'Mission lifecycle does not belong to this client/session identity');
     }
@@ -350,6 +366,40 @@ export class DurableMissionLifecycleService {
       await this.store.write(replaceLifecycleRecord(document, next));
       return next;
     });
+  }
+
+  private async reclaimArchivedCapacity(document: DurableMissionLifecycleDocument): Promise<DurableMissionLifecycleDocument> {
+    const activeMissionIds = new Set((await this.state.listMissions()).map((mission) => mission.id));
+    const candidates: Array<{ readonly record: DurableMissionLifecycleSnapshot; readonly missionUpdatedAt: string }> = [];
+
+    for (const candidate of document.records) {
+      const record = validateLifecycleRecord(candidate);
+      if (activeMissionIds.has(record.missionId) || !lifecycleCapacityArchiveEligible(record)) continue;
+
+      let mission;
+      try {
+        mission = await this.state.getMission(record.missionId);
+      } catch (error) {
+        if (error instanceof RuntimeError && error.code === 'MISSION_NOT_FOUND') continue;
+        throw error;
+      }
+      if (mission.state !== 'COMPLETED' || mission.projectId !== record.projectId) continue;
+      candidates.push({ record, missionUpdatedAt: mission.updatedAt });
+    }
+
+    const selected = candidates.sort((left, right) =>
+      left.missionUpdatedAt !== right.missionUpdatedAt
+        ? left.missionUpdatedAt.localeCompare(right.missionUpdatedAt)
+        : left.record.missionId.localeCompare(right.record.missionId))[0];
+    if (selected === undefined) return document;
+
+    await this.store.archiveForCapacity(selected.record);
+    const next: DurableMissionLifecycleDocument = {
+      schemaVersion: 1,
+      records: document.records.filter((record) => record.missionId !== selected.record.missionId),
+    };
+    await this.store.write(next);
+    return next;
   }
 
   private workerOperation(

@@ -35,6 +35,7 @@ export interface MissionRebindInput {
   readonly projectId: string;
   readonly expectedBindingRevision: number;
   readonly reason: string;
+  readonly principal?: 'owner' | 'tunnel-service';
 }
 
 export class RuntimeState {
@@ -95,6 +96,7 @@ export class RuntimeState {
     const sessionId = normalizeUuidIdentity(input.sessionId, 'sessionId');
     const projectId = normalizeUuidIdentity(input.projectId, 'projectId');
     const reason = normalizeMissionText(input.reason, 'reason', 500);
+    const principal = input.principal ?? 'owner';
     if (!Number.isSafeInteger(input.expectedBindingRevision) || input.expectedBindingRevision <= 0) {
       throw new RuntimeError('INVALID_REQUEST', 'expectedBindingRevision is invalid');
     }
@@ -127,7 +129,7 @@ export class RuntimeState {
         oldSessionId: mission.sessionId,
         newClientId: clientId,
         newSessionId: sessionId,
-        principal: 'owner',
+        principal,
         projectId,
         timestamp: now,
         reason,
@@ -141,7 +143,7 @@ export class RuntimeState {
         bindingRevision,
         rebindAudit: [...mission.rebindAudit, audit].slice(-64),
         updatedAt: now,
-        timeline: appendMissionEvent(mission.timeline, missionEvent('MISSION_SESSION_REBOUND', 'Durable mission session rebound by the authenticated owner', null, null, now)),
+        timeline: appendMissionEvent(mission.timeline, missionEvent('MISSION_SESSION_REBOUND', `Durable mission session rebound by authenticated ${principal === 'owner' ? 'owner' : 'tunnel connector'}`, null, null, now)),
       };
       const missions = [...document.missions];
       missions[index] = updated;

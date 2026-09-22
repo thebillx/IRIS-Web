@@ -39,7 +39,7 @@ interface ProfileDefinition {
   readonly maxTimeoutMs: number;
   readonly envAllowlist: readonly string[];
   readonly effectEnvelope: readonly CapabilityEffect[];
-  readonly argvPolicy: 'NODE_SCRIPT' | 'PYTHON_SCRIPT' | 'ROBOT_SCRIPT' | 'PNPM_SCRIPT' | 'NPM_SCRIPT' | 'FFMPEG' | 'FFPROBE' | 'CODEX_REVIEW';
+  readonly argvPolicy: 'NODE_SCRIPT' | 'PYTHON_SCRIPT' | 'ROBOT_SCRIPT' | 'PNPM_SCRIPT' | 'NPM_SCRIPT' | 'FFMPEG' | 'FFPROBE' | 'PROJECT_TOOL' | 'CODEX_REVIEW';
   readonly serverOnly?: boolean;
 }
 
@@ -50,6 +50,20 @@ const MAX_ENV_VALUE = 8 * 1024;
 const SCRIPT_NAME = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,99}$/;
 const CONSERVATIVE_EFFECTS = ['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE'] as const satisfies readonly CapabilityEffect[];
 const CODE_REVIEW_EFFECTS = ['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE'] as const satisfies readonly CapabilityEffect[];
+const PROJECT_TOOL_EFFECTS = ['READ', 'WRITE', 'EXECUTE', 'DESTRUCTIVE'] as const satisfies readonly CapabilityEffect[];
+const PROJECT_TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,119}$/;
+const SYSTEM_PROJECT_TOOLS = new Set([
+  'node','python3','python','ruby','perl','java','javac','go','swift','xcodebuild','clang','clang++','cc','c++',
+  'make','cmake','ninja','adb','ffmpeg','ffprobe','robot','pytest','jq','yq','grep','sed','awk','find','ls','cat',
+  'head','tail','wc','sort','uniq','cut','tr','xargs','mkdir','cp','mv','rm','touch','pwd','printf','echo','tar',
+  'gzip','gunzip','zip','unzip',
+]);
+const PROJECT_TOOL_DENIED_EXECUTABLES = new Set(['git','gh','sudo','su','open','osascript','launchctl','security','profiles','installer','defaults']);
+const PROJECT_TOOL_PROCESS_DENY = [
+  '/usr/bin/sudo','/usr/bin/su','/usr/bin/open','/usr/bin/osascript','/bin/launchctl','/usr/bin/security',
+  '/usr/bin/profiles','/usr/sbin/installer','/usr/bin/defaults','/usr/sbin/systemsetup','/usr/sbin/networksetup',
+  '/usr/bin/git','/opt/homebrew/bin/git','/usr/local/bin/git','/opt/homebrew/bin/gh','/usr/local/bin/gh',
+] as const;
 const CODE_REVIEW_RUNNER_CANDIDATES = [
   fileURLToPath(new URL('./code-review-runner.mjs', import.meta.url)),
   fileURLToPath(new URL('./code-review-runner.mts', import.meta.url)),
@@ -63,6 +77,7 @@ const PROFILES: readonly ProfileDefinition[] = [
   { id: 'npm-script', executable: 'npm', candidates: () => nodePackageManagerCandidates('npm', ['/opt/homebrew/bin/npm','/usr/local/bin/npm','/usr/bin/npm']), minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'NPM_SCRIPT' },
   { id: 'ffmpeg', executable: 'ffmpeg', candidates: () => ['/opt/homebrew/bin/ffmpeg','/usr/local/bin/ffmpeg'], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI'], effectEnvelope: CONSERVATIVE_EFFECTS, argvPolicy: 'FFMPEG' },
   { id: 'ffprobe', executable: 'ffprobe', candidates: () => ['/opt/homebrew/bin/ffprobe','/usr/local/bin/ffprobe'], minTimeoutMs: 100, maxTimeoutMs: 30 * 60_000, envAllowlist: ['CI'], effectEnvelope: ['READ','EXECUTE'], argvPolicy: 'FFPROBE' },
+  { id: 'project-tool', executable: '*', candidates: () => [], minTimeoutMs: 100, maxTimeoutMs: 60 * 60_000, envAllowlist: ['CI','NODE_ENV','PYTHONUNBUFFERED','API_TOKEN','AUTH_TOKEN','PASSWORD'], effectEnvelope: PROJECT_TOOL_EFFECTS, argvPolicy: 'PROJECT_TOOL' },
   { id: 'codex-review', executable: 'node', candidates: () => [canonicalNodeRuntime().path], minTimeoutMs: 10_000, maxTimeoutMs: 30 * 60_000, envAllowlist: [], effectEnvelope: CODE_REVIEW_EFFECTS, argvPolicy: 'CODEX_REVIEW', serverOnly: true },
 ] as const;
 
@@ -91,13 +106,16 @@ export async function resolveServerOwnedCodeReviewExecutionProfile(input: Resolv
 async function resolveExecutionProfileInternal(input: ResolveExecutionInput, allowServerOnly: boolean): Promise<ExecutionProfilePlan> {
   const profile = PROFILES.find((candidate) => candidate.id === input.executionProfile);
   if (profile === undefined || (profile.serverOnly === true && !allowServerOnly)) throw new RuntimeError('CAPABILITY_DENIED', 'UNKNOWN_EXECUTION_PROFILE: execution profile is not caller-selectable');
-  if (input.executable !== profile.executable) throw new RuntimeError('CAPABILITY_DENIED', 'UNKNOWN_EXECUTABLE: executable does not match the selected server-owned profile');
+  const projectTool = profile.argvPolicy === 'PROJECT_TOOL';
+  if (!projectTool && input.executable !== profile.executable) throw new RuntimeError('CAPABILITY_DENIED', 'UNKNOWN_EXECUTABLE: executable does not match the selected server-owned profile');
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < profile.minTimeoutMs || input.timeoutMs > profile.maxTimeoutMs) {
     throw new RuntimeError('INVALID_REQUEST', `timeoutMs must be from ${profile.minTimeoutMs} through ${profile.maxTimeoutMs} for this profile`);
   }
   validateArgvShape(input.argv);
-  const executableIdentity = await resolveExecutable(profile.candidates());
   const cwd = await resolveWorkspaceDirectory(input.workspace, input.cwd);
+  const targetExecutableIdentity = projectTool
+    ? await resolveProjectToolExecutable(input.workspace, cwd, input.executable)
+    : await resolveExecutable(profile.candidates());
   await validateArgvPolicy(profile.argvPolicy, input.argv, input.workspace, cwd);
   const codexExecutableIdentity = profile.argvPolicy === 'CODEX_REVIEW' ? await resolveCodexExecutable() : null;
   const codeReviewRuntime = profile.argvPolicy === 'CODEX_REVIEW'
@@ -117,9 +135,32 @@ async function resolveExecutionProfileInternal(input: ResolveExecutionInput, all
     if (codeReviewRuntime !== null) await cleanupPreparedCodeReviewDirectory(codeReviewRuntime.codexHome, 'CODEX_HOME');
     throw error;
   }
+
+  if (projectTool) {
+    const sandboxExecutable = await resolveExecutable(['/usr/bin/sandbox-exec']);
+    environment = {
+      ...environment,
+      PATH: projectToolPath(input.workspace, cwd),
+      HOME: input.workspace.physicalRoot,
+      TMPDIR: input.workspace.physicalRoot,
+    };
+    return {
+      profileId: profile.id,
+      executableIdentity: sandboxExecutable,
+      argv: ['-p', projectToolSandboxPolicy(input.workspace), targetExecutableIdentity, ...input.argv],
+      cwd,
+      environment,
+      redactionValues,
+      timeoutMs: input.timeoutMs,
+      effectEnvelope: profile.effectEnvelope,
+      stdinPath: input.stdinPath ?? null,
+      cleanupPaths: [],
+    };
+  }
+
   return {
     profileId: profile.id,
-    executableIdentity,
+    executableIdentity: targetExecutableIdentity,
     argv: [...input.argv],
     cwd,
     environment,
@@ -176,6 +217,7 @@ async function resolveWorkspaceDirectory(workspace: WorkspaceRecord, relativeCwd
 
 async function validateArgvPolicy(policy: ProfileDefinition['argvPolicy'], argv: readonly string[], workspace: WorkspaceRecord, cwd: string): Promise<void> {
   rejectInlineInterpreterForms(argv);
+  if (policy === 'PROJECT_TOOL') return;
   if (policy === 'CODEX_REVIEW') {
     if (argv.length !== 1) throw new RuntimeError('CAPABILITY_DENIED', 'codex-review accepts only the server-owned review runner');
     let physical: string;
@@ -256,6 +298,108 @@ async function verifyPhysicalScript(workspace: WorkspaceRecord, cwd: string, scr
   if (!pathIsWithin(workspace.physicalRoot, physical) || !extensions.some((extension) => physical.endsWith(extension))) {
     throw new RuntimeError('CAPABILITY_DENIED', 'Project script does not satisfy the selected execution profile');
   }
+}
+
+async function resolveProjectToolExecutable(workspace: WorkspaceRecord, cwd: string, executable: string): Promise<string> {
+  if (process.platform !== 'darwin') throw new RuntimeError('CAPABILITY_DENIED', 'project-tool is supported only by the macOS sandbox runtime');
+  if (!PROJECT_TOOL_NAME.test(executable) || PROJECT_TOOL_DENIED_EXECUTABLES.has(executable)) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'PROJECT_TOOL_EXECUTABLE_DENIED: executable is not eligible for project-tool');
+  }
+  const localCandidates = [
+    path.join(cwd, 'node_modules', '.bin', executable),
+    path.join(workspace.physicalRoot, 'node_modules', '.bin', executable),
+    path.join(cwd, 'bin', executable),
+    path.join(workspace.physicalRoot, 'bin', executable),
+  ];
+  for (const candidate of uniquePaths(localCandidates)) {
+    try {
+      const lexical = await lstat(candidate);
+      if (!lexical.isFile() && !lexical.isSymbolicLink()) continue;
+      const physical = await realpath(candidate);
+      if (!pathIsWithin(workspace.physicalRoot, physical)) continue;
+      const metadata = await lstat(physical);
+      if (!metadata.isFile()) continue;
+      await access(physical, constants.X_OK);
+      return physical;
+    } catch {
+      // Try the next workspace-local candidate.
+    }
+  }
+  if (!SYSTEM_PROJECT_TOOLS.has(executable)) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'PROJECT_TOOL_NOT_FOUND: executable is not a verified project-local or allowlisted system tool');
+  }
+  if (executable === 'node') return canonicalNodeRuntime().path;
+  return resolveExecutable([
+    `/opt/homebrew/bin/${executable}`,
+    `/usr/local/bin/${executable}`,
+    `/usr/bin/${executable}`,
+    `/bin/${executable}`,
+    `/usr/sbin/${executable}`,
+    `/sbin/${executable}`,
+  ]);
+}
+
+function projectToolPath(workspace: WorkspaceRecord, cwd: string): string {
+  return uniquePaths([
+    path.join(cwd, 'node_modules', '.bin'),
+    path.join(workspace.physicalRoot, 'node_modules', '.bin'),
+    path.dirname(canonicalNodeRuntime().path),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+  ]).join(path.delimiter);
+}
+
+function projectToolSandboxPolicy(workspace: WorkspaceRecord): string {
+  const usersRoot = '/Users';
+  const root = workspace.physicalRoot;
+  if (!pathIsWithin(usersRoot, root) || root === usersRoot) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'PROJECT_TOOL_SCOPE_UNSUPPORTED: workspace must be inside /Users for the macOS project sandbox');
+  }
+  const relative = path.relative(usersRoot, root);
+  const segments = relative.split(path.sep).filter((segment) => segment.length > 0);
+  let current = usersRoot;
+  const ancestors = [usersRoot];
+  for (const segment of segments.slice(0, -1)) {
+    current = path.join(current, segment);
+    ancestors.push(current);
+  }
+  const readExemptions = ancestors.map((candidate) => `    (require-not (literal ${JSON.stringify(candidate)}))`).join('\n');
+  const processDeny = PROJECT_TOOL_PROCESS_DENY.map((candidate) => `(deny process-exec (literal ${JSON.stringify(candidate)}))`).join('\n');
+  return [
+    '(version 1)',
+    '(allow default)',
+    '(deny network*)',
+    '(deny appleevent-send)',
+    '(deny file-read*',
+    '  (require-all',
+    `    (subpath ${JSON.stringify(usersRoot)})`,
+    `    (require-not (subpath ${JSON.stringify(root)}))`,
+    readExemptions,
+    '  )',
+    ')',
+    '(deny file-write*',
+    '  (require-all',
+    `    (require-not (subpath ${JSON.stringify(root)}))`,
+    '    (require-not (literal "/dev/null"))',
+    '    (require-not (literal "/dev/tty"))',
+    '    (require-not (subpath "/dev/fd"))',
+    '  )',
+    ')',
+    '(deny file-read* (subpath "/Volumes"))',
+    '(deny file-read* (subpath "/private/tmp"))',
+    '(deny file-read* (subpath "/private/var/tmp"))',
+    '(deny file-read* (subpath "/private/var/folders"))',
+    processDeny,
+    '',
+  ].join('\n');
+}
+
+function uniquePaths(values: readonly string[]): readonly string[] {
+  return [...new Set(values)];
 }
 
 export async function resolveCodeReviewRunnerPath(): Promise<string> {

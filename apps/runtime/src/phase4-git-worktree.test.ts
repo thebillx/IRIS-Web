@@ -31,7 +31,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     const fixture = await serviceFixture();
     const definitions = phase4GroupedToolDefinitions();
     expect(definitions.map((tool) => tool.name)).toEqual(['git']);
-    expect(catalogToolNames('FULL')).toHaveLength(54);
+    expect(catalogToolNames('FULL')).toHaveLength(55);
     expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['git_status','git_local','remote_publish','workspace','fs','artifact','shell','job','git']));
     expect(catalogToolNames('PRO')).toEqual(['list_projects','project_info','git_status','file_read','search']);
 
@@ -302,7 +302,38 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     expect(JSON.stringify(audits)).not.toContain('SUPERSECRET');
   });
 
-  it('binds grouped git.push to one prepared CHATGPT mission action and originating owner approval', async () => {
+  it('auto-executes direct safe feature push under FULL_LOCAL_OWNER without mission or effect ceremony', async () => {
+    const fixture = await serviceFixture();
+    const request = new Request('http://127.0.0.1/mcp', { headers: { 'x-iris-client-id': fixture.session.clientId } });
+    const identity = await fixture.engine.inspectRepository(fixture.project.id, fixture.primary.workspaceId);
+
+    await git(fixture.projectRoot, ['switch', '-c', 'feature/direct-tools']);
+    await writeFile(path.join(fixture.projectRoot, 'direct-tools.txt'), 'direct tools\n');
+    await git(fixture.projectRoot, ['add', '--', 'direct-tools.txt']);
+    await git(fixture.projectRoot, ['commit', '-m', 'direct tools']);
+
+    const sessionsBefore = fixture.state.listSessionsForClient(fixture.session.clientId).length;
+    const pushed = await executePhase4GroupedTool('git', {
+      operation: 'push', projectId: fixture.project.id,
+      workspaceId: fixture.primary.workspaceId, repositoryId: identity.repositoryId,
+      remote: 'origin', branch: 'feature/direct-tools',
+    }, request, fixture.service, fixture.state, 'tunnel-service');
+    expect(pushed.status).toBe('executed');
+    if (pushed.status !== 'executed') throw new Error(`Expected direct push execution, received ${pushed.status}`);
+    expect(pushed.value).toMatchObject({ operation: 'push', branch: 'feature/direct-tools', remote: 'origin', verified: true });
+    expect(fixture.service.listPendingApprovals()).toHaveLength(0);
+    const tunnelSessions = fixture.state.listSessionsForClient(fixture.session.clientId).filter((session) => session.agentId === 'iris-tunnel-service');
+    expect(tunnelSessions).toHaveLength(1);
+    expect(fixture.state.listSessionsForClient(fixture.session.clientId)).toHaveLength(sessionsBefore + 1);
+
+    const attached = await executePhase4GroupedTool('git', {
+      operation: 'status', projectId: fixture.project.id, workspaceId: fixture.primary.workspaceId,
+    }, request, fixture.service, fixture.state, 'tunnel-service');
+    expect(attached.status).toBe('executed');
+    expect(fixture.state.listSessionsForClient(fixture.session.clientId).filter((session) => session.agentId === 'iris-tunnel-service')).toHaveLength(1);
+  });
+
+  it('binds grouped git.push to one prepared CHATGPT mission action and originating owner approval in legacy ASK_EVERY_TIME mode', async () => {
     const fixture = await serviceFixture();
     const owner = fixture.state.createSession('chatgpt', 'chatgpt-direct-orchestrator', 'owner');
     await fixture.state.setSessionCurrentProject(owner.id, owner.clientId, fixture.project.id);

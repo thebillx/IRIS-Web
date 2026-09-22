@@ -2100,20 +2100,28 @@ function sameEndpoint(left: NonNullable<RuntimeObservedStatus['endpoint']>, righ
 
 async function acquireOperationLock(filename: string, operation: string): Promise<() => Promise<void>> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    const processStart = observeProcessStart(process.pid);
+    if (processStart.state !== 'live') {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Supervisor process start identity could not be measured safely');
+    }
     try {
       const handle = await open(filename, 'wx', 0o600);
+      let initialized = false;
       try {
-        const processStart = observeProcessStart(process.pid);
-        if (processStart.state !== 'live') throw new RuntimeError('PERSISTENCE_FAILURE', 'Supervisor process start identity could not be measured safely');
         await handle.writeFile(`${JSON.stringify({ schemaVersion: 1, pid: process.pid, startedAt: new Date().toISOString(), operation, processStartMarker: processStart.marker } satisfies SupervisorOperationLock)}\n`, 'utf8');
         await handle.sync();
+        initialized = true;
       } finally {
-        await handle.close();
+        try {
+          if (!initialized) await rm(filename, { force: true });
+        } finally {
+          await handle.close();
+        }
       }
       return async () => { await rm(filename, { force: true }); };
     } catch (error) {
       if (!isAlreadyExists(error)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Supervisor operation lock could not be created', { cause: error });
-      const content = await readFile(filename, 'utf8').catch(() => null);
+      const content = await readOperationLockContent(filename);
       if (content === null) continue;
       let lock: SupervisorOperationLock;
       try {
@@ -2137,6 +2145,15 @@ async function acquireOperationLock(filename: string, operation: string): Promis
     }
   }
   throw new RuntimeError('SUPERVISOR_BUSY', 'Supervisor operation lock changed while stale recovery was in progress');
+}
+
+async function readOperationLockContent(filename: string): Promise<string | null> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const content = await readFile(filename, 'utf8').catch(() => null);
+    if (content === null || content.length > 0) return content;
+    if (attempt < 2) await delay(10);
+  }
+  return '';
 }
 
 async function assertOwnedRuntimeProcess(record: OwnedProcess): Promise<void> {

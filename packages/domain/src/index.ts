@@ -228,7 +228,7 @@ export interface MissionRebindAuditEvent {
   readonly oldSessionId: string;
   readonly newClientId: string;
   readonly newSessionId: string;
-  readonly principal: 'owner';
+  readonly principal: 'owner' | 'tunnel-service';
   readonly projectId: string;
   readonly timestamp: string;
   readonly reason: string;
@@ -450,6 +450,124 @@ export interface WorkerReview {
   readonly reviewedByOrchestratorId: string;
   readonly basedOnRunRevision: number;
   readonly createdAt: string;
+}
+
+export type SecurityAuditRunState =
+  | 'HUNTING'
+  | 'VERIFYING'
+  | 'PROOFING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED';
+
+export type SecurityCoverageStatus = 'IN_PROGRESS' | 'COVERED' | 'GAP';
+export type SecurityFindingState = 'CANDIDATE' | 'VERIFYING' | 'VERIFIED' | 'REJECTED' | 'NEEDS_MORE_EVIDENCE';
+export type SecurityFindingSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+export type SecurityVerificationDecision = 'VERIFIED' | 'REJECTED' | 'NEEDS_MORE_EVIDENCE';
+export type SecurityProofDecision = SecurityVerificationDecision;
+
+export interface SecurityAuditRun {
+  readonly id: string;
+  readonly missionId: string;
+  readonly orchestrationRunId: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly workspaceId: WorkspaceId;
+  readonly baselineRunId: string | null;
+  readonly state: SecurityAuditRunState;
+  readonly coverageTargetIds: readonly string[];
+  readonly findingIds: readonly string[];
+  readonly verificationIds: readonly string[];
+  readonly proofGateResultIds: readonly string[];
+  readonly decisionPackageId: string | null;
+  readonly comparisonId: string | null;
+  readonly failureReason: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly completedAt: string | null;
+}
+
+export interface SecurityCoverageTarget {
+  readonly id: string;
+  readonly auditRunId: string;
+  readonly key: string;
+  readonly title: string;
+  readonly scope: string;
+  readonly status: SecurityCoverageStatus;
+  readonly hunterWorkerId: string;
+  readonly hunterTaskId: string;
+  readonly hunterResultId: string | null;
+  readonly evidenceRefs: readonly string[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface SecurityFinding {
+  readonly id: string;
+  readonly auditRunId: string;
+  readonly coverageTargetId: string;
+  readonly fingerprint: string;
+  readonly title: string;
+  readonly category: string;
+  readonly severity: SecurityFindingSeverity;
+  readonly location: string;
+  readonly summary: string;
+  readonly state: SecurityFindingState;
+  readonly hunterWorkerId: string;
+  readonly hunterTaskId: string;
+  readonly hunterResultId: string;
+  readonly evidenceRefs: readonly string[];
+  readonly verificationIds: readonly string[];
+  readonly proofGateResultId: string | null;
+  readonly occurrences: number;
+  readonly firstSeenAt: string;
+  readonly lastSeenAt: string;
+}
+
+export interface SecurityVerificationResult {
+  readonly id: string;
+  readonly auditRunId: string;
+  readonly findingId: string;
+  readonly verifierWorkerId: string;
+  readonly verifierTaskId: string;
+  readonly verifierResultId: string;
+  readonly decision: SecurityVerificationDecision;
+  readonly rationale: string;
+  readonly evidenceRefs: readonly string[];
+  readonly createdAt: string;
+}
+
+export interface SecurityProofGateResult {
+  readonly id: string;
+  readonly auditRunId: string;
+  readonly findingId: string;
+  readonly verificationId: string | null;
+  readonly decision: SecurityProofDecision;
+  readonly satisfiedRequirements: readonly string[];
+  readonly missingRequirements: readonly string[];
+  readonly evaluatedAt: string;
+}
+
+export interface SecurityDecisionPackage {
+  readonly id: string;
+  readonly auditRunId: string;
+  readonly verifiedFindingIds: readonly string[];
+  readonly rejectedFindingIds: readonly string[];
+  readonly needsMoreEvidenceFindingIds: readonly string[];
+  readonly coverageGapTargetIds: readonly string[];
+  readonly coverageTargetCount: number;
+  readonly findingCount: number;
+  readonly generatedAt: string;
+}
+
+export interface SecurityAuditComparison {
+  readonly id: string;
+  readonly auditRunId: string;
+  readonly baselineRunId: string;
+  readonly newVerifiedFingerprints: readonly string[];
+  readonly persistentVerifiedFingerprints: readonly string[];
+  readonly resolvedVerifiedFingerprints: readonly string[];
+  readonly generatedAt: string;
 }
 
 export interface RuntimeClientState {

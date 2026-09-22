@@ -8,6 +8,7 @@ import type { RuntimeState } from './state.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import type { DurableMissionLifecycleService } from './durable-mission-service.js';
 import type { MultiWorkerRoutingService } from './multi-worker/service.js';
+import type { SecurityAuditService } from './security-audit/service.js';
 import { handleV21OwnerRoute } from './server-v21-routes.js';
 import { handleHermesMcpRequest } from './hermes-mcp.js';
 import type { McpCatalogRuntimeContext } from './mcp-catalog.js';
@@ -32,6 +33,7 @@ export interface RuntimeServerContext {
   readonly missionBroker: MissionBrokerService;
   readonly missionLifecycle?: DurableMissionLifecycleService;
   readonly multiWorker?: MultiWorkerRoutingService;
+  readonly securityAudit?: SecurityAuditService;
   readonly health: () => RuntimeHealth;
   readonly doctor: () => Promise<DoctorReport>;
   readonly isShuttingDown: () => boolean;
@@ -217,6 +219,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
         context.missionLifecycle,
         mcpPrincipal ?? 'owner',
         context.catalogRuntimeContext,
+        context.securityAudit,
       );
     await writeFetchResponse(response, mcpResponse);
     return;
@@ -263,6 +266,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
         broker: brokerByMission.get(mission.id) ?? null,
         lifecycle: lifecycleByMission.get(mission.id) ?? null,
         multiWorker: context.multiWorker === undefined ? null : await context.multiWorker.observabilityForMission(mission.id),
+        securityAudit: context.securityAudit === undefined ? null : await context.securityAudit.observabilityForMission(mission.id),
         orchestratorHandoff: await context.missionBroker.orchestratorHandoffStatus(mission.id),
       }))),
     });
