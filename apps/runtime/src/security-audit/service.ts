@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -905,7 +906,7 @@ async function assertFileEvidenceRange(
     throw new RuntimeError('CAPABILITY_DENIED', 'Security file evidence resolves outside the audit workspace');
   }
 
-  const handle = await open(physical, 'r');
+  const { handle } = await openVerifiedRegularFile(physical, 'Security file evidence');
   try {
     const digest = createHash('sha256');
     const buffer = Buffer.allocUnsafe(64 * 1024);
@@ -932,16 +933,11 @@ async function assertFileEvidenceRange(
 }
 
 async function assertArtifactEvidenceIntegrity(physicalPath: string, expectedSize: number, expectedSha256: string): Promise<string> {
-  let metadata;
-  try {
-    metadata = await lstat(physicalPath);
-  } catch (error) {
-    throw new RuntimeError('PRECONDITION_FAILED', 'Security evidence artifact is unavailable', { cause: error });
-  }
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size !== expectedSize) {
+  const { handle, metadata } = await openVerifiedRegularFile(physicalPath, 'Security evidence artifact');
+  if (metadata.size !== expectedSize) {
+    await handle.close().catch(() => undefined);
     throw new RuntimeError('PRECONDITION_FAILED', 'Security evidence artifact no longer matches its registered metadata');
   }
-  const handle = await open(physicalPath, 'r');
   try {
     const digest = createHash('sha256');
     const buffer = Buffer.allocUnsafe(64 * 1024);
@@ -959,6 +955,34 @@ async function assertArtifactEvidenceIntegrity(physicalPath: string, expectedSiz
     return observedSha256;
   } finally {
     await handle.close();
+  }
+}
+
+async function openVerifiedRegularFile(filename: string, label: string) {
+  let before;
+  try {
+    before = await lstat(filename);
+    if (!before.isFile() || before.isSymbolicLink()) throw new Error('not a physical regular file');
+  } catch (error) {
+    throw new RuntimeError('PRECONDITION_FAILED', `${label} is unavailable`, { cause: error });
+  }
+
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(filename, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    throw new RuntimeError('PRECONDITION_FAILED', `${label} could not be opened safely`, { cause: error });
+  }
+
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || metadata.dev !== before.dev || metadata.ino !== before.ino) {
+      throw new RuntimeError('PRECONDITION_FAILED', `${label} identity changed while it was being opened`);
+    }
+    return { handle, metadata };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
   }
 }
 
