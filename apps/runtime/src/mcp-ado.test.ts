@@ -123,6 +123,33 @@ describe('ADO FULL MCP requirement context', () => {
     });
   });
 
+  it('returns structured local rate-limit metadata without automatic retry', async () => {
+    const f = await fixture(1);
+    const response = await handleMcpV21Request(
+      rpc('tools/call', 7, {
+        name: 'ado_discovery',
+        arguments: {
+          projectId: f.project.id,
+          requestId: 'mcp-ado-local-rate-limit',
+          expectedEffects: ['READ','NETWORK'],
+        },
+      }, f.session.clientId, f.session.id, 'ado_discovery'),
+      f.service, f.state, f.broker, f.lifecycle,
+    );
+    expect(await response.json()).toMatchObject({
+      result: {
+        isError: true,
+        structuredContent: {
+          code: 'LOCAL_RATE_LIMITED',
+          retryAfterMs: expect.any(Number),
+          limit: 1,
+          remaining: 0,
+          windowMs: 60_000,
+        },
+      },
+    });
+  });
+
   it('rejects ADO calls on the PRO endpoint', async () => {
     const f = await fixture();
     const response = await handleMcpProRequest(
@@ -142,7 +169,7 @@ describe('ADO FULL MCP requirement context', () => {
   });
 });
 
-async function fixture() {
+async function fixture(rateLimitRequests = 100) {
   const sourceRoot = await realpath(await temp('iris-ado-mcp-source-'));
   const dataRoot = await realpath(await temp('iris-ado-mcp-data-'));
   const legacyRoot = await realpath(await temp('iris-ado-mcp-legacy-'));
@@ -159,7 +186,7 @@ async function fixture() {
   const broker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
   const resources = new VNextResourceRegistry(state, dataRoot);
   const jobs = new DurableJobManager(dataRoot, resources);
-  const ado = new AdoRequirementContextService(bindingProvider(project.id), fakeFetch());
+  const ado = new AdoRequirementContextService(bindingProvider(project.id, rateLimitRequests), fakeFetch());
   const service = new CapabilityService(state, policy, audit, () => ({
     status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: 'runtime', instanceId: 'instance', pid: process.pid,
     uptimeMs: 1, authority: 'owned', connectedClients: 1, connectedSessions: 1,
@@ -170,7 +197,7 @@ async function fixture() {
   return { state, project, session, broker, service, lifecycle, audit };
 }
 
-function bindingProvider(irisProjectId: string): AdoRuntimeBindingProvider {
+function bindingProvider(irisProjectId: string, rateLimitRequests = 100): AdoRuntimeBindingProvider {
   const resolved: ResolvedAdoRuntimeBinding = {
     identity: {
       organization: { id: 'org-id', name: 'org' },
@@ -204,7 +231,7 @@ function bindingProvider(irisProjectId: string): AdoRuntimeBindingProvider {
         maxPageItems: 100,
         maxPages: 4,
         maxBatchItems: 100,
-        rateLimit: { requests: 100, windowMs: 60000, maxRetryAfterMs: 10000 },
+        rateLimit: { requests: rateLimitRequests, windowMs: 60000, maxRetryAfterMs: 10000 },
       },
     },
   };

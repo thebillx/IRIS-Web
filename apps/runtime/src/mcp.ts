@@ -121,7 +121,12 @@ async function handleMcpTransportRequest(
         : await executeTool(params.name, args, request, capabilities, state, broker, principal);
       return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
     } catch (error) {
-      return jsonRpcResult(rpc.id ?? null, toolError(error instanceof RuntimeError ? error.code : 'INVALID_REQUEST', error instanceof Error ? error.message : 'Tool call failed'));
+      const runtimeError = error instanceof RuntimeError ? error : null;
+      return jsonRpcResult(rpc.id ?? null, toolError(
+        runtimeError?.code ?? 'INVALID_REQUEST',
+        error instanceof Error ? error.message : 'Tool call failed',
+        runtimeError?.publicDetails === undefined ? {} : { ...runtimeError.publicDetails },
+      ));
     }
   }
 

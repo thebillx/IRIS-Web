@@ -213,7 +213,15 @@ describe('ADO runtime requirement context', () => {
     const service = new AdoRequirementContextService(limitedProvider, fakeFetch(calls));
 
     await expect(service.discovery('iris-project', 'req-rate-limit'))
-      .rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+      .rejects.toMatchObject({
+        code: 'LOCAL_RATE_LIMITED',
+        publicDetails: {
+          retryAfterMs: expect.any(Number),
+          limit: 1,
+          remaining: 0,
+          windowMs: 60_000,
+        },
+      });
     expect(calls).toHaveLength(1);
   });
 });

@@ -774,6 +774,7 @@ export type RuntimeFailureCode =
   | 'PERSISTENCE_FAILURE'
   | 'OWNER_DECISION_REQUIRED'
   | 'CAPABILITY_DENIED'
+  | 'LOCAL_RATE_LIMITED'
   | 'APPROVAL_NOT_FOUND'
   | 'INVALID_REQUEST'
   | 'CREDENTIAL_MISSING'
@@ -802,13 +803,19 @@ export type RuntimeFailureCode =
   | 'PRECONDITION_FAILED';
 
 export class RuntimeError extends Error {
+  public readonly publicDetails: Readonly<Record<string, string | number | boolean | null>> | undefined;
+
   public constructor(
     public readonly code: RuntimeFailureCode,
     message: string,
-    options?: { readonly cause?: unknown },
+    options?: {
+      readonly cause?: unknown;
+      readonly publicDetails?: Readonly<Record<string, string | number | boolean | null>>;
+    },
   ) {
     super(message);
     this.name = 'RuntimeError';
+    this.publicDetails = options?.publicDetails;
     if (options?.cause !== undefined) {
       Object.defineProperty(this, 'cause', { value: options.cause, configurable: true });
     }
