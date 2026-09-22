@@ -10,13 +10,13 @@ The engine is invoked through the FULL-only `security_audit` MCP tool. PRO remai
 
 1. **No per-command audit lock or approval ceremony.** Proof Gate evaluates evidence quality and finding truth. It never grants execution authority.
 2. **Hunter and Verifier are read-only Multi-Worker tasks.** Their immutable authority envelope has `mutablePaths=[]`, `mutablePathOwnership=READ_ONLY`, and read-only capabilities only.
-3. **Verifier independence is structural.** A verification must use a different durable worker identity from the Hunter that produced the candidate.
+3. **Verifier independence is structural.** A verification must use a different durable worker identity, role/task, result provenance, and read-only authority envelope from the Hunter that produced the candidate. Phase 2 does not claim separate model-process isolation because Multi-Worker V1 exposes `IRIS_LOGICAL` worker provenance rather than a distinct model-process attestation primitive.
 4. **Runtime identity is fenced.** Worker assignment records machine/runtime/instance/deployment/catalog identity through the existing Multi-Worker runtime fence.
 5. **Evidence is durable and bound.** Security evidence references are restricted to:
    - `file:<workspace-relative-path>#L<start>-L<end>`, and the path must be present in `filesRead`;
    - `artifact:<artifact-uuid>`, and the artifact must belong to the audit workspace;
    - `receipt:sha256:<digest>` for non-source receipts.
-   Proof Gate requires source evidence from Hunter and Verifier; receipt-only model agreement is insufficient for VERIFIED.
+   When a source ref is accepted, the engine records a SHA-256 binding receipt over the exact reference identity plus current source bytes. Proof Gate revalidates the source and requires the binding receipt to match; changed files/artifacts become NEEDS_MORE_EVIDENCE even when the path/range still exists. Receipt-only model agreement remains insufficient for VERIFIED.
 6. **Mission completion is gated only by active audit lifecycle.** A mission with an active Security Audit run cannot complete until the run is finalized or cancelled.
 7. **Cross-chat continuation remains fail-closed.** Mission rebind is authoritative. An audit may rebind the underlying Multi-Worker session only when every task in that run is read-only; assignment authority digests are recomputed atomically.
 8. **Durability uses generation CAS and atomic publication.** Security audit state is persisted separately from Multi-Worker state but all references are validated on read/write.
@@ -71,11 +71,11 @@ A later verification attempt may be recorded for a finding that needs more evide
 
 A finding can become VERIFIED only when all of the following are true:
 
-- Hunter task has a successful durable WorkerResult.
-- Hunter has source evidence.
+- Hunter task has a successful durable read-only WorkerResult.
+- Hunter has source evidence whose current bytes still match its durable binding receipt.
 - Verifier worker identity differs from Hunter worker identity.
 - Verifier task has a successful read-only WorkerResult.
-- Verifier has source evidence.
+- Verifier has source evidence whose current bytes still match its durable binding receipt.
 - The latest verifier decision is VERIFIED.
 
 A verifier REJECTED decision produces REJECTED only when evidence requirements are satisfied. Missing evidence always resolves to NEEDS_MORE_EVIDENCE.

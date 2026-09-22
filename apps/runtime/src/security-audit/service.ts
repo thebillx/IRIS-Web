@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { lstat, open, realpath } from 'node:fs/promises';
+import path from 'node:path';
 import {
   RuntimeError,
   type CapabilityId,
@@ -296,16 +298,18 @@ export class SecurityAuditService {
       if (input.coverageStatus !== 'COVERED' && input.coverageStatus !== 'GAP') throw new RuntimeError('INVALID_REQUEST', 'coverageStatus is invalid');
       const summary = bounded(input.summary, 'summary', 4_000);
       const evidenceRefs = strings(input.evidenceRefs, 'evidenceRefs', 128, 2_000);
-      const filesRead = strings(input.filesRead, 'filesRead', 128, 2_000);
-      await this.validateEvidenceRefs(evidenceRefs, filesRead, run.projectId, run.workspaceId);
+      const filesRead = workspacePaths(input.filesRead, 'filesRead', 128, 2_000);
+      const bindingReceipts = await this.validateEvidenceRefs(evidenceRefs, filesRead, run.projectId, run.workspaceId);
       if (!Array.isArray(input.findings) || input.findings.length > MAX_FINDINGS_PER_REPORT) throw new RuntimeError('INVALID_REQUEST', 'findings exceeds the bounded report limit');
       const candidates = input.findings.map(normalizeCandidate);
-      for (const candidate of candidates) await this.validateEvidenceRefs(candidate.evidenceRefs, filesRead, run.projectId, run.workspaceId);
+      for (const candidate of candidates) {
+        bindingReceipts.push(...await this.validateEvidenceRefs(candidate.evidenceRefs, filesRead, run.projectId, run.workspaceId));
+      }
       if (input.coverageStatus === 'GAP' && candidates.length > 0) throw new RuntimeError('INVALID_REQUEST', 'Coverage GAP report cannot publish findings');
 
       const result = await this.finalizeWorkerTask(run.orchestrationRunId, target.hunterTaskId, target.hunterWorkerId, {
         summary,
-        evidenceRefs: union(evidenceRefs, candidates.flatMap((candidate) => candidate.evidenceRefs)),
+        evidenceRefs: union(union(evidenceRefs, candidates.flatMap((candidate) => candidate.evidenceRefs)), bindingReceipts),
         filesRead,
         validationName: 'security-hunter-report',
       });
@@ -391,8 +395,8 @@ export class SecurityAuditService {
       if (!['VERIFIED','REJECTED','NEEDS_MORE_EVIDENCE'].includes(input.decision)) throw new RuntimeError('INVALID_REQUEST', 'Verifier decision is invalid');
       const rationale = bounded(input.rationale, 'rationale', 4_000);
       const evidenceRefs = strings(input.evidenceRefs, 'evidenceRefs', 128, 2_000);
-      const filesRead = strings(input.filesRead, 'filesRead', 128, 2_000);
-      await this.validateEvidenceRefs(evidenceRefs, filesRead, run.projectId, run.workspaceId);
+      const filesRead = workspacePaths(input.filesRead, 'filesRead', 128, 2_000);
+      const bindingReceipts = await this.validateEvidenceRefs(evidenceRefs, filesRead, run.projectId, run.workspaceId);
       const mwBeforeVerifier = await this.multiWorker.getRun(run.orchestrationRunId);
       if (mwBeforeVerifier.run.sessionId !== input.sessionId) {
         await this.multiWorker.rebindRunSession({
@@ -443,7 +447,7 @@ export class SecurityAuditService {
       });
       const result = await this.finalizeWorkerTask(run.orchestrationRunId, task.id, worker.id, {
         summary: rationale,
-        evidenceRefs,
+        evidenceRefs: union(evidenceRefs, bindingReceipts),
         filesRead,
         validationName: 'security-verifier-report',
       });
@@ -495,15 +499,20 @@ export class SecurityAuditService {
       const satisfied: string[] = [];
       const missing: string[] = [];
       const hunterResult = await this.multiWorker.getResult(finding.hunterResultId).catch(() => null);
+      const hunterEvidenceValid = hunterResult !== null
+        && await this.evidenceRefsRemainValid(finding.evidenceRefs, hunterResult.filesRead, run.projectId, run.workspaceId, hunterResult.evidenceRefs);
       requirement(hunterResult?.status === 'SUCCEEDED', 'HUNTER_RESULT_SUCCEEDED', satisfied, missing);
-      requirement(hasSourceEvidence(finding.evidenceRefs) || hasSourceEvidence(hunterResult?.evidenceRefs ?? []), 'HUNTER_EVIDENCE_PRESENT', satisfied, missing);
+      requirement(hunterResult?.filesChanged.length === 0, 'HUNTER_RESULT_READ_ONLY', satisfied, missing);
+      requirement(hunterEvidenceValid && hasSourceEvidence(finding.evidenceRefs), 'HUNTER_EVIDENCE_PRESENT', satisfied, missing);
 
       const verificationId = finding.verificationIds.at(-1) ?? null;
       const verification = verificationId === null ? null : requiredVerification(current, verificationId);
       requirement(verification !== null && verification.verifierWorkerId !== finding.hunterWorkerId, 'INDEPENDENT_VERIFIER', satisfied, missing);
       const verifierResult = verification === null ? null : await this.multiWorker.getResult(verification.verifierResultId).catch(() => null);
+      const verifierEvidenceValid = verification !== null && verifierResult !== null
+        && await this.evidenceRefsRemainValid(verification.evidenceRefs, verifierResult.filesRead, run.projectId, run.workspaceId, verifierResult.evidenceRefs);
       requirement(verifierResult?.status === 'SUCCEEDED' && verifierResult.filesChanged.length === 0, 'VERIFIER_RESULT_READ_ONLY', satisfied, missing);
-      requirement(hasSourceEvidence(verification?.evidenceRefs ?? []), 'VERIFIER_EVIDENCE_PRESENT', satisfied, missing);
+      requirement(verifierEvidenceValid && hasSourceEvidence(verification?.evidenceRefs ?? []), 'VERIFIER_EVIDENCE_PRESENT', satisfied, missing);
 
       let decision: SecurityVerificationDecision;
       if (missing.length > 0 || verification === null) decision = 'NEEDS_MORE_EVIDENCE';
@@ -744,18 +753,37 @@ export class SecurityAuditService {
     }
   }
 
+  private async evidenceRefsRemainValid(
+    refs: readonly string[],
+    filesRead: readonly string[],
+    projectId: string,
+    workspaceId: string,
+    boundEvidenceRefs: readonly string[],
+  ): Promise<boolean> {
+    try {
+      const currentBindingReceipts = await this.validateEvidenceRefs(refs, filesRead, projectId, workspaceId);
+      return currentBindingReceipts.every((receipt) => boundEvidenceRefs.includes(receipt));
+    } catch {
+      return false;
+    }
+  }
+
   private async validateEvidenceRefs(
     refs: readonly string[],
     filesRead: readonly string[],
     projectId: string,
     workspaceId: string,
-  ): Promise<void> {
+  ): Promise<string[]> {
+    const workspace = await this.resources.getActiveWorkspace(projectId, workspaceId);
+    const bindingReceipts: string[] = [];
     for (const ref of refs) {
       const parsed = parseEvidenceRef(ref);
       if (parsed.kind === 'file') {
         if (!filesRead.includes(parsed.path)) {
           throw new RuntimeError('CAPABILITY_DENIED', 'File evidence must reference a path declared in filesRead');
         }
+        const sha256 = await assertFileEvidenceRange(workspace.physicalRoot, parsed);
+        bindingReceipts.push(sourceEvidenceBindingReceipt(ref, sha256));
         continue;
       }
       if (parsed.kind === 'artifact') {
@@ -763,8 +791,11 @@ export class SecurityAuditService {
         if (String(artifact.workspaceId) !== workspaceId) {
           throw new RuntimeError('CAPABILITY_DENIED', 'Security evidence artifact does not belong to the audit workspace');
         }
+        const sha256 = await assertArtifactEvidenceIntegrity(artifact.physicalPath, artifact.size, artifact.sha256);
+        bindingReceipts.push(sourceEvidenceBindingReceipt(ref, sha256));
       }
     }
+    return [...new Set(bindingReceipts)];
   }
 
   private runtimeFence(): WorkerRuntimeFence {
@@ -839,12 +870,10 @@ type ParsedEvidenceRef =
 function parseEvidenceRef(value: string): ParsedEvidenceRef {
   const file = /^file:([^#]+)#L([1-9]\d*)-L([1-9]\d*)$/.exec(value);
   if (file !== null) {
-    const candidate = file[1]!;
+    const candidate = canonicalWorkspacePath(file[1]!, 'Security file evidence path');
     const startLine = Number(file[2]);
     const endLine = Number(file[3]);
-    if (candidate.startsWith('/') || candidate.includes('\\') || candidate.includes('\0') || candidate === '.' || candidate === '..'
-      || candidate.startsWith('../') || candidate.split('/').some((segment) => segment === '..')
-      || !Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || endLine < startLine) {
+    if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || endLine < startLine) {
       throw new RuntimeError('INVALID_REQUEST', 'Security file evidence reference is invalid');
     }
     return { kind: 'file', path: candidate, startLine, endLine };
@@ -854,6 +883,88 @@ function parseEvidenceRef(value: string): ParsedEvidenceRef {
   const receipt = /^receipt:sha256:([0-9a-f]{64})$/.exec(value);
   if (receipt !== null) return { kind: 'receipt', sha256: receipt[1]! };
   throw new RuntimeError('INVALID_REQUEST', 'Security evidence reference must be a bounded file, artifact, or SHA-256 receipt reference');
+}
+
+async function assertFileEvidenceRange(
+  workspaceRoot: string,
+  evidence: Extract<ParsedEvidenceRef, { readonly kind: 'file' }>,
+): Promise<string> {
+  const lexical = path.resolve(workspaceRoot, evidence.path);
+  if (!pathIsWithin(workspaceRoot, lexical) || lexical === workspaceRoot) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Security file evidence escapes the audit workspace');
+  }
+  let physical: string;
+  try {
+    const metadata = await lstat(lexical);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error('not a physical regular file');
+    physical = await realpath(lexical);
+  } catch (error) {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Security file evidence target is unavailable', { cause: error });
+  }
+  if (!pathIsWithin(workspaceRoot, physical)) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Security file evidence resolves outside the audit workspace');
+  }
+
+  const handle = await open(physical, 'r');
+  try {
+    const digest = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    let currentLine = 1;
+    let endLineExists = false;
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+      digest.update(buffer.subarray(0, bytesRead));
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (currentLine === evidence.endLine) endLineExists = true;
+        if (buffer[index] === 0x0a) currentLine += 1;
+      }
+    }
+    if (!endLineExists) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Security file evidence line range does not exist');
+    }
+    return digest.digest('hex');
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertArtifactEvidenceIntegrity(physicalPath: string, expectedSize: number, expectedSha256: string): Promise<string> {
+  let metadata;
+  try {
+    metadata = await lstat(physicalPath);
+  } catch (error) {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Security evidence artifact is unavailable', { cause: error });
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size !== expectedSize) {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Security evidence artifact no longer matches its registered metadata');
+  }
+  const handle = await open(physicalPath, 'r');
+  try {
+    const digest = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+      digest.update(buffer.subarray(0, bytesRead));
+    }
+    const observedSha256 = digest.digest('hex');
+    if (observedSha256 !== expectedSha256) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Security evidence artifact hash no longer matches its registered metadata');
+    }
+    return observedSha256;
+  } finally {
+    await handle.close();
+  }
+}
+
+function sourceEvidenceBindingReceipt(ref: string, sourceSha256: string): string {
+  const digest = createHash('sha256').update(ref).update('\0').update(sourceSha256).digest('hex');
+  return `receipt:sha256:${digest}`;
 }
 
 function hasSourceEvidence(refs: readonly string[]): boolean {
@@ -957,6 +1068,25 @@ function replaceById<T extends { readonly id: string }>(values: readonly T[], va
 function uniqueOrThrow(values: readonly string[], label: string): void {
   if (new Set(values).size !== values.length) throw new RuntimeError('INVALID_REQUEST', `Duplicate ${label}`);
 }
+function workspacePaths(value: readonly string[], label: string, maxItems: number, maxLength: number): string[] {
+  return strings(value, label, maxItems, maxLength).map((entry) => canonicalWorkspacePath(entry, label));
+}
+
+function canonicalWorkspacePath(value: string, label: string): string {
+  const candidate = bounded(value, label, 2_000);
+  const segments = candidate.split('/');
+  if (path.posix.isAbsolute(candidate) || candidate.includes('\\') || segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')
+    || path.posix.normalize(candidate) !== candidate) {
+    throw new RuntimeError('INVALID_REQUEST', `${label} must be a canonical workspace-relative path`);
+  }
+  return candidate;
+}
+
+function pathIsWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
 function strings(value: readonly string[], label: string, maxItems: number, maxLength: number): string[] {
   if (!Array.isArray(value) || value.length > maxItems) throw new RuntimeError('INVALID_REQUEST', `${label} is invalid`);
   const normalized = value.map((entry) => bounded(entry, label, maxLength));

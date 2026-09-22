@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -20,7 +21,12 @@ async function fixture() {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-security-audit-data-'));
   roots.push(sourceRoot, dataRoot);
   const projectRoot = path.join(sourceRoot, 'iris');
-  await mkdir(projectRoot);
+  await mkdir(path.join(projectRoot, 'apps/runtime/src'), { recursive: true });
+  await writeFile(
+    path.join(projectRoot, 'apps/runtime/src/capability-service.ts'),
+    Array.from({ length: 220 }, (_, index) => `line ${index + 1}\n`).join(''),
+    'utf8',
+  );
   const state = new RuntimeState(new FoundationStateStore(dataRoot));
   const project = await state.registerProject('iris', projectRoot);
   const session = state.createSession('chatgpt-security', 'iris-tunnel-service', 'other');
@@ -59,7 +65,7 @@ async function fixture() {
   });
   const store = new SecurityAuditStore(dataRoot);
   const service = new SecurityAuditService(state, multiWorker, resources, store, health, () => '2026-09-22T05:30:00.000Z');
-  return { state, project, session, mission, resources, workspace, multiWorker, store, service };
+  return { state, project, session, mission, resources, workspace, multiWorker, store, service, projectRoot };
 }
 
 async function createRun(f: Awaited<ReturnType<typeof fixture>>, title = 'Trust boundary') {
@@ -139,6 +145,7 @@ describe('Security Audit Engine Phase 2', () => {
     });
     expect(proofed.proofGateResults[0]?.satisfiedRequirements).toEqual(expect.arrayContaining([
       'HUNTER_RESULT_SUCCEEDED',
+      'HUNTER_RESULT_READ_ONLY',
       'HUNTER_EVIDENCE_PRESENT',
       'INDEPENDENT_VERIFIER',
       'VERIFIER_RESULT_READ_ONLY',
@@ -204,6 +211,77 @@ describe('Security Audit Engine Phase 2', () => {
     });
     expect(proofed.findings[0]?.state).toBe('NEEDS_MORE_EVIDENCE');
     expect(proofed.proofGateResults[0]?.missingRequirements).toContain('VERIFIER_EVIDENCE_PRESENT');
+  });
+
+  it('requires finding-specific Hunter evidence instead of allowing coverage evidence to substitute', async () => {
+    const f = await fixture();
+    const created = await createRun(f);
+    const hunted = await f.service.recordHunterReport({
+      clientId: f.session.clientId,
+      sessionId: f.session.id,
+      projectId: f.project.id,
+      auditRunId: created.run.id,
+      coverageTargetId: created.coverageTargets[0]!.id,
+      coverageStatus: 'COVERED',
+      summary: 'Coverage has evidence but the finding does not.',
+      evidenceRefs: ['file:apps/runtime/src/capability-service.ts#L80-L99'],
+      filesRead: ['apps/runtime/src/capability-service.ts'],
+      findings: [candidate({ evidenceRefs: [] })],
+    });
+    await f.service.recordVerifierReport({
+      clientId: f.session.clientId,
+      sessionId: f.session.id,
+      projectId: f.project.id,
+      auditRunId: hunted.run.id,
+      findingId: hunted.findings[0]!.id,
+      decision: 'VERIFIED',
+      rationale: 'Verifier has independent source evidence.',
+      evidenceRefs: ['file:apps/runtime/src/capability-service.ts#L100-L120'],
+      filesRead: ['apps/runtime/src/capability-service.ts'],
+    });
+    const proofed = await f.service.evaluateProofGate({
+      clientId: f.session.clientId,
+      sessionId: f.session.id,
+      projectId: f.project.id,
+      auditRunId: hunted.run.id,
+      findingId: hunted.findings[0]!.id,
+    });
+    expect(proofed.findings[0]?.state).toBe('NEEDS_MORE_EVIDENCE');
+    expect(proofed.proofGateResults[0]?.missingRequirements).toContain('HUNTER_EVIDENCE_PRESENT');
+  });
+
+  it('revalidates source evidence at Proof Gate and refuses stale file evidence', async () => {
+    const f = await fixture();
+    const hunted = await hunterWithFinding(f);
+    await f.service.recordVerifierReport({
+      clientId: f.session.clientId,
+      sessionId: f.session.id,
+      projectId: f.project.id,
+      auditRunId: hunted.run.id,
+      findingId: hunted.findings[0]!.id,
+      decision: 'VERIFIED',
+      rationale: 'Verifier reproduced the candidate before source evidence changed.',
+      evidenceRefs: ['file:apps/runtime/src/capability-service.ts#L100-L120'],
+      filesRead: ['apps/runtime/src/capability-service.ts'],
+    });
+    await writeFile(
+      path.join(f.workspace.physicalRoot, 'apps/runtime/src/capability-service.ts'),
+      Array.from({ length: 220 }, (_, index) => `changed line ${index + 1}\n`).join(''),
+      'utf8',
+    );
+
+    const proofed = await f.service.evaluateProofGate({
+      clientId: f.session.clientId,
+      sessionId: f.session.id,
+      projectId: f.project.id,
+      auditRunId: hunted.run.id,
+      findingId: hunted.findings[0]!.id,
+    });
+    expect(proofed.findings[0]?.state).toBe('NEEDS_MORE_EVIDENCE');
+    expect(proofed.proofGateResults[0]?.missingRequirements).toEqual(expect.arrayContaining([
+      'HUNTER_EVIDENCE_PRESENT',
+      'VERIFIER_EVIDENCE_PRESENT',
+    ]));
   });
 
   it('records an evidence-backed verifier rejection as REJECTED rather than VERIFIED', async () => {
@@ -358,6 +436,54 @@ describe('Security Audit Engine Phase 2', () => {
       evidenceRefs: ['file:apps/runtime/src/state.ts#L1-L10'],
       filesRead: ['apps/runtime/src/capability-service.ts'],
     })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    await expect(f.service.recordHunterReport({
+      ...common,
+      evidenceRefs: ['file:apps/runtime/src/state.ts#L1-L10'],
+      filesRead: ['apps/runtime/src/state.ts'],
+    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    await expect(f.service.recordHunterReport({
+      ...common,
+      evidenceRefs: ['file:apps/runtime/src/capability-service.ts#L999-L1000'],
+      filesRead: ['apps/runtime/src/capability-service.ts'],
+    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    await expect(f.service.recordHunterReport({
+      ...common,
+      evidenceRefs: ['file:apps//runtime/src/capability-service.ts#L1-L2'],
+      filesRead: ['apps/runtime/src/capability-service.ts'],
+    })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+  });
+
+  it('rejects artifact evidence whose bytes no longer match the registered hash', async () => {
+    const f = await fixture();
+    const created = await createRun(f);
+    const filename = path.join(f.workspace.physicalRoot, 'security-evidence.txt');
+    const original = 'security evidence v1\n';
+    await writeFile(filename, original, 'utf8');
+    const artifact = await f.resources.registerArtifact({
+      projectId: f.project.id,
+      workspaceId: f.workspace.workspaceId,
+      physicalPath: filename,
+      mime: 'text/plain',
+      artifactType: 'security-audit-evidence',
+      size: Buffer.byteLength(original, 'utf8'),
+      sha256: createHash('sha256').update(original).digest('hex'),
+      sensitivity: 'INTERNAL',
+      retentionPolicy: 'MISSION',
+    });
+    await writeFile(filename, 'tampered security evidence\n', 'utf8');
+
+    await expect(f.service.recordHunterReport({
+      clientId: f.session.clientId,
+      sessionId: f.session.id,
+      projectId: f.project.id,
+      auditRunId: created.run.id,
+      coverageTargetId: created.coverageTargets[0]!.id,
+      coverageStatus: 'COVERED',
+      summary: 'Artifact integrity adversarial report',
+      evidenceRefs: [`artifact:${artifact.artifactId}`],
+      filesRead: [],
+      findings: [],
+    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
   it('uses project-bound Direct Context for security_audit calls without an explicit sessionId', async () => {

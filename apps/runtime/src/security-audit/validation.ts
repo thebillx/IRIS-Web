@@ -203,8 +203,9 @@ function securityEvidenceRef(value: unknown): boolean {
     const candidate = file[1]!;
     const start = Number(file[2]);
     const end = Number(file[3]);
-    return !candidate.startsWith('/') && !candidate.includes('\\') && candidate !== '.' && candidate !== '..'
-      && !candidate.startsWith('../') && !candidate.split('/').some((segment) => segment === '..')
+    const segments = candidate.split('/');
+    return !candidate.startsWith('/') && !candidate.includes('\\')
+      && !segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')
       && Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start;
   }
   return /^artifact:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
