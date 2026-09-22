@@ -91,7 +91,11 @@ export async function handleMcpV21Request(
     const runtimeError = error instanceof RuntimeError
       ? error
       : new RuntimeError('INVALID_REQUEST', error instanceof Error ? error.message : 'Lifecycle/Phase 2 tool call failed');
-    return jsonRpcResult(rpc.id ?? null, toolError(runtimeError.code, runtimeError.message));
+    return jsonRpcResult(rpc.id ?? null, toolError(
+      runtimeError.code,
+      runtimeError.message,
+      runtimeError.publicDetails === undefined ? {} : { ...runtimeError.publicDetails },
+    ));
   }
 }
 

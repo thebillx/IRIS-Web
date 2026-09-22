@@ -484,7 +484,20 @@ export class AdoRequirementContextService {
     const floor = now - windowMs;
     const active = (this.requestWindows.get(key) ?? []).filter((timestamp) => timestamp > floor);
     if (active.length >= requests) {
-      throw new RuntimeError('CAPABILITY_DENIED', 'ADO local read rate limit exceeded; no automatic retry was performed');
+      const retryAfterMs = Math.max(1, active[0]! + windowMs - now);
+      this.requestWindows.set(key, active);
+      throw new RuntimeError(
+        'LOCAL_RATE_LIMITED',
+        'ADO local read rate limit exceeded; no automatic retry was performed',
+        {
+          publicDetails: {
+            retryAfterMs,
+            limit: requests,
+            remaining: 0,
+            windowMs,
+          },
+        },
+      );
     }
     active.push(now);
     this.requestWindows.set(key, active);
