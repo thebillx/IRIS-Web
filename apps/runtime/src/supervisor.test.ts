@@ -403,6 +403,81 @@ setInterval(() => undefined, 1000);
     expect(stopped.runtime.state).toBe('FAILED');
   }, 30_000);
 
+  it('probes verified owned tunnels with their recorded executable when the configured tunnel client is unavailable', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-owned-executable-'));
+    const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-owned-executable-fake-'));
+    roots.push(dataRoot, fakeRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      fullHealthPort: await freePort(),
+      proHealthPort: await freePort(),
+    });
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const fakeTunnel = await fakeTunnelClient(fakeRoot);
+    const webPort = await freePort();
+    const adminPort = await freePort();
+    const owner = await createSupervisor({ dataRoot, sourceRoot, tunnelClientPath: fakeTunnel, webPort, adminPort });
+    await owner.up();
+
+    const statusOnly = await createSupervisor({
+      dataRoot,
+      sourceRoot,
+      tunnelClientPath: 'definitely-missing-tunnel-client',
+      webPort,
+      adminPort,
+    });
+    const status = await statusOnly.status();
+    expect(status.tunnel).toMatchObject({ state: 'READY', code: 'READY' });
+    expect(status.connectors.map((connector) => connector.state)).toEqual(['READY', 'READY']);
+
+    await owner.down();
+  }, 30_000);
+
+  it('recycles owned workload tunnels when the supervisor source root changes', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-source-reconcile-'));
+    const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-source-reconcile-fake-'));
+    const nextSourceRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-source-next-'));
+    roots.push(dataRoot, fakeRoot, nextSourceRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      fullHealthPort: await freePort(),
+      proHealthPort: await freePort(),
+    });
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const fakeTunnel = await fakeTunnelClient(fakeRoot);
+    const webPort = await freePort();
+    const adminPort = await freePort();
+    const first = await createSupervisor({ dataRoot, sourceRoot, tunnelClientPath: fakeTunnel, webPort, adminPort });
+    await first.up();
+
+    const statePath = path.join(dataRoot, 'supervisor', 'state.json');
+    const before = JSON.parse(await readFile(statePath, 'utf8')) as {
+      readonly runtime: { readonly pid: number } | null;
+      readonly admin: { readonly pid: number } | null;
+      readonly tunnels: {
+        readonly full: { readonly pid: number; readonly workingDirectory?: string | null } | null;
+        readonly pro: { readonly pid: number; readonly workingDirectory?: string | null } | null;
+      };
+    };
+
+    const next = await createSupervisor({ dataRoot, sourceRoot: nextSourceRoot, tunnelClientPath: fakeTunnel, webPort, adminPort });
+    const reconciled = await next.up();
+    expect(reconciled.tunnel).toMatchObject({ state: 'READY', code: 'READY' });
+    const after = JSON.parse(await readFile(statePath, 'utf8')) as typeof before;
+    expect(after.runtime?.pid).toBe(before.runtime?.pid);
+    expect(after.admin?.pid).toBe(before.admin?.pid);
+    expect(after.tunnels.full?.pid).not.toBe(before.tunnels.full?.pid);
+    expect(after.tunnels.pro?.pid).not.toBe(before.tunnels.pro?.pid);
+    expect(after.tunnels.full?.workingDirectory).toBe(nextSourceRoot);
+    expect(after.tunnels.pro?.workingDirectory).toBe(nextSourceRoot);
+
+    await next.down();
+  }, 30_000);
+
   it('isolates admin/workload tunnel digests and recycles only the admin child', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-isolated-admin-'));
     const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-isolated-admin-fake-'));
