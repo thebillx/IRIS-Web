@@ -1146,10 +1146,11 @@ export class Supervisor {
       if (inspected === 'running') {
         const profileChanged = current.profilePath !== profilePath
           || current.tunnelId !== binding.tunnelId
-          || current.profileDigest !== profileDigest;
+          || current.profileDigest !== profileDigest
+          || current.workingDirectory !== this.sourceRoot;
         if (!profileChanged) {
           try {
-            await waitForTunnel(await resolveExecutable(this.tunnelClientPath), this.adminTunnelHealthPort, 750);
+            await waitForTunnel(current.executable, this.adminTunnelHealthPort, 750);
             return state;
           } catch {
             // Recycle only the verified admin tunnel when its own readiness fails.
@@ -1227,10 +1228,11 @@ export class Supervisor {
           || current.runtimeId !== binding.runtimeId
           || current.instanceId !== runtimeInstanceId
           || current.profileDigest !== profileDigest
+          || current.workingDirectory !== this.sourceRoot
           || runtimeReplaced;
         if (!deploymentChanged) {
           try {
-            await waitForTunnel(await resolveExecutable(this.tunnelClientPath), binding.healthPort, 750);
+            await waitForTunnel(current.executable, binding.healthPort, 750);
             return state;
           } catch {
             // A live process with failed readiness is still an owned process. Recycle it
@@ -1277,7 +1279,7 @@ export class Supervisor {
     if (inspected === 'ambiguous') return layer('FAILED', 'PROCESS_OWNERSHIP_AMBIGUOUS', 'Tunnel process identity is ambiguous');
     if (inspected === 'stopped') return layer('FAILED', 'TUNNEL_NOT_RUNNING', 'Tunnel process is stopped');
     try {
-      await waitForTunnel(await resolveExecutable(this.tunnelClientPath), binding.healthPort, 2_000);
+      await waitForTunnel(record.executable, binding.healthPort, 2_000);
       return layer('READY', 'READY', `${binding.label} tunnel health and readiness are healthy`);
     } catch (error) {
       return layer('FAILED', runtimeErrorCode(error), `${binding.label} tunnel readiness failed`);
@@ -1296,7 +1298,7 @@ export class Supervisor {
     if (inspected === 'ambiguous') return layer('FAILED', 'PROCESS_OWNERSHIP_AMBIGUOUS', 'Isolated admin tunnel process identity is ambiguous');
     if (inspected === 'stopped') return layer('FAILED', 'TUNNEL_NOT_RUNNING', 'Isolated admin tunnel process is stopped');
     try {
-      await waitForTunnel(await resolveExecutable(this.tunnelClientPath), this.adminTunnelHealthPort, 2_000);
+      await waitForTunnel(record.executable, this.adminTunnelHealthPort, 2_000);
       return layer('READY', 'READY', 'Isolated admin tunnel health and readiness are healthy');
     } catch (error) {
       return layer('FAILED', runtimeErrorCode(error), 'Isolated admin tunnel readiness failed');
