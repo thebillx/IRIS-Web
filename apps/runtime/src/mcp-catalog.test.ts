@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, MCP_CATALOG_VERSION, orderToolDefinitions } from './mcp-catalog.js';
+import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, isSupportedCatalogVersion, MCP_CATALOG_VERSION, orderToolDefinitions } from './mcp-catalog.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
 import { proMcpToolDefinitions } from './mcp.js';
 
@@ -35,6 +35,16 @@ describe('canonical MCP catalog', () => {
     expect(v25.catalogHash).not.toBe(v26.catalogHash);
     expect(MCP_CATALOG_VERSION).toBe('2.6.0');
     expect(catalogIdentity('PRO', definitions)).toEqual(v26);
+  });
+
+  it('accepts the next catalog version for controlled transition parsing without changing the control-source catalog', () => {
+    expect(MCP_CATALOG_VERSION).toBe('2.6.0');
+    expect(isSupportedCatalogVersion('2.7.0')).toBe(true);
+    expect(catalogIdentityAtVersion('PRO', proMcpToolDefinitions(), '2.7.0')).toMatchObject({
+      profile: 'PRO',
+      catalogVersion: '2.7.0',
+      toolCount: 5,
+    });
   });
 
   it('keeps the exact read-only PRO allowlist separate from governed FULL tools', () => {
