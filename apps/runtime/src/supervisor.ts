@@ -425,7 +425,7 @@ export class Supervisor {
     if (state.runtime !== null) {
       if (observed.state === 'running') {
         assertRuntimeOwnership(state.runtime, observed);
-        await stopRuntime(this.dataRoot, CONTROLLED_ACTIVATION_SHUTDOWN_DEADLINE_MS);
+        await this.retireRuntime(state.runtime, observed, CONTROLLED_ACTIVATION_SHUTDOWN_DEADLINE_MS);
       } else {
         await this.retireRuntime(state.runtime, observed);
       }
@@ -1009,13 +1009,13 @@ export class Supervisor {
     return { state: stateValue, runtime: runtimeLayer, web: webLayer, tunnel: tunnelLayer, controlPlane, localRuntime: local.status, endToEnd: e2e, connectors: connectorStatuses, credentials, registryPresent: true, recovery: recoveryView((await this.readState()).recovery) };
   }
 
-  private async retireRuntime(record: OwnedProcess, observed: RuntimeObservedStatus): Promise<void> {
+  private async retireRuntime(record: OwnedProcess, observed: RuntimeObservedStatus, shutdownDeadlineMs = 10_000): Promise<void> {
     const inspected = await inspectProcess(record);
     if (inspected === 'ambiguous') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Recorded runtime process identity is not verified');
     if (inspected === 'running') {
       if (observed.state === 'running') {
         try {
-          await stopRuntime(this.dataRoot);
+          await stopRuntime(this.dataRoot, shutdownDeadlineMs);
         } catch {
           if (await inspectProcess(record) !== 'running') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Runtime identity changed during graceful shutdown');
           await stopOwnedProcess(record, true);
