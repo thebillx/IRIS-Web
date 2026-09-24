@@ -48,7 +48,7 @@ describe('canonical MCP catalog', () => {
     expect(catalogToolNames('PRO')).not.toContain('git_local');
     expect(catalogToolNames('PRO')).not.toContain('remote_publish');
     expect(catalogToolNames('PRO')).not.toContain('mission_rebind');
-    for (const name of ['ado_discovery','ado_workitem_read','ado_hierarchy_read','ado_context_search']) {
+    for (const name of ['ado_discovery','ado_workitem_read','ado_hierarchy_read','ado_context_search','ado_backlog_list']) {
       expect(catalogToolNames('FULL')).toContain(name);
       expect(catalogToolNames('PRO')).not.toContain(name);
     }

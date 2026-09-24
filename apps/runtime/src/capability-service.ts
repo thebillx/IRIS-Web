@@ -58,6 +58,7 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'ado.workitem.read'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly requestId: string; readonly workItemId: number; readonly includeComments: boolean; readonly includeLinks: boolean }
   | { readonly capabilityId: 'ado.hierarchy.read'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly requestId: string; readonly rootWorkItemId: number; readonly maxDepth: number; readonly maxItems: number }
   | { readonly capabilityId: 'ado.context.search'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly requestId: string; readonly query: string; readonly limit: number }
+  | { readonly capabilityId: 'ado.backlog.list'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly requestId: string; readonly backlog: string; readonly cursor: string | null; readonly limit: number }
   | { readonly capabilityId: 'project.test.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'project.command.run'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined; readonly scriptName: string }
   | { readonly capabilityId: 'project.validation.discover'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string }
@@ -629,6 +630,16 @@ export class CapabilityService {
         limit: operation.limit,
       });
     }
+    if (operation.capabilityId === 'ado.backlog.list') {
+      const project = await this.authorizedProject(operation);
+      return this.adoContextService().backlogList({
+        projectId: project.id,
+        requestId: operation.requestId,
+        backlog: operation.backlog,
+        cursor: operation.cursor,
+        limit: operation.limit,
+      });
+    }
     if (operation.capabilityId === 'project.test.run') {
       const project = await this.authorizedProject(operation);
       return this.validationCompatibility().run(project, 'test', decision.effectiveEffects ?? [], operation.mission);
@@ -1034,7 +1045,7 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
-  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'ado.discovery' || operation.capabilityId === 'ado.workitem.read' || operation.capabilityId === 'ado.hierarchy.read' || operation.capabilityId === 'ado.context.search' || operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.discover' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'project.validation.job.read' || operation.capabilityId === 'code_review.start' || operation.capabilityId === 'code_review.status' || operation.capabilityId === 'code_review.result' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish') {
+  } else if (operation.capabilityId === 'project.info' || operation.capabilityId === 'project.git_status' || operation.capabilityId === 'project.search' || operation.capabilityId === 'ado.discovery' || operation.capabilityId === 'ado.workitem.read' || operation.capabilityId === 'ado.hierarchy.read' || operation.capabilityId === 'ado.context.search' || operation.capabilityId === 'ado.backlog.list' || operation.capabilityId === 'project.test.run' || operation.capabilityId === 'project.command.run' || operation.capabilityId === 'project.validation.discover' || operation.capabilityId === 'project.validation.start' || operation.capabilityId === 'project.validation.job.read' || operation.capabilityId === 'code_review.start' || operation.capabilityId === 'code_review.status' || operation.capabilityId === 'code_review.result' || operation.capabilityId === 'git.local' || operation.capabilityId === 'remote.publish') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, projectId: operation.projectId };
   } else if (operation.capabilityId === 'mission.get') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId };
@@ -1159,6 +1170,7 @@ function describeOperation(operation: CapabilityOperation): string {
   if (operation.capabilityId === 'ado.workitem.read') return `ado.workitem.read projectId=${operation.projectId} workItemId=${operation.workItemId} comments=${operation.includeComments} links=${operation.includeLinks} requestId=${operation.requestId}`;
   if (operation.capabilityId === 'ado.hierarchy.read') return `ado.hierarchy.read projectId=${operation.projectId} rootWorkItemId=${operation.rootWorkItemId} maxDepth=${operation.maxDepth} maxItems=${operation.maxItems} requestId=${operation.requestId}`;
   if (operation.capabilityId === 'ado.context.search') return `ado.context.search projectId=${operation.projectId} queryLength=${operation.query.length} querySha256=${createHash('sha256').update(operation.query).digest('hex')} limit=${operation.limit} requestId=${operation.requestId}`;
+  if (operation.capabilityId === 'ado.backlog.list') return `ado.backlog.list projectId=${operation.projectId} backlog=${JSON.stringify(operation.backlog)} cursor=${operation.cursor ?? 'null'} limit=${operation.limit} requestId=${operation.requestId}`;
   if (operation.capabilityId === 'project.test.run') return `project.test.run projectId=${operation.projectId ?? 'session-current'} declared-script=test`;
   if (operation.capabilityId === 'project.command.run') return `project.command.run projectId=${operation.projectId ?? 'session-current'} declared-script=${operation.scriptName}`;
   if (operation.capabilityId === 'project.validation.discover') return `project.validation.discover projectId=${operation.projectId}`;

@@ -12,6 +12,7 @@ export const ADO_TOOL_NAMES = [
   'ado_workitem_read',
   'ado_hierarchy_read',
   'ado_context_search',
+  'ado_backlog_list',
 ] as const;
 
 export type AdoToolName = (typeof ADO_TOOL_NAMES)[number];
@@ -95,6 +96,22 @@ export function adoToolDefinitions(): readonly Record<string, unknown>[] {
       },
       annotations,
     },
+    {
+      name: 'ado_backlog_list',
+      description: 'Enumerate one exact provider-discovered Azure DevOps backlog level inside the protected Team Area Path. Server-built WIQL only; deterministic keyset cursor; FULL only.',
+      inputSchema: {
+        type: 'object',
+        required: ['projectId','requestId','backlog','limit','expectedEffects'],
+        properties: {
+          ...common,
+          backlog: { type: 'string', minLength: 1, maxLength: 100 },
+          cursor: { type: ['string','null'], maxLength: 96, default: null },
+          limit: { type: 'integer', minimum: 1, maximum: 200 },
+        },
+        additionalProperties: false,
+      },
+      annotations,
+    },
   ];
 }
 
@@ -151,14 +168,27 @@ export async function executeAdoTool(
       expectedEffects,
     });
   }
+  if (name === 'ado_context_search') {
+    return capabilities.execute({
+      capabilityId: 'ado.context.search',
+      clientId: identity.clientId,
+      sessionId: identity.sessionId,
+      projectId,
+      requestId,
+      query: requiredBoundedString(args, 'query', 200),
+      limit: requiredIntegerInRange(args, 'limit', 1, 50),
+      expectedEffects,
+    });
+  }
   return capabilities.execute({
-    capabilityId: 'ado.context.search',
+    capabilityId: 'ado.backlog.list',
     clientId: identity.clientId,
     sessionId: identity.sessionId,
     projectId,
     requestId,
-    query: requiredBoundedString(args, 'query', 200),
-    limit: requiredIntegerInRange(args, 'limit', 1, 50),
+    backlog: requiredBoundedString(args, 'backlog', 100),
+    cursor: optionalNullableBoundedString(args, 'cursor', 96),
+    limit: requiredIntegerInRange(args, 'limit', 1, 200),
     expectedEffects,
   });
 }
@@ -172,7 +202,9 @@ function assertOnlyKnownKeys(name: AdoToolName, args: Record<string, unknown>): 
       ? ['rootWorkItemId','maxDepth','maxItems']
       : name === 'ado_context_search'
         ? ['query','limit']
-        : [];
+        : name === 'ado_backlog_list'
+          ? ['backlog','cursor','limit']
+          : [];
   const allowed = new Set<string>([...COMMON_KEYS, ...extra]);
   for (const key of Object.keys(args)) if (!allowed.has(key)) throw new RuntimeError('INVALID_REQUEST', `Unsupported ${name} field: ${key}`);
 }
@@ -236,6 +268,11 @@ function requiredBoundedString(record: Record<string, unknown>, name: string, ma
 
 function optionalBoundedString(record: Record<string, unknown>, name: string, maxLength: number): string | undefined {
   if (record[name] === undefined) return undefined;
+  return requiredBoundedString(record, name, maxLength);
+}
+
+function optionalNullableBoundedString(record: Record<string, unknown>, name: string, maxLength: number): string | null {
+  if (record[name] === undefined || record[name] === null) return null;
   return requiredBoundedString(record, name, maxLength);
 }
 

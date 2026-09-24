@@ -10,6 +10,7 @@ const DEFINITIONS: readonly CapabilityDefinition[] = [
   { id: 'ado.workitem.read', title: 'Read one scoped Azure DevOps Work Item context', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
   { id: 'ado.hierarchy.read', title: 'Read bounded scoped Azure DevOps hierarchy context', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
   { id: 'ado.context.search', title: 'Search bounded scoped Azure DevOps requirement context', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
+  { id: 'ado.backlog.list', title: 'Enumerate one exact scoped Azure DevOps backlog level', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
   { id: 'project.test.run', title: 'Run declared project test script', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'mission.list', title: 'List mission execution records', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },
   { id: 'mission.get', title: 'Read mission execution record', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },
