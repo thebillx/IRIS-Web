@@ -24,7 +24,7 @@ const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('ADO FULL MCP requirement context', () => {
-  it('exposes four ADO read tools only on FULL while PRO remains exactly five tools', async () => {
+  it('exposes five ADO read tools only on FULL while PRO remains exactly five tools', async () => {
     const f = await fixture();
     const full = await handleMcpV21Request(rpc('tools/list', 1), f.service, f.state, f.broker, f.lifecycle);
     const fullBody = await full.json() as { result: { tools: Array<{ name: string }> } };
@@ -34,6 +34,7 @@ describe('ADO FULL MCP requirement context', () => {
       'ado_workitem_read',
       'ado_hierarchy_read',
       'ado_context_search',
+      'ado_backlog_list',
     ]));
 
     const pro = await handleMcpProRequest(rpc('tools/list', 2, undefined, 'chatgpt-pro'), f.service);
@@ -85,6 +86,110 @@ describe('ADO FULL MCP requirement context', () => {
     expect(audit.some((entry) => entry.capabilityId === 'ado.workitem.read'
       && entry.result === 'SUCCESS'
       && entry.effectiveEffects?.join(',') === 'READ,NETWORK')).toBe(true);
+  });
+
+  it('enumerates a provider-discovered backlog with deterministic bounded pagination', async () => {
+    const f = await fixture();
+    const first = await handleMcpV21Request(
+      rpc('tools/call', 30, {
+        name: 'ado_backlog_list',
+        arguments: {
+          projectId: f.project.id,
+          requestId: 'mcp-ado-backlog-1',
+          backlog: 'Stories',
+          cursor: null,
+          limit: 1,
+          expectedEffects: ['READ','NETWORK'],
+        },
+      }, f.session.clientId, f.session.id, 'ado_backlog_list'),
+      f.service, f.state, f.broker, f.lifecycle,
+    );
+    const firstBody = await first.json() as {
+      result: {
+        isError: boolean;
+        structuredContent: { page: { nextCursor: string | null }; enumeration: { uniqueCount: number; total: number | null } };
+      };
+    };
+    expect(firstBody).toMatchObject({
+      result: {
+        isError: false,
+        structuredContent: {
+          backlog: { name: 'Stories', workItemTypes: ['User Story'] },
+          items: [{ id: 101, type: 'User Story', areaPath: 'Project\\Team\\ETB' }],
+          page: { index: 0, afterId: 0, limit: 1, nextCursor: expect.any(String), complete: false },
+          enumeration: { pages: 1, uniqueCount: 1, total: null, complete: false },
+        },
+      },
+    });
+    const cursor = firstBody.result.structuredContent.page.nextCursor;
+    expect(cursor).toMatch(/^p:1:a:101:c:1:s:[A-Za-z0-9_-]{22}$/);
+    if (cursor === null) throw new Error('expected signed backlog cursor');
+
+    const second = await handleMcpV21Request(
+      rpc('tools/call', 32, {
+        name: 'ado_backlog_list',
+        arguments: {
+          projectId: f.project.id,
+          requestId: 'mcp-ado-backlog-2',
+          backlog: 'Stories',
+          cursor,
+          limit: 1,
+          expectedEffects: ['READ','NETWORK'],
+        },
+      }, f.session.clientId, f.session.id, 'ado_backlog_list'),
+      f.service, f.state, f.broker, f.lifecycle,
+    );
+    expect(await second.json()).toMatchObject({
+      result: {
+        isError: false,
+        structuredContent: {
+          items: [],
+          page: { index: 1, afterId: 101, limit: 1, nextCursor: null, complete: true },
+          enumeration: { pages: 2, uniqueCount: 1, total: 1, complete: true },
+        },
+      },
+    });
+  });
+
+  it('rejects unknown backlog selectors and arbitrary pagination cursors', async () => {
+    const f = await fixture();
+    for (const [backlog, cursor, limit] of [['Unknown', null, 50], ['Stories', 'offset:1', 50], ['Stories', 'p:1:a:101:c:1:s:AAAAAAAAAAAAAAAAAAAAAA', 50], ['Stories', null, 101]] as const) {
+      const response = await handleMcpV21Request(
+        rpc('tools/call', 31, {
+          name: 'ado_backlog_list',
+          arguments: {
+            projectId: f.project.id,
+            requestId: 'mcp-ado-backlog-invalid',
+            backlog,
+            cursor,
+            limit,
+            expectedEffects: ['READ','NETWORK'],
+          },
+        }, f.session.clientId, f.session.id, 'ado_backlog_list'),
+        f.service, f.state, f.broker, f.lifecycle,
+      );
+      expect((await response.json()) as { result: { isError: boolean } }).toMatchObject({ result: { isError: true } });
+    }
+  });
+
+  it('rejects raw WIQL and URL escape-hatch fields for backlog enumeration', async () => {
+    const f = await fixture();
+    const response = await handleMcpV21Request(
+      rpc('tools/call', 33, {
+        name: 'ado_backlog_list',
+        arguments: {
+          projectId: f.project.id,
+          requestId: 'mcp-ado-backlog-raw-input',
+          backlog: 'Stories',
+          limit: 50,
+          wiql: 'SELECT * FROM WorkItems',
+          url: 'https://example.invalid',
+          expectedEffects: ['READ','NETWORK'],
+        },
+      }, f.session.clientId, f.session.id, 'ado_backlog_list'),
+      f.service, f.state, f.broker, f.lifecycle,
+    );
+    expect(await response.json()).toMatchObject({ result: { isError: true } });
   });
 
   it('fails closed on downgraded expectedEffects and on session/project mismatch', async () => {
@@ -242,18 +347,45 @@ function bindingProvider(irisProjectId: string, rateLimitRequests = 100): AdoRun
 }
 
 function fakeFetch(): typeof fetch {
-  return (async (input: string | URL | Request): Promise<Response> => {
+  return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = new URL(input instanceof Request ? input.url : String(input));
+    const body = typeof init?.body === 'string' ? init.body : '';
     if (url.pathname.endsWith('/_apis/work/teamsettings/teamfieldvalues')) return json({
       field: { referenceName: 'System.AreaPath' },
-      defaultValue: 'Project\\Team',
-      values: [{ value: 'Project\\Team', includeChildren: true }],
+      defaultValue: 'Project\\Team\\ETB',
+      values: [{ value: 'Project\\Team\\ETB', includeChildren: false }],
     });
     if (url.pathname.endsWith('/_apis/work/boards/board-id')) return json({ id: 'board-id', name: 'Stories' });
     if (url.pathname.endsWith('/_apis/work/backlogs')) return json({ value: [
       { id: 'story', name: 'Stories', rank: 1, type: 'requirement', workItemTypes: [{ name: 'User Story' }] },
     ] });
-    if (url.pathname.endsWith('/_apis/wit/wiql')) return json({ workItems: [{ id: 101 }] });
+    if (url.pathname.endsWith('/_apis/wit/wiql')) {
+      const parsed = body.length === 0 ? {} : JSON.parse(body) as { query?: unknown };
+      const query = typeof parsed.query === 'string' ? parsed.query : '';
+      if (query.includes('[System.WorkItemType] IN')) {
+        return json({ workItems: query.includes('[System.Id] > 101') ? [] : [{ id: 101 }] });
+      }
+      return json({ workItems: [{ id: 101 }] });
+    }
+    if (url.pathname.endsWith('/_apis/wit/workitemsbatch')) return json({ value: [{
+      id: 101,
+      rev: 7,
+      fields: {
+        'System.WorkItemType': 'User Story',
+        'System.Title': 'ETB Login Story',
+        'System.State': 'Active',
+        'System.Description': '<p>User can login</p>',
+        'Microsoft.VSTS.Common.AcceptanceCriteria': '<p>Given valid user</p>',
+        'System.AreaPath': 'Project\\Team\\ETB',
+        'System.IterationPath': 'Project\\Sprint 1',
+        'System.Parent': null,
+        'System.Tags': 'etb;automation',
+        'System.BoardColumn': 'Doing',
+        'System.CreatedDate': '2026-09-01T10:00:00Z',
+        'System.ChangedDate': '2026-09-20T12:00:00Z',
+      },
+      relations: [],
+    }] });
     if (url.pathname.endsWith('/_apis/wit/workitems/101')) return json({
       id: 101,
       rev: 7,

@@ -629,6 +629,7 @@ export type CapabilityId =
   | 'ado.workitem.read'
   | 'ado.hierarchy.read'
   | 'ado.context.search'
+  | 'ado.backlog.list'
   | 'project.test.run'
   | 'mission.list'
   | 'mission.get'

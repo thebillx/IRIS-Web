@@ -195,6 +195,46 @@ describe('ADO runtime requirement context', () => {
     expect(calls.some((call) => call.url.pathname.endsWith('/_apis/wit/workitems/102'))).toBe(false);
   });
 
+  it('requires exact backlog Area Path scope with includeChildren=false', async () => {
+    const service = new AdoRequirementContextService(provider, fakeFetch([]));
+
+    await expect(service.backlogList({
+      projectId: 'iris-project',
+      requestId: 'req-backlog-exact-scope',
+      backlog: 'Stories',
+      cursor: null,
+      limit: 2,
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+  });
+
+  it('fails closed when backlog WIQL IDs are not strictly ascending', async () => {
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname.endsWith('/_apis/work/teamsettings/teamfieldvalues')) return json({
+        field: { referenceName: 'System.AreaPath' },
+        defaultValue: 'Project\\Team',
+        values: [{ value: 'Project\\Team', includeChildren: false }],
+      });
+      if (url.pathname.endsWith('/_apis/work/backlogs')) return json({ value: [
+        { id: 'story', name: 'Stories', rank: 2, type: 'requirement', workItemTypes: [{ name: 'User Story' }] },
+      ] });
+      if (url.pathname.endsWith('/_apis/wit/wiql')) {
+        expect(typeof init?.body).toBe('string');
+        return json({ workItems: [{ id: 102 }, { id: 101 }] });
+      }
+      throw new Error('unexpected fake ADO route: ' + url.pathname);
+    }) as typeof fetch;
+    const service = new AdoRequirementContextService(provider, fetchImpl);
+
+    await expect(service.backlogList({
+      projectId: 'iris-project',
+      requestId: 'req-backlog-order',
+      backlog: 'Stories',
+      cursor: null,
+      limit: 2,
+    })).rejects.toMatchObject({ code: 'CONTROL_PLANE_UNREACHABLE' });
+  });
+
   it('enforces the configured local request window before an extra network request is dispatched', async () => {
     const calls: RequestRecord[] = [];
     const limited: ResolvedAdoRuntimeBinding = {

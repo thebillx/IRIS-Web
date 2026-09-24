@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { RuntimeError } from '@iris/domain';
 import { normalizeHtml, sanitizeText, stageRawSource, type CanonicalWorkItem } from '@iris/ado';
 import { bindAdoRead, type AdoReadRequest } from './governance.js';
@@ -13,7 +13,7 @@ export interface AdoContextProvenance {
   readonly acquisitionId: string;
   readonly requestId: string;
   readonly provider: 'azure-devops';
-  readonly operation: 'discovery' | 'workitem.read' | 'hierarchy.read' | 'context.search';
+  readonly operation: 'discovery' | 'workitem.read' | 'hierarchy.read' | 'context.search' | 'backlog.list';
   readonly organizationId: string;
   readonly projectId: string;
   readonly teamId: string;
@@ -60,6 +60,15 @@ export interface AdoHierarchyResult {
 export interface AdoSearchResult {
   readonly query: string;
   readonly items: readonly CanonicalWorkItem[];
+  readonly provenance: AdoContextProvenance;
+}
+
+export interface AdoBacklogListResult {
+  readonly backlog: { readonly id: string; readonly name: string; readonly type: string; readonly workItemTypes: readonly string[] };
+  readonly scope: AdoScopeSnapshot;
+  readonly items: readonly CanonicalWorkItem[];
+  readonly page: { readonly index: number; readonly afterId: number; readonly limit: number; readonly nextCursor: string | null; readonly complete: boolean };
+  readonly enumeration: { readonly pages: number; readonly uniqueCount: number; readonly total: number | null; readonly complete: boolean };
   readonly provenance: AdoContextProvenance;
 }
 
@@ -249,6 +258,118 @@ export class AdoRequirementContextService {
       query,
       items,
       provenance: provenance(binding.identity, rid, 'context.search'),
+    };
+  }
+
+  public async backlogList(input: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly backlog: string;
+    readonly cursor: string | null;
+    readonly limit: number;
+  }): Promise<AdoBacklogListResult> {
+    const binding = await this.bindings.resolve(input.projectId);
+    const rid = validRequestId(input.requestId);
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 200) {
+      throw new RuntimeError('INVALID_REQUEST', 'ADO backlog list limit must be from 1 through 200');
+    }
+    const maxPageSize = Math.min(200, binding.grant.policy.maxPageItems, binding.grant.policy.maxBatchItems);
+    if (input.limit > maxPageSize) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog list limit exceeds the protected binding page/batch limit');
+    }
+    const scope = await this.readScope(binding, childRequestId(rid, 'scope'));
+    if (scope.snapshot.values.some((entry) => entry.includeChildren)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog enumeration requires exact Area Path scope with includeChildren=false');
+    }
+    const backlogs = await this.readBacklogs(binding, childRequestId(rid, 'backlogs'));
+    const selector = input.backlog.trim();
+    if (selector.length === 0 || selector.length > 100 || /[\0\r\n]/.test(selector)) {
+      throw new RuntimeError('INVALID_REQUEST', 'ADO backlog selector is invalid');
+    }
+    const matches = backlogs.filter((entry) => entry.id === selector || entry.name === selector);
+    if (matches.length !== 1) throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog must resolve to exactly one provider-discovered backlog level');
+    const backlog = matches[0]!;
+    if (backlog.workItemTypes.length === 0) throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog has no provider-discovered work-item types');
+    const cursor = parseBacklogCursor(input.cursor);
+    if (cursor.pageIndex >= binding.grant.policy.maxPages) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog cursor exceeds the protected binding page limit');
+    }
+    if (cursor.signature !== null && !verifyBacklogCursor(binding, scope.snapshot, backlog, cursor)) {
+      throw new RuntimeError('INVALID_REQUEST', 'ADO backlog cursor signature is invalid');
+    }
+    const wiql = buildScopedBacklogWiql(binding.projectName, scope.snapshot, backlog.workItemTypes, cursor.afterId);
+    this.bind(binding, {
+      operation: 'ado.work_items.query',
+      requestId: childRequestId(rid, 'query'),
+      identity: binding.identity,
+      wiql,
+      page: { index: cursor.pageIndex, continuation: input.cursor ?? null, limit: input.limit },
+    });
+    const result = await this.requestJson(
+      binding,
+      'POST',
+      `/${encodeURIComponent(binding.identity.project.id)}/_apis/wit/wiql`,
+      { 'api-version': '7.1', '$top': String(input.limit) },
+      { query: wiql },
+    );
+    const pageIds = parseBacklogWiqlIds(result.body);
+    if (pageIds.length > input.limit) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog query exceeded the bounded page size');
+    for (let index = 0; index < pageIds.length; index += 1) {
+      const id = pageIds[index]!;
+      if (id <= cursor.afterId || (index > 0 && id <= pageIds[index - 1]!)) {
+        throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog query did not preserve strict Work Item ID ordering');
+      }
+    }
+    const uniqueCount = cursor.uniqueCount + pageIds.length;
+    if (!Number.isSafeInteger(uniqueCount) || uniqueCount < cursor.uniqueCount) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog enumeration unique count exceeds the safe integer bound');
+    }
+    const hasMore = pageIds.length === input.limit;
+    if (hasMore && cursor.pageIndex + 1 >= binding.grant.policy.maxPages) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog enumeration exceeds the protected binding page limit');
+    }
+    let items: CanonicalWorkItem[] = [];
+    if (pageIds.length > 0) {
+      this.bind(binding, {
+        operation: 'ado.work_items.batch',
+        requestId: childRequestId(rid, 'batch'),
+        identity: binding.identity,
+        ids: pageIds,
+      });
+      const batch = await this.requestJson(
+        binding,
+        'POST',
+        `/${encodeURIComponent(binding.identity.project.id)}/_apis/wit/workitemsbatch`,
+        { 'api-version': '7.1' },
+        { ids: pageIds, fields: [...SAFE_FIELDS], errorPolicy: 'Omit' },
+      );
+      items = parseArrayResponse(batch.body).map(parseWorkItem).map((raw) => canonicalize(raw));
+      if (items.length !== pageIds.length) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog batch response did not preserve the requested work-item set');
+      for (let index = 0; index < items.length; index += 1) {
+        const item = items[index]!;
+        if (item.id !== pageIds[index]) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog batch response changed deterministic Work Item order');
+        assertAreaInScope(item, scope.snapshot);
+        if (item.type === null || !backlog.workItemTypes.includes(item.type)) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog item type changed outside provider-discovered backlog metadata');
+      }
+    }
+    return {
+      backlog: { id: backlog.id, name: backlog.name, type: backlog.type, workItemTypes: [...backlog.workItemTypes] },
+      scope: scope.snapshot,
+      items,
+      page: {
+        index: cursor.pageIndex,
+        afterId: cursor.afterId,
+        limit: input.limit,
+        nextCursor: hasMore ? backlogCursor(binding, scope.snapshot, backlog, cursor.pageIndex + 1, pageIds[pageIds.length - 1]!, uniqueCount) : null,
+        complete: !hasMore,
+      },
+      enumeration: {
+        pages: cursor.pageIndex + 1,
+        uniqueCount,
+        total: hasMore ? null : uniqueCount,
+        complete: !hasMore,
+      },
+      provenance: provenance(binding.identity, rid, 'backlog.list'),
     };
   }
 
@@ -704,6 +825,90 @@ function buildScopedWiql(projectName: string, scope: AdoScopeSnapshot, query: st
   ].join(' ');
 }
 
+function buildScopedBacklogWiql(
+  projectName: string,
+  scope: AdoScopeSnapshot,
+  workItemTypes: readonly string[],
+  afterId: number,
+): string {
+  if (workItemTypes.length === 0 || workItemTypes.length > 50) throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog work-item type set is invalid');
+  if (!Number.isSafeInteger(afterId) || afterId < 0) {
+    throw new RuntimeError('INVALID_REQUEST', 'ADO backlog pagination is invalid');
+  }
+  const project = wiqlLiteral(projectName);
+  const areas = scopedAreaClauses(scope);
+  const types = workItemTypes.map((value) => `'${wiqlLiteral(value)}'`).join(',');
+  return [
+    'SELECT [System.Id] FROM WorkItems',
+    `WHERE [System.TeamProject] = '${project}'`,
+    `AND (${areas.join(' OR ')})`,
+    `AND [System.WorkItemType] IN (${types})`,
+    ...(afterId === 0 ? [] : [`AND [System.Id] > ${afterId}`]),
+    'ORDER BY [System.Id] ASC',
+  ].join(' ');
+}
+
+interface ParsedBacklogCursor {
+  readonly pageIndex: number;
+  readonly afterId: number;
+  readonly uniqueCount: number;
+  readonly signature: string | null;
+}
+
+function parseBacklogCursor(value: string | null): ParsedBacklogCursor {
+  if (value === null) return { pageIndex: 0, afterId: 0, uniqueCount: 0, signature: null };
+  const match = /^p:([1-9]\d*):a:([1-9]\d*):c:([1-9]\d*):s:([A-Za-z0-9_-]{22})$/.exec(value);
+  if (match === null) throw new RuntimeError('INVALID_REQUEST', 'ADO backlog cursor is invalid');
+  const pageIndex = Number(match[1]);
+  const afterId = Number(match[2]);
+  const uniqueCount = Number(match[3]);
+  if (!Number.isSafeInteger(pageIndex) || pageIndex < 1 || !Number.isSafeInteger(afterId) || afterId < 1
+    || !Number.isSafeInteger(uniqueCount) || uniqueCount < 1) {
+    throw new RuntimeError('INVALID_REQUEST', 'ADO backlog cursor is invalid');
+  }
+  return { pageIndex, afterId, uniqueCount, signature: match[4]! };
+}
+
+function backlogCursor(
+  binding: ResolvedAdoRuntimeBinding,
+  scope: AdoScopeSnapshot,
+  backlog: Backlog,
+  pageIndex: number,
+  afterId: number,
+  uniqueCount: number,
+): string {
+  if (!Number.isSafeInteger(pageIndex) || pageIndex < 1 || !Number.isSafeInteger(afterId) || afterId < 1
+    || !Number.isSafeInteger(uniqueCount) || uniqueCount < 1) {
+    throw new RuntimeError('INVALID_REQUEST', 'ADO backlog cursor state is invalid');
+  }
+  const signature = signBacklogCursor(binding, scope, backlog, pageIndex, afterId, uniqueCount);
+  return `p:${pageIndex}:a:${afterId}:c:${uniqueCount}:s:${signature}`;
+}
+
+function verifyBacklogCursor(
+  binding: ResolvedAdoRuntimeBinding,
+  scope: AdoScopeSnapshot,
+  backlog: Backlog,
+  cursor: ParsedBacklogCursor,
+): boolean {
+  if (cursor.signature === null) return cursor.pageIndex === 0 && cursor.afterId === 0 && cursor.uniqueCount === 0;
+  const expected = signBacklogCursor(binding, scope, backlog, cursor.pageIndex, cursor.afterId, cursor.uniqueCount);
+  return timingSafeEqual(Buffer.from(cursor.signature, 'utf8'), Buffer.from(expected, 'utf8'));
+}
+
+function signBacklogCursor(
+  binding: ResolvedAdoRuntimeBinding,
+  scope: AdoScopeSnapshot,
+  backlog: Backlog,
+  pageIndex: number,
+  afterId: number,
+  uniqueCount: number,
+): string {
+  const scopeKey = scope.values.map((entry) => `${entry.value}:${entry.includeChildren ? '1' : '0'}`).join('|');
+  const payload = [binding.grant.projectId, binding.identity.organization.id, binding.identity.project.id, binding.identity.team.id, binding.identity.board.id, backlog.id, scope.defaultValue, scopeKey, String(pageIndex), String(afterId), String(uniqueCount)].join('\0');
+  return createHmac('sha256', binding.auth.secret).update(payload, 'utf8').digest('base64url').slice(0, 22);
+}
+
 function buildScopedIdWiql(projectName: string, scope: AdoScopeSnapshot, ids: readonly number[]): string {
   if (ids.length === 0 || ids.some((id) => !Number.isSafeInteger(id) || id < 1)) {
     throw new RuntimeError('INVALID_REQUEST', 'ADO scoped membership proof requires positive Work Item IDs');
@@ -772,6 +977,16 @@ function parseArrayResponse(value: unknown): unknown[] {
 function parseCommentResponse(value: unknown): unknown[] {
   if (isRecord(value) && Array.isArray(value.comments)) return value.comments;
   return parseArrayResponse(value);
+}
+
+function parseBacklogWiqlIds(value: unknown): number[] {
+  if (!isRecord(value) || !Array.isArray(value.workItems)) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO WIQL response is invalid');
+  const ids = value.workItems.map((item) => {
+    if (!isRecord(item) || !Number.isSafeInteger(item.id) || Number(item.id) < 1) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO WIQL result identity is invalid');
+    return Number(item.id);
+  });
+  if (new Set(ids).size !== ids.length) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog WIQL returned duplicate Work Item IDs');
+  return ids;
 }
 
 function parseWiqlIds(value: unknown): number[] {

@@ -52,6 +52,7 @@ const FULL_CATALOG = [
   entry('ado_workitem_read', 'READ_ONLY', 'ado.workitem.read', '2.6.0'),
   entry('ado_hierarchy_read', 'READ_ONLY', 'ado.hierarchy.read', '2.6.0'),
   entry('ado_context_search', 'READ_ONLY', 'ado.context.search', '2.6.0'),
+  entry('ado_backlog_list', 'READ_ONLY', 'ado.backlog.list', '2.7.0'),
   entry('mission_list', 'READ_ONLY', 'mission.list', '2.0.0'),
   entry('session_open', 'READ_ONLY', 'session.create', '2.0.0'),
   entry('session_get', 'READ_ONLY', null, '2.0.0'),
