@@ -207,9 +207,11 @@ describe('ADO runtime requirement context', () => {
     })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
   });
 
-  it('fails closed when backlog WIQL IDs are not strictly ascending', async () => {
+  it('fails closed when authoritative backlog membership changes across a signed cursor', async () => {
+    let membershipReads = 0;
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const url = new URL(input instanceof Request ? input.url : String(input));
+      const body = typeof init?.body === 'string' ? init.body : '';
       if (url.pathname.endsWith('/_apis/work/teamsettings/teamfieldvalues')) return json({
         field: { referenceName: 'System.AreaPath' },
         defaultValue: 'Project\\Team',
@@ -218,20 +220,37 @@ describe('ADO runtime requirement context', () => {
       if (url.pathname.endsWith('/_apis/work/backlogs')) return json({ value: [
         { id: 'story', name: 'Stories', rank: 2, type: 'requirement', workItemTypes: [{ name: 'User Story' }] },
       ] });
-      if (url.pathname.endsWith('/_apis/wit/wiql')) {
-        expect(typeof init?.body).toBe('string');
-        return json({ workItems: [{ id: 102 }, { id: 101 }] });
+      if (url.pathname.endsWith('/_apis/work/backlogs/story/workItems')) {
+        membershipReads += 1;
+        return json({ workItems: membershipReads === 1
+          ? [{ target: { id: 101 } }, { target: { id: 102 } }]
+          : [{ target: { id: 101 } }, { target: { id: 103 } }] });
+      }
+      if (url.pathname.endsWith('/_apis/wit/workitemsbatch')) {
+        const parsed = JSON.parse(body) as { ids?: unknown };
+        if (!Array.isArray(parsed.ids)) throw new Error('invalid fake batch body');
+        return json({ value: parsed.ids.map((id) => rawWorkItem(Number(id), 'Project\\Team', false)) });
       }
       throw new Error('unexpected fake ADO route: ' + url.pathname);
     }) as typeof fetch;
     const service = new AdoRequirementContextService(provider, fetchImpl);
 
-    await expect(service.backlogList({
+    const first = await service.backlogList({
       projectId: 'iris-project',
-      requestId: 'req-backlog-order',
+      requestId: 'req-backlog-membership-1',
       backlog: 'Stories',
       cursor: null,
-      limit: 2,
+      limit: 1,
+    });
+    expect(first.page.complete).toBe(false);
+    expect(first.page.nextCursor).toEqual(expect.any(String));
+
+    await expect(service.backlogList({
+      projectId: 'iris-project',
+      requestId: 'req-backlog-membership-2',
+      backlog: 'Stories',
+      cursor: first.page.nextCursor,
+      limit: 1,
     })).rejects.toMatchObject({ code: 'CONTROL_PLANE_UNREACHABLE' });
   });
 

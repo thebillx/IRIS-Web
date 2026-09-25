@@ -11,6 +11,7 @@ export const adoReadOperations = [
   'ado.board.read',
   'ado.scope.read',
   'ado.backlogs.list',
+  'ado.backlog.work_items',
   'ado.work_items.query',
   'ado.work_items.get',
   'ado.work_items.batch',
@@ -51,6 +52,7 @@ interface AdoReadRequestBase {
 export type AdoReadRequest =
   | (AdoReadRequestBase & { readonly operation: 'ado.board.read' | 'ado.scope.read' })
   | (AdoReadRequestBase & { readonly operation: 'ado.backlogs.list'; readonly page: PageRequest })
+  | (AdoReadRequestBase & { readonly operation: 'ado.backlog.work_items'; readonly backlogId: string })
   | (AdoReadRequestBase & { readonly operation: 'ado.work_items.query'; readonly wiql: string; readonly page: PageRequest })
   | (AdoReadRequestBase & { readonly operation: 'ado.work_items.get'; readonly id: number })
   | (AdoReadRequestBase & { readonly operation: 'ado.work_items.batch'; readonly ids: readonly number[] })
@@ -98,6 +100,10 @@ export function bindAdoRead(grant: AdoReadGrant, request: AdoReadRequest, now: n
   if (request.operation === 'ado.backlogs.list') {
     return Object.freeze({ ...common, operation: request.operation, page: freezePage(request.page, grant.policy) });
   }
+  if (request.operation === 'ado.backlog.work_items') {
+    if (!boundedText(request.backlogId, 1024)) fail('INVALID_REQUEST');
+    return Object.freeze({ ...common, operation: request.operation, backlogId: request.backlogId });
+  }
   if (request.operation === 'ado.work_items.query') {
     if (!boundedText(request.wiql, wiqlMaxLength)) fail('INVALID_REQUEST');
     return Object.freeze({
@@ -132,7 +138,7 @@ export function bindAdoRead(grant: AdoReadGrant, request: AdoReadRequest, now: n
 export function resourceForOperation(operation: AdoReadOperation): Resource {
   if (operation === 'ado.board.read') return 'board';
   if (operation === 'ado.scope.read') return 'scope';
-  if (operation === 'ado.backlogs.list') return 'backlogs';
+  if (operation === 'ado.backlogs.list' || operation === 'ado.backlog.work_items') return 'backlogs';
   if (operation === 'ado.work_items.query') return 'query';
   if (operation === 'ado.work_items.get' || operation === 'ado.work_items.batch') return 'workItems';
   if (operation === 'ado.comments.list') return 'comments';
