@@ -63,6 +63,7 @@ describe('ADO current-governance binding', () => {
       { ...base, operation: 'ado.board.read' },
       { ...base, operation: 'ado.scope.read' },
       { ...base, operation: 'ado.backlogs.list', page: { index: 0, continuation: null, limit: 50 } },
+      { ...base, operation: 'ado.backlog.work_items', backlogId: 'story' },
       { ...base, operation: 'ado.work_items.query', wiql: 'SELECT [System.Id] FROM WorkItems', page: { index: 0, continuation: null, limit: 50 } },
       { ...base, operation: 'ado.work_items.get', id: 1 },
       { ...base, operation: 'ado.work_items.batch', ids: [1, 2] },
@@ -75,7 +76,7 @@ describe('ADO current-governance binding', () => {
       expect(JSON.stringify(bound)).not.toContain(grant.credentialRef);
       expect(JSON.stringify(bound)).not.toContain(grant.sessionRef);
     }
-    expect(bindAdoRead(grant, requests[3]!, now).semanticEffect).toBe('READ_QUERY');
+    expect(bindAdoRead(grant, requests[4]!, now).semanticEffect).toBe('READ_QUERY');
   });
 
   it('requires the least-privilege documented read scope', () => {
@@ -104,6 +105,7 @@ describe('ADO current-governance binding', () => {
     expect(bindAdoRead(boardOnly, { ...base, operation: 'ado.board.read' }, now).operation).toBe('ado.board.read');
     expect(code(() => bindAdoRead(boardOnly, { ...base, operation: 'ado.work_items.get', id: 1 }, now))).toBe('SCOPE_DENIED');
     expect(resourceForOperation('ado.work_items.batch')).toBe('workItems');
+    expect(resourceForOperation('ado.backlog.work_items')).toBe('backlogs');
   });
 
   it('caps batch grants and requests at the upstream 200-item maximum', () => {

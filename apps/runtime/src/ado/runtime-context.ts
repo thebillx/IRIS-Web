@@ -1,4 +1,4 @@
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { RuntimeError } from '@iris/domain';
 import { normalizeHtml, sanitizeText, stageRawSource, type CanonicalWorkItem } from '@iris/ado';
 import { bindAdoRead, type AdoReadRequest } from './governance.js';
@@ -290,6 +290,7 @@ export class AdoRequirementContextService {
     if (matches.length !== 1) throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog must resolve to exactly one provider-discovered backlog level');
     const backlog = matches[0]!;
     if (backlog.workItemTypes.length === 0) throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog has no provider-discovered work-item types');
+
     const cursor = parseBacklogCursor(input.cursor);
     if (cursor.pageIndex >= binding.grant.policy.maxPages) {
       throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog cursor exceeds the protected binding page limit');
@@ -297,37 +298,42 @@ export class AdoRequirementContextService {
     if (cursor.signature !== null && !verifyBacklogCursor(binding, scope.snapshot, backlog, cursor)) {
       throw new RuntimeError('INVALID_REQUEST', 'ADO backlog cursor signature is invalid');
     }
-    const wiql = buildScopedBacklogWiql(binding.projectName, scope.snapshot, backlog.workItemTypes, cursor.afterId);
+
     this.bind(binding, {
-      operation: 'ado.work_items.query',
-      requestId: childRequestId(rid, 'query'),
+      operation: 'ado.backlog.work_items',
+      requestId: childRequestId(rid, 'membership'),
       identity: binding.identity,
-      wiql,
-      page: { index: cursor.pageIndex, continuation: input.cursor ?? null, limit: input.limit },
+      backlogId: backlog.id,
     });
-    const result = await this.requestJson(
+    const membership = await this.requestJson(
       binding,
-      'POST',
-      `/${encodeURIComponent(binding.identity.project.id)}/_apis/wit/wiql`,
-      { 'api-version': '7.1', '$top': String(input.limit) },
-      { query: wiql },
+      'GET',
+      `/${encodeURIComponent(binding.identity.project.id)}/${encodeURIComponent(binding.identity.team.id)}/_apis/work/backlogs/${encodeURIComponent(backlog.id)}/workItems`,
+      { 'api-version': '7.1' },
     );
-    const pageIds = parseBacklogWiqlIds(result.body);
-    if (pageIds.length > input.limit) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog query exceeded the bounded page size');
-    for (let index = 0; index < pageIds.length; index += 1) {
-      const id = pageIds[index]!;
-      if (id <= cursor.afterId || (index > 0 && id <= pageIds[index - 1]!)) {
-        throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog query did not preserve strict Work Item ID ordering');
-      }
+    const maxItems = binding.grant.policy.maxPageItems * binding.grant.policy.maxPages;
+    if (!Number.isSafeInteger(maxItems) || maxItems < 1) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog enumeration total bound is invalid');
     }
+    const membershipIds = parseBacklogMembershipIds(membership.body, maxItems);
+    const membershipDigest = backlogMembershipDigest(backlog.id, membershipIds);
+    if (cursor.membershipDigest !== null && cursor.membershipDigest !== membershipDigest) {
+      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog membership changed during deterministic enumeration');
+    }
+    if (cursor.uniqueCount > membershipIds.length) {
+      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog cursor exceeds the current authoritative membership size');
+    }
+    if (cursor.uniqueCount > 0 && membershipIds[cursor.uniqueCount - 1] !== cursor.afterId) {
+      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog cursor does not align with authoritative membership ordering');
+    }
+
+    const pageIds = membershipIds.slice(cursor.uniqueCount, cursor.uniqueCount + input.limit);
     const uniqueCount = cursor.uniqueCount + pageIds.length;
-    if (!Number.isSafeInteger(uniqueCount) || uniqueCount < cursor.uniqueCount) {
-      throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog enumeration unique count exceeds the safe integer bound');
-    }
-    const hasMore = pageIds.length === input.limit;
+    const hasMore = uniqueCount < membershipIds.length;
     if (hasMore && cursor.pageIndex + 1 >= binding.grant.policy.maxPages) {
       throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog enumeration exceeds the protected binding page limit');
     }
+
     let items: CanonicalWorkItem[] = [];
     if (pageIds.length > 0) {
       this.bind(binding, {
@@ -349,8 +355,14 @@ export class AdoRequirementContextService {
         const item = items[index]!;
         if (item.id !== pageIds[index]) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog batch response changed deterministic Work Item order');
         assertAreaInScope(item, scope.snapshot);
-        if (item.type === null || !backlog.workItemTypes.includes(item.type)) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog item type changed outside provider-discovered backlog metadata');
+        if (item.type === null || !backlog.workItemTypes.includes(item.type)) {
+          throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog item type changed outside provider-discovered backlog metadata');
+        }
       }
+    }
+
+    if (!hasMore && uniqueCount !== membershipIds.length) {
+      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog terminal count does not equal authoritative unique membership');
     }
     return {
       backlog: { id: backlog.id, name: backlog.name, type: backlog.type, workItemTypes: [...backlog.workItemTypes] },
@@ -360,13 +372,23 @@ export class AdoRequirementContextService {
         index: cursor.pageIndex,
         afterId: cursor.afterId,
         limit: input.limit,
-        nextCursor: hasMore ? backlogCursor(binding, scope.snapshot, backlog, cursor.pageIndex + 1, pageIds[pageIds.length - 1]!, uniqueCount) : null,
+        nextCursor: hasMore
+          ? backlogCursor(
+            binding,
+            scope.snapshot,
+            backlog,
+            cursor.pageIndex + 1,
+            pageIds[pageIds.length - 1]!,
+            uniqueCount,
+            membershipDigest,
+          )
+          : null,
         complete: !hasMore,
       },
       enumeration: {
         pages: cursor.pageIndex + 1,
         uniqueCount,
-        total: hasMore ? null : uniqueCount,
+        total: hasMore ? null : membershipIds.length,
         complete: !hasMore,
       },
       provenance: provenance(binding.identity, rid, 'backlog.list'),
@@ -825,39 +847,19 @@ function buildScopedWiql(projectName: string, scope: AdoScopeSnapshot, query: st
   ].join(' ');
 }
 
-function buildScopedBacklogWiql(
-  projectName: string,
-  scope: AdoScopeSnapshot,
-  workItemTypes: readonly string[],
-  afterId: number,
-): string {
-  if (workItemTypes.length === 0 || workItemTypes.length > 50) throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog work-item type set is invalid');
-  if (!Number.isSafeInteger(afterId) || afterId < 0) {
-    throw new RuntimeError('INVALID_REQUEST', 'ADO backlog pagination is invalid');
-  }
-  const project = wiqlLiteral(projectName);
-  const areas = scopedAreaClauses(scope);
-  const types = workItemTypes.map((value) => `'${wiqlLiteral(value)}'`).join(',');
-  return [
-    'SELECT [System.Id] FROM WorkItems',
-    `WHERE [System.TeamProject] = '${project}'`,
-    `AND (${areas.join(' OR ')})`,
-    `AND [System.WorkItemType] IN (${types})`,
-    ...(afterId === 0 ? [] : [`AND [System.Id] > ${afterId}`]),
-    'ORDER BY [System.Id] ASC',
-  ].join(' ');
-}
-
 interface ParsedBacklogCursor {
   readonly pageIndex: number;
   readonly afterId: number;
   readonly uniqueCount: number;
+  readonly membershipDigest: string | null;
   readonly signature: string | null;
 }
 
 function parseBacklogCursor(value: string | null): ParsedBacklogCursor {
-  if (value === null) return { pageIndex: 0, afterId: 0, uniqueCount: 0, signature: null };
-  const match = /^p:([1-9]\d*):a:([1-9]\d*):c:([1-9]\d*):s:([A-Za-z0-9_-]{22})$/.exec(value);
+  if (value === null) {
+    return { pageIndex: 0, afterId: 0, uniqueCount: 0, membershipDigest: null, signature: null };
+  }
+  const match = /^p:([1-9]\d*):a:([1-9]\d*):c:([1-9]\d*):m:([0-9a-f]{32}):s:([A-Za-z0-9_-]{22})$/.exec(value);
   if (match === null) throw new RuntimeError('INVALID_REQUEST', 'ADO backlog cursor is invalid');
   const pageIndex = Number(match[1]);
   const afterId = Number(match[2]);
@@ -866,7 +868,7 @@ function parseBacklogCursor(value: string | null): ParsedBacklogCursor {
     || !Number.isSafeInteger(uniqueCount) || uniqueCount < 1) {
     throw new RuntimeError('INVALID_REQUEST', 'ADO backlog cursor is invalid');
   }
-  return { pageIndex, afterId, uniqueCount, signature: match[4]! };
+  return { pageIndex, afterId, uniqueCount, membershipDigest: match[4]!, signature: match[5]! };
 }
 
 function backlogCursor(
@@ -876,13 +878,14 @@ function backlogCursor(
   pageIndex: number,
   afterId: number,
   uniqueCount: number,
+  membershipDigest: string,
 ): string {
   if (!Number.isSafeInteger(pageIndex) || pageIndex < 1 || !Number.isSafeInteger(afterId) || afterId < 1
-    || !Number.isSafeInteger(uniqueCount) || uniqueCount < 1) {
+    || !Number.isSafeInteger(uniqueCount) || uniqueCount < 1 || !/^[0-9a-f]{32}$/.test(membershipDigest)) {
     throw new RuntimeError('INVALID_REQUEST', 'ADO backlog cursor state is invalid');
   }
-  const signature = signBacklogCursor(binding, scope, backlog, pageIndex, afterId, uniqueCount);
-  return `p:${pageIndex}:a:${afterId}:c:${uniqueCount}:s:${signature}`;
+  const signature = signBacklogCursor(binding, scope, backlog, pageIndex, afterId, uniqueCount, membershipDigest);
+  return `p:${pageIndex}:a:${afterId}:c:${uniqueCount}:m:${membershipDigest}:s:${signature}`;
 }
 
 function verifyBacklogCursor(
@@ -891,8 +894,19 @@ function verifyBacklogCursor(
   backlog: Backlog,
   cursor: ParsedBacklogCursor,
 ): boolean {
-  if (cursor.signature === null) return cursor.pageIndex === 0 && cursor.afterId === 0 && cursor.uniqueCount === 0;
-  const expected = signBacklogCursor(binding, scope, backlog, cursor.pageIndex, cursor.afterId, cursor.uniqueCount);
+  if (cursor.signature === null) {
+    return cursor.pageIndex === 0 && cursor.afterId === 0 && cursor.uniqueCount === 0 && cursor.membershipDigest === null;
+  }
+  if (cursor.membershipDigest === null) return false;
+  const expected = signBacklogCursor(
+    binding,
+    scope,
+    backlog,
+    cursor.pageIndex,
+    cursor.afterId,
+    cursor.uniqueCount,
+    cursor.membershipDigest,
+  );
   return timingSafeEqual(Buffer.from(cursor.signature, 'utf8'), Buffer.from(expected, 'utf8'));
 }
 
@@ -903,10 +917,48 @@ function signBacklogCursor(
   pageIndex: number,
   afterId: number,
   uniqueCount: number,
+  membershipDigest: string,
 ): string {
   const scopeKey = scope.values.map((entry) => `${entry.value}:${entry.includeChildren ? '1' : '0'}`).join('|');
-  const payload = [binding.grant.projectId, binding.identity.organization.id, binding.identity.project.id, binding.identity.team.id, binding.identity.board.id, backlog.id, scope.defaultValue, scopeKey, String(pageIndex), String(afterId), String(uniqueCount)].join('\0');
+  const payload = [
+    binding.grant.projectId,
+    binding.identity.organization.id,
+    binding.identity.project.id,
+    binding.identity.team.id,
+    binding.identity.board.id,
+    backlog.id,
+    scope.defaultValue,
+    scopeKey,
+    String(pageIndex),
+    String(afterId),
+    String(uniqueCount),
+    membershipDigest,
+  ].join('\0');
   return createHmac('sha256', binding.auth.secret).update(payload, 'utf8').digest('base64url').slice(0, 22);
+}
+
+function backlogMembershipDigest(backlogId: string, ids: readonly number[]): string {
+  return createHash('sha256').update(backlogId + '\0' + ids.join(','), 'utf8').digest('hex').slice(0, 32);
+}
+
+function parseBacklogMembershipIds(value: unknown, maxItems: number): number[] {
+  if (!Number.isSafeInteger(maxItems) || maxItems < 1) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog membership bound is invalid');
+  }
+  if (!isRecord(value) || !Array.isArray(value.workItems)) {
+    throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog membership response is invalid');
+  }
+  const ids = new Set<number>();
+  for (const entry of value.workItems) {
+    if (!isRecord(entry) || !isRecord(entry.target) || !Number.isSafeInteger(entry.target.id) || Number(entry.target.id) < 1) {
+      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog membership identity is invalid');
+    }
+    ids.add(Number(entry.target.id));
+    if (ids.size > maxItems) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'ADO backlog membership exceeds the configured bounded result limit');
+    }
+  }
+  return [...ids].sort((left, right) => left - right);
 }
 
 function buildScopedIdWiql(projectName: string, scope: AdoScopeSnapshot, ids: readonly number[]): string {
@@ -977,16 +1029,6 @@ function parseArrayResponse(value: unknown): unknown[] {
 function parseCommentResponse(value: unknown): unknown[] {
   if (isRecord(value) && Array.isArray(value.comments)) return value.comments;
   return parseArrayResponse(value);
-}
-
-function parseBacklogWiqlIds(value: unknown): number[] {
-  if (!isRecord(value) || !Array.isArray(value.workItems)) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO WIQL response is invalid');
-  const ids = value.workItems.map((item) => {
-    if (!isRecord(item) || !Number.isSafeInteger(item.id) || Number(item.id) < 1) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO WIQL result identity is invalid');
-    return Number(item.id);
-  });
-  if (new Set(ids).size !== ids.length) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ADO backlog WIQL returned duplicate Work Item IDs');
-  return ids;
 }
 
 function parseWiqlIds(value: unknown): number[] {

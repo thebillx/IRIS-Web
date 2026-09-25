@@ -122,7 +122,7 @@ describe('ADO FULL MCP requirement context', () => {
       },
     });
     const cursor = firstBody.result.structuredContent.page.nextCursor;
-    expect(cursor).toMatch(/^p:1:a:101:c:1:s:[A-Za-z0-9_-]{22}$/);
+    expect(cursor).toMatch(/^p:1:a:101:c:1:m:[0-9a-f]{32}:s:[A-Za-z0-9_-]{22}$/);
     if (cursor === null) throw new Error('expected signed backlog cursor');
 
     const second = await handleMcpV21Request(
@@ -143,9 +143,9 @@ describe('ADO FULL MCP requirement context', () => {
       result: {
         isError: false,
         structuredContent: {
-          items: [],
+          items: [{ id: 103, type: 'User Story', areaPath: 'Project\\Team\\ETB' }],
           page: { index: 1, afterId: 101, limit: 1, nextCursor: null, complete: true },
-          enumeration: { pages: 2, uniqueCount: 1, total: 1, complete: true },
+          enumeration: { pages: 2, uniqueCount: 2, total: 2, complete: true },
         },
       },
     });
@@ -153,7 +153,7 @@ describe('ADO FULL MCP requirement context', () => {
 
   it('rejects unknown backlog selectors and arbitrary pagination cursors', async () => {
     const f = await fixture();
-    for (const [backlog, cursor, limit] of [['Unknown', null, 50], ['Stories', 'offset:1', 50], ['Stories', 'p:1:a:101:c:1:s:AAAAAAAAAAAAAAAAAAAAAA', 50], ['Stories', null, 101]] as const) {
+    for (const [backlog, cursor, limit] of [['Unknown', null, 50], ['Stories', 'offset:1', 50], ['Stories', 'p:1:a:101:c:1:m:00000000000000000000000000000000:s:AAAAAAAAAAAAAAAAAAAAAA', 50], ['Stories', null, 101]] as const) {
       const response = await handleMcpV21Request(
         rpc('tools/call', 31, {
           name: 'ado_backlog_list',
@@ -359,6 +359,10 @@ function fakeFetch(): typeof fetch {
     if (url.pathname.endsWith('/_apis/work/backlogs')) return json({ value: [
       { id: 'story', name: 'Stories', rank: 1, type: 'requirement', workItemTypes: [{ name: 'User Story' }] },
     ] });
+    if (url.pathname.endsWith('/_apis/work/backlogs/story/workItems')) return json({ workItems: [
+      { target: { id: 101 } },
+      { target: { id: 103 } },
+    ] });
     if (url.pathname.endsWith('/_apis/wit/wiql')) {
       const parsed = body.length === 0 ? {} : JSON.parse(body) as { query?: unknown };
       const query = typeof parsed.query === 'string' ? parsed.query : '';
@@ -367,25 +371,29 @@ function fakeFetch(): typeof fetch {
       }
       return json({ workItems: [{ id: 101 }] });
     }
-    if (url.pathname.endsWith('/_apis/wit/workitemsbatch')) return json({ value: [{
-      id: 101,
-      rev: 7,
-      fields: {
-        'System.WorkItemType': 'User Story',
-        'System.Title': 'ETB Login Story',
-        'System.State': 'Active',
-        'System.Description': '<p>User can login</p>',
-        'Microsoft.VSTS.Common.AcceptanceCriteria': '<p>Given valid user</p>',
-        'System.AreaPath': 'Project\\Team\\ETB',
-        'System.IterationPath': 'Project\\Sprint 1',
-        'System.Parent': null,
-        'System.Tags': 'etb;automation',
-        'System.BoardColumn': 'Doing',
-        'System.CreatedDate': '2026-09-01T10:00:00Z',
-        'System.ChangedDate': '2026-09-20T12:00:00Z',
-      },
-      relations: [],
-    }] });
+    if (url.pathname.endsWith('/_apis/wit/workitemsbatch')) {
+      const parsed = body.length === 0 ? {} : JSON.parse(body) as { ids?: unknown };
+      if (!Array.isArray(parsed.ids) || !parsed.ids.every((id) => Number.isSafeInteger(id))) throw new Error('invalid fake batch body');
+      return json({ value: parsed.ids.map((id) => ({
+        id: Number(id),
+        rev: Number(id) === 101 ? 7 : 8,
+        fields: {
+          'System.WorkItemType': 'User Story',
+          'System.Title': Number(id) === 101 ? 'ETB Login Story' : 'Second ETB Story',
+          'System.State': 'Active',
+          'System.Description': '<p>User can login</p>',
+          'Microsoft.VSTS.Common.AcceptanceCriteria': '<p>Given valid user</p>',
+          'System.AreaPath': 'Project\\Team\\ETB',
+          'System.IterationPath': 'Project\\Sprint 1',
+          'System.Parent': null,
+          'System.Tags': 'etb;automation',
+          'System.BoardColumn': 'Doing',
+          'System.CreatedDate': '2026-09-01T10:00:00Z',
+          'System.ChangedDate': '2026-09-20T12:00:00Z',
+        },
+        relations: [],
+      })) });
+    }
     if (url.pathname.endsWith('/_apis/wit/workitems/101')) return json({
       id: 101,
       rev: 7,
