@@ -558,7 +558,7 @@ function buildEnvironment(
         PATH: node24Path(),
         HOME: codexHome ?? '',
         CODEX_HOME: codexHome ?? '',
-        TMPDIR: '/tmp',
+        TMPDIR: tmpdir(),
         LANG: 'en_US.UTF-8',
         LC_ALL: '',
         CI: '1',

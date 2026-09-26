@@ -192,7 +192,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     await writeFile(path.join(fixture.projectARoot, 'async.mjs'), [
       "console.log('begin')",
       "for (let i=0;i<200;i++) console.log('line-' + i + '-' + 'q'.repeat(200))",
-      "setTimeout(() => { console.error('done-stderr'); process.exit(0) }, 700)",
+      "setTimeout(() => { console.error('done-stderr'); process.exit(0) }, 2000)",
     ].join('\n') + '\n');
     const requestId = `ninja-${randomUUID()}`;
     const startAt = Date.now();
@@ -240,7 +240,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
       "import { appendFileSync } from 'node:fs'",
       "appendFileSync('spawn-count.txt', 'spawn\\n')",
       "console.log('restart-job-alive')",
-      "setTimeout(() => process.exit(0), 1400)",
+      "setTimeout(() => process.exit(0), 4000)",
     ].join('\n') + '\n');
     const requestId = `restart-${randomUUID()}`;
     const prepared = await fixture.jobs.prepare({ projectId: fixture.projectA.id, workspaceId: primary.workspaceId, executable: 'node', argv: ['restart.mjs'], cwd: '.', executionProfile: 'node-script', envOverrides: {}, timeoutMs: 5000 });
@@ -323,7 +323,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     const fixture = await serviceFixture();
     expect(phase3GroupedToolDefinitions().map((tool) => tool.name)).toEqual(['shell','job']);
     expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['shell','job','workspace','fs','artifact','project_validation_run','project_validation_start']));
-    expect(catalogToolNames('FULL')).toHaveLength(55);
+    expect(catalogToolNames('FULL')).toHaveLength(56);
     expect(catalogToolNames('PRO')).toEqual(['list_projects','project_info','git_status','file_read','search']);
 
     await expect(runDeclaredProjectScript(fixture.projectARoot, 'anything')).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });

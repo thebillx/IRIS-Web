@@ -24,7 +24,7 @@ const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('ADO FULL MCP requirement context', () => {
-  it('exposes four ADO read tools only on FULL while PRO remains exactly five tools', async () => {
+  it('exposes five ADO read tools only on FULL while PRO remains exactly five tools', async () => {
     const f = await fixture();
     const full = await handleMcpV21Request(rpc('tools/list', 1), f.service, f.state, f.broker, f.lifecycle);
     const fullBody = await full.json() as { result: { tools: Array<{ name: string }> } };
@@ -34,6 +34,7 @@ describe('ADO FULL MCP requirement context', () => {
       'ado_workitem_read',
       'ado_hierarchy_read',
       'ado_context_search',
+      'ado_backlog_list',
     ]));
 
     const pro = await handleMcpProRequest(rpc('tools/list', 2, undefined, 'chatgpt-pro'), f.service);
@@ -85,6 +86,55 @@ describe('ADO FULL MCP requirement context', () => {
     expect(audit.some((entry) => entry.capabilityId === 'ado.workitem.read'
       && entry.result === 'SUCCESS'
       && entry.effectiveEffects?.join(',') === 'READ,NETWORK')).toBe(true);
+  });
+
+  it('enumerates a provider-discovered backlog with deterministic bounded pagination', async () => {
+    const f = await fixture();
+    const first = await handleMcpV21Request(
+      rpc('tools/call', 30, {
+        name: 'ado_backlog_list',
+        arguments: {
+          projectId: f.project.id,
+          requestId: 'mcp-ado-backlog-1',
+          backlog: 'Stories',
+          cursor: null,
+          limit: 1,
+          expectedEffects: ['READ','NETWORK'],
+        },
+      }, f.session.clientId, f.session.id, 'ado_backlog_list'),
+      f.service, f.state, f.broker, f.lifecycle,
+    );
+    expect(await first.json()).toMatchObject({
+      result: {
+        isError: false,
+        structuredContent: {
+          backlog: { name: 'Stories', workItemTypes: ['User Story'] },
+          items: [{ id: 101, type: 'User Story', areaPath: 'Project\\Team\\ETB' }],
+          page: { offset: 0, limit: 1, nextCursor: null, complete: true },
+        },
+      },
+    });
+  });
+
+  it('rejects unknown backlog selectors and arbitrary pagination cursors', async () => {
+    const f = await fixture();
+    for (const [backlog, cursor] of [['Unknown', null], ['Stories', 'skip:1']] as const) {
+      const response = await handleMcpV21Request(
+        rpc('tools/call', 31, {
+          name: 'ado_backlog_list',
+          arguments: {
+            projectId: f.project.id,
+            requestId: 'mcp-ado-backlog-invalid',
+            backlog,
+            cursor,
+            limit: 50,
+            expectedEffects: ['READ','NETWORK'],
+          },
+        }, f.session.clientId, f.session.id, 'ado_backlog_list'),
+        f.service, f.state, f.broker, f.lifecycle,
+      );
+      expect((await response.json()) as { result: { isError: boolean } }).toMatchObject({ result: { isError: true } });
+    }
   });
 
   it('fails closed on downgraded expectedEffects and on session/project mismatch', async () => {
@@ -254,6 +304,25 @@ function fakeFetch(): typeof fetch {
       { id: 'story', name: 'Stories', rank: 1, type: 'requirement', workItemTypes: [{ name: 'User Story' }] },
     ] });
     if (url.pathname.endsWith('/_apis/wit/wiql')) return json({ workItems: [{ id: 101 }] });
+    if (url.pathname.endsWith('/_apis/wit/workitemsbatch')) return json({ value: [{
+      id: 101,
+      rev: 7,
+      fields: {
+        'System.WorkItemType': 'User Story',
+        'System.Title': 'ETB Login Story',
+        'System.State': 'Active',
+        'System.Description': '<p>User can login</p>',
+        'Microsoft.VSTS.Common.AcceptanceCriteria': '<p>Given valid user</p>',
+        'System.AreaPath': 'Project\\Team\\ETB',
+        'System.IterationPath': 'Project\\Sprint 1',
+        'System.Parent': null,
+        'System.Tags': 'etb;automation',
+        'System.BoardColumn': 'Doing',
+        'System.CreatedDate': '2026-09-01T10:00:00Z',
+        'System.ChangedDate': '2026-09-20T12:00:00Z',
+      },
+      relations: [],
+    }] });
     if (url.pathname.endsWith('/_apis/wit/workitems/101')) return json({
       id: 101,
       rev: 7,

@@ -5,15 +5,16 @@ DevOps read semantics and scope governance. `IRIS_ADO_REQUIREMENT_CONTEXT_V1`
 adds a bounded production runtime integration around that foundation without
 adding any ADO write authority.
 
-Source catalog 2.6.0 adds four **FULL-only** read tools:
+Source catalog 2.7.0 adds five **FULL-only** read tools:
 
 - `ado_discovery`
 - `ado_workitem_read`
 - `ado_hierarchy_read`
 - `ado_context_search`
+- `ado_backlog_list`
 
 PRO remains the exact five-tool read-only surface and exposes no ADO tool.
-All four ADO capabilities are LOW / PROJECT / non-mutating and derive
+All five ADO capabilities are LOW / PROJECT / non-mutating and derive
 `READ + NETWORK` server-side. They require a live IRIS session whose selected
 project has an exact protected ADO binding. Raw URL, HTTP method, headers, raw
 WIQL and credentials are never accepted from MCP callers.

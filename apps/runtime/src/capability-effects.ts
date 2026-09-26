@@ -25,6 +25,7 @@ const BASE_EFFECTS: Readonly<Record<CapabilityId, readonly CapabilityEffect[]>> 
   'ado.workitem.read': ['READ', 'NETWORK'],
   'ado.hierarchy.read': ['READ', 'NETWORK'],
   'ado.context.search': ['READ', 'NETWORK'],
+  'ado.backlog.list': ['READ', 'NETWORK'],
   'project.test.run': ['READ', 'WRITE', 'EXECUTE', 'NETWORK', 'DESTRUCTIVE'],
   'mission.list': ['READ'],
   'mission.get': ['READ'],
