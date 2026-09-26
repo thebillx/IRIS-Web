@@ -98,14 +98,14 @@ export function adoToolDefinitions(): readonly Record<string, unknown>[] {
     },
     {
       name: 'ado_backlog_list',
-      description: 'Enumerate one exact provider-discovered Azure DevOps backlog level inside the protected Team Area Path. Server-built WIQL only; deterministic keyset cursor; FULL only.',
+      description: 'Enumerate one exact provider-discovered Azure DevOps backlog level inside the protected Team Area Path. Server-built WIQL only; deterministic offset cursor; FULL only.',
       inputSchema: {
         type: 'object',
         required: ['projectId','requestId','backlog','limit','expectedEffects'],
         properties: {
           ...common,
           backlog: { type: 'string', minLength: 1, maxLength: 100 },
-          cursor: { type: ['string','null'], maxLength: 96, default: null },
+          cursor: { type: ['string','null'], maxLength: 40, default: null },
           limit: { type: 'integer', minimum: 1, maximum: 200 },
         },
         additionalProperties: false,
@@ -187,7 +187,7 @@ export async function executeAdoTool(
     projectId,
     requestId,
     backlog: requiredBoundedString(args, 'backlog', 100),
-    cursor: optionalNullableBoundedString(args, 'cursor', 96),
+    cursor: optionalNullableBoundedString(args, 'cursor', 40),
     limit: requiredIntegerInRange(args, 'limit', 1, 200),
     expectedEffects,
   });

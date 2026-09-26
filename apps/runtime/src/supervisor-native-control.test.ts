@@ -5,18 +5,82 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { catalogToolNames } from './mcp-catalog.js';
 import { loadOrCreateTunnelServiceSecret } from './credentials.js';
-import { MCP_PROTOCOL_VERSION } from './mcp.js';
+import { MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import {
   startSupervisorNativeControlServer,
   type AdminRecycleInput,
+  type AdminTunnelRecycleInput,
   type SupervisorNativeOperations,
 } from './supervisor-native-control.js';
-import type { SupervisorAdminToolCallResult } from './supervisor-admin.js';
+import { adminToolDefinitions, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 describe('outer supervisor native control', () => {
+  it('implements the authenticated tunnel-client initialize handshake without widening native tools', async () => {
+    const harness = await startHarness();
+    const initialize = {
+      jsonrpc: '2.0' as const,
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+        capabilities: { roots: { listChanged: true } },
+        clientInfo: { name: 'tunnel-client', version: '0.0.12' },
+      },
+    };
+    try {
+      const accepted = await postRpc(harness, initialize);
+      expect(accepted.status).toBe(200);
+      await expect(accepted.json()).resolves.toMatchObject({ result: {
+        protocolVersion: TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+        capabilities: { tools: {} },
+        serverInfo: { name: 'IRIS Native Supervisor Control', version: '0.0.0' },
+      } });
+
+      const initialized = await postRpc(harness, { jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, {
+        'MCP-Protocol-Version': TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+      });
+      expect(initialized.status).toBe(202);
+
+      const listed = await rpc(harness, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, {
+        'MCP-Protocol-Version': TUNNEL_CLIENT_MCP_PROTOCOL_VERSION,
+        'Mcp-Method': 'tools/list',
+      });
+      expect(toolNames(listed)).toEqual([
+        'supervisor_status', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
+        'activation_status', 'activation_prepare', 'activation_apply', 'activation_confirm', 'activation_rollback',
+      ]);
+      expect(catalogToolNames('FULL')).not.toContain('admin_tunnel_recycle');
+      expect(catalogToolNames('PRO')).not.toContain('admin_tunnel_recycle');
+      expect(adminToolDefinitions().map((tool) => tool.name)).not.toContain('admin_tunnel_recycle');
+
+      const unsupported = await postRpc(harness, {
+        ...initialize,
+        id: 3,
+        params: { ...initialize.params, protocolVersion: '2099-01-01' },
+      });
+      expect(unsupported.status).toBe(400);
+      await expect(unsupported.json()).resolves.toMatchObject({ error: { code: -32602 } });
+
+      const malformed = await postRpc(harness, {
+        jsonrpc: '2.0', id: 4, method: 'initialize', params: { protocolVersion: TUNNEL_CLIENT_MCP_PROTOCOL_VERSION },
+      });
+      expect(malformed.status).toBe(400);
+      await expect(malformed.json()).resolves.toMatchObject({ error: { code: -32602 } });
+
+      const mismatchedMethod = await postRpc(harness, initialize, { 'Mcp-Method': 'tools/list' });
+      expect(mismatchedMethod.status).toBe(400);
+      await expect(mismatchedMethod.json()).resolves.toMatchObject({ error: { code: -32600 } });
+
+      const unauthenticated = await postRpc(harness, initialize, {}, false);
+      expect(unauthenticated.status).toBe(401);
+    } finally {
+      await harness.server.close();
+    }
+  });
+
   it('requires authentication and exposes only bounded supervisor/admin plus activation lifecycle operations', async () => {
     const harness = await startHarness();
     try {
@@ -29,19 +93,26 @@ describe('outer supervisor native control', () => {
       expect(toolNames(listed)).toEqual([
         'supervisor_status',
         'admin_status',
+        'runtime_reconcile',
         'admin_recycle',
+        'admin_tunnel_recycle',
         'activation_status',
         'activation_prepare',
         'activation_apply',
         'activation_confirm',
         'activation_rollback',
       ]);
-      for (const name of ['supervisor_status', 'admin_status', 'admin_recycle']) {
+      for (const name of ['supervisor_status', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
         expect(catalogToolNames('FULL')).not.toContain(name);
         expect(catalogToolNames('PRO')).not.toContain(name);
       }
+      for (const name of ['supervisor_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
+        expect(adminToolDefinitions().map((tool) => tool.name)).not.toContain(name);
+      }
+      expect(adminToolDefinitions().map((tool) => tool.name)).toContain('admin_status');
       expect(structured(await rpcTool(harness, 'supervisor_status', {}))).toMatchObject({ supervisor: 'outer', workloadRuntimeId: 'runtime-a' });
       expect(structured(await rpcTool(harness, 'admin_status', {}))).toMatchObject({ adminIdentity: 'admin-a' });
+      expect(structured(await rpcTool(harness, 'runtime_reconcile', {}))).toMatchObject({ readiness: 'READY', workloadAnchorsPreserved: true });
       expect(structured(await rpcTool(harness, 'activation_status', {}))).toMatchObject({ proxied: 'activation_status' });
     } finally {
       await harness.server.close();
@@ -68,6 +139,8 @@ describe('outer supervisor native control', () => {
       })) {
         const response = await rpcTool(harness, 'admin_recycle', { [key]: value });
         expect(toolError(response)).toMatchObject({ code: 'INVALID_REQUEST' });
+        const adminTunnelResponse = await rpcTool(harness, 'admin_tunnel_recycle', { [key]: value });
+        expect(toolError(adminTunnelResponse)).toMatchObject({ code: 'INVALID_REQUEST' });
       }
       expect(harness.recycleInputs).toEqual([]);
     } finally {
@@ -105,10 +178,12 @@ async function startHarness() {
   const operations: SupervisorNativeOperations = {
     supervisorStatus: async () => ({ supervisor: 'outer', workloadRuntimeId: harness.workloadRuntimeId }),
     adminStatus: async () => ({ adminIdentity: recycleInputs.length === 0 ? 'admin-a' : 'admin-b' }),
+    runtimeReconcile: async () => ({ readiness: 'READY', workloadAnchorsPreserved: true }),
     adminRecycle: async (input) => {
       recycleInputs.push(input);
       return { beforeAdminIdentity: 'admin-a', afterAdminIdentity: 'admin-b', workloadRuntimeIdUnchanged: true };
     },
+    adminTunnelRecycle: async (input: AdminTunnelRecycleInput) => ({ ...input, readiness: 'READY' }),
     adminToolCall: async (name): Promise<SupervisorAdminToolCallResult> => ({ structuredContent: { proxied: name }, isError: false }),
   };
   const server = await startSupervisorNativeControlServer(dataRoot, await freePort(), operations);
@@ -126,18 +201,26 @@ async function rpc(
   body: unknown,
   extraHeaders: Record<string, string> = {},
 ): Promise<Record<string, unknown>> {
-  const response = await fetch(harness.server.mcpUrl, {
+  const response = await postRpc(harness, body, { 'MCP-Protocol-Version': MCP_PROTOCOL_VERSION, ...extraHeaders });
+  expect(response.status).toBe(200);
+  return await response.json() as Record<string, unknown>;
+}
+
+async function postRpc(
+  harness: Awaited<ReturnType<typeof startHarness>>,
+  body: unknown,
+  extraHeaders: Record<string, string> = {},
+  authenticated = true,
+): Promise<Response> {
+  return fetch(harness.server.mcpUrl, {
     method: 'POST',
     headers: {
-      authorization: `Bearer ${harness.secret}`,
+      ...(authenticated ? { authorization: `Bearer ${harness.secret}` } : {}),
       'content-type': 'application/json',
-      'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
       ...extraHeaders,
     },
     body: JSON.stringify(body),
   });
-  expect(response.status).toBe(200);
-  return await response.json() as Record<string, unknown>;
 }
 
 function toolNames(value: Record<string, unknown>): string[] {

@@ -192,7 +192,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     await writeFile(path.join(fixture.projectARoot, 'async.mjs'), [
       "console.log('begin')",
       "for (let i=0;i<200;i++) console.log('line-' + i + '-' + 'q'.repeat(200))",
-      "setTimeout(() => { console.error('done-stderr'); process.exit(0) }, 700)",
+      "setTimeout(() => { console.error('done-stderr'); process.exit(0) }, 2000)",
     ].join('\n') + '\n');
     const requestId = `ninja-${randomUUID()}`;
     const startAt = Date.now();
@@ -240,7 +240,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
       "import { appendFileSync } from 'node:fs'",
       "appendFileSync('spawn-count.txt', 'spawn\\n')",
       "console.log('restart-job-alive')",
-      "setTimeout(() => process.exit(0), 1400)",
+      "setTimeout(() => process.exit(0), 4000)",
     ].join('\n') + '\n');
     const requestId = `restart-${randomUUID()}`;
     const prepared = await fixture.jobs.prepare({ projectId: fixture.projectA.id, workspaceId: primary.workspaceId, executable: 'node', argv: ['restart.mjs'], cwd: '.', executionProfile: 'node-script', envOverrides: {}, timeoutMs: 5000 });

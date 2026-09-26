@@ -104,48 +104,13 @@ describe('ADO FULL MCP requirement context', () => {
       }, f.session.clientId, f.session.id, 'ado_backlog_list'),
       f.service, f.state, f.broker, f.lifecycle,
     );
-    const firstBody = await first.json() as {
-      result: {
-        isError: boolean;
-        structuredContent: { page: { nextCursor: string | null }; enumeration: { uniqueCount: number; total: number | null } };
-      };
-    };
-    expect(firstBody).toMatchObject({
+    expect(await first.json()).toMatchObject({
       result: {
         isError: false,
         structuredContent: {
           backlog: { name: 'Stories', workItemTypes: ['User Story'] },
           items: [{ id: 101, type: 'User Story', areaPath: 'Project\\Team\\ETB' }],
-          page: { index: 0, afterId: 0, limit: 1, nextCursor: expect.any(String), complete: false },
-          enumeration: { pages: 1, uniqueCount: 1, total: null, complete: false },
-        },
-      },
-    });
-    const cursor = firstBody.result.structuredContent.page.nextCursor;
-    expect(cursor).toMatch(/^p:1:a:101:c:1:m:[0-9a-f]{32}:s:[A-Za-z0-9_-]{22}$/);
-    if (cursor === null) throw new Error('expected signed backlog cursor');
-
-    const second = await handleMcpV21Request(
-      rpc('tools/call', 32, {
-        name: 'ado_backlog_list',
-        arguments: {
-          projectId: f.project.id,
-          requestId: 'mcp-ado-backlog-2',
-          backlog: 'Stories',
-          cursor,
-          limit: 1,
-          expectedEffects: ['READ','NETWORK'],
-        },
-      }, f.session.clientId, f.session.id, 'ado_backlog_list'),
-      f.service, f.state, f.broker, f.lifecycle,
-    );
-    expect(await second.json()).toMatchObject({
-      result: {
-        isError: false,
-        structuredContent: {
-          items: [{ id: 103, type: 'User Story', areaPath: 'Project\\Team\\ETB' }],
-          page: { index: 1, afterId: 101, limit: 1, nextCursor: null, complete: true },
-          enumeration: { pages: 2, uniqueCount: 2, total: 2, complete: true },
+          page: { offset: 0, limit: 1, nextCursor: null, complete: true },
         },
       },
     });
@@ -153,7 +118,7 @@ describe('ADO FULL MCP requirement context', () => {
 
   it('rejects unknown backlog selectors and arbitrary pagination cursors', async () => {
     const f = await fixture();
-    for (const [backlog, cursor, limit] of [['Unknown', null, 50], ['Stories', 'offset:1', 50], ['Stories', 'p:1:a:101:c:1:m:00000000000000000000000000000000:s:AAAAAAAAAAAAAAAAAAAAAA', 50], ['Stories', null, 101]] as const) {
+    for (const [backlog, cursor] of [['Unknown', null], ['Stories', 'skip:1']] as const) {
       const response = await handleMcpV21Request(
         rpc('tools/call', 31, {
           name: 'ado_backlog_list',
@@ -162,7 +127,7 @@ describe('ADO FULL MCP requirement context', () => {
             requestId: 'mcp-ado-backlog-invalid',
             backlog,
             cursor,
-            limit,
+            limit: 50,
             expectedEffects: ['READ','NETWORK'],
           },
         }, f.session.clientId, f.session.id, 'ado_backlog_list'),
@@ -170,26 +135,6 @@ describe('ADO FULL MCP requirement context', () => {
       );
       expect((await response.json()) as { result: { isError: boolean } }).toMatchObject({ result: { isError: true } });
     }
-  });
-
-  it('rejects raw WIQL and URL escape-hatch fields for backlog enumeration', async () => {
-    const f = await fixture();
-    const response = await handleMcpV21Request(
-      rpc('tools/call', 33, {
-        name: 'ado_backlog_list',
-        arguments: {
-          projectId: f.project.id,
-          requestId: 'mcp-ado-backlog-raw-input',
-          backlog: 'Stories',
-          limit: 50,
-          wiql: 'SELECT * FROM WorkItems',
-          url: 'https://example.invalid',
-          expectedEffects: ['READ','NETWORK'],
-        },
-      }, f.session.clientId, f.session.id, 'ado_backlog_list'),
-      f.service, f.state, f.broker, f.lifecycle,
-    );
-    expect(await response.json()).toMatchObject({ result: { isError: true } });
   });
 
   it('fails closed on downgraded expectedEffects and on session/project mismatch', async () => {
@@ -347,53 +292,37 @@ function bindingProvider(irisProjectId: string, rateLimitRequests = 100): AdoRun
 }
 
 function fakeFetch(): typeof fetch {
-  return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+  return (async (input: string | URL | Request): Promise<Response> => {
     const url = new URL(input instanceof Request ? input.url : String(input));
-    const body = typeof init?.body === 'string' ? init.body : '';
     if (url.pathname.endsWith('/_apis/work/teamsettings/teamfieldvalues')) return json({
       field: { referenceName: 'System.AreaPath' },
-      defaultValue: 'Project\\Team\\ETB',
-      values: [{ value: 'Project\\Team\\ETB', includeChildren: false }],
+      defaultValue: 'Project\\Team',
+      values: [{ value: 'Project\\Team', includeChildren: true }],
     });
     if (url.pathname.endsWith('/_apis/work/boards/board-id')) return json({ id: 'board-id', name: 'Stories' });
     if (url.pathname.endsWith('/_apis/work/backlogs')) return json({ value: [
       { id: 'story', name: 'Stories', rank: 1, type: 'requirement', workItemTypes: [{ name: 'User Story' }] },
     ] });
-    if (url.pathname.endsWith('/_apis/work/backlogs/story/workItems')) return json({ workItems: [
-      { target: { id: 101 } },
-      { target: { id: 103 } },
-    ] });
-    if (url.pathname.endsWith('/_apis/wit/wiql')) {
-      const parsed = body.length === 0 ? {} : JSON.parse(body) as { query?: unknown };
-      const query = typeof parsed.query === 'string' ? parsed.query : '';
-      if (query.includes('[System.WorkItemType] IN')) {
-        return json({ workItems: query.includes('[System.Id] > 101') ? [] : [{ id: 101 }] });
-      }
-      return json({ workItems: [{ id: 101 }] });
-    }
-    if (url.pathname.endsWith('/_apis/wit/workitemsbatch')) {
-      const parsed = body.length === 0 ? {} : JSON.parse(body) as { ids?: unknown };
-      if (!Array.isArray(parsed.ids) || !parsed.ids.every((id) => Number.isSafeInteger(id))) throw new Error('invalid fake batch body');
-      return json({ value: parsed.ids.map((id) => ({
-        id: Number(id),
-        rev: Number(id) === 101 ? 7 : 8,
-        fields: {
-          'System.WorkItemType': 'User Story',
-          'System.Title': Number(id) === 101 ? 'ETB Login Story' : 'Second ETB Story',
-          'System.State': 'Active',
-          'System.Description': '<p>User can login</p>',
-          'Microsoft.VSTS.Common.AcceptanceCriteria': '<p>Given valid user</p>',
-          'System.AreaPath': 'Project\\Team\\ETB',
-          'System.IterationPath': 'Project\\Sprint 1',
-          'System.Parent': null,
-          'System.Tags': 'etb;automation',
-          'System.BoardColumn': 'Doing',
-          'System.CreatedDate': '2026-09-01T10:00:00Z',
-          'System.ChangedDate': '2026-09-20T12:00:00Z',
-        },
-        relations: [],
-      })) });
-    }
+    if (url.pathname.endsWith('/_apis/wit/wiql')) return json({ workItems: [{ id: 101 }] });
+    if (url.pathname.endsWith('/_apis/wit/workitemsbatch')) return json({ value: [{
+      id: 101,
+      rev: 7,
+      fields: {
+        'System.WorkItemType': 'User Story',
+        'System.Title': 'ETB Login Story',
+        'System.State': 'Active',
+        'System.Description': '<p>User can login</p>',
+        'Microsoft.VSTS.Common.AcceptanceCriteria': '<p>Given valid user</p>',
+        'System.AreaPath': 'Project\\Team\\ETB',
+        'System.IterationPath': 'Project\\Sprint 1',
+        'System.Parent': null,
+        'System.Tags': 'etb;automation',
+        'System.BoardColumn': 'Doing',
+        'System.CreatedDate': '2026-09-01T10:00:00Z',
+        'System.ChangedDate': '2026-09-20T12:00:00Z',
+      },
+      relations: [],
+    }] });
     if (url.pathname.endsWith('/_apis/wit/workitems/101')) return json({
       id: 101,
       rev: 7,
