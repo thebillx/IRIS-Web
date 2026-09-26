@@ -20,7 +20,7 @@ import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
-import { startSupervisorNativeControlServer, type AdminRecycleInput } from './supervisor-native-control.js';
+import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput } from './supervisor-native-control.js';
 
 const execFileAsync = promisify(execFile);
 const SUPERVISOR_DIRECTORY = 'supervisor';
@@ -123,12 +123,6 @@ export interface SupervisorOptions {
   readonly supervisorControlPort?: number;
   readonly adminTunnelHealthPort?: number;
   readonly protectedReferenceRoot?: string;
-  readonly e2eProbe?: SupervisorE2eProbe;
-}
-
-export interface SupervisorE2eProbe {
-  readonly fullUrl: string;
-  readonly proUrl: string;
 }
 
 interface SupervisorOperationLock {
@@ -204,7 +198,6 @@ export async function createSupervisor(options: SupervisorOptions = {}): Promise
     options.supervisorControlPort ?? DEFAULT_SUPERVISOR_CONTROL_PORT,
     options.adminTunnelHealthPort ?? DEFAULT_ADMIN_TUNNEL_HEALTH_PORT,
     protectedReferenceRoot,
-    options.e2eProbe,
   );
 }
 
@@ -220,7 +213,6 @@ export class Supervisor {
     private readonly supervisorControlPort: number,
     private readonly adminTunnelHealthPort: number,
     private readonly protectedReferenceRoot?: string,
-    private readonly e2eProbe?: SupervisorE2eProbe,
   ) {
     for (const [label, port] of [
       ['Supervisor admin', adminPort],
@@ -326,7 +318,7 @@ export class Supervisor {
         if (profiles.admin === null) throw new RuntimeError('PRECONDITION_FAILED', 'Persistent native supervisor control requires a dedicated ADMIN tunnel identity');
         state = await this.ensureAdminTunnel(state, boundRegistry, profiles.admin, started);
       }
-      state = await this.ensureWeb(state, runtime.endpoint.apiUrl, started, expectedSourceIdentity);
+      state = await this.ensureWeb(state, runtime.endpoint.apiUrl, started, runtimeReplaced, expectedSourceIdentity);
       state = await this.ensureTunnel(state, 'full', boundRegistry, profiles.full, runtime.endpoint.instanceId, started, runtimeReplaced);
       state = await this.ensureTunnel(state, 'pro', boundRegistry, profiles.pro, runtime.endpoint.instanceId, started, runtimeReplaced);
       await this.writeState(state);
@@ -634,6 +626,83 @@ export class Supervisor {
     return this.withOperationLock('adopt-runtime', () => this.adoptRuntimeUnlocked());
   }
 
+  public async runtimeReconcile(): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('runtime-reconcile', () => this.runtimeReconcileUnlocked());
+  }
+
+  private async runtimeReconcileUnlocked(): Promise<Record<string, unknown>> {
+    let state = await this.readState();
+    if (state.runtime !== null) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime reconciliation requires missing supervisor runtime ownership metadata');
+    const runtime = await runtimeStatus(this.dataRoot);
+    if (runtime.state !== 'running' || runtime.endpoint === null) throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Only a verified running IRIS runtime can be reconciled');
+    if (!(await commandLooksLikeIris(runtime.endpoint.pid, state.workloadSourceRoot))) {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Runtime process identity could not be verified against the persisted workload source binding');
+    }
+    const adoptedRuntime = await runtimeRecordFromObserved(runtime.endpoint, state.workloadSourceRoot);
+    const registry = await readConnectorRegistry(this.dataRoot);
+    if (registry === null || registry.deploymentEpoch <= 0) throw new RuntimeError('PRECONDITION_FAILED', 'A valid connector registry is required for runtime reconciliation');
+    const serviceSecret = await readTunnelServiceSecret(this.dataRoot);
+    if (serviceSecret === null) throw new RuntimeError('CREDENTIAL_MISSING', 'Tunnel service credential is required for runtime reconciliation');
+    const full = await this.proveReconciledTunnel(state.tunnels.full, registry, 'full', runtime.endpoint, serviceSecret);
+    const pro = await this.proveReconciledTunnel(state.tunnels.pro, registry, 'pro', runtime.endpoint, serviceSecret);
+    const before = {
+      fullIdentity: ownedProcessIdentity(state.tunnels.full),
+      proIdentity: ownedProcessIdentity(state.tunnels.pro),
+      adminIdentity: ownedProcessIdentity(state.admin),
+      webIdentity: ownedProcessIdentity(state.web),
+      workloadSourceRoot: state.workloadSourceRoot,
+      deploymentEpoch: registry.deploymentEpoch,
+    };
+    const currentRuntime = await runtimeStatus(this.dataRoot);
+    if (currentRuntime.state !== 'running' || currentRuntime.endpoint === null || !sameEndpoint(currentRuntime.endpoint, runtime.endpoint)) {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime identity changed before reconciliation could be persisted');
+    }
+    if (await inspectProcess(full.record) !== 'running' || await inspectProcess(pro.record) !== 'running') {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'A workload tunnel identity changed before reconciliation could be persisted');
+    }
+    state = {
+      ...state,
+      runtime: adoptedRuntime,
+      tunnels: {
+        full: { ...full.record, instanceId: runtime.endpoint.instanceId },
+        pro: { ...pro.record, instanceId: runtime.endpoint.instanceId },
+      },
+    };
+    await this.writeState(state);
+    const [persisted, afterRuntime, afterRegistry] = await Promise.all([
+      this.readState(),
+      runtimeStatus(this.dataRoot),
+      readConnectorRegistry(this.dataRoot),
+    ]);
+    const anchorsPreserved = afterRuntime.state === 'running' && afterRuntime.endpoint !== null
+      && sameEndpoint(afterRuntime.endpoint, runtime.endpoint)
+      && afterRegistry !== null && afterRegistry.deploymentEpoch === before.deploymentEpoch
+      && persisted.workloadSourceRoot === before.workloadSourceRoot
+      && ownedProcessIdentity(persisted.tunnels.full) === before.fullIdentity
+      && ownedProcessIdentity(persisted.tunnels.pro) === before.proIdentity
+      && ownedProcessIdentity(persisted.admin) === before.adminIdentity
+      && ownedProcessIdentity(persisted.web) === before.webIdentity
+      && persisted.runtime !== null && sameOwnedRuntime(persisted.runtime, adoptedRuntime)
+      && persisted.tunnels.full?.instanceId === runtime.endpoint.instanceId
+      && persisted.tunnels.pro?.instanceId === runtime.endpoint.instanceId;
+    if (!anchorsPreserved) throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime reconciliation changed a protected process or workload anchor');
+    await waitForTunnel(full.record.executable, full.binding.healthPort, 2_000);
+    await waitForTunnel(pro.record.executable, pro.binding.healthPort, 2_000);
+    return {
+      runtimePid: runtime.endpoint.pid,
+      runtimeId: runtime.endpoint.runtimeId,
+      instanceId: runtime.endpoint.instanceId,
+      fullTunnelId: full.binding.tunnelId,
+      proTunnelId: pro.binding.tunnelId,
+      fullTunnelPid: full.record.pid,
+      proTunnelPid: pro.record.pid,
+      deploymentEpoch: registry.deploymentEpoch,
+      readiness: 'READY',
+      workloadAnchorsPreserved: true,
+    };
+  }
+
   private async adoptRuntimeUnlocked(): Promise<SupervisorStackStatus> {
     const observed = await runtimeStatus(this.dataRoot);
     if (observed.state !== 'running' || observed.endpoint === null) throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Only a verified running IRIS runtime can be adopted');
@@ -653,7 +722,9 @@ export class Supervisor {
     const nativeControl = await startSupervisorNativeControlServer(this.dataRoot, this.supervisorControlPort, {
       supervisorStatus: () => this.supervisorNativeStatus(),
       adminStatus: () => this.adminNativeStatus(),
+      runtimeReconcile: () => this.runtimeReconcile(),
       adminRecycle: (input) => this.adminRecycle(input),
+      adminTunnelRecycle: (input) => this.adminTunnelRecycle(input),
       adminToolCall: (name, args) => this.adminToolCall(name, args),
     });
     this.nativeControlActive = true;
@@ -763,6 +834,110 @@ export class Supervisor {
   public async adminRecycle(input: AdminRecycleInput = {}): Promise<Record<string, unknown>> {
     await this.prepareDirectories();
     return this.withOperationLock('admin-recycle', () => this.adminRecycleUnlocked(input));
+  }
+
+  public async adminTunnelRecycle(input: AdminTunnelRecycleInput): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('admin-tunnel-recycle', () => this.adminTunnelRecycleUnlocked(input));
+  }
+
+  private async adminTunnelRecycleUnlocked(input: AdminTunnelRecycleInput): Promise<Record<string, unknown>> {
+    let state = await this.readState();
+    const current = state.adminTunnel;
+    if (current === null || current.component !== 'tunnel-admin') {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor ADMIN tunnel is not owned');
+    }
+    if (await inspectProcess(current) !== 'running') {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Supervisor ADMIN tunnel identity is not live and verified');
+    }
+    const beforeIdentity = ownedProcessIdentity(current);
+    if (beforeIdentity === null || input.expectedAdminTunnelIdentity !== beforeIdentity) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Supervisor ADMIN tunnel identity changed before recycle');
+    }
+    if (input.expectedAdminProfileDigest !== current.profileDigest) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Supervisor ADMIN tunnel profile digest changed before recycle');
+    }
+    const registry = await readConnectorRegistry(this.dataRoot);
+    if (registry === null || registry.admin === null) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Supervisor ADMIN tunnel binding is unavailable');
+    }
+    const binding = registry.admin;
+    if (current.tunnelId !== binding.tunnelId || input.expectedAdminTunnelId !== binding.tunnelId) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Supervisor ADMIN tunnel binding changed before recycle');
+    }
+    if (current.profilePath !== binding.managedProfilePath) {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Supervisor ADMIN tunnel profile path is not the managed ADMIN profile');
+    }
+    const target = `http://127.0.0.1:${this.supervisorControlPort}/mcp`;
+    const credentials = credentialPaths(this.dataRoot);
+    const expectedProfile = managedAdminProfile(binding, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), this.adminTunnelHealthPort, target);
+    const actualProfile = await readFile(binding.managedProfilePath, 'utf8').catch(() => null);
+    if (actualProfile !== expectedProfile) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Managed ADMIN profile is not the corrected native-control profile');
+    }
+    const correctedProfileDigest = await fileSha256(binding.managedProfilePath);
+    const [beforeRuntime, beforeAdminResult] = await Promise.all([
+      runtimeStatus(this.dataRoot),
+      callSupervisorAdminTool(this.dataRoot, this.adminPort, 'activation_status', {}),
+    ]);
+    if (beforeRuntime.state !== 'running' || beforeRuntime.endpoint === null) {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Workload runtime must remain ready during ADMIN tunnel recycle');
+    }
+    const beforeActivation = requireSuccessfulAdminResult(beforeAdminResult, 'activation_status');
+    const anchors = {
+      runtimeId: beforeRuntime.endpoint.runtimeId,
+      instanceId: beforeRuntime.endpoint.instanceId,
+      deploymentEpoch: registry.deploymentEpoch,
+      workloadSourceRoot: state.workloadSourceRoot,
+      adminIdentity: ownedProcessIdentity(state.admin),
+      fullTunnelIdentity: ownedProcessIdentity(state.tunnels.full),
+      proTunnelIdentity: ownedProcessIdentity(state.tunnels.pro),
+      webIdentity: ownedProcessIdentity(state.web),
+      activeTransactionId: beforeActivation.activeTransactionId ?? null,
+    };
+
+    await stopOwnedProcess(current);
+    state = { ...state, adminTunnel: null };
+    await this.writeState(state);
+    state = await this.ensureAdminTunnel(state, registry, binding.managedProfilePath, []);
+    const replacement = state.adminTunnel;
+    if (replacement === null || replacement.pid === current.pid || replacement.tunnelId !== binding.tunnelId || replacement.profileDigest !== correctedProfileDigest) {
+      throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Replacement ADMIN tunnel did not retain its corrected managed profile and binding');
+    }
+    await waitForTunnel(replacement.executable, this.adminTunnelHealthPort, 2_000);
+    if (!await supervisorNativeEndpointResponds(this.dataRoot, this.supervisorControlPort)) {
+      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'Corrected ADMIN profile target did not reach native supervisor control');
+    }
+
+    const [persisted, afterRegistry, afterRuntime, afterAdminResult] = await Promise.all([
+      this.readState(),
+      readConnectorRegistry(this.dataRoot),
+      runtimeStatus(this.dataRoot),
+      callSupervisorAdminTool(this.dataRoot, this.adminPort, 'activation_status', {}),
+    ]);
+    const afterActivation = requireSuccessfulAdminResult(afterAdminResult, 'activation_status');
+    const workloadAnchorsPreserved = afterRuntime.state === 'running' && afterRuntime.endpoint !== null
+      && afterRuntime.endpoint.runtimeId === anchors.runtimeId
+      && afterRuntime.endpoint.instanceId === anchors.instanceId
+      && afterRegistry !== null && afterRegistry.deploymentEpoch === anchors.deploymentEpoch
+      && persisted.workloadSourceRoot === anchors.workloadSourceRoot
+      && ownedProcessIdentity(persisted.admin) === anchors.adminIdentity
+      && ownedProcessIdentity(persisted.tunnels.full) === anchors.fullTunnelIdentity
+      && ownedProcessIdentity(persisted.tunnels.pro) === anchors.proTunnelIdentity
+      && ownedProcessIdentity(persisted.web) === anchors.webIdentity
+      && (afterActivation.activeTransactionId ?? null) === anchors.activeTransactionId;
+    if (!workloadAnchorsPreserved) {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'ADMIN tunnel recycle changed a protected workload or activation anchor');
+    }
+    return {
+      oldAdminTunnelPid: current.pid,
+      newAdminTunnelPid: replacement.pid,
+      adminTunnelId: binding.tunnelId,
+      adminProfileDigest: correctedProfileDigest,
+      target,
+      readiness: 'READY',
+      workloadAnchorsPreserved: true,
+    };
   }
 
   private async adminRecycleUnlocked(input: AdminRecycleInput): Promise<Record<string, unknown>> {
@@ -1011,7 +1186,7 @@ export class Supervisor {
       ? layer('READY', 'READY', 'Workload tunnels, isolated admin tunnel, and persistent supervisor-admin endpoint are healthy')
       : combineLayers(controlPlaneParts, 'CONTROL_PLANE_UNREACHABLE', 'Control-plane readiness is not proven for workload and isolated admin transport');
     const connectorStatuses = registry.connectors.map((binding) => connectorStatus(binding, local.connectors.find((entry) => entry.connectorId === binding.connectorId), tunnelResults[binding.connectorId === 'iris-full' ? 0 : 1]));
-    const e2e = await this.probeEndToEnd(registry, connectorStatuses);
+    const e2e = layer('UNKNOWN', 'E2E_PROBE_UNAVAILABLE', 'No safe remote connector probe is configured; /readyz is not treated as end-to-end proof');
     const stateValue = runtimeLayer.state === 'FAILED' || local.status.state === 'FAILED' || tunnelLayer.state === 'FAILED' ? 'FAILED'
       : e2e.state === 'UNKNOWN' || webLayer.state !== 'READY' ? 'DEGRADED' : 'READY';
     return { state: stateValue, runtime: runtimeLayer, web: webLayer, tunnel: tunnelLayer, controlPlane, localRuntime: local.status, endToEnd: e2e, connectors: connectorStatuses, credentials, registryPresent: true, recovery: recoveryView((await this.readState()).recovery) };
@@ -1170,7 +1345,7 @@ export class Supervisor {
     const executable = await resolveExecutable(this.tunnelClientPath);
     const pidFile = path.join(this.supervisorDirectory(), 'admin.tunnel.pid');
     const record = await spawnManaged(
-      'tunnel-admin', executable, ['run', '--embedded-mcp-stub', '--profile-file', profilePath, '--pid.file', pidFile],
+      'tunnel-admin', executable, ['run', '--profile-file', profilePath, '--pid.file', pidFile],
       this.sourceRoot, {}, profilePath, this.logDirectory(), 'tunnel-client', binding.tunnelId,
       null, null, null, profileDigest,
     );
@@ -1185,6 +1360,7 @@ export class Supervisor {
     state: SupervisorStateDocument,
     runtimeUrl: string,
     started: Array<'runtime' | 'web' | 'admin' | 'full' | 'pro' | 'admin-tunnel'>,
+    runtimeReplaced: boolean,
     expectedSourceIdentity?: ActivationSourceIdentity,
   ): Promise<SupervisorStateDocument> {
     if (expectedSourceIdentity !== undefined) {
@@ -1197,7 +1373,7 @@ export class Supervisor {
     if (state.web !== null) {
       const inspected = await inspectProcess(state.web);
       if (inspected === 'ambiguous') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Web process identity changed');
-      if (inspected === 'running' && await endpointResponds(`http://127.0.0.1:${this.webPort}/`)) return state;
+      if (inspected === 'running' && !runtimeReplaced && await endpointResponds(`http://127.0.0.1:${this.webPort}/`)) return state;
       if (inspected === 'running') await stopOwnedProcess(state.web);
     }
     const executable = path.join(state.workloadSourceRoot, 'apps/web/node_modules/.bin/vite');
@@ -1263,6 +1439,65 @@ export class Supervisor {
     return next;
   }
 
+  private async proveReconciledTunnel(
+    record: OwnedProcess | null,
+    registry: ConnectorRegistryDocument,
+    profile: 'full' | 'pro',
+    endpoint: NonNullable<RuntimeObservedStatus['endpoint']>,
+    serviceSecret: string,
+  ): Promise<{ readonly record: OwnedProcess; readonly binding: ConnectorBinding }> {
+    const binding = registry.connectors.find((connector) => connector.connectorId === (profile === 'full' ? 'iris-full' : 'iris-pro'));
+    const expectedComponent = profile === 'full' ? 'tunnel-full' : 'tunnel-pro';
+    if (record === null || binding === undefined || record.component !== expectedComponent) {
+      throw new RuntimeError('PRECONDITION_FAILED', `${profile} tunnel ownership metadata is unavailable`);
+    }
+    if (await inspectProcess(record) !== 'running') {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `${profile} tunnel process identity is not live and verified`);
+    }
+    if (record.tunnelId !== binding.tunnelId || record.runtimeId !== endpoint.runtimeId
+      || record.deploymentEpoch !== registry.deploymentEpoch || record.profilePath !== binding.managedProfilePath
+      || binding.runtimeId !== endpoint.runtimeId || binding.deploymentEpoch !== registry.deploymentEpoch) {
+      throw new RuntimeError('PRECONDITION_FAILED', `${profile} tunnel binding metadata does not match the active runtime binding`);
+    }
+    const expectedProfile = managedProfile(binding, credentialPaths(this.dataRoot).controlPlaneApiKey, credentialPaths(this.dataRoot).tunnelServiceAuthorization,
+      this.logDirectory(), registry.deploymentEpoch, endpoint.apiUrl, null);
+    const actualProfile = await readFile(binding.managedProfilePath, 'utf8').catch(() => null);
+    if (actualProfile !== expectedProfile || await fileSha256(binding.managedProfilePath) !== record.profileDigest) {
+      throw new RuntimeError('PRECONDITION_FAILED', `${profile} tunnel profile is not the verified active runtime profile`);
+    }
+    await waitForTunnel(record.executable, binding.healthPort, 2_000);
+    const headers = {
+      authorization: `Bearer ${serviceSecret}`,
+      'content-type': 'application/json',
+      'x-iris-connector-profile': binding.mode,
+      'x-iris-deployment-epoch': String(registry.deploymentEpoch),
+      'x-iris-runtime-id': binding.runtimeId ?? '',
+      'x-iris-client-id': binding.mode === 'FULL' ? 'iris-supervisor-full' : 'iris-supervisor-pro',
+      'MCP-Protocol-Version': '2026-07-28',
+    };
+    const api = `${endpoint.apiUrl}${binding.mcpPath}`;
+    const discovered = await postJson(api, { jsonrpc: '2.0', id: 1, method: 'server/discover' }, headers);
+    if (!isExpectedDiscovery(discovered, binding.mode)) {
+      throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', `${profile} tunnel route did not reach the authenticated active runtime`);
+    }
+    const listed = await postJson(api, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, headers);
+    const names = toolNames(listed);
+    if (names.length !== binding.expectedToolNames.length || !names.every((name, index) => name === binding.expectedToolNames[index])) {
+      throw new RuntimeError('MCP_CATALOG_STALE', `${profile} tunnel route did not preserve the bound live catalog`);
+    }
+    if (binding.mode === 'FULL') {
+      const identityResponse = await postJson(api, {
+        jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'catalog_identity', arguments: {} },
+      }, { ...headers, 'Mcp-Name': 'catalog_identity' });
+      const identity = runtimeIdentityFromFullCatalogToolResponse(identityResponse);
+      if (identity === null || identity.runtimeId !== endpoint.runtimeId || identity.instanceId !== endpoint.instanceId
+        || identity.deploymentEpoch !== registry.deploymentEpoch || identity.catalogHash !== binding.catalogHash) {
+        throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'FULL tunnel route did not identify the active runtime instance and binding');
+      }
+    }
+    return { record, binding };
+  }
+
   private async probeWeb(record: OwnedProcess | null): Promise<LayerStatus> {
     if (record === null) return layer('FAILED', 'SUPERVISOR_NOT_RUNNING', 'Web is not supervisor-owned');
     const inspected = await inspectProcess(record);
@@ -1292,41 +1527,6 @@ export class Supervisor {
     } catch (error) {
       return layer('FAILED', runtimeErrorCode(error), `${binding.label} tunnel readiness failed`);
     }
-  }
-
-  private async probeEndToEnd(registry: ConnectorRegistryDocument, connectors: readonly ConnectorStatus[]): Promise<LayerStatus> {
-    if (this.e2eProbe === undefined) {
-      return layer('UNKNOWN', 'E2E_PROBE_UNAVAILABLE', 'No safe remote connector probe is configured; /readyz is not treated as end-to-end proof');
-    }
-    if (connectors.some((connector) => connector.state !== 'READY')) {
-      return layer('FAILED', 'CONTROL_PLANE_UNREACHABLE', 'Remote connector probing requires ready local connector identity and catalog state');
-    }
-    const credentials = await readTunnelServiceSecret(this.dataRoot);
-    if (credentials === null) return layer('FAILED', 'CREDENTIAL_MISSING', 'Remote connector probing requires the tunnel service credential');
-    const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
-    const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
-    if (full === undefined || pro === undefined) return layer('FAILED', 'CONNECTOR_BINDING_MISMATCH', 'Remote connector probing requires FULL and PRO connector bindings');
-    const probe = async (url: string, binding: ConnectorBinding, clientId: string): Promise<boolean> => {
-      const listed = await postJson(url, { jsonrpc: '2.0', id: 1, method: 'tools/list' }, {
-        authorization: `Bearer ${credentials}`,
-        'content-type': 'application/json',
-        'MCP-Protocol-Version': '2026-07-28',
-        'x-iris-connector-profile': binding.mode,
-        'x-iris-deployment-epoch': String(registry.deploymentEpoch),
-        'x-iris-runtime-id': binding.runtimeId ?? '',
-        'x-iris-client-id': clientId,
-      });
-      const names = toolNames(listed);
-      return names.length === binding.expectedToolNames.length
-        && names.every((name, index) => name === binding.expectedToolNames[index]);
-    };
-    const [fullReady, proReady] = await Promise.all([
-      probe(this.e2eProbe.fullUrl, full, 'iris-supervisor-e2e-full'),
-      probe(this.e2eProbe.proUrl, pro, 'iris-supervisor-e2e-pro'),
-    ]);
-    return fullReady && proReady
-      ? layer('READY', 'READY', 'Configured remote FULL and PRO connector probes returned the bound tool catalogs')
-      : layer('FAILED', 'CONTROL_PLANE_UNREACHABLE', 'Configured remote connector probe did not return the bound tool catalogs');
   }
 
   private async probeNativeControl(): Promise<LayerStatus> {
@@ -1514,7 +1714,7 @@ function managedAdminProfile(
     `  file: ${yamlString(path.join(logDirectory, 'iris-admin-tunnel.log'))}`,
     'mcp:',
     '  server_urls:',
-    '    - channel: admin',
+    '    - channel: main',
     `      url: ${yamlString(supervisorMcpUrl)}`,
     '  extra_headers:',
     headers,
@@ -1689,6 +1889,24 @@ function catalogIdentityFromToolResponse(value: unknown): McpCatalogIdentity | n
     catalogVersion: identity.catalogVersion,
     catalogHash: identity.catalogHash as string,
     toolCount: Number(identity.toolCount),
+  };
+}
+
+function runtimeIdentityFromFullCatalogToolResponse(value: unknown): {
+  readonly runtimeId: string;
+  readonly instanceId: string;
+  readonly deploymentEpoch: number;
+  readonly catalogHash: string;
+} | null {
+  if (!isRecord(value) || !isRecord(value.result)) return null;
+  const identity = isRecord(value.result.structuredContent) ? value.result.structuredContent : value.result;
+  if (typeof identity.runtimeId !== 'string' || typeof identity.instanceId !== 'string'
+    || !Number.isSafeInteger(identity.deploymentEpoch) || typeof identity.catalogHash !== 'string') return null;
+  return {
+    runtimeId: identity.runtimeId,
+    instanceId: identity.instanceId,
+    deploymentEpoch: Number(identity.deploymentEpoch),
+    catalogHash: identity.catalogHash,
   };
 }
 
@@ -1910,7 +2128,7 @@ async function waitForTunnel(executable: string, port: number, timeoutMs: number
       const parsed = JSON.parse(result.stdout) as unknown;
       if (isRecord(parsed) && parsed.result === 'ok' && isRecord(parsed.healthz) && parsed.healthz.ok === true && isRecord(parsed.readyz) && parsed.readyz.ok === true) return;
       lastCode = 'CONTROL_PLANE_UNREACHABLE';
-    } catch (error) { lastCode = runtimeErrorCode(error); }
+    } catch (error) { lastCode = error instanceof RuntimeError ? error.code : 'TUNNEL_NOT_RUNNING'; }
     await delay(100);
   }
   throw new RuntimeError(lastCode, 'Tunnel health and readiness were not proven before the deadline');

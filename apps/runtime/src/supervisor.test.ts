@@ -32,19 +32,6 @@ describe('IRIS supervisor', () => {
     await expect(import('node:fs/promises').then(({ access }) => access(path.join(dataRoot, 'supervisor')))).rejects.toThrow();
   });
 
-  it('keeps L3 unknown unless an explicit safe remote probe is configured', async () => {
-    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-e2e-unconfigured-'));
-    roots.push(dataRoot);
-    await initializeConnectorRegistry(dataRoot, {
-      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-    });
-    await loadOrCreateTunnelServiceSecret(dataRoot);
-    const supervisor = await createSupervisor({ dataRoot, sourceRoot: '/Users/example/iris' });
-    const status = await supervisor.status();
-    expect(status.endToEnd).toMatchObject({ state: 'UNKNOWN', code: 'E2E_PROBE_UNAVAILABLE' });
-  });
-
   it('does not misclassify a stopped runtime as an MCP authentication failure', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-stopped-'));
     roots.push(dataRoot);
@@ -363,8 +350,8 @@ setInterval(() => undefined, 1000);
     expect(fullProfile).not.toContain('Bearer ');
     expect(fullProfile).not.toContain('channel: admin');
     expect(proProfile).not.toContain('channel: admin');
-    expect(adminProfile).toContain('channel: admin');
-    expect(adminProfile).not.toContain('channel: main');
+    expect(adminProfile).toContain('channel: main');
+    expect(adminProfile).not.toContain('channel: admin');
     expect(adminProfile).toContain('tunnel_cccccccccccccccccccccccccccccccc');
     expect(adminProfile).not.toContain(`http://127.0.0.1:${adminPort}/mcp`);
     expect(adminProfile).not.toContain('x-iris-runtime-id');
@@ -521,7 +508,9 @@ setInterval(() => undefined, 1000);
     const native = await startSupervisorNativeControlServer(dataRoot, nativePort, {
       supervisorStatus: () => supervisor.supervisorNativeStatus(),
       adminStatus: () => supervisor.adminNativeStatus(),
+      runtimeReconcile: () => supervisor.runtimeReconcile(),
       adminRecycle: (input) => supervisor.adminRecycle(input),
+      adminTunnelRecycle: (input) => supervisor.adminTunnelRecycle(input),
       adminToolCall: (name, args) => supervisor.adminToolCall(name, args),
     });
     try {
@@ -566,7 +555,7 @@ setInterval(() => undefined, 1000);
           readonly workingDirectory?: string | null;
           readonly environmentDigest?: string | null;
         } | null;
-        readonly adminTunnel: { readonly pid: number; readonly tunnelId?: string | null; readonly profileDigest?: string | null } | null;
+        readonly adminTunnel: { readonly pid: number; readonly tunnelId?: string | null; readonly profileDigest?: string | null; readonly processStartTimeMs?: number | null } | null;
         readonly tunnels: {
           readonly full: { readonly pid: number; readonly tunnelId?: string | null; readonly profileDigest?: string | null } | null;
           readonly pro: { readonly pid: number; readonly profileDigest?: string | null } | null;
@@ -663,22 +652,199 @@ setInterval(() => undefined, 1000);
       expect(afterRecycle.runtime?.pid).toBe(afterWorkloadDigest.runtime?.pid);
       expect(afterRecycle.web?.pid).toBe(afterWorkloadDigest.web?.pid);
 
+      const adminTunnelStatus = await supervisor.supervisorNativeStatus();
+      if (typeof adminTunnelStatus.adminTunnelBindingId !== 'string'
+        || typeof adminTunnelStatus.adminTunnelIdentity !== 'string'
+        || typeof adminTunnelStatus.adminProfileDigest !== 'string') {
+        throw new Error('missing ADMIN tunnel recycle preconditions');
+      }
+      await expect(supervisor.adminTunnelRecycle({
+        expectedAdminTunnelId: 'tunnel_wrong',
+        expectedAdminTunnelIdentity: adminTunnelStatus.adminTunnelIdentity,
+        expectedAdminProfileDigest: adminTunnelStatus.adminProfileDigest,
+      })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+      await expect(supervisor.adminTunnelRecycle({
+        expectedAdminTunnelId: adminTunnelStatus.adminTunnelBindingId,
+        expectedAdminTunnelIdentity: 'tunnel-admin:wrong',
+        expectedAdminProfileDigest: adminTunnelStatus.adminProfileDigest,
+      })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+      await expect(supervisor.adminTunnelRecycle({
+        expectedAdminTunnelId: adminTunnelStatus.adminTunnelBindingId,
+        expectedAdminTunnelIdentity: adminTunnelStatus.adminTunnelIdentity,
+        expectedAdminProfileDigest: '0'.repeat(64),
+      })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+      const tunnelRecycled = await nativeToolCall(native.mcpUrl, secret, 'admin_tunnel_recycle', {
+        expectedAdminTunnelId: adminTunnelStatus.adminTunnelBindingId,
+        expectedAdminTunnelIdentity: adminTunnelStatus.adminTunnelIdentity,
+        expectedAdminProfileDigest: adminTunnelStatus.adminProfileDigest,
+      });
+      expect(tunnelRecycled).toMatchObject({
+        oldAdminTunnelPid: afterRecycle.adminTunnel?.pid,
+        adminTunnelId: 'tunnel_cccccccccccccccccccccccccccccccc',
+        target: `http://127.0.0.1:${nativePort}/mcp`,
+        readiness: 'READY',
+        workloadAnchorsPreserved: true,
+      });
+      expect(tunnelRecycled.newAdminTunnelPid).not.toBe(tunnelRecycled.oldAdminTunnelPid);
+      const afterTunnelRecycle = JSON.parse(await readFile(statePath, 'utf8')) as State;
+      expect(afterTunnelRecycle.adminTunnel?.pid).not.toBe(afterRecycle.adminTunnel?.pid);
+      expect(afterTunnelRecycle.admin?.pid).toBe(afterRecycle.admin?.pid);
+      expect(afterTunnelRecycle.tunnels.full?.pid).toBe(afterRecycle.tunnels.full?.pid);
+      expect(afterTunnelRecycle.tunnels.pro?.pid).toBe(afterRecycle.tunnels.pro?.pid);
+      expect(afterTunnelRecycle.runtime?.pid).toBe(afterRecycle.runtime?.pid);
+      expect(afterTunnelRecycle.web?.pid).toBe(afterRecycle.web?.pid);
+      expect((await nativeToolCall(native.mcpUrl, secret, 'activation_status', {})).activeTransactionId).toBeNull();
+
+      const concurrentTunnelStatus = await supervisor.supervisorNativeStatus();
+      if (typeof concurrentTunnelStatus.adminTunnelBindingId !== 'string'
+        || typeof concurrentTunnelStatus.adminTunnelIdentity !== 'string'
+        || typeof concurrentTunnelStatus.adminProfileDigest !== 'string') {
+        throw new Error('missing concurrent ADMIN tunnel recycle preconditions');
+      }
+      const tunnelInput = {
+        expectedAdminTunnelId: concurrentTunnelStatus.adminTunnelBindingId,
+        expectedAdminTunnelIdentity: concurrentTunnelStatus.adminTunnelIdentity,
+        expectedAdminProfileDigest: concurrentTunnelStatus.adminProfileDigest,
+      };
+      const concurrentTunnel = await Promise.allSettled([supervisor.adminTunnelRecycle(tunnelInput), supervisor.adminTunnelRecycle(tunnelInput)]);
+      expect(concurrentTunnel.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+      expect(concurrentTunnel.filter((result): result is PromiseRejectedResult => result.status === 'rejected')[0]?.reason)
+        .toMatchObject({ code: 'SUPERVISOR_BUSY' });
+      const afterConcurrentTunnel = JSON.parse(await readFile(statePath, 'utf8')) as State;
+      expect(afterConcurrentTunnel.admin?.pid).toBe(afterTunnelRecycle.admin?.pid);
+      expect(afterConcurrentTunnel.tunnels.full?.pid).toBe(afterTunnelRecycle.tunnels.full?.pid);
+      expect(afterConcurrentTunnel.tunnels.pro?.pid).toBe(afterTunnelRecycle.tunnels.pro?.pid);
+      expect(afterConcurrentTunnel.runtime?.pid).toBe(afterTunnelRecycle.runtime?.pid);
+      expect(afterConcurrentTunnel.web?.pid).toBe(afterTunnelRecycle.web?.pid);
+
+      await writeFile(statePath, JSON.stringify({
+        ...afterConcurrentTunnel,
+        adminTunnel: afterConcurrentTunnel.adminTunnel === null ? null : {
+          ...afterConcurrentTunnel.adminTunnel,
+          processStartTimeMs: (afterConcurrentTunnel.adminTunnel.processStartTimeMs ?? 0) + 1,
+        },
+      }), { mode: 0o600 });
+      await expect(supervisor.adminTunnelRecycle({
+        expectedAdminTunnelId: tunnelInput.expectedAdminTunnelId,
+        expectedAdminTunnelIdentity: tunnelInput.expectedAdminTunnelIdentity,
+        expectedAdminProfileDigest: tunnelInput.expectedAdminProfileDigest,
+      })).rejects.toMatchObject({ code: 'PROCESS_OWNERSHIP_AMBIGUOUS' });
+      expect(() => process.kill(afterConcurrentTunnel.adminTunnel!.pid, 0)).not.toThrow();
+      await writeFile(statePath, JSON.stringify(afterConcurrentTunnel), { mode: 0o600 });
+
       const concurrent = await Promise.allSettled([supervisor.adminRecycle(), supervisor.adminRecycle()]);
       expect(concurrent.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
       const rejected = concurrent.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
       expect(rejected).toHaveLength(1);
       expect(rejected[0]?.reason).toMatchObject({ code: 'SUPERVISOR_BUSY' });
       const afterConcurrent = JSON.parse(await readFile(statePath, 'utf8')) as State;
-      expect(afterConcurrent.adminTunnel?.pid).toBe(afterRecycle.adminTunnel?.pid);
+      expect(afterConcurrent.adminTunnel?.pid).toBe(afterConcurrentTunnel.adminTunnel?.pid);
       expect(afterConcurrent.tunnels.full?.pid).toBe(afterRecycle.tunnels.full?.pid);
       expect(afterConcurrent.tunnels.pro?.pid).toBe(afterRecycle.tunnels.pro?.pid);
       expect(afterConcurrent.runtime?.pid).toBe(afterRecycle.runtime?.pid);
       expect(afterConcurrent.web?.pid).toBe(afterRecycle.web?.pid);
       expect((await fetch(native.healthUrl, { headers: { authorization: `Bearer ${await readTunnelServiceSecret(dataRoot)}` } })).status).toBe(200);
+
+      const failingTunnelStatus = await supervisor.supervisorNativeStatus();
+      if (typeof failingTunnelStatus.adminTunnelBindingId !== 'string'
+        || typeof failingTunnelStatus.adminTunnelIdentity !== 'string'
+        || typeof failingTunnelStatus.adminProfileDigest !== 'string') {
+        throw new Error('missing readiness-failure ADMIN tunnel recycle preconditions');
+      }
+      await writeFile(fakeTunnel, `#!/usr/bin/env node
+if (process.argv[2] === 'health') process.exit(1);
+process.on('SIGTERM', () => process.exit(0));
+setInterval(() => undefined, 1000);
+`);
+      await expect(supervisor.adminTunnelRecycle({
+        expectedAdminTunnelId: failingTunnelStatus.adminTunnelBindingId,
+        expectedAdminTunnelIdentity: failingTunnelStatus.adminTunnelIdentity,
+        expectedAdminProfileDigest: failingTunnelStatus.adminProfileDigest,
+      })).rejects.toMatchObject({ code: 'TUNNEL_NOT_RUNNING' });
+      const afterReadinessFailure = JSON.parse(await readFile(statePath, 'utf8')) as State;
+      expect(afterReadinessFailure.adminTunnel?.pid).not.toBe(afterConcurrent.adminTunnel?.pid);
+      expect(afterReadinessFailure.adminTunnel?.tunnelId).toBe(failingTunnelStatus.adminTunnelBindingId);
+      expect(afterReadinessFailure.adminTunnel?.profileDigest).toBe(failingTunnelStatus.adminProfileDigest);
+      expect(afterReadinessFailure.runtime?.pid).toBe(afterConcurrent.runtime?.pid);
+      expect(afterReadinessFailure.web?.pid).toBe(afterConcurrent.web?.pid);
+      expect(afterReadinessFailure.admin?.pid).toBe(afterConcurrent.admin?.pid);
+      expect(afterReadinessFailure.tunnels.full?.pid).toBe(afterConcurrent.tunnels.full?.pid);
+      expect(afterReadinessFailure.tunnels.pro?.pid).toBe(afterConcurrent.tunnels.pro?.pid);
     } finally {
       (supervisor as unknown as { nativeControlActive: boolean }).nativeControlActive = false;
       await supervisor.down();
       await native.close();
+    }
+  }, 30_000);
+
+  it('reconciles only verified runtime and workload tunnel instance metadata without restarting owned processes', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-runtime-reconcile-'));
+    const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-runtime-reconcile-fake-'));
+    roots.push(dataRoot, fakeRoot);
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      fullHealthPort: await freePort(),
+      proHealthPort: await freePort(),
+    });
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const supervisor = await createSupervisor({
+      dataRoot,
+      sourceRoot,
+      tunnelClientPath: await fakeTunnelClient(fakeRoot),
+      webPort: await freePort(),
+      adminPort: await freePort(),
+    });
+    try {
+      await supervisor.up();
+      const statePath = path.join(dataRoot, 'supervisor', 'state.json');
+      const before = JSON.parse(await readFile(statePath, 'utf8')) as {
+        runtime: { pid: number; instanceId: string } | null;
+        web: { pid: number } | null;
+        admin: { pid: number } | null;
+        tunnels: { full: { pid: number; instanceId: string } | null; pro: { pid: number; instanceId: string } | null };
+      };
+      const live = await runtimeStatus(dataRoot);
+      if (live.endpoint === null || before.runtime === null || before.tunnels.full === null || before.tunnels.pro === null) throw new Error('missing reconciliation baseline');
+      const stale = {
+        ...before,
+        runtime: null,
+        tunnels: {
+          full: { ...before.tunnels.full, instanceId: randomUUID() },
+          pro: { ...before.tunnels.pro, instanceId: randomUUID() },
+        },
+      };
+      await writeFile(statePath, JSON.stringify({
+        ...stale,
+        tunnels: { ...stale.tunnels, full: { ...stale.tunnels.full, profileDigest: '0'.repeat(64) } },
+      }), { mode: 0o600 });
+      await expect(supervisor.runtimeReconcile()).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+      const rejected = JSON.parse(await readFile(statePath, 'utf8')) as typeof before;
+      expect(rejected.runtime).toBeNull();
+      expect(rejected.tunnels.full?.pid).toBe(before.tunnels.full.pid);
+      expect(rejected.tunnels.pro?.pid).toBe(before.tunnels.pro.pid);
+      await writeFile(statePath, JSON.stringify(stale), { mode: 0o600 });
+
+      const receipt = await supervisor.runtimeReconcile();
+      expect(receipt).toMatchObject({
+        runtimePid: live.endpoint.pid,
+        runtimeId: live.endpoint.runtimeId,
+        instanceId: live.endpoint.instanceId,
+        readiness: 'READY',
+        workloadAnchorsPreserved: true,
+      });
+      const after = JSON.parse(await readFile(statePath, 'utf8')) as typeof before;
+      expect(after.runtime?.pid).toBe(before.runtime.pid);
+      expect(after.runtime?.instanceId).toBe(live.endpoint.instanceId);
+      expect(after.tunnels.full?.pid).toBe(before.tunnels.full.pid);
+      expect(after.tunnels.pro?.pid).toBe(before.tunnels.pro.pid);
+      expect(after.tunnels.full?.instanceId).toBe(live.endpoint.instanceId);
+      expect(after.tunnels.pro?.instanceId).toBe(live.endpoint.instanceId);
+      expect(after.web?.pid).toBe(before.web?.pid);
+      expect(after.admin?.pid).toBe(before.admin?.pid);
+    } finally {
+      await supervisor.down().catch(() => undefined);
     }
   }, 30_000);
 
@@ -1285,7 +1451,9 @@ setInterval(() => undefined, 1000);
     const native = await startSupervisorNativeControlServer(dataRoot, options.supervisorControlPort, {
       supervisorStatus: () => outer.supervisorNativeStatus(),
       adminStatus: () => outer.adminNativeStatus(),
+      runtimeReconcile: () => outer.runtimeReconcile(),
       adminRecycle: (input) => outer.adminRecycle(input),
+      adminTunnelRecycle: (input) => outer.adminTunnelRecycle(input),
       adminToolCall: (name, args) => outer.adminToolCall(name, args),
     });
     (outer as unknown as { nativeControlActive: boolean }).nativeControlActive = true;
@@ -1397,7 +1565,10 @@ setInterval(() => undefined, 1000);
     const supervisor = await createSupervisor({ dataRoot, sourceRoot, tunnelClientPath: fakeTunnel, webPort: await freePort(), adminPort: await freePort() });
     await supervisor.up();
     const supervisorStatePath = path.join(dataRoot, 'supervisor', 'state.json');
-    const beforeSupervisorState = JSON.parse(await readFile(supervisorStatePath, 'utf8')) as { readonly admin: { readonly pid: number } | null };
+    const beforeSupervisorState = JSON.parse(await readFile(supervisorStatePath, 'utf8')) as {
+      readonly admin: { readonly pid: number } | null;
+      readonly web: { readonly pid: number } | null;
+    };
     expect(beforeSupervisorState.admin).not.toBeNull();
     const before = await runtimeStatus(dataRoot);
     if (before.endpoint === null) throw new Error('missing runtime before crash');
@@ -1411,6 +1582,7 @@ setInterval(() => undefined, 1000);
     expect(after.endpoint.instanceId).not.toBe(before.endpoint.instanceId);
     const afterSupervisorState = JSON.parse(await readFile(supervisorStatePath, 'utf8')) as typeof beforeSupervisorState;
     expect(afterSupervisorState.admin?.pid).toBe(beforeSupervisorState.admin?.pid);
+    expect(afterSupervisorState.web?.pid).not.toBe(beforeSupervisorState.web?.pid);
     const status = await supervisor.status();
     expect(status.localRuntime).toMatchObject({ state: 'READY', code: 'READY' });
     expect(status.tunnel).toMatchObject({ state: 'READY', code: 'READY' });
@@ -1738,7 +1910,6 @@ async function freePort(): Promise<number> {
 async function fakeTunnelClient(fakeRoot: string): Promise<string> {
   const filename = path.join(fakeRoot, 'tunnel-client-fake.mjs');
   await writeFile(filename, `#!/usr/bin/env node
-if (process.argv[2] === 'run' && process.argv.some((arg) => arg.endsWith('/iris-admin.yaml')) && !process.argv.includes('--embedded-mcp-stub')) { process.stderr.write('main channel is required\\n'); process.exit(1); }
 if (process.argv[2] === 'health') { process.stdout.write(JSON.stringify({ result: 'ok', healthz: { ok: true, status: 200 }, readyz: { ok: true, status: 200 } })); process.exit(0); }
 process.on('SIGTERM', () => process.exit(0));
 setInterval(() => undefined, 1000);

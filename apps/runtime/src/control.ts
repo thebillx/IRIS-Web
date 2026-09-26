@@ -54,6 +54,8 @@ try {
       process.stdout.write(`${await supervisor.logs()}\n`);
     } else if (command === 'adopt-runtime') {
       printStatus(await supervisor.adoptRuntime());
+    } else if (command === 'runtime-reconcile') {
+      process.stdout.write(`${JSON.stringify(await supervisor.runtimeReconcile(), null, 2)}\n`);
     } else if (command === 'supervisor') {
       await supervisor.runSupervisorDaemon();
     } else if (command === 'credentials' && process.argv[3] === 'migrate') {
@@ -76,7 +78,7 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'status') {
       process.stdout.write(`${JSON.stringify({ loaded: await launchAgentLoaded(), paths: launchdPaths(dataRoot) }, null, 2)}\n`);
     } else {
-      process.stderr.write('Usage: iris <up|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|supervisor|credentials|launchd>\n');
+      process.stderr.write('Usage: iris <up|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|runtime-reconcile|supervisor|credentials|launchd>\n');
       process.exitCode = 2;
     }
   }
