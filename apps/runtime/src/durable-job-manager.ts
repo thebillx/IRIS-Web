@@ -350,7 +350,7 @@ export class DurableJobManager {
 
       const runner = spawn(process.execPath, [RUNNER_PATH, '--spec', specPath, '--job', jobId, '--runner', runnerIdentity], {
         cwd: this.dataRoot,
-        env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: this.dataRoot, TMPDIR: '/tmp', LANG: 'en_US.UTF-8' },
+        env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: this.dataRoot, TMPDIR: tmpdir(), LANG: 'en_US.UTF-8' },
         detached: true,
         stdio: 'ignore',
       });
@@ -603,20 +603,22 @@ export class DurableJobManager {
 
   private async reconcile(job: DurableJobRecord): Promise<DurableJobRecord> {
     if (isTerminal(job.state)) return job;
+    const claim = await readClaim(job.claimPath);
+    const persistedClaimMatches = claim !== null && persistedIdentityMatchesClaim(job, claim);
+    if (job.state === 'RUNNING' && job.pid !== null && !persistedClaimMatches) return this.markLost(job);
     const runnerResult = await readRunnerResult(job.resultPath);
     if (runnerResult !== null) return this.finishFromRunner(job, runnerResult);
-    const claim = await readClaim(job.claimPath);
     if (claim !== null && await verifyClaim(claim, job.jobId, job.runnerIdentity)) {
       if (job.state === 'QUEUED' || job.pid === null) {
         const running: DurableJobRecord = { ...job, state: 'RUNNING', runnerPid: claim.runnerPid, runnerStartMarker: claim.runnerStartMarker, pid: claim.targetPid, processStartMarker: claim.targetStartMarker, processGroupId: claim.targetProcessGroupId };
         await this.replaceJob(running);
         return running;
       }
-      if (claim.targetPid === job.pid && claim.targetStartMarker === job.processStartMarker && claim.targetProcessGroupId === job.processGroupId) return job;
+      if (persistedClaimMatches) return job;
     }
     const retry = await readRunnerResult(job.resultPath);
     if (retry !== null) return this.finishFromRunner(job, retry);
-    if (job.executionProfile === 'codex-review') {
+    if (persistedClaimMatches) {
       const terminal = await waitForTrustedTerminalResult(job.resultPath, job.jobId, job.runnerIdentity, 1_000);
       if (terminal !== null) return this.finishFromRunner(job, terminal);
     }
@@ -825,6 +827,13 @@ async function readLogTail(filename: string, maxBytes: number): Promise<{ readon
 function statusView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, requestId: job.requestId, projectId: job.projectId, workspaceId: job.workspaceId, state: job.state, startedAt: job.startedAt, finishedAt: job.finishedAt, pid: job.pid, processStartMarker: job.processStartMarker, processGroupId: job.processGroupId, runnerIdentity: job.runnerIdentity, effectiveEffects: job.effectiveEffects }; }
 function resultView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, state: job.state, exitCode: job.exitCode, signal: job.signal, startedAt: job.startedAt, finishedAt: job.finishedAt, logArtifactIds: job.logArtifactIds, artifactIds: job.artifactIds }; }
 function isTerminal(state: DurableJobState): boolean { return state === 'SUCCEEDED' || state === 'FAILED' || state === 'CANCELLED' || state === 'LOST' || state === 'INTERRUPTED'; }
+function persistedIdentityMatchesClaim(job: DurableJobRecord, claim: RunnerClaim): boolean {
+  return job.runnerPid === claim.runnerPid
+    && job.runnerStartMarker === claim.runnerStartMarker
+    && job.pid === claim.targetPid
+    && job.processStartMarker === claim.targetStartMarker
+    && job.processGroupId === claim.targetProcessGroupId;
+}
 function tailAppend(current: string, addition: string): string { const combined = current + addition; return Buffer.byteLength(combined, 'utf8') <= INLINE_OUTPUT_BYTES * 2 ? combined : Buffer.from(combined, 'utf8').subarray(-INLINE_OUTPUT_BYTES * 2).toString('utf8'); }
 function writeWithBackpressure(stream: NodeJS.WritableStream, text: string, source: NodeJS.ReadableStream | null): void { if (!stream.write(text) && source !== null && 'pause' in source) { source.pause(); stream.once('drain', () => source.resume()); } }
 function endStream(stream: NodeJS.WritableStream): Promise<void> { return new Promise((resolve) => stream.end(resolve)); }

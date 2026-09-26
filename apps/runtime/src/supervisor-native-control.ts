@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { RuntimeError } from '@iris/domain';
 import { readTunnelServiceSecret } from './credentials.js';
-import { MCP_PROTOCOL_VERSION } from './mcp.js';
+import { LEGACY_MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import { adminToolDefinitions, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -14,6 +14,7 @@ const ACTIVATION_NAMES = new Set([
   'activation_confirm',
   'activation_rollback',
 ]);
+const INITIALIZE_PROTOCOL_VERSIONS = new Set<string>([LEGACY_MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION]);
 
 interface JsonRpcRequest {
   readonly jsonrpc: '2.0';
@@ -27,10 +28,18 @@ export interface AdminRecycleInput {
   readonly expectedAdminProfileDigest?: string;
 }
 
+export interface AdminTunnelRecycleInput {
+  readonly expectedAdminTunnelId: string;
+  readonly expectedAdminTunnelIdentity: string;
+  readonly expectedAdminProfileDigest: string;
+}
+
 export interface SupervisorNativeOperations {
   supervisorStatus(): Promise<unknown>;
   adminStatus(): Promise<unknown>;
+  runtimeReconcile(): Promise<unknown>;
   adminRecycle(input: AdminRecycleInput): Promise<unknown>;
+  adminTunnelRecycle(input: AdminTunnelRecycleInput): Promise<unknown>;
   adminToolCall(name: string, args: Record<string, unknown>): Promise<SupervisorAdminToolCallResult>;
 }
 
@@ -101,8 +110,38 @@ async function handleRequest(
     });
     return;
   }
-  if (request.headers['mcp-protocol-version'] !== MCP_PROTOCOL_VERSION) {
-    writeJsonRpcError(response, rpc.id ?? null, -32600, `MCP-Protocol-Version must be ${MCP_PROTOCOL_VERSION}`, 400);
+  const methodHeader = request.headers['mcp-method'];
+  if (methodHeader !== undefined && methodHeader !== rpc.method) {
+    writeJsonRpcError(response, rpc.id ?? null, -32600, 'Mcp-Method does not match JSON-RPC method', 400);
+    return;
+  }
+  if (rpc.method === 'initialize') {
+    const params = isRecord(rpc.params) ? rpc.params : null;
+    const clientInfo = params !== null && isRecord(params.clientInfo) ? params.clientInfo : null;
+    if (typeof params?.protocolVersion !== 'string'
+      || !INITIALIZE_PROTOCOL_VERSIONS.has(params.protocolVersion)
+      || !isRecord(params.capabilities)
+      || typeof clientInfo?.name !== 'string'
+      || typeof clientInfo.version !== 'string') {
+      writeJsonRpcError(response, rpc.id ?? null, -32602, 'Invalid initialize parameters', 400);
+      return;
+    }
+    writeJsonRpcResult(response, rpc.id ?? null, {
+      protocolVersion: params.protocolVersion,
+      capabilities: { tools: {} },
+      serverInfo: { name: SERVER_NAME, version: '0.0.0' },
+    });
+    return;
+  }
+  const protocolVersion = request.headers['mcp-protocol-version'];
+  if (typeof protocolVersion !== 'string'
+    || (protocolVersion !== MCP_PROTOCOL_VERSION && !INITIALIZE_PROTOCOL_VERSIONS.has(protocolVersion))) {
+    writeJsonRpcError(response, rpc.id ?? null, -32600, 'Unsupported MCP-Protocol-Version', 400);
+    return;
+  }
+  if (rpc.method === 'notifications/initialized' && rpc.id === undefined) {
+    response.writeHead(202);
+    response.end();
     return;
   }
   if (rpc.method === 'ping') {
@@ -140,8 +179,17 @@ async function handleRequest(
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.adminStatus()));
       return;
     }
+    if (name === 'runtime_reconcile') {
+      requireNoArguments(args);
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeReconcile()));
+      return;
+    }
     if (name === 'admin_recycle') {
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.adminRecycle(adminRecycleArguments(args))));
+      return;
+    }
+    if (name === 'admin_tunnel_recycle') {
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.adminTunnelRecycle(adminTunnelRecycleArguments(args))));
       return;
     }
     if (ACTIVATION_NAMES.has(name)) {
@@ -177,6 +225,12 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
       annotations: { readOnlyHint: true },
     },
     {
+      name: 'runtime_reconcile',
+      description: 'Adopt only a verified running workload runtime and reconcile only already-proven healthy FULL/PRO supervisor ownership metadata without restarting any process.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    {
       name: 'admin_recycle',
       description: 'Recycle only the supervisor-owned admin child using supervisor-governed identity and optional fail-closed identity/digest preconditions.',
       inputSchema: {
@@ -185,6 +239,21 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
           expectedAdminIdentity: { type: 'string', minLength: 1, maxLength: 300 },
           expectedAdminProfileDigest: { type: 'string', pattern: '^[0-9a-f]{64}$' },
         },
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    {
+      name: 'admin_tunnel_recycle',
+      description: 'Recycle only the supervisor-owned ADMIN tunnel after fail-closed identity and corrected-profile checks.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          expectedAdminTunnelId: { type: 'string', minLength: 1, maxLength: 300 },
+          expectedAdminTunnelIdentity: { type: 'string', minLength: 1, maxLength: 300 },
+          expectedAdminProfileDigest: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+        },
+        required: ['expectedAdminTunnelId', 'expectedAdminTunnelIdentity', 'expectedAdminProfileDigest'],
         additionalProperties: false,
       },
       annotations: { readOnlyHint: false, destructiveHint: true },
@@ -206,6 +275,17 @@ function adminRecycleArguments(args: Record<string, unknown>): AdminRecycleInput
   };
 }
 
+function adminTunnelRecycleArguments(args: Record<string, unknown>): AdminTunnelRecycleInput {
+  assertAllowedKeys(args, ['expectedAdminTunnelId', 'expectedAdminTunnelIdentity', 'expectedAdminProfileDigest']);
+  const expectedAdminTunnelId = requiredBoundedString(args, 'expectedAdminTunnelId', 300);
+  const expectedAdminTunnelIdentity = requiredBoundedString(args, 'expectedAdminTunnelIdentity', 300);
+  const expectedAdminProfileDigest = requiredBoundedString(args, 'expectedAdminProfileDigest', 64);
+  if (!/^[0-9a-f]{64}$/.test(expectedAdminProfileDigest)) {
+    throw new RuntimeError('INVALID_REQUEST', 'expectedAdminProfileDigest must be a lowercase SHA-256 digest');
+  }
+  return { expectedAdminTunnelId, expectedAdminTunnelIdentity, expectedAdminProfileDigest };
+}
+
 function requireNoArguments(args: Record<string, unknown>): void {
   assertAllowedKeys(args, []);
 }
@@ -222,6 +302,12 @@ function optionalBoundedString(args: Record<string, unknown>, key: string, maxLe
   if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) {
     throw new RuntimeError('INVALID_REQUEST', `${key} must be a bounded non-empty string when provided`);
   }
+  return value;
+}
+
+function requiredBoundedString(args: Record<string, unknown>, key: string, maxLength: number): string {
+  const value = optionalBoundedString(args, key, maxLength);
+  if (value === undefined) throw new RuntimeError('INVALID_REQUEST', `${key} is required`);
   return value;
 }
 
