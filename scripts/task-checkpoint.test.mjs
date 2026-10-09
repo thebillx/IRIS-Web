@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -49,6 +49,38 @@ test('takeover asks about blockers and verifies unknown outcomes without replayi
   assert.equal((await inspectCheckpoint(root, 'task')).action, 'ASK');
   await saveCheckpoint(root, 'task', { ...input, expectedRevision: 1, requestId: 'checkpoint-2', pendingMutation: 'Publish request 123: acknowledgement missing' });
   assert.equal((await inspectCheckpoint(root, 'task')).action, 'VERIFY');
+});
+
+test('checkpoint metadata from another task does not invalidate the first task', async (t) => {
+  const { root, input } = await fixture(t);
+  await saveCheckpoint(root, 'task', input);
+  await saveCheckpoint(root, 'other', { ...input, requestId: 'other-1', nextAction: 'Review another task' });
+  assert.equal((await inspectCheckpoint(root, 'task')).action, 'EXECUTE');
+  await saveCheckpoint(root, 'other', { ...input, expectedRevision: 1, requestId: 'other-2', nextAction: 'Finish another task' });
+  assert.equal((await inspectCheckpoint(root, 'task')).action, 'EXECUTE');
+});
+
+test('pending mutation takes VERIFY precedence over changed worktree bytes', async (t) => {
+  const { root, input } = await fixture(t);
+  await saveCheckpoint(root, 'task', { ...input, pendingMutation: 'publish request acknowledgement missing' });
+  await writeFile(path.join(root, 'owner.txt'), 'changed after uncertain mutation');
+  assert.equal((await inspectCheckpoint(root, 'task')).action, 'VERIFY');
+});
+
+test('pending mutation still stops on replaced repository or branch authority', async (t) => {
+  const { root, input, git } = await fixture(t);
+  await saveCheckpoint(root, 'task', { ...input, pendingMutation: 'mutation result unknown' });
+  await git('switch', '-c', 'different-authority');
+  assert.equal((await inspectCheckpoint(root, 'task')).action, 'STOP');
+});
+
+test('pending mutation still stops when the physical Git directory is replaced', async (t) => {
+  const { root, input, git } = await fixture(t);
+  await saveCheckpoint(root, 'task', { ...input, pendingMutation: 'mutation result unknown' });
+  await rename(path.join(root, '.git'), path.join(root, '.git-old'));
+  await git('init', '-b', 'task');
+  await git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', 'replacement');
+  assert.equal((await inspectCheckpoint(root, 'task')).action, 'STOP');
 });
 
 test('takeover stops on changed owner bytes, branch or commit', async (t) => {

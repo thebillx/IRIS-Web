@@ -11,6 +11,14 @@ import { Buffer } from 'node:buffer';
 const exec = promisify(execFile);
 const fields = ['expectedRevision', 'requestId', 'objective', 'project', 'workspace', 'currentState', 'completed', 'changedFiles', 'tests', 'remaining', 'blockers', 'questions', 'nextAction', 'pendingMutation'];
 
+function checkpointPathspecs() {
+  return [
+    ':(exclude,glob).agents/handoffs/*.json',
+    ':(exclude,glob).agents/handoffs/.*.lock',
+    ':(exclude,glob).agents/handoffs/.*.tmp',
+  ];
+}
+
 function text(value, name, limit = 2000) {
   if (typeof value !== 'string' || !value.trim() || value.length > limit || value.includes('\0')) throw new Error(`Missing or invalid ${name}; ask the owner`);
   return value.trim();
@@ -75,7 +83,7 @@ async function sourceAt(where, changedFiles) {
   const common = await lstat(commonGitDir, { bigint: true });
   const root = await lstat(where.root, { bigint: true });
   if (!common.isDirectory()) throw new Error('Git common directory identity is unavailable');
-  const excluded = [`:(exclude).agents/handoffs/${where.task}.json`, `:(exclude).agents/handoffs/.${where.task}.*`];
+  const excluded = checkpointPathspecs();
   const head = (await git(where.root, ['rev-parse', 'HEAD'])).trim();
   const branch = (await git(where.root, ['branch', '--show-current'])).trim();
   const hash = createHash('sha256');
@@ -141,8 +149,17 @@ export async function inspectCheckpoint(cwd, task) {
   const checkpoint = await recordAt(where.filename);
   if (checkpoint === null) return { action: 'ASK', reason: 'No canonical checkpoint; ask for the objective and next action', checkpoint };
   const source = await sourceAt(where, checkpoint.payload.changedFiles);
-  if (JSON.stringify(source) !== JSON.stringify(checkpoint.source)) return { action: 'STOP', reason: 'Source identity or owner work conflicts with the checkpoint', checkpoint };
+  const authorityChanged = source.root !== checkpoint.source.root
+    || source.rootDevice !== checkpoint.source.rootDevice
+    || source.rootInode !== checkpoint.source.rootInode
+    || source.commonGitDir !== checkpoint.source.commonGitDir
+    || source.commonDevice !== checkpoint.source.commonDevice
+    || source.commonInode !== checkpoint.source.commonInode
+    || source.branch !== checkpoint.source.branch
+    || source.head !== checkpoint.source.head;
+  if (authorityChanged) return { action: 'STOP', reason: 'Source identity, branch or owner authority conflicts with the checkpoint', checkpoint };
   if (checkpoint.payload.pendingMutation !== null) return { action: 'VERIFY', reason: 'Mutation outcome is unknown; inspect the result before retry', checkpoint };
+  if (JSON.stringify(source) !== JSON.stringify(checkpoint.source)) return { action: 'STOP', reason: 'Source identity or owner work conflicts with the checkpoint', checkpoint };
   if (checkpoint.payload.questions.length || checkpoint.payload.blockers.length) return { action: 'ASK', reason: 'Resolve recorded blockers/questions before dependent work', checkpoint };
   return { action: 'EXECUTE', reason: 'Verified source agrees with the canonical next action; existing authorization still applies', checkpoint };
 }
