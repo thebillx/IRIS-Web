@@ -73,6 +73,22 @@ node scripts/iris.mjs down
 
 This removes the IRIS LaunchAgent and stops owner-managed candidate processes while retaining runtime data, credentials, projects, workspaces, sessions, jobs, and checkpoints. A full removal is a separate owner action: back up and verify the data first, then remove only the IRIS-owned data root, credential directory, logs, managed profiles, and source checkout. Never remove BBL, Enhance01, or an unknown directory. Full removal/reinstall of an existing installation is not yet production-verified.
 
+## Reinstalling
+
+After the owner has approved a full removal and verified the backup, use a new checkout and private data root:
+
+```sh
+git clone https://github.com/thebillx/IRIS-Web.git iris
+cd iris
+node scripts/node24.mjs --pnpm install --frozen-lockfile --ignore-scripts
+node scripts/iris.mjs credentials migrate "$HOME/.config/tunnel-client/<profile>.yaml"
+node scripts/iris.mjs setup --tunnel-id <registered-tunnel-id>
+node scripts/iris.mjs up
+node scripts/iris.mjs doctor
+```
+
+Reinstalling an existing installation is an owner-reviewed migration and rollback exercise. Do not delete a registry to force setup, reuse another machine's data root, or reconnect ChatGPT until the local identity and tunnel have been verified.
+
 ## Recovery decisions
 
 Run the checkpoint helper from the verified Git root before taking over a task:
