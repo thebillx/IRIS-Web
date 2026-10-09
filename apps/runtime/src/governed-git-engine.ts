@@ -863,7 +863,7 @@ async function requireGitBytes(cwd: string, args: readonly string[], operation: 
       env: { ...node24Environment(), GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '0' },
     }) as unknown as { readonly stdout: Buffer };
     return result.stdout;
-  } catch (error) {
+  } catch {
     throw new RuntimeError('CAPABILITY_DENIED', `Bounded Git ${operation} could not be captured safely`);
   }
 }
