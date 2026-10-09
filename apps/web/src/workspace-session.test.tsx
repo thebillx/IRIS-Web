@@ -196,8 +196,16 @@ describe('daily workspace session experience', () => {
 
     expect(window.sessionStorage.getItem('iris.web.selectedSessionId')).toBeNull();
     expect(document.body.textContent).toContain('No sessions yet.');
+    expect(document.querySelector('.header-status')?.textContent).toBe('Online');
     expect(document.body.textContent).toContain('IRIS');
     expect(document.body.textContent).toContain('/Users/bill/iris');
+  });
+
+  it('shows Offline when the local runtime cannot be reached', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('Runtime unavailable'); }));
+    await mountApp();
+    await settleApp();
+    expect(document.querySelector('.header-status')?.textContent).toBe('Offline');
   });
 
   it('binds approval UI to the selected session and drops the prior session approval when switching context', async () => {
@@ -220,6 +228,7 @@ describe('daily workspace session experience', () => {
 
     await mountApp();
     await settleApp();
+    expect(document.querySelector('.header-status')?.textContent).toBe('Needs Attention');
     await clickButton('Approval Center (1)');
     expect(document.body.textContent).toContain('session · current project · set');
     expect(document.body.textContent).not.toContain('session-b-action');

@@ -30,7 +30,12 @@ try {
     process.stdout.write(`${secret}\n`);
   } else {
     const supervisor = await createSupervisor({ dataRoot });
-    if (command === 'up') {
+    if (command === 'connectors' && process.argv[3] === 'init') {
+      const tunnelId = process.argv[4];
+      if (tunnelId === undefined || process.argv.length !== 5) throw new Error('Usage: iris connectors init <tunnel-id>');
+      const registry = await supervisor.initializeUnified(tunnelId);
+      process.stdout.write(`${JSON.stringify({ label: 'IRIS', tunnelId, mcpPath: '/mcp', deploymentEpoch: registry.deploymentEpoch }, null, 2)}\n`);
+    } else if (command === 'up') {
       printStatus(await supervisor.up());
     } else if (command === 'down') {
       printStatus(await supervisor.down());
@@ -117,6 +122,12 @@ function parseLaunchdInstallOptions(argumentsList: readonly string[]): LaunchdIn
 }
 
 function printStatus(status: Awaited<ReturnType<Awaited<ReturnType<typeof createSupervisor>>['status']>>): void {
+  if (status.connectors.length === 1 && status.connectors[0]?.label === 'IRIS') {
+    const available = [status.runtime, status.web, status.tunnel, status.controlPlane, status.localRuntime].every((part) => part.state === 'READY');
+    const label = status.runtime.code === 'RUNTIME_NOT_RUNNING' ? 'Offline' : available ? 'Online' : 'Needs Attention';
+    process.stdout.write(`IRIS=${label}\n`);
+    return;
+  }
   process.stdout.write(`IRIS_STACK=${status.state}\n`);
   process.stdout.write(`Runtime        ${status.runtime.state}\n`);
   process.stdout.write(`Web            ${status.web.state}\n`);

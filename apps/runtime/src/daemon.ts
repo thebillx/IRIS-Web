@@ -200,6 +200,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         tunnelServiceSecret,
         ...(connectorRegistry === null ? {} : { connectorDeploymentEpoch: connectorRegistry.deploymentEpoch }),
         connectorRuntimeId: runtimeId,
+        singleConnector: connectorRegistry?.connectors.length === 1,
         catalogRuntimeContext: {
           machineId,
           runtimeId,

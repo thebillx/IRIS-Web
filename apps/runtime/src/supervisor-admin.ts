@@ -87,7 +87,7 @@ export async function readSupervisorAdminSnapshot(dataRoot: string): Promise<Sup
   const endpoint = observed.endpoint;
   let fullCatalogId: string | null = null;
   let fullToolCount: number | null = null;
-  let proToolCount: number | null = null;
+  let proToolCount: number | null = registry?.connectors.length === 1 ? 0 : null;
   if (endpoint !== null && registry !== null && serviceSecret !== null && observed.state === 'running') {
     const full = registry.connectors.find((candidate) => candidate.mode === 'FULL');
     const pro = registry.connectors.find((candidate) => candidate.mode === 'PRO');
