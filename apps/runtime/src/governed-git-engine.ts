@@ -10,7 +10,7 @@ import {
   type WorkspaceRecord,
 } from '@iris/domain';
 import { node24Environment } from './node-runtime.js';
-import { VNextResourceRegistry, primaryWorkspaceId } from './resource-registry.js';
+import { VNextResourceRegistry, primaryWorkspaceId, type RepositoryReconciliationInput } from './resource-registry.js';
 
 const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 120_000;
@@ -268,6 +268,66 @@ export class GovernedGitEngine {
     const binding = await this.resources.findRepository(projectId, identity.repositoryId);
     if (binding !== null) verifyRepositoryBinding(binding, identity);
     return identity;
+  }
+
+  public async reconcileRepository(input: RepositoryReconciliationInput, approvedFingerprint?: string) {
+    return this.resources.reconcileRepository(input, async (repository, workspaces) => {
+      if (deterministicRepositoryId(input.projectId, input.previousDevice, repository.commonGitDirInode) !== input.previousRepositoryId) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Previous repository identity is inconsistent');
+      }
+      const primary = await this.resources.primaryWorkspace(input.projectId);
+      const identity = await inspectRepositoryPhysicalIdentity(input.projectId, primary);
+      if (identity.commonGitDir !== repository.commonGitDir || identity.commonGitDirInode !== repository.commonGitDirInode) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository path or inode changed; automatic recovery is unsafe');
+      }
+      const commonMetadata = await lstat(identity.commonGitDir);
+      if (commonMetadata.birthtimeMs <= 0 || commonMetadata.birthtimeMs > Date.parse(repository.createdAt)) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository directory was replaced after registration or its creation time is unknown');
+      }
+      const listing = await requireGit(primary.physicalRoot, ['worktree', 'list', '--porcelain'], 'recovery worktree inventory');
+      const entries = parseWorktreePorcelain(listing.stdout);
+      const active = [primary, ...workspaces];
+      if (entries.length !== active.length || entries.some((entry) => entry.locked || entry.prunable
+        || !active.some((workspace) => workspace.physicalRoot === entry.path))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Git worktree inventory is incomplete, locked, or not exclusively authorized');
+      }
+      const evidence = [];
+      for (const workspace of active) {
+        await this.resources.getActiveWorkspace(input.projectId, workspace.workspaceId);
+        const physical = await inspectRepositoryPhysicalIdentity(input.projectId, workspace);
+        if (physical.repositoryId !== identity.repositoryId || physical.commonGitDir !== identity.commonGitDir) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'Linked worktree does not share the registered Git common directory');
+        }
+        const gitDir = (await requireGit(workspace.physicalRoot, ['rev-parse', '--absolute-git-dir'], 'recovery Git directory')).stdout.trim();
+        await verifiedDirectoryPhysicalPath(gitDir, 'Recovery Git directory');
+        if (workspace.role === 'WORKTREE') {
+          const backlink = path.join(gitDir, 'gitdir');
+          const metadata = await lstat(backlink);
+          if (!metadata.isFile() || metadata.isSymbolicLink()
+            || (await readBoundedText(backlink, 4096, 'worktree backlink')).trim() !== path.join(workspace.physicalRoot, '.git')) {
+            throw new RuntimeError('CAPABILITY_DENIED', 'Linked worktree backlink is inconsistent');
+          }
+        } else if (gitDir !== identity.commonGitDir) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'PRIMARY Git directory does not match its common directory');
+        }
+        for (const directory of new Set([gitDir, identity.commonGitDir])) {
+          for (const name of ['index.lock', 'HEAD.lock', 'config.lock', 'packed-refs.lock', 'shallow.lock']) {
+            await assertMissing(path.join(directory, name), 'Repository has an active or ambiguous Git lock');
+          }
+        }
+        const head = (await requireGit(workspace.physicalRoot, ['rev-parse', 'HEAD'], 'recovery HEAD')).stdout.trim();
+        const branch = (await requireGit(workspace.physicalRoot, ['rev-parse', '--symbolic-full-name', 'HEAD'], 'recovery branch')).stdout.trim();
+        const status = (await requireGit(workspace.physicalRoot, ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=all'], 'recovery status')).stdout;
+        const rootMetadata = await lstat(workspace.physicalRoot, { bigint: true });
+        const marker = await lstat(path.join(workspace.physicalRoot, '.git'), { bigint: true });
+        evidence.push({ workspaceId: workspace.workspaceId, root: workspace.physicalRoot, gitDir,
+          rootInode: rootMetadata.ino.toString(), markerInode: marker.ino.toString(), head, branch, status });
+      }
+      return { identity: { repositoryId: identity.repositoryId, projectId: identity.projectId,
+        primaryWorkspaceId: identity.primaryWorkspaceId, commonGitDir: identity.commonGitDir,
+        commonGitDirDevice: identity.commonGitDirDevice, commonGitDirInode: identity.commonGitDirInode },
+        evidence: { commonBirthtimeMs: commonMetadata.birthtimeMs, workspaces: evidence } };
+    }, approvedFingerprint);
   }
 
   private async ensureRepositoryBinding(identity: GitRepositoryIdentity): Promise<RepositoryRecord> {

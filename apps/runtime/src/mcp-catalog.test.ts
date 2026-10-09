@@ -4,6 +4,31 @@ import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
 import { proMcpToolDefinitions } from './mcp.js';
 
 describe('canonical MCP catalog', () => {
+  it('preserves the GitHub main FULL and PRO contracts during repository recovery', () => {
+    expect(catalogIdentity('FULL', fullMcpToolDefinitionsV21())).toEqual({
+      profile: 'FULL', catalogVersion: '2.7.0', toolCount: 56,
+      catalogHash: 'sha256:cd51971fa290453e7d70e7eda30961ac0d8f66cfb56c34b65b72a4066374e30a',
+    });
+    expect(catalogIdentity('PRO', proMcpToolDefinitions())).toEqual({
+      profile: 'PRO', catalogVersion: '2.7.0', toolCount: 5,
+      catalogHash: 'sha256:bca6dcdecff2793b0865a3470c96f35b5b85356a2eb6f27e51c80bc7c07af7ee',
+    });
+  });
+
+  it('records the inherited cursor-schema difference against authenticated RARW epoch 30', () => {
+    const definitions = fullMcpToolDefinitionsV21();
+    const backlog = definitions.find((tool) => tool.name === 'ado_backlog_list')!;
+    const schema = backlog.inputSchema as { properties: { cursor: { maxLength: number } } };
+    expect(schema.properties.cursor.maxLength).toBe(96);
+    const liveDefinitions = definitions.map((tool) => tool === backlog ? {
+      ...tool, inputSchema: { ...tool.inputSchema, properties: {
+        ...schema.properties, cursor: { ...schema.properties.cursor, maxLength: 40 },
+      } },
+    } : tool);
+    expect(catalogIdentity('FULL', liveDefinitions).catalogHash)
+      .toBe('sha256:c047d48ffbe57ea1d4e0af505e435809a400462f1f3e565e5fee52811686f879');
+  });
+
   it('produces a deterministic identity and changes it for schema changes', () => {
     const definitions = fullMcpToolDefinitionsV21();
     const first = catalogIdentity('FULL', definitions);
