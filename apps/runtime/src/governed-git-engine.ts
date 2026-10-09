@@ -813,8 +813,8 @@ async function readBoundedText(filename: string, maxBytes: number, label: string
 
 async function captureWorkContent(root: string): Promise<Record<string, unknown>> {
   const index = await requireGitBytes(root, ['ls-files', '--stage', '-z'], 'index evidence');
-  const staged = await requireGitBytes(root, ['diff', '--cached', '--binary', '--no-ext-diff', '--no-color'], 'staged evidence');
-  const unstaged = await requireGitBytes(root, ['diff', '--binary', '--no-ext-diff', '--no-color'], 'unstaged evidence');
+  const staged = await requireGitBytes(root, ['diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--no-color'], 'staged evidence');
+  const unstaged = await requireGitBytes(root, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-color'], 'unstaged evidence');
   const untrackedListing = await requireGitBytes(root, ['ls-files', '--others', '--exclude-standard', '--full-name', '-z'], 'untracked evidence');
   const paths = untrackedListing.toString('utf8').split('\0').filter(Boolean).sort();
   if (paths.length > MAX_EVIDENCE_FILES) throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence exceeds the bounded file limit');
