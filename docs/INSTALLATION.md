@@ -91,6 +91,8 @@ node scripts/iris.mjs doctor
 
 Reinstalling an existing installation is an owner-reviewed migration and rollback exercise. Do not delete a registry to force setup, reuse another machine's data root, or reconnect ChatGPT until the local identity and tunnel have been verified.
 
+The detailed later-operation contract is [the migration and rollback runbook](acceptance/MIGRATION_ROLLBACK_RUNBOOK.md). It is a design and checklist for a separately authorized exercise, not a command to run during a fresh install.
+
 ## Recovery decisions
 
 Run the checkpoint helper from the verified Git root before taking over a task:

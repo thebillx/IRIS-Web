@@ -64,4 +64,43 @@ describe('unified IRIS fresh setup', () => {
       expect(await readdir(path.join(dataRoot, 'tunnel-profiles'))).toEqual(['iris-full.yaml']);
     } finally { await daemon.close(); }
   });
+
+  it('keeps two unified machines request-isolated without a fallback connector', async () => {
+    const firstRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-unified-machine-a-'));
+    const secondRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-unified-machine-b-'));
+    roots.push(firstRoot, secondRoot);
+    const [firstRegistry, secondRegistry] = await Promise.all([
+      initializeConnectorRegistry(firstRoot, { unified: true, fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }),
+      initializeConnectorRegistry(secondRoot, { unified: true, fullTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }),
+    ]);
+    const [firstDaemon, secondDaemon] = await Promise.all([
+      startDaemon({ dataRoot: firstRoot, preferredPort: 0 }),
+      startDaemon({ dataRoot: secondRoot, preferredPort: 0 }),
+    ]);
+    try {
+      const firstSecret = await readTunnelServiceSecret(firstRoot);
+      const secondSecret = await readTunnelServiceSecret(secondRoot);
+      expect(firstSecret).not.toBeNull();
+      expect(secondSecret).not.toBeNull();
+      const request = (daemon: typeof firstDaemon, registry: ConnectorRegistryDocument, secret: string, pathName = '/mcp') => fetch(daemon.apiUrl + pathName, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${secret}`,
+          'content-type': 'application/json',
+          'MCP-Protocol-Version': '2026-07-28',
+          'x-iris-connector-profile': 'FULL',
+          'x-iris-deployment-epoch': String(registry.deploymentEpoch),
+          'x-iris-runtime-id': daemon.identity.runtimeId,
+          'x-iris-client-id': 'machine-isolation-fixture',
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      });
+      expect((await request(firstDaemon, firstRegistry, secondSecret!)).status).toBe(401);
+      expect((await request(secondDaemon, secondRegistry, firstSecret!)).status).toBe(401);
+      expect((await fetch(firstDaemon.apiUrl + '/mcp-pro')).status).toBe(404);
+      expect((await fetch(secondDaemon.apiUrl + '/mcp-pro')).status).toBe(404);
+    } finally {
+      await Promise.all([firstDaemon.close(), secondDaemon.close()]);
+    }
+  });
 });

@@ -15,7 +15,7 @@ This matrix records candidate evidence only. Disposable tests do not establish p
 | Uninstall/reinstall | Owner can stop/remove runtime components while retaining data, then reinstall only after verified backup. | LaunchAgent artifact and data-preserving checklist review | PARTIAL | `launchd uninstall` is supported; full removal/reinstall of an existing installation is not production-verified. |
 | Real ChatGPT connectivity | Authenticated Owner UI reaches the intended registered tunnel and `/mcp`. | Requires authenticated Owner UI and a real registered tunnel | UNVERIFIED | Owner must perform a separately authorized remote acceptance test. |
 | macOS login persistence | The owner-managed LaunchAgent starts the intended installation after login/reboot. | LaunchAgent rendering tests only; no install on this host | UNVERIFIED | Verify login/reboot on a disposable or designated acceptance Mac. |
-| Existing-installation migration | Existing state is preserved until an explicit migration and rollback plan is approved. | Setup intentionally refuses an existing registry | BLOCKED | Design and separately authorize a migration/rollback procedure before destructive reinstall. |
+| Existing-installation migration | Existing state is preserved until an explicit migration and rollback plan is approved. | Setup intentionally refuses an existing registry; [migration and rollback runbook](MIGRATION_ROLLBACK_RUNBOOK.md) documents the contract | BLOCKED | Design is documented; separately authorize and execute the migration/rollback procedure before destructive reinstall. |
 
 ## Combined candidate
 
