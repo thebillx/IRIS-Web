@@ -3,6 +3,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
+import { inspectCredentialStatus, loadOrCreateTunnelServiceSecret } from './credentials.js';
 import { createSupervisor } from './supervisor.js';
 import { installLaunchAgent, launchAgentLoaded, launchdPaths, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
@@ -12,12 +13,14 @@ const legacyRuntimeControl = process.env.IRIS_STACK_CLI !== '1';
 
 try {
   assertSupportedNodeVersion();
+  const setupOptions = command === 'setup' ? parseSetupOptions(process.argv.slice(3)) : null;
   const launchdInstallOptions = command === 'launchd' && process.argv[3] === 'install'
     ? parseLaunchdInstallOptions(process.argv.slice(4))
     : null;
-  const dataRoot = launchdInstallOptions?.runtimeDataRoot === undefined
+  const configuredDataRoot = setupOptions?.runtimeDataRoot ?? launchdInstallOptions?.runtimeDataRoot;
+  const dataRoot = configuredDataRoot === undefined
     ? await resolveRuntimeDataRoot()
-    : await resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: launchdInstallOptions.runtimeDataRoot });
+    : await resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: configuredDataRoot });
   if (legacyRuntimeControl && command === 'start') {
     process.stdout.write(`${JSON.stringify(await startRuntime({ dataRoot }), null, 2)}\n`);
   } else if (legacyRuntimeControl && command === 'status') {
@@ -29,8 +32,13 @@ try {
     if (secret === null) throw new Error('IRIS owner access credential is not initialized');
     process.stdout.write(`${secret}\n`);
   } else {
-    const supervisor = await createSupervisor({ dataRoot });
-    if (command === 'connectors' && process.argv[3] === 'init') {
+    const supervisor = await createSupervisor({
+      dataRoot,
+      ...(setupOptions?.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: setupOptions.protectedReferenceRoot }),
+    });
+    if (command === 'setup') {
+      process.stdout.write(`${JSON.stringify(await guidedSetup(supervisor, dataRoot, setupOptions!), null, 2)}\n`);
+    } else if (command === 'connectors' && process.argv[3] === 'init') {
       const tunnelId = process.argv[4];
       if (tunnelId === undefined || process.argv.length !== 5) throw new Error('Usage: iris connectors init <tunnel-id>');
       const registry = await supervisor.initializeUnified(tunnelId);
@@ -83,7 +91,7 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'status') {
       process.stdout.write(`${JSON.stringify({ loaded: await launchAgentLoaded(), paths: launchdPaths(dataRoot) }, null, 2)}\n`);
     } else {
-      process.stderr.write('Usage: iris <up|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|runtime-reconcile|supervisor|credentials|launchd>\n');
+      process.stderr.write('Usage: iris <setup --tunnel-id <registered-tunnel-id>|up|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|runtime-reconcile|supervisor|credentials|launchd>\n');
       process.exitCode = 2;
     }
   }
@@ -97,6 +105,85 @@ try {
 interface LaunchdInstallOptions {
   runtimeDataRoot?: string;
   protectedReferenceRoot?: string;
+}
+
+interface SetupOptions {
+  readonly tunnelId: string;
+  readonly runtimeDataRoot?: string;
+  readonly protectedReferenceRoot?: string;
+  readonly start: boolean;
+}
+
+function parseSetupOptions(argumentsList: readonly string[]): SetupOptions {
+  let tunnelId: string | undefined;
+  let runtimeDataRoot: string | undefined;
+  let protectedReferenceRoot: string | undefined;
+  let start = false;
+  for (let index = 0; index < argumentsList.length; index += 1) {
+    const name = argumentsList[index];
+    if (name === '--start') {
+      if (start) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
+      start = true;
+      continue;
+    }
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
+    if (name === '--tunnel-id' && tunnelId === undefined) tunnelId = value;
+    else if (name === '--runtime-data-root' && runtimeDataRoot === undefined) runtimeDataRoot = value;
+    else if (name === '--protected-reference-root' && protectedReferenceRoot === undefined) protectedReferenceRoot = value;
+    else throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
+    index += 1;
+  }
+  if (tunnelId === undefined) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
+  return { tunnelId, ...(runtimeDataRoot === undefined ? {} : { runtimeDataRoot }), ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }), start };
+}
+
+async function guidedSetup(supervisor: Awaited<ReturnType<typeof createSupervisor>>, dataRoot: string, options: SetupOptions): Promise<Record<string, unknown>> {
+  if (process.platform !== 'darwin') throw new Error('IRIS setup is supported on macOS only');
+  const credentials = await inspectCredentialStatus(dataRoot);
+  const safeCredentials = {
+    controlPlaneApiKeyPresent: credentials.controlPlaneApiKeyPresent,
+    tunnelServicePresent: credentials.tunnelServicePresent,
+    tunnelServiceGeneration: credentials.tunnelServiceGeneration,
+    legacyMigrationRequired: credentials.legacy.migrationRequired,
+  };
+  if (!credentials.controlPlaneApiKeyPresent) {
+    return {
+      status: 'NEEDS_CREDENTIALS',
+      credentials: safeCredentials,
+      next: ['node scripts/iris.mjs credentials migrate <existing-profile-path>', `node scripts/iris.mjs setup --tunnel-id ${options.tunnelId}`],
+      message: 'Provide the existing tunnel credential through the explicit migration command; no registry or runtime state was created.',
+    };
+  }
+  let registry;
+  let repeated = false;
+  try {
+    registry = await supervisor.initializeUnified(options.tunnelId);
+  } catch (error) {
+    if (!(error instanceof Error) || !('code' in error) || (error as { readonly code?: unknown }).code !== 'PRECONDITION_FAILED') throw error;
+    const existing = await supervisor.connectors();
+    if (existing.connectors.length !== 1 || existing.connectors[0]?.label !== 'IRIS' || existing.connectors[0].tunnelId !== options.tunnelId || existing.admin !== null) throw error;
+    registry = existing;
+    repeated = true;
+  }
+  await loadOrCreateTunnelServiceSecret(dataRoot);
+  const configuredCredentials = await inspectCredentialStatus(dataRoot);
+  const status = options.start ? await supervisor.up() : await supervisor.status();
+  return {
+    status: options.start ? (status.state === 'READY' ? 'READY' : 'NEEDS_ATTENTION') : 'READY_TO_START',
+    repeated,
+    machineId: registry.connectors[0]?.machineId ?? null,
+    connector: { label: 'IRIS', tunnelId: options.tunnelId, mcpPath: '/mcp' },
+    credentials: {
+      controlPlaneApiKeyPresent: configuredCredentials.controlPlaneApiKeyPresent,
+      tunnelServicePresent: configuredCredentials.tunnelServicePresent,
+      tunnelServiceGeneration: configuredCredentials.tunnelServiceGeneration,
+      legacyMigrationRequired: configuredCredentials.legacy.migrationRequired,
+    },
+    local: { stack: status.state, runtime: status.runtime, tunnel: status.tunnel, controlPlane: status.controlPlane },
+    next: options.start ? ['node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'] : ['node scripts/iris.mjs up', 'node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'],
+    message: 'Remote tunnel provisioning and ChatGPT connector selection remain owner-verifiable steps; this command does not claim either occurred.',
+  };
 }
 
 const LAUNCHD_INSTALL_USAGE = 'Usage: iris launchd install [--runtime-data-root <external-directory>] [--protected-reference-root <existing-directory>]';

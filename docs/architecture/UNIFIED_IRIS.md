@@ -4,15 +4,17 @@ The candidate supports a fresh macOS installation with one user-facing IRIS conn
 
 ## Fresh setup (future owner operation)
 
-Run from the reviewed installed source root with Node 24 and frozen dependencies ready. The owner must first provision the existing private tunnel credential configuration using the supported credential setup workflow and obtain one registered tunnel ID. Never put secrets in command arguments or source control. No setup command below was executed against the live installation during development.
+The complete owner-facing checklist is [the installation guide](../INSTALLATION.md). Run from the reviewed installed source root with Node 24 and frozen dependencies ready. The owner must first provision the existing private tunnel credential configuration using the supported credential setup workflow and obtain one registered tunnel ID. Never put secrets in command arguments or source control. No setup command below was executed against the live installation during development.
 
 ```sh
-node scripts/iris.mjs connectors init <registered-tunnel-id>
+node scripts/iris.mjs setup --tunnel-id <registered-tunnel-id>
+node scripts/iris.mjs up
+node scripts/iris.mjs doctor
 node scripts/iris.mjs launchd install
 node scripts/iris.mjs status
 ```
 
-Initialization refuses an existing registry. LaunchAgent installation uses the existing macOS login-start mechanism and starts the stack; it therefore requires explicit installation authority. Production migration, backup/fencing and a real login/remote connector acceptance test remain separate operational gates. Do not run these commands on an existing installation to approximate migration.
+Setup refuses an existing registry unless it is the same unified binding. LaunchAgent installation uses the existing macOS login-start mechanism and starts the stack; it therefore requires explicit installation authority. Production migration, backup/fencing and a real login/remote connector acceptance test remain separate operational gates. Do not run these commands on an existing installation to approximate migration.
 
 Unified CLI and Web status use Online / Offline / Needs Attention. Online describes the observed local service/stack, not a claim that a ChatGPT round trip passed. Detailed owner-local diagnostics remain available through `doctor` and `catalog status`. Routine tasks retain the existing permission policy; lifecycle, credentials and filesystem boundaries are not broadened.
 

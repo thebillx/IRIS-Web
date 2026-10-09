@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import process from 'node:process';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 import { inspectCheckpoint, saveCheckpoint } from './task-checkpoint.mjs';
@@ -41,6 +42,13 @@ test('one durable canonical checkpoint survives takeover and lost acknowledgemen
   await assert.rejects(saveCheckpoint(root, 'task', { ...input, objective: 'A different task' }), /conflicts/);
   await assert.rejects(saveCheckpoint(root, 'task', { ...input, requestId: 'new-request' }), /Stale/);
   assert.equal(await readFile(path.join(root, 'owner.txt'), 'utf8'), 'owner work');
+});
+
+test('a fresh process can inspect the durable checkpoint without in-memory state', async (t) => {
+  const { root, input } = await fixture(t);
+  await saveCheckpoint(root, 'task', input);
+  const result = await exec(process.execPath, [path.join(import.meta.dirname, 'task-checkpoint.mjs'), 'inspect', 'task'], { cwd: root });
+  assert.equal(JSON.parse(result.stdout).action, 'EXECUTE');
 });
 
 test('takeover asks about blockers and verifies unknown outcomes without replaying them', async (t) => {
