@@ -36,13 +36,13 @@ jobs:
 
       - name: Typecheck runtime and web
         run: |
-          node scripts/node24.mjs --pnpm --filter @iris/runtime typecheck
-          node scripts/node24.mjs --pnpm --filter @iris/web typecheck
+          pnpm --filter @iris/runtime typecheck
+          pnpm --filter @iris/web typecheck
 
       - name: Run setup and continuity tests
         run: |
           if [ -f apps/runtime/src/control-setup.test.ts ]; then
-            node scripts/node24.mjs --pnpm --filter @iris/runtime exec tsx src/control-setup.test.ts
+            pnpm --filter @iris/runtime exec tsx src/control-setup.test.ts
           fi
           if [ -f scripts/task-checkpoint.test.mjs ]; then
             node --test scripts/task-checkpoint.test.mjs
@@ -51,19 +51,19 @@ jobs:
       - name: Run focused runtime suites
         run: |
           if [ -f apps/runtime/src/repository-reconcile.test.ts ]; then
-            node scripts/node24.mjs --pnpm --filter @iris/runtime exec vitest run src/repository-reconcile.test.ts src/server.test.ts src/mcp-catalog.test.ts src/phase8-catalog-compat.test.ts src/activation-controller.test.ts src/supervisor-admin-activation.test.ts src/phase4-git-worktree.test.ts src/permissions.test.ts
+            pnpm --filter @iris/runtime exec vitest run src/repository-reconcile.test.ts src/server.test.ts src/mcp-catalog.test.ts src/phase8-catalog-compat.test.ts src/activation-controller.test.ts src/supervisor-admin-activation.test.ts src/phase4-git-worktree.test.ts src/permissions.test.ts
           fi
           if [ -f apps/runtime/src/unified-iris.test.ts ]; then
-            node scripts/node24.mjs --pnpm --filter @iris/runtime exec vitest run src/unified-iris.test.ts src/connector-registry.test.ts src/server.test.ts src/permissions.test.ts src/mcp-catalog.test.ts
+            pnpm --filter @iris/runtime exec vitest run src/unified-iris.test.ts src/connector-registry.test.ts src/server.test.ts src/permissions.test.ts src/mcp-catalog.test.ts
           fi
 
       - name: Run affected lint and diff checks
         run: |
-          node scripts/node24.mjs --pnpm exec eslint apps/runtime/src/control.ts
+          pnpm exec eslint apps/runtime/src/control.ts
           if [ -f apps/runtime/src/control-setup.test.ts ]; then
-            node scripts/node24.mjs --pnpm exec eslint apps/runtime/src/control-setup.test.ts
+            pnpm exec eslint apps/runtime/src/control-setup.test.ts
           fi
           if [ -f scripts/task-checkpoint.mjs ]; then
-            node scripts/node24.mjs --pnpm exec eslint scripts/task-checkpoint.mjs scripts/task-checkpoint.test.mjs
+            pnpm exec eslint scripts/task-checkpoint.mjs scripts/task-checkpoint.test.mjs
           fi
           git diff --check
