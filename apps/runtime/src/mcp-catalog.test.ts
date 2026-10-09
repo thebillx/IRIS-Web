@@ -21,7 +21,7 @@ describe('canonical MCP catalog', () => {
     const schema = backlog.inputSchema as { properties: { cursor: { maxLength: number } } };
     expect(schema.properties.cursor.maxLength).toBe(96);
     const liveDefinitions = definitions.map((tool) => tool === backlog ? {
-      ...tool, inputSchema: { ...tool.inputSchema, properties: {
+      ...tool, inputSchema: { ...schema, properties: {
         ...schema.properties, cursor: { ...schema.properties.cursor, maxLength: 40 },
       } },
     } : tool);
