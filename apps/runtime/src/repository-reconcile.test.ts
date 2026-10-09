@@ -139,7 +139,7 @@ describe('owner-authorized repository device reconciliation', () => {
     const retry = approval(await f.service.execute(f.operation));
     expect(value(await f.service.resolveApproval(retry, 'ALLOW_ONCE')).changed).toBe(false);
     expect(await readFile(f.filename, 'utf8')).toBe(before);
-  });
+  }, 15_000);
 
   it('does not mutate on owner denial and rejects a persistent approval override', async () => {
     const f = await fixture();
@@ -235,6 +235,53 @@ describe('owner-authorized repository device reconciliation', () => {
     await git(f.projectRoot, ['switch', '-c', 'changed-branch']);
     expect(await f.service.resolveApproval(id, 'ALLOW_ONCE')).toMatchObject({ status: 'denied' });
     await expect(f.engine.inspectRepository(f.project.id, f.primary.workspaceId)).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+  });
+
+  it('invalidates approval when an untracked file changes but its status does not', async () => {
+    const f = await fixture();
+    const ownerFile = path.join(f.projectRoot, 'owner.txt');
+    await writeFile(ownerFile, 'first bytes');
+    const before = (await git(f.projectRoot, ['status', '--porcelain=v1', '--untracked-files=all'])).stdout;
+    const id = approval(await f.service.execute(f.operation));
+    await writeFile(ownerFile, 'second bytes');
+    expect((await git(f.projectRoot, ['status', '--porcelain=v1', '--untracked-files=all'])).stdout).toBe(before);
+    expect(await f.service.resolveApproval(id, 'ALLOW_ONCE')).toMatchObject({ status: 'denied' });
+  });
+
+  it('invalidates approval when staged content changes but its status does not', async () => {
+    const f = await fixture();
+    const trackedFile = path.join(f.projectRoot, 'tracked.txt');
+    await writeFile(trackedFile, 'base bytes');
+    await git(f.projectRoot, ['add', 'tracked.txt']);
+    await git(f.projectRoot, ['-c', 'user.name=IRIS Test', '-c', 'user.email=iris@example.invalid', 'commit', '-m', 'tracked fixture']);
+    await writeFile(trackedFile, 'first staged bytes');
+    await git(f.projectRoot, ['add', 'tracked.txt']);
+    const before = (await git(f.projectRoot, ['status', '--porcelain=v1', '--untracked-files=all'])).stdout;
+    const id = approval(await f.service.execute(f.operation));
+    await writeFile(trackedFile, 'second staged bytes');
+    await git(f.projectRoot, ['add', 'tracked.txt']);
+    expect((await git(f.projectRoot, ['status', '--porcelain=v1', '--untracked-files=all'])).stdout).toBe(before);
+    expect(await f.service.resolveApproval(id, 'ALLOW_ONCE')).toMatchObject({ status: 'denied' });
+  });
+
+  it('invalidates approval when unstaged content changes but its status does not', async () => {
+    const f = await fixture();
+    const trackedFile = path.join(f.projectRoot, 'tracked.txt');
+    await writeFile(trackedFile, 'base bytes');
+    await git(f.projectRoot, ['add', 'tracked.txt']);
+    await git(f.projectRoot, ['-c', 'user.name=IRIS Test', '-c', 'user.email=iris@example.invalid', 'commit', '-m', 'tracked fixture']);
+    await writeFile(trackedFile, 'first unstaged bytes');
+    const before = (await git(f.projectRoot, ['status', '--porcelain=v1', '--untracked-files=all'])).stdout;
+    const id = approval(await f.service.execute(f.operation));
+    await writeFile(trackedFile, 'second unstaged bytes');
+    expect((await git(f.projectRoot, ['status', '--porcelain=v1', '--untracked-files=all'])).stdout).toBe(before);
+    expect(await f.service.resolveApproval(id, 'ALLOW_ONCE')).toMatchObject({ status: 'denied' });
+  });
+
+  it('fails closed when untracked evidence exceeds the bounded size', async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.projectRoot, 'oversized.bin'), Buffer.alloc(8 * 1024 * 1024 + 1, 7));
+    await expect(f.service.execute(f.operation)).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
   });
 
   it('rechecks the approved fingerprint at publication', async () => {

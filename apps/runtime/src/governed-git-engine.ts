@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstat, readFile, realpath } from 'node:fs/promises';
+import { lstat, readFile, readlink, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import {
@@ -18,6 +18,10 @@ const NETWORK_TIMEOUT_MS = 10 * 60_000;
 const MAX_BUFFER = 1024 * 1024;
 const MAX_OUTPUT = 16 * 1024;
 const MAX_CAT_CONTENT = 64 * 1024;
+const MAX_EVIDENCE_BYTES = 8 * 1024 * 1024;
+const MAX_EVIDENCE_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_EVIDENCE_TOTAL_BYTES = 32 * 1024 * 1024;
+const MAX_EVIDENCE_FILES = 200;
 const MAX_REF_ENTRIES = 200;
 const MAX_LOG_ENTRIES = 100;
 const MAX_GIT_PATHS = 24;
@@ -318,10 +322,11 @@ export class GovernedGitEngine {
         const head = (await requireGit(workspace.physicalRoot, ['rev-parse', 'HEAD'], 'recovery HEAD')).stdout.trim();
         const branch = (await requireGit(workspace.physicalRoot, ['rev-parse', '--symbolic-full-name', 'HEAD'], 'recovery branch')).stdout.trim();
         const status = (await requireGit(workspace.physicalRoot, ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=all'], 'recovery status')).stdout;
+        const workContent = await captureWorkContent(workspace.physicalRoot);
         const rootMetadata = await lstat(workspace.physicalRoot, { bigint: true });
         const marker = await lstat(path.join(workspace.physicalRoot, '.git'), { bigint: true });
         evidence.push({ workspaceId: workspace.workspaceId, root: workspace.physicalRoot, gitDir,
-          rootInode: rootMetadata.ino.toString(), markerInode: marker.ino.toString(), head, branch, status });
+          rootInode: rootMetadata.ino.toString(), markerInode: marker.ino.toString(), head, branch, status, workContent });
       }
       return { identity: { repositoryId: identity.repositoryId, projectId: identity.projectId,
         primaryWorkspaceId: identity.primaryWorkspaceId, commonGitDir: identity.commonGitDir,
@@ -804,6 +809,63 @@ async function readBoundedText(filename: string, maxBytes: number, label: string
   const content = await readFile(filename);
   if (content.byteLength > maxBytes) throw new RuntimeError('CAPABILITY_DENIED', `${label} exceeds the bounded metadata limit`);
   return content.toString('utf8');
+}
+
+async function captureWorkContent(root: string): Promise<Record<string, unknown>> {
+  const index = await requireGitBytes(root, ['ls-files', '--stage', '-z'], 'index evidence');
+  const staged = await requireGitBytes(root, ['diff', '--cached', '--binary', '--no-ext-diff', '--no-color'], 'staged evidence');
+  const unstaged = await requireGitBytes(root, ['diff', '--binary', '--no-ext-diff', '--no-color'], 'unstaged evidence');
+  const untrackedListing = await requireGitBytes(root, ['ls-files', '--others', '--exclude-standard', '--full-name', '-z'], 'untracked evidence');
+  const paths = untrackedListing.toString('utf8').split('\0').filter(Boolean).sort();
+  if (paths.length > MAX_EVIDENCE_FILES) throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence exceeds the bounded file limit');
+  let totalBytes = 0;
+  const untracked = [];
+  for (const relative of paths) {
+    const absolute = path.resolve(root, relative);
+    if (path.isAbsolute(relative) || !pathIsWithin(root, absolute) || absolute === root) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence contains an unsafe path');
+    }
+    const before = await lstat(absolute, { bigint: true });
+    if (before.isSymbolicLink()) {
+      const target = await readlink(absolute);
+      const after = await lstat(absolute, { bigint: true });
+      if (before.ino !== after.ino || before.mtimeNs !== after.mtimeNs) throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence changed while inspected');
+      untracked.push({ path: relative, kind: 'symlink', size: target.length, sha256: createHash('sha256').update(`symlink:${target}`).digest('hex') });
+      continue;
+    }
+    if (!before.isFile() || before.size > BigInt(MAX_EVIDENCE_FILE_BYTES)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence is not a bounded physical file');
+    }
+    totalBytes += Number(before.size);
+    if (totalBytes > MAX_EVIDENCE_TOTAL_BYTES) throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence exceeds the bounded byte limit');
+    const content = await readFile(absolute);
+    const after = await lstat(absolute, { bigint: true });
+    if (before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence changed while inspected');
+    }
+    untracked.push({ path: relative, kind: 'file', size: content.byteLength, sha256: createHash('sha256').update(content).digest('hex') });
+  }
+  return {
+    indexSha256: createHash('sha256').update(index).digest('hex'),
+    stagedDiffSha256: createHash('sha256').update(staged).digest('hex'),
+    unstagedDiffSha256: createHash('sha256').update(unstaged).digest('hex'),
+    untracked,
+  };
+}
+
+async function requireGitBytes(cwd: string, args: readonly string[], operation: string): Promise<Buffer> {
+  try {
+    const result = await execFileAsync('git', [...args], {
+      cwd,
+      encoding: 'buffer',
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: MAX_EVIDENCE_BYTES,
+      env: { ...node24Environment(), GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '0' },
+    }) as unknown as { readonly stdout: Buffer };
+    return result.stdout;
+  } catch (error) {
+    throw new RuntimeError('CAPABILITY_DENIED', `Bounded Git ${operation} could not be captured safely`);
+  }
 }
 
 async function verifiedDirectoryPhysicalPath(candidate: string, label: string): Promise<string> {
