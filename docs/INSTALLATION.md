@@ -37,6 +37,8 @@ IRIS_RUNTIME_DATA_ROOT="$HOME/Library/Application Support/IRIS-rarw" \
 
 Setup refuses an existing registry unless it is already the same one-connector IRIS binding. A different tunnel ID or a legacy two-connector registry requires an owner-reviewed migration; setup never overwrites it.
 
+The default output is a human-readable readiness summary. Automation can request the same result as JSON by adding `--json`; neither form prints credential values. `ChatGPT Not Verified` remains explicit until the owner completes the authenticated Owner UI connection.
+
 Start and diagnose the local stack explicitly:
 
 ```sh

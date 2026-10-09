@@ -37,7 +37,8 @@ try {
       ...(setupOptions?.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: setupOptions.protectedReferenceRoot }),
     });
     if (command === 'setup') {
-      process.stdout.write(`${JSON.stringify(await guidedSetup(supervisor, dataRoot, setupOptions!), null, 2)}\n`);
+      const result = await guidedSetup(supervisor, dataRoot, setupOptions!);
+      process.stdout.write(setupOptions!.json ? `${JSON.stringify(result, null, 2)}\n` : formatSetupOutput(result));
     } else if (command === 'connectors' && process.argv[3] === 'init') {
       const tunnelId = process.argv[4];
       if (tunnelId === undefined || process.argv.length !== 5) throw new Error('Usage: iris connectors init <tunnel-id>');
@@ -112,6 +113,7 @@ interface SetupOptions {
   readonly runtimeDataRoot?: string;
   readonly protectedReferenceRoot?: string;
   readonly start: boolean;
+  readonly json: boolean;
 }
 
 function parseSetupOptions(argumentsList: readonly string[]): SetupOptions {
@@ -119,23 +121,29 @@ function parseSetupOptions(argumentsList: readonly string[]): SetupOptions {
   let runtimeDataRoot: string | undefined;
   let protectedReferenceRoot: string | undefined;
   let start = false;
+  let json = false;
   for (let index = 0; index < argumentsList.length; index += 1) {
     const name = argumentsList[index];
     if (name === '--start') {
-      if (start) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
+      if (start) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--json] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
       start = true;
       continue;
     }
+    if (name === '--json') {
+      if (json) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--json] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
+      json = true;
+      continue;
+    }
     const value = argumentsList[index + 1]?.trim();
-    if (value === undefined || value.length === 0) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
+    if (value === undefined || value.length === 0) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--json] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
     if (name === '--tunnel-id' && tunnelId === undefined) tunnelId = value;
     else if (name === '--runtime-data-root' && runtimeDataRoot === undefined) runtimeDataRoot = value;
     else if (name === '--protected-reference-root' && protectedReferenceRoot === undefined) protectedReferenceRoot = value;
-    else throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
+    else throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--json] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
     index += 1;
   }
-  if (tunnelId === undefined) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
-  return { tunnelId, ...(runtimeDataRoot === undefined ? {} : { runtimeDataRoot }), ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }), start };
+  if (tunnelId === undefined) throw new Error('Usage: iris setup --tunnel-id <registered-tunnel-id> [--start] [--json] [--runtime-data-root <directory>] [--protected-reference-root <directory>]');
+  return { tunnelId, ...(runtimeDataRoot === undefined ? {} : { runtimeDataRoot }), ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }), start, json };
 }
 
 async function guidedSetup(supervisor: Awaited<ReturnType<typeof createSupervisor>>, dataRoot: string, options: SetupOptions): Promise<Record<string, unknown>> {
@@ -184,6 +192,28 @@ async function guidedSetup(supervisor: Awaited<ReturnType<typeof createSuperviso
     next: options.start ? ['node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'] : ['node scripts/iris.mjs up', 'node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'],
     message: 'Remote tunnel provisioning and ChatGPT connector selection remain owner-verifiable steps; this command does not claim either occurred.',
   };
+}
+
+function formatSetupOutput(result: Record<string, unknown>): string {
+  const credentials = result.credentials as { controlPlaneApiKeyPresent?: boolean; tunnelServicePresent?: boolean } | undefined;
+  const connector = result.connector as { tunnelId?: string } | undefined;
+  const next = Array.isArray(result.next) ? result.next.filter((value): value is string => typeof value === 'string') : [];
+  const local = result.local as { stack?: string } | undefined;
+  const localRuntime = result.status === 'READY' ? 'Online' : result.status === 'NEEDS_ATTENTION' ? 'Needs Attention' : result.status === 'READY_TO_START' ? 'Offline (run iris up)' : 'Action Required';
+  const credentialStatus = credentials?.controlPlaneApiKeyPresent && credentials.tunnelServicePresent ? 'Ready' : 'Action Required';
+  const tunnelStatus = connector?.tunnelId === undefined ? 'Action Required' : 'Configured';
+  const nextAction = next.length === 0 ? 'Inspect the setup result and ask the owner for the next authorized action.' : next.join(' → ');
+  return [
+    `IRIS_SETUP=${String(result.status ?? 'NEEDS_ATTENTION')}`,
+    'Prerequisites  Ready (macOS, Node.js 24)',
+    `Credentials    ${credentialStatus}`,
+    `Tunnel         ${tunnelStatus}`,
+    `Local Runtime  ${localRuntime}${local?.stack === undefined ? '' : ` [${local.stack}]`}`,
+    'ChatGPT        Not Verified',
+    `Next Action    ${nextAction}`,
+    typeof result.message === 'string' ? `Details        ${result.message}` : '',
+    '',
+  ].filter((line) => line.length > 0).join('\n');
 }
 
 const LAUNCHD_INSTALL_USAGE = 'Usage: iris launchd install [--runtime-data-root <external-directory>] [--protected-reference-root <existing-directory>]';

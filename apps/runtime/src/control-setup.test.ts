@@ -15,6 +15,14 @@ const tunnelId = 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 async function runSetup(dataRoot: string, ...args: string[]): Promise<{ readonly stdout: string; readonly stderr: string }> {
+  return exec(process.execPath, ['scripts/iris.mjs', 'setup', '--json', ...args], {
+    cwd: sourceRoot,
+    env: { ...process.env, IRIS_RUNTIME_DATA_ROOT: dataRoot },
+    maxBuffer: 2 * 1024 * 1024,
+  });
+}
+
+async function runHumanSetup(dataRoot: string, ...args: string[]): Promise<{ readonly stdout: string; readonly stderr: string }> {
   return exec(process.execPath, ['scripts/iris.mjs', 'setup', ...args], {
     cwd: sourceRoot,
     env: { ...process.env, IRIS_RUNTIME_DATA_ROOT: dataRoot },
@@ -29,6 +37,17 @@ test('guided setup reports missing credentials without creating registry state',
   assert.equal(result.status, 'NEEDS_CREDENTIALS');
   assert.equal(result.credentials.controlPlaneApiKeyPresent, false);
   await assert.rejects(stat(path.join(dataRoot, 'connector-registry.json')), { code: 'ENOENT' });
+});
+
+test('guided setup has a human-readable readiness summary while JSON remains opt-in', async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-guided-setup-human-'));
+  roots.push(dataRoot);
+  const result = await runHumanSetup(dataRoot, '--tunnel-id', tunnelId);
+  assert.match(result.stdout, /IRIS_SETUP=NEEDS_CREDENTIALS/);
+  assert.match(result.stdout, /Prerequisites\s+Ready/);
+  assert.match(result.stdout, /Credentials\s+Action Required/);
+  assert.match(result.stdout, /ChatGPT\s+Not Verified/);
+  assert.doesNotMatch(result.stdout, /controlPlaneApiKeyPresent/);
 });
 
 test('guided setup requires an explicit tunnel ID before touching state', async () => {

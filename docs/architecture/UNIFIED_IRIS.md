@@ -16,6 +16,8 @@ node scripts/iris.mjs status
 
 Setup refuses an existing registry unless it is the same unified binding. LaunchAgent installation uses the existing macOS login-start mechanism and starts the stack; it therefore requires explicit installation authority. Production migration, backup/fencing and a real login/remote connector acceptance test remain separate operational gates. Do not run these commands on an existing installation to approximate migration.
 
+Setup prints a human-readable readiness summary by default; append `--json` for automation. The summary keeps local readiness separate from the unverified ChatGPT round trip.
+
 Unified CLI and Web status use Online / Offline / Needs Attention. Online describes the observed local service/stack, not a claim that a ChatGPT round trip passed. Detailed owner-local diagnostics remain available through `doctor` and `catalog status`. Routine tasks retain the existing permission policy; lifecycle, credentials and filesystem boundaries are not broadened.
 
 ## One checkpoint per task
