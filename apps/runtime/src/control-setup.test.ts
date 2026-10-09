@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, test } from 'node:test';
-import { persistControlPlaneApiKey } from './credentials.js';
+import { credentialPaths, persistControlPlaneApiKey } from './credentials.js';
 
 const exec = promisify(execFile);
 const roots: string[] = [];
@@ -31,6 +31,21 @@ test('guided setup reports missing credentials without creating registry state',
   await assert.rejects(stat(path.join(dataRoot, 'connector-registry.json')), { code: 'ENOENT' });
 });
 
+test('guided setup requires an explicit tunnel ID before touching state', async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-guided-setup-usage-'));
+  roots.push(dataRoot);
+  await assert.rejects(runSetup(dataRoot), (error: unknown) => error instanceof Error && 'stderr' in error && String((error as { readonly stderr?: unknown }).stderr).includes('Usage: iris setup'));
+  await assert.rejects(stat(path.join(dataRoot, 'connector-registry.json')), { code: 'ENOENT' });
+});
+
+test('guided setup rejects an invalid tunnel ID without creating a registry', async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-guided-setup-invalid-'));
+  roots.push(dataRoot);
+  await persistControlPlaneApiKey(dataRoot, 'fixture-control-plane-key-invalid-123456');
+  await assert.rejects(runSetup(dataRoot, '--tunnel-id', 'not-a-tunnel'), (error: unknown) => error instanceof Error && 'stderr' in error && String((error as { readonly stderr?: unknown }).stderr).includes('IRIS_COMMAND_FAILED'));
+  await assert.rejects(stat(path.join(dataRoot, 'connector-registry.json')), { code: 'ENOENT' });
+});
+
 test('guided setup initializes one connector and repeats without mutation', async () => {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-guided-setup-ready-'));
   roots.push(dataRoot);
@@ -53,6 +68,21 @@ test('guided setup rejects a different tunnel on an existing installation', asyn
   await persistControlPlaneApiKey(dataRoot, 'fixture-control-plane-key-123456');
   await runSetup(dataRoot, '--tunnel-id', tunnelId);
   await assert.rejects(runSetup(dataRoot, '--tunnel-id', 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'), (error: unknown) => error instanceof Error && 'stderr' in error && String((error as { readonly stderr?: unknown }).stderr).includes('IRIS_COMMAND_FAILED'));
+});
+
+test('guided setup repairs a partial credential state without replacing the binding', async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-guided-setup-partial-'));
+  roots.push(dataRoot);
+  await persistControlPlaneApiKey(dataRoot, 'fixture-control-plane-key-partial-123456');
+  await runSetup(dataRoot, '--tunnel-id', tunnelId);
+  const registryBefore = await readFile(path.join(dataRoot, 'connector-registry.json'), 'utf8');
+  const paths = credentialPaths(dataRoot);
+  await rm(paths.tunnelServiceAuthorization, { force: true });
+  await rm(paths.tunnelServiceMetadata, { force: true });
+  const result = JSON.parse((await runSetup(dataRoot, '--tunnel-id', tunnelId)).stdout) as { repeated: boolean; credentials: { tunnelServicePresent: boolean } };
+  assert.equal(result.repeated, true);
+  assert.equal(result.credentials.tunnelServicePresent, true);
+  assert.equal(await readFile(path.join(dataRoot, 'connector-registry.json'), 'utf8'), registryBefore);
 });
 
 test('two disposable installations keep machine, tunnel and registry state independent', async () => {
