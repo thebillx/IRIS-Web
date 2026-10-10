@@ -438,7 +438,7 @@ function createTrustedWriterVerifier(): TestWriterVerifier {
         generation: context.generation + verifier.generationOffset,
       };
     },
-    acquireMaintenanceFence: async (_writers, _identity, _context) => {
+    acquireMaintenanceFence: async () => {
       if (!verifier.fenceAvailable || !verifier.available || verifier.fail) return null;
       const fenceId = `test-fence-${verifier.fenceCount += 1}`;
       verifier.activeFences.add(fenceId);
