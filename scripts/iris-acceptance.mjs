@@ -52,15 +52,68 @@ export function parseAcceptanceArgs(argumentsList) {
   return { runtimeDataRoot, protectedRoots, command: argumentsList.slice(separator + 1) };
 }
 
+export function validateAcceptanceCommand(command) {
+  const [name, ...argumentsList] = command;
+  const reject = () => { throw new AcceptanceError('ACCEPTANCE_COMMAND_UNSUPPORTED', 'Acceptance command is not allowlisted; use the documented wrapper workflow'); };
+  const requireExact = (count) => { if (argumentsList.length !== count) reject(); };
+  const requireValue = (index) => {
+    const value = argumentsList[index];
+    if (value === undefined || value.length === 0 || value.startsWith('--')) reject();
+    return value;
+  };
+  if (name === 'preflight') {
+    requireExact(0);
+    return command;
+  }
+  if (name === 'setup') {
+    let tunnelId = false;
+    let json = false;
+    for (let index = 0; index < argumentsList.length; index += 1) {
+      const option = argumentsList[index];
+      if (option === '--tunnel-id') {
+        if (tunnelId) reject();
+        requireValue(index + 1);
+        tunnelId = true;
+        index += 1;
+      } else if (option === '--json') {
+        if (json) reject();
+        json = true;
+      } else {
+        reject();
+      }
+    }
+    if (!tunnelId) reject();
+    return command;
+  }
+  if (['up', 'down', 'restart', 'status', 'doctor', 'logs', 'supervisor'].includes(name)) {
+    requireExact(0);
+    return command;
+  }
+  if (name === 'connectors') {
+    if (argumentsList.length === 0) return command;
+    reject();
+  }
+  if (name === 'catalog' && argumentsList.length === 1 && argumentsList[0] === 'status') return command;
+  if (name === 'credentials' && argumentsList[0] === 'migrate' && argumentsList.length === 2) {
+    requireValue(1);
+    return command;
+  }
+  if (name === 'launchd' && argumentsList.length === 1 && argumentsList[0] === 'status') return command;
+  if (name === 'launchd' && argumentsList.length === 1 && ['install', 'uninstall'].includes(argumentsList[0])) return command;
+  reject();
+}
+
 export async function inspectAcceptanceEnvironment(options) {
   const environment = options.environment ?? process.env;
   const command = options.command ?? [];
+  validateAcceptanceCommand(command);
   const dataRoot = await existingPrivateDirectory(options.runtimeDataRoot, 'ACCEPTANCE_ROOT_INVALID');
   const sourceRoot = await existingDirectory(options.sourceRoot ?? REPO_ROOT, 'ACCEPTANCE_SOURCE_INVALID');
   const sessionRoot = environment.IRIS_ACCEPTANCE_ROOT?.trim();
   if (sessionRoot === undefined || sessionRoot.length === 0) throw new AcceptanceError('ACCEPTANCE_ROOT_ENV_MISSING', 'IRIS_ACCEPTANCE_ROOT must be exported for every acceptance command; refusing the default IRIS data root');
   const sessionCanonical = await existingPrivateDirectory(sessionRoot, 'ACCEPTANCE_ROOT_INVALID');
   if (sessionCanonical !== dataRoot) throw new AcceptanceError('ACCEPTANCE_ROOT_MISMATCH', 'The command root differs from IRIS_ACCEPTANCE_ROOT; keep one acceptance identity for the whole session');
+  const rootIdentity = await physicalDirectoryIdentity(dataRoot);
 
   const protectedInputs = [DEFAULT_DATA_ROOT, DEFAULT_CREDENTIAL_ROOT, sourceRoot, ...options.protectedRoots];
   if (isWithin(sourceRoot, dataRoot) || isWithin(dataRoot, sourceRoot)) {
@@ -79,7 +132,7 @@ export async function inspectAcceptanceEnvironment(options) {
   const expectedBranch = environment.IRIS_ACCEPTANCE_EXPECTED_BRANCH?.trim();
   if (expectedHead !== undefined && expectedHead.length > 0 && git.head !== expectedHead) throw new AcceptanceError('ACCEPTANCE_SOURCE_HEAD_MISMATCH', `Acceptance checkout HEAD is ${git.head}, expected ${expectedHead}`);
   if (expectedBranch !== undefined && expectedBranch.length > 0 && git.branch !== expectedBranch) throw new AcceptanceError('ACCEPTANCE_SOURCE_BRANCH_MISMATCH', `Acceptance checkout branch is ${git.branch}, expected ${expectedBranch}`);
-  await bindIdentity(dataRoot, sourceRoot, git, command[0] === 'preflight');
+  await bindIdentity(dataRoot, sourceRoot, git, rootIdentity, command[0] === 'preflight');
 
   const processState = await inspectProcessState(dataRoot, sourceRoot, options.isPidAlive);
   const commandName = command[0] ?? '';
@@ -92,7 +145,7 @@ export async function inspectAcceptanceEnvironment(options) {
   }
 
   const requestedTunnelId = commandValue(command, '--tunnel-id');
-  const tunnelClaims = requestedTunnelId === null ? [] : await findTunnelClaims(protectedRoots, requestedTunnelId);
+  const tunnelClaims = requestedTunnelId === null ? [] : await findTunnelClaims(protectedRoots, requestedTunnelId, options.readTextFile);
   if (tunnelClaims.length > 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_CONFLICT', `Acceptance tunnel identity is already claimed by protected installation ${tunnelClaims[0]}`);
   if (startsRemoteTunnel(command)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_UNVERIFIED', 'Acceptance tunnel ownership is UNVERIFIED; remote acceptance startup is blocked until authoritative non-production tunnel ownership evidence exists');
 
@@ -100,6 +153,7 @@ export async function inspectAcceptanceEnvironment(options) {
   return {
     sourceRoot,
     dataRoot,
+    rootIdentity,
     git,
     protectedRoots,
     processState,
@@ -135,15 +189,17 @@ async function main() {
 }
 
 export function buildChildEnvironment(dataRoot, environment = process.env) {
-  return { ...environment, IRIS_RUNTIME_DATA_ROOT: dataRoot, IRIS_ACCEPTANCE_ROOT: dataRoot };
+  const childEnvironment = { ...environment };
+  delete childEnvironment.IRIS_PROTECTED_REFERENCE_ROOT;
+  return { ...childEnvironment, IRIS_RUNTIME_DATA_ROOT: dataRoot, IRIS_ACCEPTANCE_ROOT: dataRoot };
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) await main();
 
-async function bindIdentity(dataRoot, sourceRoot, git, allowCreate) {
+async function bindIdentity(dataRoot, sourceRoot, git, rootIdentity, allowCreate) {
   const filename = path.join(dataRoot, IDENTITY_FILE);
   const current = await readFile(filename, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
-  const expected = { schemaVersion: 1, dataRoot, sourceRoot, branch: git.branch, head: git.head };
+  const expected = { schemaVersion: 2, dataRoot, sourceRoot, rootIdentity, branch: git.branch, head: git.head };
   if (current !== null) {
     let parsed;
     try { parsed = JSON.parse(current); } catch { throw new AcceptanceError('ACCEPTANCE_IDENTITY_INVALID', 'Acceptance identity file is invalid; preserve the root and ask the owner'); }
@@ -180,17 +236,30 @@ async function validateCredentialProfile(profile, protectedRoots) {
   if ((metadata.mode & 0o077) !== 0) throw new AcceptanceError('ACCEPTANCE_PROFILE_PRIVATE', 'Credential profile must be private to the current user');
 }
 
-async function findTunnelClaims(protectedRoots, tunnelId) {
+async function findTunnelClaims(protectedRoots, tunnelId, readTextFile = readFile) {
   const claims = [];
   for (const root of protectedRoots) {
     const filename = path.join(root, 'connector-registry.json');
-    const content = await readFile(filename, 'utf8').catch(() => null);
-    if (content === null) continue;
+    let content;
+    try {
+      content = await readTextFile(filename, 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_UNAVAILABLE', 'Protected tunnel ownership evidence is unavailable; refusing acceptance');
+    }
     let parsed;
-    try { parsed = JSON.parse(content); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', `Protected connector registry is invalid at ${root}`); }
+    try { parsed = JSON.parse(content); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Protected connector registry is invalid; refusing acceptance'); }
     const registry = parsed?.registry ?? parsed;
-    const bindings = [...(registry?.connectors ?? []), registry?.admin].filter(Boolean);
-    if (bindings.some((binding) => binding.tunnelId === tunnelId)) claims.push(root);
+    const bindings = registry?.connectors;
+    const admin = registry?.admin;
+    if (!Array.isArray(bindings) || (admin !== null && admin !== undefined && (typeof admin !== 'object' || Array.isArray(admin)))) {
+      throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Protected connector registry is invalid; refusing acceptance');
+    }
+    const candidates = [...bindings, admin].filter(Boolean);
+    if (candidates.some((binding) => typeof binding !== 'object' || Array.isArray(binding) || typeof binding.tunnelId !== 'string')) {
+      throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Protected connector registry is invalid; refusing acceptance');
+    }
+    if (candidates.some((binding) => binding.tunnelId === tunnelId)) claims.push(root);
   }
   return claims;
 }
@@ -220,6 +289,18 @@ async function existingPrivateDirectory(input, code) {
   if (typeof process.getuid === 'function' && metadata.uid !== process.getuid()) throw new AcceptanceError(code, `Directory ${canonical} is not owned by the current user`);
   if ((metadata.mode & 0o077) !== 0) throw new AcceptanceError(code, `Directory ${canonical} must grant access only to the current user`);
   return canonical;
+}
+
+async function physicalDirectoryIdentity(canonical) {
+  const metadata = await stat(canonical).catch(() => null);
+  if (metadata === null || !metadata.isDirectory()) throw new AcceptanceError('ACCEPTANCE_ROOT_INVALID', 'Acceptance root is no longer a physical directory');
+  return {
+    canonicalPath: canonical,
+    device: metadata.dev,
+    inode: metadata.ino,
+    ownerUid: metadata.uid,
+    mode: metadata.mode & 0o777,
+  };
 }
 
 async function existingDirectory(input, code) {
@@ -279,6 +360,11 @@ function sameIdentity(actual, expected) {
   return actual?.schemaVersion === expected.schemaVersion
     && actual.dataRoot === expected.dataRoot
     && actual.sourceRoot === expected.sourceRoot
+    && actual.rootIdentity?.canonicalPath === expected.rootIdentity.canonicalPath
+    && actual.rootIdentity?.device === expected.rootIdentity.device
+    && actual.rootIdentity?.inode === expected.rootIdentity.inode
+    && actual.rootIdentity?.ownerUid === expected.rootIdentity.ownerUid
+    && actual.rootIdentity?.mode === expected.rootIdentity.mode
     && actual.branch === expected.branch
     && actual.head === expected.head;
 }

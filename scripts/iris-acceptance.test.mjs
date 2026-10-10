@@ -1,8 +1,10 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, realpath, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import process from 'node:process';
 import { buildChildEnvironment, inspectAcceptanceEnvironment, parseAcceptanceArgs } from './iris-acceptance.mjs';
 
 const roots = [];
@@ -30,6 +32,42 @@ describe('acceptance isolation preflight', () => {
     const report = await inspectAcceptanceEnvironment(options);
     assert.equal(report.dataRoot, await realpath(root));
     assert.equal((await readFile(path.join(root, '.iris-acceptance-identity.json'), 'utf8')).includes('"head"'), true);
+  });
+
+  it('persists and rechecks the physical acceptance root identity', async () => {
+    const root = await fixtureRoot();
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
+    const marker = JSON.parse(await readFile(path.join(root, '.iris-acceptance-identity.json'), 'utf8'));
+    assert.equal(marker.rootIdentity.canonicalPath, await realpath(root));
+    assert.equal(typeof marker.rootIdentity.device, 'number');
+    assert.equal(typeof marker.rootIdentity.inode, 'number');
+    assert.equal(typeof marker.rootIdentity.ownerUid, 'number');
+    assert.equal(marker.rootIdentity.mode, 0o700);
+    const repeated = await inspectAcceptanceEnvironment(baseOptions(root, ['status']));
+    assert.deepEqual(repeated.rootIdentity, marker.rootIdentity);
+  });
+
+  it('blocks replacement, symlink substitution and unsafe permissions', async () => {
+    const replacementRoot = await fixtureRoot();
+    const root = await fixtureRoot();
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
+    const marker = await readFile(path.join(root, '.iris-acceptance-identity.json'));
+    await rm(root, { recursive: true, force: true });
+    await mkdir(root, { mode: 0o700 });
+    await chmod(root, 0o700);
+    await writeFile(path.join(root, '.iris-acceptance-identity.json'), marker, { mode: 0o600 });
+    await assert.rejects(inspectAcceptanceEnvironment(baseOptions(root, ['status'])), (error) => error.code === 'ACCEPTANCE_IDENTITY_CHANGED');
+
+    const symlinkRoot = await fixtureRoot();
+    const target = await fixtureRoot();
+    await inspectAcceptanceEnvironment(baseOptions(symlinkRoot, ['preflight']));
+    await rm(symlinkRoot, { recursive: true, force: true });
+    await symlink(target, symlinkRoot);
+    await assert.rejects(inspectAcceptanceEnvironment(baseOptions(symlinkRoot, ['status'])), (error) => error.code === 'ACCEPTANCE_ROOT_INVALID');
+
+    await inspectAcceptanceEnvironment(baseOptions(replacementRoot, ['preflight']));
+    await chmod(replacementRoot, 0o755);
+    await assert.rejects(inspectAcceptanceEnvironment(baseOptions(replacementRoot, ['status'])), (error) => error.code === 'ACCEPTANCE_ROOT_INVALID');
   });
 
   it('rejects switching roots inside one acceptance session', async () => {
@@ -69,6 +107,34 @@ describe('acceptance isolation preflight', () => {
     await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, ['setup', '--tunnel-id', 'tunnel_0123456789abcdef0123456789abcdef']), protectedRoots: [protectedRoot] }), (error) => error.code === 'ACCEPTANCE_TUNNEL_CONFLICT');
   });
 
+  it('distinguishes missing, valid, malformed and unreadable tunnel evidence', async () => {
+    const root = await fixtureRoot();
+    const protectedRoot = await fixtureRoot();
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
+    const command = ['setup', '--tunnel-id', 'tunnel_0123456789abcdef0123456789abcdef'];
+    const missing = await inspectAcceptanceEnvironment({ ...baseOptions(root, command), protectedRoots: [protectedRoot] });
+    assert.equal(missing.tunnelIdentity, 'UNVERIFIED');
+
+    await writeFile(path.join(protectedRoot, 'connector-registry.json'), JSON.stringify({ connectors: [], admin: null }));
+    const valid = await inspectAcceptanceEnvironment({ ...baseOptions(root, command), protectedRoots: [protectedRoot] });
+    assert.equal(valid.tunnelIdentity, 'UNVERIFIED');
+
+    await writeFile(path.join(protectedRoot, 'connector-registry.json'), '{malformed');
+    await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, command), protectedRoots: [protectedRoot] }), (error) => error.code === 'ACCEPTANCE_TUNNEL_EVIDENCE_INVALID');
+
+    const protectedRegistry = path.join(await realpath(protectedRoot), 'connector-registry.json');
+    for (const code of ['EACCES', 'EIO']) {
+      await assert.rejects(inspectAcceptanceEnvironment({
+        ...baseOptions(root, command),
+        protectedRoots: [protectedRoot],
+        readTextFile: async (filename, encoding) => {
+          if (filename === protectedRegistry) throw Object.assign(new Error('fixture read failure'), { code });
+          return readFile(filename, encoding);
+        },
+      }), (error) => error.code === 'ACCEPTANCE_TUNNEL_EVIDENCE_UNAVAILABLE');
+    }
+  });
+
   it('rejects a controlled port conflict without adopting the process', async () => {
     const root = await fixtureRoot();
     await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
@@ -88,6 +154,58 @@ describe('acceptance isolation preflight', () => {
     await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, ['up']), probePort: async () => false }), (error) => error.code === 'ACCEPTANCE_TUNNEL_UNVERIFIED');
     const report = await inspectAcceptanceEnvironment({ ...baseOptions(root, ['status']), environment: { IRIS_ACCEPTANCE_ROOT: root } });
     assert.equal(report.dataRoot, await realpath(root));
+  });
+
+  it('rejects connector mutation and unsupported commands before child execution', async () => {
+    const root = await fixtureRoot();
+    const protectedRoot = await fixtureRoot();
+    const protectedFile = path.join(protectedRoot, 'protected-state.json');
+    await writeFile(protectedFile, 'fixture-protected-bytes\n');
+    assert.equal((await runWrapper(root, [protectedRoot], ['preflight'])).code, 0);
+    const before = await readFile(protectedFile);
+    for (const command of [
+      ['connectors', 'init', 'tunnel_0123456789abcdef0123456789abcdef'],
+      ['connectors', 'admin-bind', 'tunnel_0123456789abcdef0123456789abcdef'],
+      ['credentials', 'rotate-tunnel'],
+      ['catalog', 'reload'],
+      ['unknown-command'],
+    ]) {
+      const result = await runWrapper(root, [protectedRoot], command);
+      assert.equal(result.code, 1, command.join(' '));
+      assert.match(result.stderr, /ACCEPTANCE_COMMAND_UNSUPPORTED/);
+    }
+    assert.deepEqual(await readFile(protectedFile), before);
+  });
+
+  it('rejects nested root overrides at the actual wrapper-to-child boundary', async () => {
+    const root = await fixtureRoot();
+    const protectedRoot = await fixtureRoot();
+    const otherRoot = await fixtureRoot();
+    const protectedFile = path.join(protectedRoot, 'protected-state.json');
+    await writeFile(protectedFile, 'fixture-protected-bytes\n');
+    assert.equal((await runWrapper(root, [protectedRoot], ['preflight'])).code, 0);
+    const before = await readFile(protectedFile);
+    for (const command of [
+      ['setup', '--tunnel-id', 'tunnel_0123456789abcdef0123456789abcdef', '--runtime-data-root', protectedRoot],
+      ['setup', '--tunnel-id', 'tunnel_0123456789abcdef0123456789abcdef', '--protected-reference-root', otherRoot],
+      ['setup', '--tunnel-id', 'tunnel_0123456789abcdef0123456789abcdef', '--unknown'],
+    ]) {
+      const result = await runWrapper(root, [protectedRoot], command);
+      assert.equal(result.code, 1, command.join(' '));
+      assert.match(result.stderr, /ACCEPTANCE_COMMAND_UNSUPPORTED/);
+    }
+    assert.deepEqual(await readFile(protectedFile), before);
+  });
+
+  it('allows setup and read-only status through the child boundary with the accepted root', async () => {
+    const root = await fixtureRoot();
+    const protectedRoot = await fixtureRoot();
+    assert.equal((await runWrapper(root, [protectedRoot], ['preflight'])).code, 0);
+    const setup = await runWrapper(root, [protectedRoot], ['setup', '--tunnel-id', 'tunnel_0123456789abcdef0123456789abcdef', '--json']);
+    assert.equal(setup.code, 0, setup.stderr);
+    assert.match(setup.stdout, /NEEDS_CREDENTIALS|READY_TO_START|IRIS_SETUP=/);
+    const status = await runWrapper(root, [protectedRoot], ['status']);
+    assert.equal(status.code, 0, status.stderr);
   });
 
   it('rejects production credential profiles and documentation keeps the wrapper mandatory', async () => {
@@ -113,9 +231,10 @@ describe('acceptance isolation preflight', () => {
 
   it('propagates the explicit identity through the runtime control wrapper', async () => {
     const root = await fixtureRoot();
-    const child = buildChildEnvironment(await realpath(root), { IRIS_RUNTIME_DATA_ROOT: '/wrong', OTHER: 'kept' });
+    const child = buildChildEnvironment(await realpath(root), { IRIS_RUNTIME_DATA_ROOT: '/wrong', IRIS_PROTECTED_REFERENCE_ROOT: '/wrong-reference', OTHER: 'kept' });
     assert.equal(child.IRIS_RUNTIME_DATA_ROOT, await realpath(root));
     assert.equal(child.IRIS_ACCEPTANCE_ROOT, await realpath(root));
+    assert.equal(child.IRIS_PROTECTED_REFERENCE_ROOT, undefined);
     assert.equal(child.OTHER, 'kept');
     assert.match(await readFile(path.join(sourceRoot, 'scripts', 'iris.mjs'), 'utf8'), /node24Environment\(\{ \.\.\.process\.env/);
   });
@@ -136,4 +255,25 @@ function baseOptions(root, command) {
     command,
     environment: { IRIS_ACCEPTANCE_ROOT: root },
   };
+}
+
+function runWrapper(root, protectedRoots, command) {
+  const argumentsList = [path.join(sourceRoot, 'scripts', 'iris-acceptance.mjs'), '--runtime-data-root', root];
+  for (const protectedRoot of protectedRoots) argumentsList.push('--protected-root', protectedRoot);
+  argumentsList.push('--', ...command);
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, argumentsList, {
+      cwd: sourceRoot,
+      env: { ...process.env, IRIS_ACCEPTANCE_ROOT: root },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
 }

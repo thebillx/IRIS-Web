@@ -53,9 +53,21 @@ iris_acceptance preflight
 The wrapper checks the physical source/data paths, owner and mode, Git branch
 and HEAD, protected-root collisions, existing process state, runtime ports
 `43110–43113` and web port `5173`, tunnel claims visible in protected local
-registries, and the global LaunchAgent risk. It writes one visible
-`.iris-acceptance-identity.json` guard file in the empty acceptance root. A
+registries, and the global LaunchAgent risk. Its visible
+`.iris-acceptance-identity.json` guard binds the canonical root path, device,
+inode, owner and private mode as well as the checkout, branch and HEAD. A
 later command with a changed root, checkout, branch or HEAD fails closed.
+
+The wrapper is the only acceptance command entrypoint. Its allowlist is:
+`preflight`; `setup --tunnel-id <id> [--json]`; `status`, `doctor`,
+`connectors`, `catalog status`, `logs`, `down`, `launchd status`, and the
+diagnostic/recovery commands documented below; and
+`credentials migrate <private-profile>`. Nested root or protected-reference
+flags, unknown options, positional arguments, `connectors init`,
+`connectors admin-bind`, credential rotation, catalog reload, runtime adoption,
+and supervisor mutation commands are rejected before a child process starts.
+The wrapper also rejects unreadable protected registries as unavailable
+evidence; only a missing registry is treated as no local claim.
 
 If `IRIS_ACCEPTANCE_ROOT` is missing, a command root differs from it, or the
 root identity changes, the wrapper refuses to run. Forgetting an export in a
@@ -90,6 +102,12 @@ occupied, do not kill or adopt the process; stop and schedule a separately
 isolated window.
 Use `iris_acceptance down` only for the acceptance root whose identity was
 verified by the wrapper.
+
+If a command is blocked, preserve the root and error output. A fresh terminal
+must re-export `IRIS_ACCEPTANCE_ROOT` and rerun `iris_acceptance preflight`; an
+existing guard with a replaced directory, symlink, owner or mode is not repaired
+in place. Passing local preflight proves only disposable local identity and
+storage checks; it does not prove production safety or remote tunnel ownership.
 
 ## LaunchAgent and two-machine isolation
 
