@@ -1,81 +1,137 @@
 # IRIS owner acceptance plan
 
-This plan is the controlled handoff for the first real-machine acceptance. It is
-not an authorization to change the live IRIS, BBL, Enhance01, tunnel, registry,
-LaunchAgent, or ChatGPT configuration.
+This plan is a guarded handoff for a separately authorized real-machine
+acceptance. Do not run the old sequence of direct `scripts/iris.mjs` commands
+beside an existing installation. The acceptance wrapper below is mandatory: it
+requires one explicit root on every invocation and refuses the default IRIS
+root, ambiguous state, occupied ports, protected tunnel claims, and the global
+LaunchAgent collision.
 
 ## Preconditions
 
-- The owner names the acceptance Mac and records its hostname and macOS version.
-- The owner verifies the checkout, branch, commit, and private data root before
-  any setup command.
-- The owner has a separately authorized registered tunnel ID and private tunnel
-  profile. Credentials stay in the private profile and local credential store.
-- The owner has a verified backup before touching an existing installation.
+- The owner names the acceptance Mac and records its hostname, macOS version,
+  source checkout, branch and expected candidate HEAD.
+- Create a new private root with a unique name. Do not reuse a generic
+  `IRIS-rarw` directory, an existing IRIS root, or a path under the checkout.
+- Identify every protected live source/data root on that Mac and pass each one
+  to `--protected-root`. The wrapper also protects the default IRIS data root,
+  the default tunnel profile directory and the candidate source checkout.
+- Provision a separate non-production tunnel profile and tunnel ID. Never copy
+  a production credential or reuse a production tunnel identity.
+- Do not proceed if the root, process, port, tunnel, credential or LaunchAgent
+  identity cannot be proved. Preserve the evidence and ask the owner.
 
-## RARW machine sequence
+## Guarded session setup
 
-1. From the candidate checkout, run frozen install and inspect the Git identity:
-
-   ```sh
-   node scripts/node24.mjs --pnpm install --frozen-lockfile --ignore-scripts
-   git status --short
-   git branch --show-current
-   git rev-parse HEAD
-   ```
-
-2. Use a new private data root for the acceptance, migrate the selected private
-   tunnel profile, and run guided setup:
-
-   ```sh
-   node scripts/iris.mjs credentials migrate "$HOME/.config/tunnel-client/<profile>.yaml"
-   IRIS_RUNTIME_DATA_ROOT="$HOME/Library/Application Support/IRIS-rarw" \
-     node scripts/iris.mjs setup --tunnel-id <registered-tunnel-id>
-   node scripts/iris.mjs up
-   node scripts/iris.mjs status
-   node scripts/iris.mjs doctor
-   ```
-
-3. Confirm the local authenticated `/mcp` response and the single `IRIS`
-   connector through the owner-approved local checks. Record only redacted
-   status, project/workspace IDs, process ownership, and commit evidence.
-
-4. If local checks pass, the owner performs the authenticated Owner UI
-   registration/connection for this machine and verifies one intended `IRIS`
-   connector. ChatGPT connectivity is accepted only after an authenticated
-   tool call reaches this machine's `/mcp` route.
-
-5. With the owner observing, repeat `status`, `doctor`, and the authenticated
-   tool call after a supported stop/start. Do not install login persistence yet.
-
-## bill machine sequence
-
-Repeat the same sequence on bill's Mac with a distinct private data root, tunnel
-ID, credential store, and owner-approved connector. Do not copy RARW's data root,
-registry, credential, LaunchAgent, or project files. Cross-machine requests
-must fail authentication and must not fall back to the other machine.
-
-## Login persistence and recovery
-
-Only after both machines pass the observed local and Owner UI checks, separately
-authorize:
+Run from the expected candidate checkout. The root must not already exist; if
+it does, stop rather than remove or overwrite it.
 
 ```sh
-node scripts/iris.mjs launchd install
-node scripts/iris.mjs launchd status
+export IRIS_ACCEPTANCE_ROOT="$HOME/Library/Application Support/IRIS-acceptance-<unique>"
+export IRIS_ACCEPTANCE_EXPECTED_BRANCH="codex/unified-iris-task-continuity"
+export IRIS_ACCEPTANCE_EXPECTED_HEAD="<expected-candidate-head>"
+export IRIS_LIVE_DATA_ROOT="$HOME/Library/Application Support/IRIS"
+export IRIS_LIVE_SOURCE_ROOT="/Users/RARW/iris"
+
+if [ -e "$IRIS_ACCEPTANCE_ROOT" ]; then
+  echo "Acceptance root already exists; preserve it and stop" >&2
+  exit 1
+fi
+mkdir -m 700 "$IRIS_ACCEPTANCE_ROOT"
+
+iris_acceptance() {
+  node scripts/iris-acceptance.mjs \
+    --runtime-data-root "$IRIS_ACCEPTANCE_ROOT" \
+    --protected-root "$IRIS_LIVE_DATA_ROOT" \
+    --protected-root "$IRIS_LIVE_SOURCE_ROOT" \
+    -- "$@"
+}
+
+iris_acceptance preflight
 ```
 
-Verify one owned process tree after login/reboot, then exercise the documented
-stop/start recovery. Capture the redacted `doctor` result and the authenticated
-tool-call result. A failed ownership, identity, or authentication check is an
-abort condition; stop and preserve the data root for review.
+The wrapper checks the physical source/data paths, owner and mode, Git branch
+and HEAD, protected-root collisions, existing process state, runtime ports
+`43110–43113` and web port `5173`, tunnel claims visible in protected local
+registries, and the global LaunchAgent risk. It writes one visible
+`.iris-acceptance-identity.json` guard file in the empty acceptance root. A
+later command with a changed root, checkout, branch or HEAD fails closed.
 
-## Acceptance record
+If `IRIS_ACCEPTANCE_ROOT` is missing, a command root differs from it, or the
+root identity changes, the wrapper refuses to run. Forgetting an export in a
+fresh terminal therefore cannot fall back to `~/Library/Application Support/IRIS`.
 
-Record for each Mac: hostname, macOS version, checkout commit, branch, private
-data-root label (not its contents), tunnel ID suffix, Project/Workspace IDs,
-LaunchAgent status, authenticated `/mcp` result, Owner UI connector result, and
-recovery result. Never include credential values, full secret paths, or raw
-logs. Mark the release matrix `PASS` only when the owner has attached this
-evidence for both Macs. Until then, the real ChatGPT, login persistence, and
-RARW/bill rows remain `UNVERIFIED`.
+## Local acceptance sequence
+
+Every command, including credential migration and diagnostics, goes through the
+same function:
+
+```sh
+export IRIS_ACCEPTANCE_PROFILE="$HOME/Library/Application Support/IRIS-acceptance-profile-<unique>/tunnel.yaml"
+iris_acceptance credentials migrate "$IRIS_ACCEPTANCE_PROFILE"
+iris_acceptance setup --tunnel-id <non-production-tunnel-id> --json
+iris_acceptance status
+iris_acceptance doctor
+iris_acceptance connectors
+iris_acceptance catalog status
+iris_acceptance logs
+```
+
+The profile must be an existing private file owned by the current user and must
+be outside every protected production path. The wrapper never prints its
+contents. Setup is local and may create the registry, but it does not prove
+remote tunnel ownership.
+
+Starting or restarting a remote tunnel is blocked while ownership is
+`UNVERIFIED`. After a separate owner authorization proves that the tunnel and
+credential are non-production, the owner may use the explicit authorization
+form below; the same root, process and port checks still apply:
+
+```sh
+node scripts/iris-acceptance.mjs \
+  --runtime-data-root "$IRIS_ACCEPTANCE_ROOT" \
+  --protected-root "$IRIS_LIVE_DATA_ROOT" \
+  --protected-root "$IRIS_LIVE_SOURCE_ROOT" \
+  --owner-authorized-tunnel -- up
+```
+
+Use the same form for `restart` or `setup --start`. If a port is occupied, do
+not kill or adopt the process; stop and schedule a separately isolated window.
+Use `iris_acceptance down` only for the acceptance root whose identity was
+verified by the wrapper.
+
+## LaunchAgent and two-machine isolation
+
+The user LaunchAgent label is `com.iris.supervisor`, which is global to the
+user and cannot safely coexist with the live installation. The wrapper blocks
+both `launchd install` and `launchd uninstall` during parallel acceptance.
+`iris_acceptance launchd status` is read-only; inspect rendered artifacts and
+the existing owner state only. Install login persistence only in a separately
+authorized window after the live label is quiesced and ownership is proven.
+
+Repeat the guarded session independently on bill's Mac with a distinct private
+root, source checkout, machine identity, credential profile and tunnel ID. Do
+not copy RARW's registry, data root, credential, LaunchAgent or project files.
+Cross-machine authentication and connector routing remain unverified until an
+owner-observed authenticated tool call proves them.
+
+## Recovery and cleanup
+
+Before taking over work, inspect the checkpoint from the verified source root:
+
+```sh
+node scripts/task-checkpoint.mjs inspect <task-slug>
+```
+
+`EXECUTE` permits the recorded action; `ASK`, `STOP`, and `VERIFY` require
+owner review. For the acceptance installation, use `iris_acceptance status`,
+`iris_acceptance doctor`, and then the supported `iris_acceptance down` before
+retrying. Never delete PID files, locks, plists, registries, runtime data or
+unknown processes to resolve a conflict. Preserve the guarded data root for
+backup and review; full removal, migration and rollback follow the separate
+[migration and rollback runbook](MIGRATION_ROLLBACK_RUNBOOK.md).
+
+Record only redacted status, Project/Workspace IDs, source commit, root label,
+process ownership, port checks, tunnel ID suffix, LaunchAgent result and
+authenticated `/mcp` evidence. Mark real ChatGPT, login persistence and
+RARW/bill rows `PASS` only after both owner-authorized machines supply evidence.

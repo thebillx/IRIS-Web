@@ -6,13 +6,13 @@ The candidate supports a fresh macOS installation with one user-facing IRIS conn
 
 The complete owner-facing checklist is [the installation guide](../INSTALLATION.md). Run from the reviewed installed source root with Node 24 and frozen dependencies ready. The owner must first provision the existing private tunnel credential configuration using the supported credential setup workflow and obtain one registered tunnel ID. Never put secrets in command arguments or source control. No setup command below was executed against the live installation during development.
 
-```sh
-node scripts/iris.mjs setup --tunnel-id <registered-tunnel-id>
-node scripts/iris.mjs up
-node scripts/iris.mjs doctor
-node scripts/iris.mjs launchd install
-node scripts/iris.mjs status
-```
+For a truly fresh Mac, follow the [installation guide](../INSTALLATION.md)
+after verifying that the default IRIS data root does not exist. For acceptance
+beside an existing installation, use the mandatory
+[`iris-acceptance.mjs` wrapper](../acceptance/OWNER_ACCEPTANCE_PLAN.md), which
+binds `credentials migrate`, `setup`, `up`, `status`, `doctor`, `connectors`,
+`catalog status`, `logs`, `down` and cleanup to one verified root. Never paste a
+scoped `setup` command followed by unscoped lifecycle commands.
 
 Setup refuses an existing registry unless it is the same unified binding. LaunchAgent installation uses the existing macOS login-start mechanism and starts the stack; it therefore requires explicit installation authority. Production migration, backup/fencing and a real login/remote connector acceptance test remain separate operational gates. Do not run these commands on an existing installation to approximate migration.
 

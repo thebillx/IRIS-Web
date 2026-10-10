@@ -12,7 +12,7 @@ The unified setup command is a fresh-install command. It refuses an existing reg
 
 1. Work from a verified checkout and record the exact Git branch and commit.
 2. Resolve the intended IRIS data root and confirm it is outside the source checkout. Do not inspect or mutate another machine's root.
-3. Run `node scripts/iris.mjs doctor`, `node scripts/iris.mjs status`, and `node scripts/iris.mjs connectors` while the installation is still observable. Save only redacted status output.
+3. For a disposable or parallel target, run `scripts/iris-acceptance.mjs` with the verified root and protected roots for every command. For an existing owner installation, set `IRIS_RUNTIME_DATA_ROOT` explicitly for each command; never rely on a remembered shell export. Run the correctly scoped `doctor`, `status` and `connectors` checks while the installation is still observable. Save only redacted status output.
 4. Record project and workspace identifiers, connector labels, tunnel IDs, runtime identity, checkpoint location, and the list of IRIS-owned paths. Do not copy secret contents into the evidence.
 5. Quiesce through the owner-approved lifecycle procedure. A backup is not consistent while an uncontrolled writer can mutate the data root.
 6. Copy only the known IRIS-owned data root, credential directory and managed LaunchAgent metadata to a private backup destination. Preserve file modes and symlinks; exclude source checkouts and registered project repositories.

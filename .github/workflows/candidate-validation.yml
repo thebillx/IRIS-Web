@@ -49,6 +49,9 @@ jobs:
           if [ -f scripts/task-checkpoint.test.mjs ]; then
             node --test scripts/task-checkpoint.test.mjs
           fi
+          if [ -f scripts/iris-acceptance.test.mjs ]; then
+            node --test scripts/iris-acceptance.test.mjs
+          fi
 
       - name: Run focused runtime suites
         run: |
