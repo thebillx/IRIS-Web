@@ -64,6 +64,25 @@ describe('production safety foundation', () => {
     await expect(state.registerProject('blocked', root)).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
+  it('fences durable session publication during quiescence and recovery', async () => {
+    const { controller, token, dataRoot } = await fixture();
+    for (const writer of requiredWriters) await registerWriter(controller, writer);
+    const state = new RuntimeState(new FoundationStateStore(dataRoot), undefined, undefined, controller);
+    const session = await state.createSessionDurable('fenced-client', 'fenced-agent', 'owner');
+    await controller.quiesce(token);
+
+    await expect(state.createSessionDurable('blocked-client', 'blocked-agent', 'owner')).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    await expect(state.submitInstruction(session.id, session.clientId, 'blocked-submission', 'must not publish')).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    const filename = path.join(dataRoot, 'sessions.json');
+    const document = JSON.parse(await readFile(filename, 'utf8')) as { sessions: Array<{ snapshot: Record<string, unknown> }> };
+    document.sessions[0]!.snapshot.executionState = 'WORKING';
+    await writeFile(filename, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+    const recovered = new RuntimeState(new FoundationStateStore(dataRoot), undefined, undefined, controller);
+    await expect(recovered.reconcileSessionPersistence()).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    expect(JSON.parse(await readFile(filename, 'utf8')) as unknown).toMatchObject({ sessions: [{ snapshot: { executionState: 'WORKING' } }] });
+  });
+
   it('creates an integrity-checked backup and restores only to a disposable destination', async () => {
     const { controller, token, dataRoot, root } = await fixture();
     for (const writer of requiredWriters) await registerWriter(controller, writer);

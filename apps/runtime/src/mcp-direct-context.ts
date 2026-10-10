@@ -45,7 +45,7 @@ export async function resolveDirectSessionIdentity(
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
   if (reusable !== undefined) return { clientId, sessionId: reusable.id };
 
-  const created = state.createSession(clientId, 'iris-tunnel-service', 'other');
+  const created = await state.createSessionDurable(clientId, 'iris-tunnel-service', 'other');
   await state.setSessionCurrentProject(created.id, created.clientId, projectId);
   return { clientId, sessionId: created.id };
 }

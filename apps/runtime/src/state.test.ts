@@ -33,6 +33,38 @@ describe('runtime machine, client, and session state', () => {
     expect(state.listClients()).toHaveLength(2);
   });
 
+  it('serializes project selection with submission publication', async () => {
+    const dataRoot = await temp('iris-session-selection-race-');
+    const projectRoot = await temp('iris-session-selection-project-');
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async () => ({ text: 'selection-safe' }),
+    };
+    const state = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const project = await state.registerProject('Selection project', projectRoot);
+    const session = state.createSession('selection-client', 'selection-agent', 'owner');
+
+    const selecting = state.setSessionCurrentProject(session.id, session.clientId, project.id);
+    const submitting = state.submitInstruction(session.id, session.clientId, 'selection-race', 'preserve both events');
+    await Promise.all([selecting, submitting]);
+
+    const final = state.getSessionForClient(session.id, session.clientId);
+    expect(final.currentProjectId).toBe(project.id);
+    expect(final.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
+  });
+
+  it('binds durable sessions to the current machine runtime authority', async () => {
+    const dataRoot = await temp('iris-session-authority-');
+    const authority = { machineId: randomUUID(), runtimeId: randomUUID() };
+    const first = new RuntimeState(new FoundationStateStore(dataRoot), undefined, undefined, undefined, authority);
+    const session = first.createSession('authority-client');
+    expect(session.id).toBeTruthy();
+    expect(() => new RuntimeState(new FoundationStateStore(dataRoot), undefined, undefined, undefined, { ...authority, machineId: randomUUID() }))
+      .toThrowError(expect.objectContaining({ code: 'AUTHORITY_CHANGED' }));
+    const resumed = new RuntimeState(new FoundationStateStore(dataRoot), undefined, undefined, undefined, authority);
+    expect(resumed.getSessionForClient(session.id, session.clientId).id).toBe(session.id);
+  });
+
   it('supports concurrent agent roles on one daemon without sharing session identity', async () => {
     const state = new RuntimeState(new FoundationStateStore(await temp('iris-agent-state-')));
     const roles = ['planner', 'implementer', 'reviewer', 'security', 'explorer'] as const;

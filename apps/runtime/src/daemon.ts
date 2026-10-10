@@ -109,7 +109,9 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
 
   try {
     const store = new FoundationStateStore(dataRoot);
-    const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env), new MissionLedgerStore(dataRoot), safety);
+    const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env), new MissionLedgerStore(dataRoot), safety, { machineId, runtimeId });
+    await state.reconcileSessionPersistence();
+    await state.revalidateSessionBindings();
     const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot), safety);
     const lifecycleStore = new DurableMissionLifecycleStore(dataRoot);
     const lifecycleWorkers = new WorkerAdapterRegistry();

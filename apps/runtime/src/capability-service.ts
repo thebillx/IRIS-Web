@@ -727,8 +727,8 @@ export class CapabilityService {
       return this.state.prepareMissionAction(operation.missionId, operation.taskId, operation.clientId, operation.sessionId, operation.actionCapabilityId, operation.summary);
     }
     if (operation.capabilityId === 'mission.supervisor_gate.set') return this.state.setMissionSupervisorGate(operation.missionId, operation.clientId, operation.sessionId, operation.state, operation.reason);
-    if (operation.capabilityId === 'session.create') return this.state.createSession(operation.clientId, operation.agentId, operation.agentRole);
-    if (operation.capabilityId === 'session.delete') { this.state.deleteSession(operation.sessionId, operation.clientId); return { deleted: true }; }
+    if (operation.capabilityId === 'session.create') return this.state.createSessionDurable(operation.clientId, operation.agentId, operation.agentRole);
+    if (operation.capabilityId === 'session.delete') { await this.state.deleteSessionDurable(operation.sessionId, operation.clientId); return { deleted: true }; }
     if (operation.capabilityId === 'session.current_project.set') return this.state.setSessionCurrentProject(operation.sessionId, operation.clientId, operation.projectId);
     if (operation.capabilityId === 'session.instruction.submit') return this.state.submitInstruction(operation.sessionId, operation.clientId, operation.submissionId, operation.instruction);
     if (operation.capabilityId === 'project.register') {

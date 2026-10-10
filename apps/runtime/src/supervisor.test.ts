@@ -334,6 +334,11 @@ describe('IRIS supervisor', () => {
       const first = await supervisor.up();
       expect(first.connectors.map((binding) => binding.label)).toEqual(['IRIS']);
       expect(first.controlPlane.state).toBe('READY');
+      const fullProfile = await readFile(path.join(dataRoot, 'tunnel-profiles', 'iris-full.yaml'), 'utf8');
+      expect(fullProfile).toContain('channel: admin');
+      expect(fullProfile).toContain(`http://127.0.0.1:${controlPort}/mcp`);
+      const secret = await readTunnelServiceSecret(dataRoot);
+      if (secret === null) throw new Error('missing unified native control test secret');
       const filename = path.join(dataRoot, 'supervisor/state.json');
       const before = JSON.parse(await readFile(filename, 'utf8'));
       expect(before.tunnels.full.pid).toBeGreaterThan(0);
@@ -343,6 +348,7 @@ describe('IRIS supervisor', () => {
       const off = await supervisor.workloadOff();
       expect(off.runtime).toMatchObject({ state: 'DEGRADED', code: 'WORKLOAD_OFF' });
       expect((await supervisor.doctor()).CODE).toBe('WORKLOAD_OFF');
+      expect(await nativeToolCall(native.mcpUrl, secret, 'supervisor_status', {})).toMatchObject({ workloadState: 'OFF', workloadDesiredState: 'OFF' });
       expect((await fetch(native.healthUrl, { headers: { authorization: `Bearer ${(await readTunnelServiceSecret(dataRoot))!}` } })).status).toBe(200);
       const stopped = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
       expect(stopped.runtime).toBeNull();
@@ -1767,6 +1773,7 @@ setInterval(() => undefined, 1000);
     expect(after.endpoint.instanceId).not.toBe(before.endpoint.instanceId);
     expect(restarted.localRuntime).toMatchObject({ state: 'READY' });
     expect(restarted.tunnel).toMatchObject({ state: 'READY' });
+    expect((JSON.parse(await readFile(path.join(dataRoot, 'supervisor', 'state.json'), 'utf8')) as { workloadDesiredState: string }).workloadDesiredState).toBe('ON');
     await supervisor.down();
   }, 30_000);
 

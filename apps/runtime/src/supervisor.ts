@@ -251,11 +251,20 @@ export class Supervisor {
       if (!(error instanceof RuntimeError) || error.code !== 'SUPERVISOR_BUSY') throw error;
       const deadline = Date.now() + 15_000;
       while (Date.now() < deadline) {
-        const state = await this.readState();
-        const observed = await runtimeStatus(this.dataRoot);
-        if (state.workloadDesiredState === 'ON' && observed.state === 'running') {
-          const current = await this.status();
-          if (current.runtime.state === 'READY') return current;
+        if (!existsSync(path.join(this.supervisorDirectory(), OPERATION_LOCK_FILE))) {
+          const state = await this.readState();
+          const observed = await runtimeStatus(this.dataRoot);
+          const registry = await readConnectorRegistry(this.dataRoot);
+          const full = registry?.connectors.find((binding) => binding.connectorId === 'iris-full');
+          const tunnelBound = state.tunnels.full !== null && observed.endpoint !== null && full !== undefined
+            && state.tunnels.full.runtimeId === observed.endpoint.runtimeId
+            && state.tunnels.full.instanceId === observed.endpoint.instanceId
+            && state.tunnels.full.deploymentEpoch === registry?.deploymentEpoch;
+          if (state.workloadDesiredState === 'ON' && observed.state === 'running' && tunnelBound) {
+            const current = await this.status();
+            if (current.runtime.state === 'READY' && current.tunnel.state === 'READY' && current.controlPlane.state === 'READY'
+              && current.connectors.every((connector) => connector.state === 'READY')) return current;
+          }
         }
         await delay(50);
       }
@@ -444,6 +453,8 @@ export class Supervisor {
       const state = await this.readState();
       if (state.workloadDesiredState !== 'ON') await this.writeState({ ...state, workloadDesiredState: 'ON' });
       await this.downUnlocked();
+      const cleared = await this.readState();
+      await this.writeState({ ...cleared, workloadDesiredState: 'ON' });
       return this.upUnlocked();
     });
   }
@@ -819,7 +830,7 @@ export class Supervisor {
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     try {
-      await this.up();
+      if ((await this.readState()).workloadDesiredState === 'ON') await this.up();
       const state = await this.readState();
       if (state.recovery.windowStartedAt !== null && recoveryWindowExpired(state.recovery)) {
         await this.writeState({ ...state, recovery: emptyRecovery() });
@@ -1561,7 +1572,8 @@ export class Supervisor {
       throw new RuntimeError('PRECONDITION_FAILED', `${profile} tunnel binding metadata does not match the active runtime binding`);
     }
     const expectedProfile = managedProfile(binding, credentialPaths(this.dataRoot).controlPlaneApiKey, credentialPaths(this.dataRoot).tunnelServiceAuthorization,
-      this.logDirectory(), registry.deploymentEpoch, endpoint.apiUrl, null);
+      this.logDirectory(), registry.deploymentEpoch, endpoint.apiUrl,
+      this.nativeControlActive && registry.connectors.length === 1 ? `http://127.0.0.1:${this.supervisorControlPort}/mcp` : null);
     const actualProfile = await readFile(binding.managedProfilePath, 'utf8').catch(() => null);
     if (actualProfile !== expectedProfile || await fileSha256(binding.managedProfilePath) !== record.profileDigest) {
       throw new RuntimeError('PRECONDITION_FAILED', `${profile} tunnel profile is not the verified active runtime profile`);
@@ -1657,7 +1669,10 @@ export class Supervisor {
     const fullPath = full.managedProfilePath;
     const proPath = pro?.managedProfilePath ?? null;
     const adminPath = registry.admin?.managedProfilePath ?? null;
-    await writePrivateText(fullPath, managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
+    const unifiedSupervisorMcpUrl = this.nativeControlActive && registry.connectors.length === 1
+      ? `http://127.0.0.1:${this.supervisorControlPort}/mcp`
+      : null;
+    await writePrivateText(fullPath, managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, unifiedSupervisorMcpUrl));
     if (pro !== undefined && proPath !== null) await writePrivateText(proPath, managedProfile(pro, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
     if (registry.admin !== null && adminPath !== null) {
       await writePrivateText(adminPath, managedAdminProfile(registry.admin, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), this.adminTunnelHealthPort, `http://127.0.0.1:${this.supervisorControlPort}/mcp`));
