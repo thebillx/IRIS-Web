@@ -83,20 +83,11 @@ contents. Setup is local and may create the registry, but it does not prove
 remote tunnel ownership.
 
 Starting or restarting a remote tunnel is blocked while ownership is
-`UNVERIFIED`. After a separate owner authorization proves that the tunnel and
-credential are non-production, the owner may use the explicit authorization
-form below; the same root, process and port checks still apply:
-
-```sh
-node scripts/iris-acceptance.mjs \
-  --runtime-data-root "$IRIS_ACCEPTANCE_ROOT" \
-  --protected-root "$IRIS_LIVE_DATA_ROOT" \
-  --protected-root "$IRIS_LIVE_SOURCE_ROOT" \
-  --owner-authorized-tunnel -- up
-```
-
-Use the same form for `restart` or `setup --start`. If a port is occupied, do
-not kill or adopt the process; stop and schedule a separately isolated window.
+`UNVERIFIED`. The wrapper does not accept an owner-provided bypass: obtain
+authoritative non-production tunnel ownership evidence and a separately
+approved implementation before enabling any remote startup. If a port is
+occupied, do not kill or adopt the process; stop and schedule a separately
+isolated window.
 Use `iris_acceptance down` only for the acceptance root whose identity was
 verified by the wrapper.
 

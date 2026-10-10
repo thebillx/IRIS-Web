@@ -64,9 +64,9 @@ The wrapper refuses a missing root export, root switch, source/data overlap,
 reused state, protected-root collision, ambiguous process state, occupied
 runtime/web ports, protected tunnel claim, production profile, and the global
 `com.iris.supervisor` LaunchAgent install/uninstall. It never falls back to
-`~/Library/Application Support/IRIS`. Remote startup remains blocked until a
-separate owner authorization proves the tunnel and credential are
-non-production.
+`~/Library/Application Support/IRIS`. Remote startup remains blocked while
+tunnel ownership is unverified; a separate owner-authorized implementation must
+first provide authoritative non-production tunnel evidence.
 
 ## C. Existing installation migration
 

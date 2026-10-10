@@ -32,17 +32,12 @@ export class AcceptanceError extends Error {
 export function parseAcceptanceArgs(argumentsList) {
   let runtimeDataRoot;
   const protectedRoots = [];
-  let ownerAuthorizedTunnel = false;
   let separator = -1;
   for (let index = 0; index < argumentsList.length; index += 1) {
     const name = argumentsList[index];
     if (name === '--') {
       separator = index;
       break;
-    }
-    if (name === '--owner-authorized-tunnel') {
-      ownerAuthorizedTunnel = true;
-      continue;
     }
     const value = argumentsList[index + 1]?.trim();
     if (value === undefined || value.length === 0) throw new AcceptanceError('ACCEPTANCE_USAGE', 'Every acceptance command requires --runtime-data-root, --protected-root and -- <iris command>');
@@ -54,7 +49,7 @@ export function parseAcceptanceArgs(argumentsList) {
   if (separator < 0 || runtimeDataRoot === undefined || protectedRoots.length === 0 || argumentsList.slice(separator + 1).length === 0) {
     throw new AcceptanceError('ACCEPTANCE_USAGE', 'Every acceptance command requires --runtime-data-root, --protected-root and -- <iris command>');
   }
-  return { runtimeDataRoot, protectedRoots, ownerAuthorizedTunnel, command: argumentsList.slice(separator + 1) };
+  return { runtimeDataRoot, protectedRoots, command: argumentsList.slice(separator + 1) };
 }
 
 export async function inspectAcceptanceEnvironment(options) {
@@ -99,9 +94,7 @@ export async function inspectAcceptanceEnvironment(options) {
   const requestedTunnelId = commandValue(command, '--tunnel-id');
   const tunnelClaims = requestedTunnelId === null ? [] : await findTunnelClaims(protectedRoots, requestedTunnelId);
   if (tunnelClaims.length > 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_CONFLICT', `Acceptance tunnel identity is already claimed by protected installation ${tunnelClaims[0]}`);
-  if (startsRemoteTunnel(command) && !options.ownerAuthorizedTunnel) {
-    throw new AcceptanceError('ACCEPTANCE_TUNNEL_UNVERIFIED', 'Acceptance tunnel ownership is UNVERIFIED; obtain separate owner authorization for a non-production tunnel before starting remote acceptance');
-  }
+  if (startsRemoteTunnel(command)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_UNVERIFIED', 'Acceptance tunnel ownership is UNVERIFIED; remote acceptance startup is blocked until authoritative non-production tunnel ownership evidence exists');
 
   if (commandName === 'credentials' && command[1] === 'migrate') await validateCredentialProfile(command[2], protectedRoots);
   return {
