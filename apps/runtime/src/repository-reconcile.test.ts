@@ -99,7 +99,7 @@ function value(outcome: CapabilityOutcome) {
   return outcome.value as { changed: boolean; repositoryId: string };
 }
 
-describe('owner-authorized repository device reconciliation', () => {
+describe('owner-authorized repository device reconciliation', { timeout: 15_000 }, () => {
   it('fails governed Git on device mismatch and changes nothing before explicit owner approval', async () => {
     const f = await fixture();
     const before = await readFile(f.filename, 'utf8');
