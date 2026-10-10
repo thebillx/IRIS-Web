@@ -479,6 +479,15 @@ setInterval(() => undefined, 1000);
 
     const stopped = await supervisor.down();
     expect(stopped.runtime.state).toBe('FAILED');
+    const downState = JSON.parse(await readFile(statePath, 'utf8')) as {
+      stackDesiredState: string;
+      workloadDesiredState: string;
+      admin: unknown;
+      tunnels: { full: unknown; pro: unknown };
+    };
+    expect(downState).toMatchObject({ stackDesiredState: 'DOWN', workloadDesiredState: 'OFF', admin: null, tunnels: { full: null, pro: null } });
+    await (supervisor as unknown as { monitorOnceUnlocked(): Promise<void> }).monitorOnceUnlocked();
+    await expect(readFile(statePath, 'utf8').then((content) => JSON.parse(content))).resolves.toMatchObject({ stackDesiredState: 'DOWN', workloadDesiredState: 'OFF', admin: null, tunnels: { full: null, pro: null } });
   }, 30_000);
 
   it('probes verified owned tunnels with their recorded executable when the configured tunnel client is unavailable', async () => {

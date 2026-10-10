@@ -77,7 +77,7 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'mission.supervisor_gate.set'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly state: SupervisorGateState; readonly reason: string | null }
   | { readonly capabilityId: 'session.create'; readonly clientId?: string | undefined; readonly agentId?: string | undefined; readonly agentRole?: AgentRole | undefined }
   | { readonly capabilityId: 'session.delete'; readonly clientId: string; readonly sessionId: string }
-  | { readonly capabilityId: 'session.current_project.set'; readonly clientId: string; readonly sessionId: string; readonly projectId: string | null }
+  | { readonly capabilityId: 'session.current_project.set'; readonly clientId: string; readonly sessionId: string; readonly projectId: string | null; readonly workspaceId?: string | undefined }
   | { readonly capabilityId: 'session.instruction.submit'; readonly clientId: string; readonly sessionId: string; readonly submissionId: string; readonly instruction: string }
   | { readonly capabilityId: 'project.register'; readonly name: string; readonly rootPath: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.default.set'; readonly projectId: string | null; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
@@ -729,7 +729,11 @@ export class CapabilityService {
     if (operation.capabilityId === 'mission.supervisor_gate.set') return this.state.setMissionSupervisorGate(operation.missionId, operation.clientId, operation.sessionId, operation.state, operation.reason);
     if (operation.capabilityId === 'session.create') return this.state.createSessionDurable(operation.clientId, operation.agentId, operation.agentRole);
     if (operation.capabilityId === 'session.delete') { await this.state.deleteSessionDurable(operation.sessionId, operation.clientId); return { deleted: true }; }
-    if (operation.capabilityId === 'session.current_project.set') return this.state.setSessionCurrentProject(operation.sessionId, operation.clientId, operation.projectId);
+    if (operation.capabilityId === 'session.current_project.set') {
+      const session = await this.state.setSessionCurrentProject(operation.sessionId, operation.clientId, operation.projectId);
+      if (operation.workspaceId === undefined || operation.projectId === null) return session;
+      return this.state.bindSessionWorkspace(operation.sessionId, operation.clientId, operation.projectId, operation.workspaceId);
+    }
     if (operation.capabilityId === 'session.instruction.submit') return this.state.submitInstruction(operation.sessionId, operation.clientId, operation.submissionId, operation.instruction);
     if (operation.capabilityId === 'project.register') {
       if (decision.target === null) throw new RuntimeError('CAPABILITY_DENIED', 'Approved project registration lost its canonical physical target');
@@ -942,7 +946,7 @@ export class CapabilityService {
     if (session.currentProjectId === null) throw new RuntimeError('CAPABILITY_DENIED', 'Session has no current project');
     if ('projectId' in operation && operation.projectId !== undefined && operation.projectId !== session.currentProjectId) throw new RuntimeError('CAPABILITY_DENIED', 'Operation project no longer matches the live session project');
     if ('workspaceId' in operation && typeof operation.workspaceId === 'string' && typeof operation.projectId === 'string') {
-      await this.state.ensureSessionWorkspace(operation.sessionId, operation.clientId, operation.projectId, operation.workspaceId);
+      await this.state.assertSessionWorkspace(operation.sessionId, operation.clientId, operation.projectId, operation.workspaceId);
     }
     const project = (await this.state.listProjects()).find((entry) => entry.id === session.currentProjectId);
     if (project === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Live session project is no longer registered');

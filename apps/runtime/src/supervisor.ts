@@ -107,6 +107,7 @@ interface SupervisorStateDocument {
   readonly updatedAt: string;
   readonly workloadSourceRoot: string;
   readonly workloadDesiredState: 'ON' | 'OFF';
+  readonly stackDesiredState: 'UP' | 'DOWN';
   readonly runtime: OwnedProcess | null;
   readonly web: OwnedProcess | null;
   readonly admin: OwnedProcess | null;
@@ -233,7 +234,7 @@ export class Supervisor {
     await this.prepareDirectories();
     return this.withOperationLock('up', async () => {
       const state = await this.readState();
-      if (state.workloadDesiredState !== 'ON') await this.writeState({ ...state, workloadDesiredState: 'ON' });
+      if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
       return this.upUnlocked();
     });
   }
@@ -244,7 +245,7 @@ export class Supervisor {
     try {
       return await this.withOperationLock('workload-on', async () => {
         const state = await this.readState();
-        if (state.workloadDesiredState !== 'ON') await this.writeState({ ...state, workloadDesiredState: 'ON' });
+        if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
         return this.upUnlocked();
       });
     } catch (error: unknown) {
@@ -283,7 +284,7 @@ export class Supervisor {
     await this.prepareDirectories();
     return this.withOperationLock('workload-restart', async () => {
       const state = await this.readState();
-      if (state.workloadDesiredState !== 'ON') await this.writeState({ ...state, workloadDesiredState: 'ON' });
+      if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
       await this.workloadOffUnlocked();
       const stopped = await this.readState();
       await this.writeState({ ...stopped, workloadDesiredState: 'ON' });
@@ -301,7 +302,7 @@ export class Supervisor {
       if (observed.state === 'stale') {
         throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Workload shutdown cannot proceed while runtime authority is stale');
       }
-      if (state.workloadDesiredState !== 'OFF') await this.writeState({ ...state, workloadDesiredState: 'OFF' });
+      if (state.workloadDesiredState !== 'OFF' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'OFF', stackDesiredState: state.stackDesiredState === 'DOWN' ? 'DOWN' : 'UP' });
       return this.status();
     }
     if (observed.state === 'running') {
@@ -312,7 +313,7 @@ export class Supervisor {
     } else {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Workload authority cannot be verified for shutdown');
     }
-    state = { ...state, runtime: null, workloadDesiredState: 'OFF' };
+    state = { ...state, runtime: null, workloadDesiredState: 'OFF', stackDesiredState: state.stackDesiredState === 'DOWN' ? 'DOWN' : 'UP' };
     await this.writeState(state);
     return this.status();
   }
@@ -442,7 +443,7 @@ export class Supervisor {
       }
     }
     await this.stopAdmin(state.admin);
-    const cleared = { ...emptyState(state.supervisorId, state.workloadSourceRoot), workloadDesiredState: 'OFF' as const };
+    const cleared = { ...emptyState(state.supervisorId, state.workloadSourceRoot), workloadDesiredState: 'OFF' as const, stackDesiredState: 'DOWN' as const };
     await this.writeState(cleared);
     return this.status();
   }
@@ -451,10 +452,10 @@ export class Supervisor {
     await this.prepareDirectories();
     return this.withOperationLock('restart', async () => {
       const state = await this.readState();
-      if (state.workloadDesiredState !== 'ON') await this.writeState({ ...state, workloadDesiredState: 'ON' });
+      if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
       await this.downUnlocked();
       const cleared = await this.readState();
-      await this.writeState({ ...cleared, workloadDesiredState: 'ON' });
+      await this.writeState({ ...cleared, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
       return this.upUnlocked();
     });
   }
@@ -830,8 +831,17 @@ export class Supervisor {
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     try {
-      if ((await this.readState()).workloadDesiredState === 'ON') await this.up();
-      else await this.withOperationLock('control-plane-off-recovery', () => this.recoverControlPlaneOffUnlocked());
+      const startupState = await this.readState();
+      if (startupState.stackDesiredState === 'UP' && startupState.workloadDesiredState === 'ON') await this.up();
+      else if (startupState.stackDesiredState === 'UP') {
+        try {
+          await this.withOperationLock('control-plane-off-recovery', () => this.recoverControlPlaneOffUnlocked());
+        } catch (error) {
+          const current = await this.readState().catch(() => null);
+          if (current?.stackDesiredState !== 'UP' || current.workloadDesiredState !== 'OFF') throw error;
+          // Keep the authenticated control path alive so the next recovery tick can retry.
+        }
+      }
       const state = await this.readState();
       if (state.recovery.windowStartedAt !== null && recoveryWindowExpired(state.recovery)) {
         await this.writeState({ ...state, recovery: emptyRecovery() });
@@ -854,6 +864,8 @@ export class Supervisor {
       await this.withOperationLock('automatic-recovery', () => this.monitorOnceUnlocked());
     } catch (error) {
       if (runtimeErrorCode(error) === 'SUPERVISOR_BUSY') return;
+      const state = await this.readState().catch(() => null);
+      if (state?.stackDesiredState === 'UP' && state.workloadDesiredState === 'OFF') return;
       throw error;
     }
   }
@@ -866,6 +878,7 @@ export class Supervisor {
     const registry = await readConnectorRegistry(this.dataRoot);
     if (registry === null) throw new RuntimeError('MIGRATION_REQUIRED', 'Connector registry is not initialized');
     let state = await this.readState();
+    if (state.stackDesiredState !== 'UP') return this.status();
     if (state.workloadDesiredState !== 'OFF') return this.upUnlocked();
     const observed = await runtimeStatus(this.dataRoot);
     if (state.runtime !== null || observed.state === 'running' || observed.state === 'indeterminate') {
@@ -873,25 +886,20 @@ export class Supervisor {
     }
     if (observed.state === 'stale') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Cannot recover an OFF control plane while workload runtime authority is stale');
     const started: Array<'runtime' | 'web' | 'admin' | 'full' | 'pro' | 'admin-tunnel'> = [];
-    try {
-      state = await this.ensureAdmin(state, started);
-      if (state.adminTunnel !== null && registry.admin !== null) {
-        state = await this.ensureAdminTunnel(state, registry, registry.admin.managedProfilePath, started);
-      }
-      for (const profile of ['full', 'pro'] as const) {
-        const current = state.tunnels[profile];
-        if (current === null) continue;
-        const binding = registry.connectors.find((candidate) => candidate.connectorId === (profile === 'full' ? 'iris-full' : 'iris-pro'));
-        if (binding === undefined || !existsSync(binding.managedProfilePath)) continue;
-        state = await this.ensureTunnel(state, profile, registry, binding.managedProfilePath, current.instanceId ?? '', started, false);
-      }
-      state = { ...state, runtime: null, workloadDesiredState: 'OFF' };
-      await this.writeState(state);
-      return this.statusFrom(state, registry, credentials);
-    } catch (error) {
-      await this.rollbackStarted(started).catch(() => undefined);
-      throw error;
+    state = await this.ensureAdmin(state, started);
+    if (state.adminTunnel !== null && registry.admin !== null) {
+      state = await this.ensureAdminTunnel(state, registry, registry.admin.managedProfilePath, started);
     }
+    for (const profile of ['full', 'pro'] as const) {
+      const current = state.tunnels[profile];
+      if (current === null) continue;
+      const binding = registry.connectors.find((candidate) => candidate.connectorId === (profile === 'full' ? 'iris-full' : 'iris-pro'));
+      if (binding === undefined || !existsSync(binding.managedProfilePath)) continue;
+      state = await this.ensureTunnel(state, profile, registry, binding.managedProfilePath, current.instanceId ?? '', started, false);
+    }
+    state = { ...state, runtime: null, workloadDesiredState: 'OFF', stackDesiredState: 'UP' };
+    await this.writeState(state);
+    return this.statusFrom(state, registry, credentials);
   }
 
   public async supervisorNativeStatus(): Promise<Record<string, unknown>> {
@@ -914,8 +922,9 @@ export class Supervisor {
       supervisorProcessIdentity: currentProcessIdentity(),
       controlSourceRoot: this.sourceRoot,
       protectedReferenceRoot: this.protectedReferenceRoot ?? null,
-      readiness: (observed.state === 'running' || (observed.state === 'stopped' && state.workloadDesiredState === 'OFF'))
+      readiness: state.stackDesiredState === 'UP' && (observed.state === 'running' || (observed.state === 'stopped' && state.workloadDesiredState === 'OFF'))
         && state.admin !== null && (registry?.connectors.length === 1 || state.adminTunnel !== null) && adminSourceCoherent ? 'READY' : 'DEGRADED',
+      stackDesiredState: state.stackDesiredState,
       workloadDesiredState: state.workloadDesiredState,
       workloadState: observed.state === 'running' ? 'ON' : observed.state === 'stopped' && state.workloadDesiredState === 'OFF' ? 'OFF' : 'UNKNOWN',
       workloadRuntimeId: observed.endpoint?.runtimeId ?? null,
@@ -1259,6 +1268,7 @@ export class Supervisor {
   private async monitorOnceUnlocked(): Promise<void> {
     const state = await this.readState();
     if (state.workloadDesiredState === 'OFF') {
+      if (state.stackDesiredState === 'DOWN') return;
       await this.recoverControlPlaneOffUnlocked();
       return;
     }
@@ -1304,7 +1314,7 @@ export class Supervisor {
   private async statusFrom(state: SupervisorStateDocument, registry: ConnectorRegistryDocument, credentials: CredentialStatus): Promise<SupervisorStackStatus> {
     const unified = registry.connectors.length === 1;
     const runtime = await runtimeStatus(this.dataRoot);
-    const controlGatewayRetained = state.admin !== null || state.adminTunnel !== null || this.nativeControlActive;
+    const controlGatewayRetained = state.stackDesiredState === 'UP' && (state.admin !== null || state.adminTunnel !== null || this.nativeControlActive);
     const runtimeLayer = runtime.state === 'running' && state.runtime !== null
       ? ownershipLayer(state.runtime, runtime)
       : runtime.state === 'stopped' && state.runtime === null && state.workloadDesiredState === 'OFF' && controlGatewayRetained ? layer('DEGRADED', 'WORKLOAD_OFF', 'IRIS workload is intentionally stopped; supervisor control remains available')
@@ -1776,6 +1786,20 @@ export class Supervisor {
         schemaVersion: 3,
         workloadSourceRoot: value.workloadSourceRoot ?? this.sourceRoot,
         workloadDesiredState: value.workloadDesiredState === 'OFF' ? 'OFF' : 'ON',
+        stackDesiredState: value.stackDesiredState === 'DOWN'
+          ? 'DOWN'
+          : value.stackDesiredState === 'UP'
+            ? 'UP'
+            : value.workloadDesiredState === 'OFF'
+              && value.runtime === null
+              && value.web === null
+              && (value.admin === undefined || value.admin === null)
+              && (value.adminTunnel === undefined || value.adminTunnel === null)
+              && isRecord(value.tunnels)
+              && value.tunnels.full === null
+              && value.tunnels.pro === null
+              ? 'DOWN'
+              : 'UP',
         admin: value.admin ?? null,
         adminTunnel: value.adminTunnel ?? null,
         recovery: { ...emptyRecovery(), ...(value.recovery ?? {}), windowStartedAt: value.recovery?.windowStartedAt ?? null },
@@ -2390,7 +2414,7 @@ function currentProcessIdentity(): string {
 }
 
 function emptyState(supervisorId: string, workloadSourceRoot: string): SupervisorStateDocument {
-  return { schemaVersion: 3, supervisorId, updatedAt: new Date().toISOString(), workloadSourceRoot, workloadDesiredState: 'ON', runtime: null, web: null, admin: null, adminTunnel: null, tunnels: { full: null, pro: null }, recovery: emptyRecovery() };
+  return { schemaVersion: 3, supervisorId, updatedAt: new Date().toISOString(), workloadSourceRoot, workloadDesiredState: 'ON', stackDesiredState: 'UP', runtime: null, web: null, admin: null, adminTunnel: null, tunnels: { full: null, pro: null }, recovery: emptyRecovery() };
 }
 
 function emptyRecovery(): RecoveryRecord { return { attempts: 0, terminal: false, lastFailureCode: null, nextAttemptAt: null, windowStartedAt: null }; }
@@ -2437,6 +2461,7 @@ function isState(value: unknown): value is SupervisorStateDocument {
   if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2 && value.schemaVersion !== 3) || typeof value.supervisorId !== 'string'
     || !(value.workloadSourceRoot === undefined || typeof value.workloadSourceRoot === 'string' && path.isAbsolute(value.workloadSourceRoot) && !value.workloadSourceRoot.includes('\0') && path.resolve(value.workloadSourceRoot) === value.workloadSourceRoot)
     || !(value.workloadDesiredState === undefined || value.workloadDesiredState === 'ON' || value.workloadDesiredState === 'OFF')
+    || !(value.stackDesiredState === undefined || value.stackDesiredState === 'UP' || value.stackDesiredState === 'DOWN')
     || !isRecord(value.tunnels)) return false;
   if (value.recovery !== undefined && !isRecord(value.recovery)) return false;
   return (value.runtime === null || isOwnedProcess(value.runtime)) && (value.web === null || isOwnedProcess(value.web))

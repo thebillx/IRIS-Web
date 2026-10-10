@@ -770,31 +770,6 @@ export class RuntimeState {
     }
   }
 
-  public async ensureSessionWorkspace(
-    sessionId: string,
-    clientIdInput: string,
-    projectId: string,
-    workspaceId: string,
-  ): Promise<void> {
-    const session = this.getSessionForClient(sessionId, clientIdInput);
-    if (session.currentProjectId !== projectId) throw new RuntimeError('CAPABILITY_DENIED', 'Session project does not match the requested workspace');
-    let workspace;
-    try {
-      workspace = await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(projectId, workspaceId);
-    } catch (error) {
-      if (error instanceof RuntimeError && error.code === 'WORKSPACE_NOT_FOUND') throw error;
-      this.invalidSessionBindings.add(session.id);
-      throw new RuntimeError('AUTHORITY_CHANGED', 'Session workspace binding is no longer authorized', { cause: error });
-    }
-    if (workspace.projectId !== projectId || workspace.workspaceId !== workspaceId) {
-      this.invalidSessionBindings.add(session.id);
-      throw new RuntimeError('AUTHORITY_CHANGED', 'Session workspace binding changed before use');
-    }
-    const binding = this.sessionBindings.get(session.id);
-    if (binding?.projectId === projectId && binding.workspaceId === workspaceId) return;
-    await this.bindSessionWorkspace(session.id, clientIdInput, projectId, workspaceId);
-  }
-
   public async bindSessionWorkspace(
     sessionId: string,
     clientIdInput: string,
@@ -922,10 +897,16 @@ export class RuntimeState {
         };
         const completed = appendInteraction({ ...current, executionState: 'READY' }, assistantEvent);
         this.sessions.set(sessionId, completed);
-        this.persistSessions();
+        try {
+          this.persistSessions();
+        } catch (error) {
+          this.sessions.set(sessionId, current);
+          throw new RuntimeError('PERSISTENCE_FAILURE', 'Executor completed but session completion publication failed; execution outcome is uncertain', { cause: error });
+        }
         return completed;
       });
     } catch (error) {
+      if (error instanceof RuntimeError && error.code === 'PERSISTENCE_FAILURE') throw error;
       await this.serializeMachineMutation(async () => {
         const current = this.getSessionForClient(sessionId, clientId);
         const errorEvent: SessionInteractionEvent = {

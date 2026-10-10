@@ -110,6 +110,33 @@ describe('runtime machine, client, and session state', () => {
     expect(retried.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
   });
 
+  it('returns an uncertain persistence outcome without appending a false failure after executor completion', async () => {
+    const dataRoot = await temp('iris-session-completion-publication-');
+    let executions = 0;
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async ({ instruction }) => { executions += 1; return { text: `result:${instruction}` }; },
+    };
+    const state = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const session = state.createSession('completion-publication-client');
+    const originalPublish = (state as unknown as { persistSessions: () => void }).persistSessions.bind(state);
+    const publication = vi.spyOn(state as unknown as { persistSessions: () => void }, 'persistSessions')
+      .mockImplementationOnce(originalPublish)
+      .mockImplementationOnce(() => { throw new RuntimeError('PERSISTENCE_FAILURE', 'injected completion publication failure'); });
+
+    await expect(state.submitInstruction(session.id, session.clientId, 'completion-uncertain', 'complete once'))
+      .rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE', message: expect.stringContaining('outcome is uncertain') });
+    expect(executions).toBe(1);
+    expect(state.getSessionForClient(session.id, session.clientId)).toMatchObject({ executionState: 'WORKING' });
+    expect(state.getSessionForClient(session.id, session.clientId).interactions.map((event) => event.kind)).toEqual(['user']);
+    expect(JSON.parse(await readFile(path.join(dataRoot, 'sessions.json'), 'utf8'))).toMatchObject({ sessions: [{ snapshot: { executionState: 'WORKING' } }] });
+
+    publication.mockRestore();
+    const duplicate = await state.submitInstruction(session.id, session.clientId, 'completion-uncertain', 'complete once');
+    expect(executions).toBe(1);
+    expect(duplicate.executionState).toBe('WORKING');
+  });
+
   it('supports concurrent agent roles on one daemon without sharing session identity', async () => {
     const state = new RuntimeState(new FoundationStateStore(await temp('iris-agent-state-')));
     const roles = ['planner', 'implementer', 'reviewer', 'security', 'explorer'] as const;

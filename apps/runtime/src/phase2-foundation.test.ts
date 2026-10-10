@@ -50,6 +50,7 @@ describe('IRIS vNext Phase 2 workspace, filesystem, and artifact foundation', ()
     expect(scratch).toMatchObject({ projectId: fixture.projectA.id, role: 'SCRATCH', lifecycleState: 'ACTIVE' });
     expect(scratch.physicalRoot).toContain(path.join(fixture.dataRoot, 'scratch', fixture.projectA.id));
     expect(scratch.physicalRoot).not.toBe(path.dirname(scratch.physicalRoot));
+    await fixture.state.bindSessionWorkspace(fixture.sessionA.id, fixture.sessionA.clientId, fixture.projectA.id, scratch.workspaceId);
 
     const inside = await fixture.service.execute({
       capabilityId: 'fs.write', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
@@ -72,7 +73,7 @@ describe('IRIS vNext Phase 2 workspace, filesystem, and artifact foundation', ()
     await expect(fixture.service.execute({
       capabilityId: 'fs.stat', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
       projectId: fixture.projectA.id, workspaceId: primaryB.workspaceId, path: '.', expectedEffects: ['READ'],
-    })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
 
     const revoked = executedValue<WorkspaceRecord>(await fixture.service.execute({
       capabilityId: 'workspace.revoke_scratch', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
@@ -347,7 +348,7 @@ describe('IRIS vNext Phase 2 workspace, filesystem, and artifact foundation', ()
     await expect(fixture.service.execute({
       capabilityId: 'fs.read', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
       projectId: fixture.projectA.id, workspaceId: artifact.artifactId as string, path: 'sources/evidence.dat', mode: 'TEXT', expectedEffects: ['READ'],
-    })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
 
     const released = executedValue<Record<string, unknown>>(await fixture.service.execute({
       capabilityId: 'artifact.release', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,

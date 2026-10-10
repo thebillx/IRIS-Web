@@ -230,6 +230,7 @@ async function executeTool(
     return capabilities.execute({
       capabilityId: 'session.current_project.set', clientId: identity.clientId, sessionId: identity.sessionId,
       projectId: requiredString(args, 'projectId'),
+      ...(optionalString(args, 'workspaceId') === undefined ? {} : { workspaceId: optionalString(args, 'workspaceId') }),
     });
   }
   if (name === 'mission_list_waiting_supervisor') {

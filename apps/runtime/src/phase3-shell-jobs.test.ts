@@ -71,7 +71,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
       capabilityId: 'shell.run', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
       projectId: fixture.projectA.id, workspaceId: primaryB.workspaceId, executable: 'node', argv: ['hello.mjs'], cwd: '.',
       executionProfile: 'node-script', envOverrides: {}, timeoutMs: 5000, expectedEffects: ALL_EXECUTION_EFFECTS,
-    })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
   });
 
   it('DT-M02 + DT-M05 runs project-tool without session/effect ceremony and enforces macOS workspace confinement', async () => {

@@ -469,6 +469,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
       sessionId: decodeURIComponent(currentProjectMatch[1]!),
       clientId: requiredClientId(request),
       projectId: nullableStringField(body, 'projectId'),
+      ...(optionalStringField(body!, 'workspaceId') === undefined ? {} : { workspaceId: optionalStringField(body!, 'workspaceId') }),
     }));
     return;
   }
