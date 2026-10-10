@@ -66,6 +66,9 @@ diagnostic/recovery commands documented below; and
 flags, unknown options, positional arguments, `connectors init`,
 `connectors admin-bind`, credential rotation, catalog reload, runtime adoption,
 and supervisor mutation commands are rejected before a child process starts.
+`up`, `restart`, and `supervisor` are recognized only so the wrapper can apply
+the tunnel-ownership and port gates; they do not reach a child process while
+ownership is `UNVERIFIED`.
 The wrapper also rejects unreadable protected registries as unavailable
 evidence; only a missing registry is treated as no local claim.
 
