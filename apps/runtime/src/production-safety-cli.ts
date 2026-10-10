@@ -33,12 +33,14 @@ async function main(argv: readonly string[]): Promise<void> {
     else if (command === 'backup') {
       const destination = args.get('destination');
       if (destination === undefined) throw new Error('--destination is required for backup');
-      result = await createRuntimeBackup({ controller, ownerAccessToken: token, destination });
+      const checkpointFile = args.get('checkpoint-file');
+      result = await createRuntimeBackup({ controller, ownerAccessToken: token, destination, ...(checkpointFile === undefined ? {} : { checkpointFile }) });
     } else {
       const backupRoot = args.get('backup');
       const destination = args.get('destination');
       if (backupRoot === undefined || destination === undefined || args.get('disposable') !== 'true') throw new Error('restore requires --backup, --destination, and --disposable true');
-      result = await restoreRuntimeBackup({ controller, ownerAccessToken: token, backupRoot, destination, disposable: true });
+      const checkpointFile = args.get('checkpoint-file');
+      result = await restoreRuntimeBackup({ controller, ownerAccessToken: token, backupRoot, destination, disposable: true, ...(checkpointFile === undefined ? {} : { checkpointFile }) });
     }
   }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

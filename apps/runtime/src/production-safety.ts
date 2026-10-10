@@ -7,6 +7,7 @@ import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs
 const SAFETY_FILE = 'production-safety.json';
 const SAFETY_LOCK = 'production-safety.lock';
 const MANIFEST_FILE = 'manifest.json';
+const CHECKPOINT_FILE = 'checkpoint.json';
 const REQUIRED_WRITERS = ['runtime-state', 'mission-state', 'mission-broker', 'durable-jobs', 'supervisor', 'external-runners'] as const;
 const WRITER_STATES = ['IDLE', 'ACTIVE', 'UNKNOWN'] as const;
 const FENCE_STATES = ['ACTIVE', 'QUIESCING', 'QUIESCED', 'BLOCKED', 'RECOVERY_REQUIRED'] as const;
@@ -76,12 +77,14 @@ export interface BackupManifest {
   readonly sourceIdentity: SafetyIdentity;
   readonly fenceGeneration: number;
   readonly files: readonly { path: string; size: number; sha256: string; mode: number }[];
+  readonly checkpoint: { size: number; sha256: string; mode: number } | null;
 }
 
 export interface CreateBackupInput {
   readonly controller: ProductionSafetyController;
   readonly ownerAccessToken: string;
   readonly destination: string;
+  readonly checkpointFile?: string;
 }
 
 export interface RestoreBackupInput {
@@ -90,6 +93,7 @@ export interface RestoreBackupInput {
   readonly backupRoot: string;
   readonly destination: string;
   readonly disposable: true;
+  readonly checkpointFile?: string;
 }
 
 export class ProductionSafetyController {
@@ -221,6 +225,8 @@ export class ProductionSafetyController {
     if (fence.state !== 'QUIESCED') reasons.push(`fence state is ${fence.state}`);
     if (fence.backup === null) reasons.push('a verified backup is not recorded');
     if (fence.restore === null) reasons.push('a disposable restore drill is not recorded');
+    if (fence.backup !== null && !fence.backup.detail.includes('checkpoint=VERIFIED')) reasons.push('backup does not include verified task checkpoint evidence');
+    if (fence.restore !== null && !fence.restore.detail.includes('checkpoint=VERIFIED')) reasons.push('restore drill does not include verified task checkpoint evidence');
     return { status: reasons.length === 0 ? 'READY_FOR_OWNER_WINDOW' : 'BLOCKED', reasons, fence };
   }
 
@@ -294,12 +300,14 @@ export async function createRuntimeBackup(input: CreateBackupInput): Promise<Bac
   await mkdir(staging, { mode: 0o700 });
   try {
     const files = await copyTree(source, staging);
-    const manifest: BackupManifest = { schemaVersion: 1, backupId: randomUUID(), createdAt: new Date().toISOString(), sourceIdentity: fence.identity, fenceGeneration: fence.generation, files: files.sort((a, b) => a.path.localeCompare(b.path)) };
+    if (input.checkpointFile !== undefined && isWithin(source, path.resolve(input.checkpointFile))) throw new RuntimeError('PRECONDITION_FAILED', 'Checkpoint source must be outside the runtime data root');
+    const checkpoint = input.checkpointFile === undefined ? null : await copyCheckpoint(input.checkpointFile, staging);
+    const manifest: BackupManifest = { schemaVersion: 1, backupId: randomUUID(), createdAt: new Date().toISOString(), sourceIdentity: fence.identity, fenceGeneration: fence.generation, files: files.sort((a, b) => a.path.localeCompare(b.path)), checkpoint };
     await writePrivateJson(path.join(staging, MANIFEST_FILE), manifest);
     await chmod(staging, 0o700);
     await rename(staging, destination);
     await verifyRuntimeBackup(destination);
-    await input.controller.recordBackupEvidence(input.ownerAccessToken, `${manifest.backupId}:${manifest.files.length} files`);
+    await input.controller.recordBackupEvidence(input.ownerAccessToken, `${manifest.backupId}:${manifest.files.length} files;checkpoint=${manifest.checkpoint === null ? 'UNVERIFIED' : 'VERIFIED'}`);
     return manifest;
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => undefined);
@@ -315,12 +323,17 @@ export async function verifyRuntimeBackup(destinationInput: string): Promise<Bac
   const manifest = parseManifest(await readPrivateFile(manifestPath, 'Backup manifest'));
   const actual = (await listFiles(destination)).filter((file) => file !== MANIFEST_FILE);
   const expected = new Set(manifest.files.map((file) => file.path));
+  if (manifest.checkpoint !== null) expected.add(CHECKPOINT_FILE);
   const actualSet = new Set(actual);
   if (actualSet.size !== expected.size || actual.some((file) => !expected.has(file))) throw new RuntimeError('PERSISTENCE_FAILURE', 'Backup contains missing or unexpected files');
   for (const file of manifest.files) {
     const filename = safeJoin(destination, file.path);
     const metadata = await safeFileMetadata(filename, 'Backup file');
     if (metadata.size !== file.size || metadata.mode !== file.mode || await hashFile(filename) !== file.sha256) throw new RuntimeError('PERSISTENCE_FAILURE', `Backup integrity check failed for ${file.path}`);
+  }
+  if (manifest.checkpoint !== null) {
+    const checkpoint = await safeFileMetadata(safeJoin(destination, CHECKPOINT_FILE), 'Backup checkpoint');
+    if (checkpoint.size !== manifest.checkpoint.size || checkpoint.mode !== manifest.checkpoint.mode || await hashFile(safeJoin(destination, CHECKPOINT_FILE)) !== manifest.checkpoint.sha256) throw new RuntimeError('PERSISTENCE_FAILURE', 'Backup checkpoint integrity check failed');
   }
   return manifest;
 }
@@ -343,10 +356,26 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
       await copyFile(source, target);
       await chmod(target, file.mode);
     }
+    if (manifest.checkpoint !== null) {
+      if (input.checkpointFile === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Restore requires a disposable checkpoint target');
+      await assertNewPrivateFile(input.checkpointFile);
+      const checkpointTarget = path.resolve(input.checkpointFile);
+      const checkpointStaging = `${checkpointTarget}.${process.pid}.${randomUUID()}.staging`;
+      await copyFile(safeJoin(backupRoot, CHECKPOINT_FILE), checkpointStaging);
+      await chmod(checkpointStaging, manifest.checkpoint.mode);
+      await copyFile(safeJoin(backupRoot, CHECKPOINT_FILE), path.join(staging, CHECKPOINT_FILE));
+      await chmod(path.join(staging, CHECKPOINT_FILE), manifest.checkpoint.mode);
+      await writePrivateJson(path.join(staging, MANIFEST_FILE), manifest);
+      await rename(staging, destination);
+      await rename(checkpointStaging, checkpointTarget);
+      await verifyRuntimeBackup(destination);
+      await input.controller.recordRestoreEvidence(input.ownerAccessToken, `${manifest.backupId}:${destination};checkpoint=VERIFIED`);
+      return manifest;
+    }
     await writePrivateJson(path.join(staging, MANIFEST_FILE), manifest);
     await rename(staging, destination);
     await verifyRuntimeBackup(destination);
-    await input.controller.recordRestoreEvidence(input.ownerAccessToken, `${manifest.backupId}:${destination}`);
+    await input.controller.recordRestoreEvidence(input.ownerAccessToken, `${manifest.backupId}:${destination};checkpoint=UNVERIFIED`);
     return manifest;
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => undefined);
@@ -384,6 +413,7 @@ function quiescenceReasons(document: SafetyDocument, observations: Readonly<Reco
 async function copyTree(source: string, destination: string): Promise<BackupManifest['files'][number][]> {
   const files: BackupManifest['files'][number][] = [];
   for (const relative of await listFiles(source)) {
+    if (relative === CHECKPOINT_FILE) throw new RuntimeError('PERSISTENCE_FAILURE', `${CHECKPOINT_FILE} is reserved for checkpoint evidence`);
     const from = safeJoin(source, relative);
     const to = safeJoin(destination, relative);
     const before = await safeFileMetadata(from, 'Runtime data file');
@@ -396,6 +426,17 @@ async function copyTree(source: string, destination: string): Promise<BackupMani
     files.push({ path: relative, size: content.length, sha256: createHash('sha256').update(content).digest('hex'), mode: before.mode });
   }
   return files;
+}
+
+async function copyCheckpoint(sourceInput: string, destination: string): Promise<NonNullable<BackupManifest['checkpoint']>> {
+  const source = path.resolve(sourceInput);
+  const metadata = await safeFileMetadata(source, 'Checkpoint file');
+  if (isWithin(path.resolve(destination), source)) throw new RuntimeError('PRECONDITION_FAILED', 'Checkpoint source overlaps backup staging');
+  const content = await readFile(source);
+  const target = path.join(destination, CHECKPOINT_FILE);
+  await writeFile(target, content, { mode: metadata.mode, flag: 'wx' });
+  await chmod(target, metadata.mode);
+  return { size: content.length, sha256: createHash('sha256').update(content).digest('hex'), mode: metadata.mode };
 }
 
 async function listFiles(root: string, prefix = ''): Promise<string[]> {
@@ -420,6 +461,14 @@ async function assertDestinationAvailable(source: string, destination: string): 
   catch (error: unknown) { if (!isNotFound(error)) throw error; }
   const parent = path.dirname(destination);
   const problem = await privateDirectoryProblem(parent, 'Backup destination parent');
+  if (problem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', problem);
+}
+
+async function assertNewPrivateFile(filenameInput: string): Promise<void> {
+  const filename = path.resolve(filenameInput);
+  try { await lstat(filename); throw new RuntimeError('PRECONDITION_FAILED', 'Checkpoint restore target already exists'); }
+  catch (error: unknown) { if (!isNotFound(error)) throw error; }
+  const problem = await privateDirectoryProblem(path.dirname(filename), 'Checkpoint restore parent');
   if (problem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', problem);
 }
 
@@ -465,7 +514,7 @@ function parseDocument(content: string): SafetyDocument {
 function parseManifest(content: string): BackupManifest {
   try {
     const value = JSON.parse(content) as BackupManifest;
-    if (value.schemaVersion !== 1 || typeof value.backupId !== 'string' || !Array.isArray(value.files) || value.files.some((file) => typeof file.path !== 'string' || !Number.isSafeInteger(file.size) || typeof file.sha256 !== 'string' || !Number.isSafeInteger(file.mode))) throw new Error('schema');
+    if (value.schemaVersion !== 1 || typeof value.backupId !== 'string' || !Array.isArray(value.files) || (value.checkpoint !== null && (value.checkpoint === undefined || !Number.isSafeInteger(value.checkpoint.size) || typeof value.checkpoint.sha256 !== 'string' || !Number.isSafeInteger(value.checkpoint.mode))) || value.files.some((file) => typeof file.path !== 'string' || !Number.isSafeInteger(file.size) || typeof file.sha256 !== 'string' || !Number.isSafeInteger(file.mode))) throw new Error('schema');
     return value;
   } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Backup manifest is invalid', { cause: error }); }
 }

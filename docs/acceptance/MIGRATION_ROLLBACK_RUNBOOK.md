@@ -19,12 +19,12 @@ The unified setup command is a fresh-install command. It refuses an existing reg
 6. Quiesce through the owner-local fence, explicitly reporting only independently observed external runners:
    `pnpm --filter @iris/runtime safety quiesce --data-root "$IRIS_RUNTIME_DATA_ROOT" --writer supervisor=IDLE,external-runners=IDLE`.
    A `BLOCKED` result is a hard stop. Do not substitute PID removal, recursive copying, or LaunchAgent removal.
-7. Create and verify a new private destination outside the data root:
-   `pnpm --filter @iris/runtime safety backup --data-root "$IRIS_RUNTIME_DATA_ROOT" --destination "$IRIS_BACKUP_ROOT"`,
+7. Set `IRIS_CHECKPOINT_FILE` to the owner-controlled canonical checkpoint file (outside the runtime data root), then create and verify a new private destination outside the data root:
+   `pnpm --filter @iris/runtime safety backup --data-root "$IRIS_RUNTIME_DATA_ROOT" --destination "$IRIS_BACKUP_ROOT" --checkpoint-file "$IRIS_CHECKPOINT_FILE"`,
    followed by `pnpm --filter @iris/runtime safety verify --data-root "$IRIS_RUNTIME_DATA_ROOT" --backup "$IRIS_BACKUP_ROOT"`.
    The manifest hashes every regular durable file and contains identity metadata without file contents or secrets.
 8. Restore drills are disposable-only and never resume jobs:
-   `pnpm --filter @iris/runtime safety restore --data-root "$IRIS_RUNTIME_DATA_ROOT" --backup "$IRIS_BACKUP_ROOT" --destination "$IRIS_RESTORE_ROOT" --disposable true`.
+   `pnpm --filter @iris/runtime safety restore --data-root "$IRIS_RUNTIME_DATA_ROOT" --backup "$IRIS_BACKUP_ROOT" --destination "$IRIS_RESTORE_ROOT" --checkpoint-file "$IRIS_RESTORE_CHECKPOINT_FILE" --disposable true`.
    Readiness remains blocked until both backup and restore evidence are recorded.
 9. After the owner window, inspect `safety readiness`; release a verified fence
    with `safety unfence`, or recover a blocked fence only after fresh idle
