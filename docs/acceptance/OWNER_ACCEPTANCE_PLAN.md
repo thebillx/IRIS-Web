@@ -143,7 +143,9 @@ record, start the separately provisioned local provider process, capture its
 PID, executable path and managed profile path, and write a mode-`0600` evidence
 file with this shape (all values are owner-supplied). The `machineId` must be
 the canonical UUID stored on the single `iris-full` workload connector in the
-acceptance registry; a hostname or admin-only binding is rejected:
+acceptance registry; `binding.profilePath` must exactly identify that connector's
+canonical `managedProfilePath` (normally `<acceptance-root>/tunnel-profiles/iris-full.yaml`);
+a hostname, admin-only binding or unrelated process is rejected:
 
 ```json
 {
@@ -163,9 +165,9 @@ acceptance registry; a hostname or admin-only binding is rejected:
 Export `IRIS_ACCEPTANCE_TUNNEL_EVIDENCE` to that file before invoking
 `iris_acceptance up --tunnel-id <non-production-tunnel-id>` or
 `iris_acceptance restart --tunnel-id <non-production-tunnel-id>`. The wrapper independently
-checks file mode/owner, current-user PID, executable identity and the provider
-command's profile/tunnel binding, and requires the exact single unified
-`iris-full` connector binding plus its canonical machine UUID. Any missing, stale or contradictory field
+checks file mode/owner, current-user PID, executable identity, the canonical managed
+profile path and the provider command's profile/tunnel binding, and requires the exact
+single unified `iris-full` connector binding plus its canonical machine UUID. Any missing, stale or contradictory field
 remains **BLOCKED**.
 Use `iris_acceptance down` only for the acceptance root whose identity was
 verified by the wrapper.
