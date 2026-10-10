@@ -14,11 +14,21 @@ The unified setup command is a fresh-install command. It refuses an existing reg
 2. Resolve the intended IRIS data root and confirm it is outside the source checkout. Do not inspect or mutate another machine's root.
 3. For a disposable or parallel target, run `scripts/iris-acceptance.mjs` with the verified root and protected roots for every command. For an existing owner installation, set `IRIS_RUNTIME_DATA_ROOT` explicitly for each command; never rely on a remembered shell export. Run the correctly scoped `doctor`, `status` and `connectors` checks while the installation is still observable. Save only redacted status output.
 4. Record project and workspace identifiers, connector labels, tunnel IDs, runtime identity, checkpoint location, and the list of IRIS-owned paths. Do not copy secret contents into the evidence.
-5. Quiesce through the owner-approved lifecycle procedure. A backup is not consistent while an uncontrolled writer can mutate the data root.
-6. Copy only the known IRIS-owned data root, credential directory and managed LaunchAgent metadata to a private backup destination. Preserve file modes and symlinks; exclude source checkouts and registered project repositories.
-7. Verify the backup manifest, byte counts and hashes from a separate read-only pass. An incomplete or unverifiable backup is a hard stop.
-
-The current candidate does not provide a production snapshot or writer-fence command. Production backup consistency remains **UNVERIFIED**.
+5. With the intended daemon observable, set the owner token only in `IRIS_OWNER_ACCESS_TOKEN` and inspect the persisted writer inventory:
+   `pnpm --filter @iris/runtime safety inspect --data-root "$IRIS_RUNTIME_DATA_ROOT"`.
+6. Quiesce through the owner-local fence, explicitly reporting only independently observed external runners:
+   `pnpm --filter @iris/runtime safety quiesce --data-root "$IRIS_RUNTIME_DATA_ROOT" --writer supervisor=IDLE,external-runners=IDLE`.
+   A `BLOCKED` result is a hard stop. Do not substitute PID removal, recursive copying, or LaunchAgent removal.
+7. Create and verify a new private destination outside the data root:
+   `pnpm --filter @iris/runtime safety backup --data-root "$IRIS_RUNTIME_DATA_ROOT" --destination "$IRIS_BACKUP_ROOT"`,
+   followed by `pnpm --filter @iris/runtime safety verify --data-root "$IRIS_RUNTIME_DATA_ROOT" --backup "$IRIS_BACKUP_ROOT"`.
+   The manifest hashes every regular durable file and contains identity metadata without file contents or secrets.
+8. Restore drills are disposable-only and never resume jobs:
+   `pnpm --filter @iris/runtime safety restore --data-root "$IRIS_RUNTIME_DATA_ROOT" --backup "$IRIS_BACKUP_ROOT" --destination "$IRIS_RESTORE_ROOT" --disposable true`.
+   Readiness remains blocked until both backup and restore evidence are recorded.
+9. After the owner window, inspect `safety readiness`; release a verified fence
+   with `safety unfence`, or recover a blocked fence only after fresh idle
+   observations using `safety recover --writer supervisor=IDLE,external-runners=IDLE`.
 
 ## Explicit migration
 
@@ -51,4 +61,4 @@ Source rollback is separate: use a fresh checkout at the known-good commit and k
 
 ## Current gate
 
-Disposable activation and unknown-outcome fixtures pass. Production writer fencing, consistent backup/restore, legacy migration execution, and live rollback remain **UNVERIFIED/BLOCKED** until an owner-authorized acceptance exercise supplies real evidence.
+The candidate now has an owner-authenticated writer fence, manifest/hash backup, and disposable restore drill with focused tests. Production quiescence, provider ownership, legacy migration execution, and live rollback remain **UNVERIFIED/BLOCKED** until an owner-authorized acceptance exercise supplies real evidence.

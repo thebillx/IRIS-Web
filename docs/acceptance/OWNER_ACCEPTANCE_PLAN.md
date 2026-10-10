@@ -163,16 +163,19 @@ from `/Users/RARW/iris`. The data files showed 20 `RUNNING` mission records;
 supported quiescence of jobs, sessions and writers was not established.
 
 `LIVE_QUIESCENCE = BLOCKED` until the owner supplies a supported fence and
-observes the resulting idle state. The candidate has no production snapshot or
-writer-fence command. A normal recursive copy, PID removal, or LaunchAgent
-removal is not a backup or quiescence procedure.
+observes the resulting idle state. The candidate owner-local safety CLI now
+provides that fence and a consistent disposable backup/restore drill. It must
+be run with `IRIS_OWNER_ACCESS_TOKEN` set in the environment and an explicit
+data root; it never prints the token or exposes a public MCP tool. A normal
+recursive copy, PID removal, or LaunchAgent removal is not a backup or
+quiescence procedure.
 
 | Window step | Expected observation | Abort condition | Recovery / evidence | Approval boundary |
 |---|---|---|---|---|
 | Before window | Owner names the Mac, candidate checkout/HEAD, maintenance period, backup destination, tunnel identity, live source/data roots, ports, LaunchAgent and active jobs/sessions | Any identity, backup, provider or active-work ambiguity | Leave live IRIS untouched; retain redacted inventory and ask the owner | Owner authorizes downtime and the exact candidate |
 | Reconfirm baseline | Read-only identity and process/port/LaunchAgent records match the recorded baseline | Source, runtime, machine, port or LaunchAgent identity differs unexpectedly | Stop before mutation; record the difference | Owner reviews the discrepancy |
-| Quiesce and fence | A supported owner-controlled lifecycle reports writers stopped and active work handled | No supported fence, `RUNNING` work cannot be explained, or sessions remain active | Keep the live stack running; mark `LIVE_QUIESCENCE = BLOCKED` | Owner supplies or approves the supported fence |
-| Backup and verify | An approved backup product or supported snapshot returns a complete manifest and independently verified hashes | No consistency guarantee, incomplete manifest, failed restore drill, or secret exposure | Do not start the candidate; preserve live state | Owner approves the backup evidence |
+| Quiesce and fence | `pnpm --filter @iris/runtime safety quiesce --data-root "$IRIS_RUNTIME_DATA_ROOT" --writer supervisor=IDLE,external-runners=IDLE` returns `QUIESCED` after `inspect` shows the required writers idle | Any `BLOCKED`, unknown writer, unexplained `RUNNING` work, or active session | Keep the live stack running; use `recover` only after independently observing every writer idle | Owner supplies the token and approves the observation |
+| Backup and verify | `pnpm --filter @iris/runtime safety backup ...` returns a manifest and `safety verify ...` passes; then run the disposable `restore ... --disposable true` drill | No consistency guarantee, incomplete manifest, failed restore drill, or secret exposure | Do not start the candidate; preserve live state | Owner approves the backup evidence |
 | Candidate preflight/start | Fresh wrapper preflight passes; all required ports are free; provider ownership and local process ownership are proven | Any occupied port, global LaunchAgent collision, stale tunnel, or wrapper block | Do not adopt or kill the owner; preserve the candidate root and diagnostics | Separate approval is required for real startup |
 | Validate | Owner UI selects the intended connector; one read-only `/mcp` identity/status call returns the expected machine/runtime/tunnel; wrong credential is rejected | Connector ambiguity, identity mismatch, mutation, or unknown result | Stop only the owned candidate through its supported lifecycle; inspect before retrying | Owner observes and records the result |
 | Restore live IRIS | Original source/data/LaunchAgent identities, catalog and durable state are verified after supported restart | Any failed or ambiguous restoration | Stop; do not replay mutations or restore state blindly | Owner confirms the maintenance window is closed |
@@ -181,6 +184,13 @@ The current wrapper intentionally blocks real remote startup while tunnel
 ownership is `UNVERIFIED`; no bypass is permitted. Source rollback and data
 restoration remain separate operations. If any step lacks the stated supported
 operation, mark it **BLOCKED** rather than substituting a guessed command.
+
+After the owner window, release the candidate fence only with the owner-local
+command `pnpm --filter @iris/runtime safety unfence --data-root
+"$IRIS_RUNTIME_DATA_ROOT"`. If a fence is `BLOCKED` or
+`RECOVERY_REQUIRED`, use `safety recover` with fresh `supervisor=IDLE` and
+`external-runners=IDLE` observations; never force the state or edit the safety
+file.
 
 ## LaunchAgent and two-machine isolation
 

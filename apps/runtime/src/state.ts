@@ -23,6 +23,7 @@ import { LocalDevelopmentAgentExecutor, type AgentExecutor } from './agent-execu
 import { FoundationStateStore } from './persistence.js';
 import { MissionLedgerStore, missionArchiveEligible } from './mission-store.js';
 import { inspectRegistrationRoot } from './project-path.js';
+import type { ProductionSafetyController } from './production-safety.js';
 
 const MAX_INSTRUCTION_CHARS = 8_000;
 const MAX_INTERACTION_EVENTS = 200;
@@ -52,6 +53,7 @@ export class RuntimeState {
     private readonly store: FoundationStateStore,
     private readonly executor: AgentExecutor = new LocalDevelopmentAgentExecutor(),
     private readonly missionStore: MissionLedgerStore = new MissionLedgerStore(store.dataRoot),
+    private readonly safety?: ProductionSafetyController,
   ) {
     this.dataRoot = store.dataRoot;
   }
@@ -874,15 +876,20 @@ export class RuntimeState {
   }
 
   private serializeMissionMutation<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.missionMutationTail.then(operation, operation);
+    const result = this.missionMutationTail.then(() => this.withSafety('mission-state', operation), () => this.withSafety('mission-state', operation));
     this.missionMutationTail = result.then(() => undefined, () => undefined);
     return result;
   }
 
   private serializeMachineMutation<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.mutationTail.then(operation, operation);
+    const result = this.mutationTail.then(() => this.withSafety('runtime-state', operation), () => this.withSafety('runtime-state', operation));
     this.mutationTail = result.then(() => undefined, () => undefined);
     return result;
+  }
+
+  private async withSafety<T>(writer: string, operation: () => Promise<T>): Promise<T> {
+    const lease = this.safety === undefined ? null : await this.safety.beginMutation(writer);
+    try { return await operation(); } finally { await lease?.release(); }
   }
 
   private touchClient(clientId: string): void {
