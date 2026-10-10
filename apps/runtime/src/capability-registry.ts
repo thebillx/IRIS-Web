@@ -1,6 +1,7 @@
 import type { CapabilityDefinition, CapabilityId } from '@iris/domain';
 
 const DEFINITIONS: readonly CapabilityDefinition[] = [
+  { id: 'repository.reconcile', title: 'Reconcile repository device identity', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: true },
   { id: 'runtime.status', title: 'Read runtime status', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },
   { id: 'project.list', title: 'List registered projects', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },
   { id: 'project.info', title: 'Read registered project metadata', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
@@ -52,6 +53,7 @@ const DEFINITIONS: readonly CapabilityDefinition[] = [
   { id: 'shell.run', title: 'Run governed local process synchronously', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'shell.start', title: 'Start governed durable local process', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },
   { id: 'job.status', title: 'Read governed durable job status', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
+  { id: 'job.list', title: 'List governed durable jobs', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
   { id: 'job.logs', title: 'Read bounded governed durable job logs', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
   { id: 'job.result', title: 'Read governed durable job result', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },
   { id: 'job.cancel', title: 'Cancel verified governed durable job process group', riskClass: 'MODERATE', requiredScope: 'PROJECT', mutation: true, implemented: true },

@@ -15,7 +15,7 @@ import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, isSupporte
 import { observeProcessStart } from './macos-safety.js';
 import { proMcpToolDefinitions } from './mcp.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
-import { loadOrCreateRuntimeId, readEndpoint, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
+import { loadOrCreateRuntimeId, readEndpoint, readOwnerAccessSecret, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
 import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
@@ -106,6 +106,8 @@ interface SupervisorStateDocument {
   readonly supervisorId: string;
   readonly updatedAt: string;
   readonly workloadSourceRoot: string;
+  readonly workloadDesiredState: 'ON' | 'OFF';
+  readonly stackDesiredState: 'UP' | 'DOWN';
   readonly runtime: OwnedProcess | null;
   readonly web: OwnedProcess | null;
   readonly admin: OwnedProcess | null;
@@ -155,7 +157,7 @@ export interface SupervisorCatalogStatus {
   readonly state: CatalogActivationState;
   readonly sourceMode: 'STRICT_CONTROL_SOURCE' | 'BOUND_WORKLOAD_COMPATIBILITY';
   readonly full: CatalogProfileStatus;
-  readonly pro: CatalogProfileStatus;
+  readonly pro: CatalogProfileStatus | null;
   readonly runtimeId: string | null;
   readonly instanceId: string | null;
   readonly deploymentEpoch: number;
@@ -230,7 +232,90 @@ export class Supervisor {
 
   public async up(): Promise<SupervisorStackStatus> {
     await this.prepareDirectories();
-    return this.withOperationLock('up', () => this.upUnlocked());
+    return this.withOperationLock('up', async () => {
+      const state = await this.readState();
+      if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
+      return this.upUnlocked();
+    });
+  }
+
+  /** Start only the workload while retaining the supervisor-owned control plane. */
+  public async workloadOn(): Promise<SupervisorStackStatus> {
+    await this.prepareDirectories();
+    try {
+      return await this.withOperationLock('workload-on', async () => {
+        const state = await this.readState();
+        if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
+        return this.upUnlocked();
+      });
+    } catch (error: unknown) {
+      if (!(error instanceof RuntimeError) || error.code !== 'SUPERVISOR_BUSY') throw error;
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        if (!existsSync(path.join(this.supervisorDirectory(), OPERATION_LOCK_FILE))) {
+          const state = await this.readState();
+          const observed = await runtimeStatus(this.dataRoot);
+          const registry = await readConnectorRegistry(this.dataRoot);
+          const full = registry?.connectors.find((binding) => binding.connectorId === 'iris-full');
+          const tunnelBound = state.tunnels.full !== null && observed.endpoint !== null && full !== undefined
+            && state.tunnels.full.runtimeId === observed.endpoint.runtimeId
+            && state.tunnels.full.instanceId === observed.endpoint.instanceId
+            && state.tunnels.full.deploymentEpoch === registry?.deploymentEpoch;
+          if (state.workloadDesiredState === 'ON' && observed.state === 'running' && tunnelBound) {
+            const current = await this.status();
+            if (current.runtime.state === 'READY' && current.tunnel.state === 'READY' && current.controlPlane.state === 'READY'
+              && current.connectors.every((connector) => connector.state === 'READY')) return current;
+          }
+        }
+        await delay(50);
+      }
+      throw error;
+    }
+  }
+
+  /** Stop only the verified workload; gateway/admin/tunnel processes remain owned. */
+  public async workloadOff(): Promise<SupervisorStackStatus> {
+    await this.prepareDirectories();
+    return this.withOperationLock('workload-off', () => this.workloadOffUnlocked());
+  }
+
+  /** Restart only the workload while retaining supervisor-owned control processes. */
+  public async workloadRestart(): Promise<SupervisorStackStatus> {
+    await this.prepareDirectories();
+    return this.withOperationLock('workload-restart', async () => {
+      const state = await this.readState();
+      if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
+      await this.workloadOffUnlocked();
+      const stopped = await this.readState();
+      await this.writeState({ ...stopped, workloadDesiredState: 'ON' });
+      return this.upUnlocked();
+    });
+  }
+
+  private async workloadOffUnlocked(): Promise<SupervisorStackStatus> {
+    let state = await this.readState();
+    const observed = await runtimeStatus(this.dataRoot);
+    if (state.runtime === null) {
+      if (observed.state === 'running' || observed.state === 'indeterminate') {
+        throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'A running or indeterminate workload is not supervisor-owned');
+      }
+      if (observed.state === 'stale') {
+        throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Workload shutdown cannot proceed while runtime authority is stale');
+      }
+      if (state.workloadDesiredState !== 'OFF' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'OFF', stackDesiredState: state.stackDesiredState === 'DOWN' ? 'DOWN' : 'UP' });
+      return this.status();
+    }
+    if (observed.state === 'running') {
+      assertRuntimeOwnership(state.runtime, observed);
+      await stopRuntime(this.dataRoot);
+    } else if (observed.state === 'stopped') {
+      await this.retireRuntime(state.runtime, observed);
+    } else {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Workload authority cannot be verified for shutdown');
+    }
+    state = { ...state, runtime: null, workloadDesiredState: 'OFF', stackDesiredState: state.stackDesiredState === 'DOWN' ? 'DOWN' : 'UP' };
+    await this.writeState(state);
+    return this.status();
   }
 
   private async upUnlocked(expectedSourceIdentity?: ActivationSourceIdentity): Promise<SupervisorStackStatus> {
@@ -245,6 +330,9 @@ export class Supervisor {
     const registryChanged = registryResult.changed || boundRegistry.deploymentEpoch !== registryResult.registry.deploymentEpoch;
     let state = await this.readState();
     const started: Array<'runtime' | 'web' | 'admin' | 'full' | 'pro' | 'admin-tunnel'> = [];
+    if (boundRegistry.connectors.length === 1 && (state.tunnels.pro !== null || state.adminTunnel !== null)) {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Unified IRIS cannot adopt existing extra tunnel processes');
+    }
     try {
       const observed = await runtimeStatus(this.dataRoot);
       let runtimeReplaced = false;
@@ -314,13 +402,13 @@ export class Supervisor {
 
       state = await this.ensureAdmin(state, started);
       const profiles = await this.writeManagedProfiles(boundRegistry, runtime.endpoint.apiUrl);
-      if (this.nativeControlActive) {
+      if (this.nativeControlActive && boundRegistry.connectors.length > 1) {
         if (profiles.admin === null) throw new RuntimeError('PRECONDITION_FAILED', 'Persistent native supervisor control requires a dedicated ADMIN tunnel identity');
         state = await this.ensureAdminTunnel(state, boundRegistry, profiles.admin, started);
       }
       state = await this.ensureWeb(state, runtime.endpoint.apiUrl, started, runtimeReplaced, expectedSourceIdentity);
       state = await this.ensureTunnel(state, 'full', boundRegistry, profiles.full, runtime.endpoint.instanceId, started, runtimeReplaced);
-      state = await this.ensureTunnel(state, 'pro', boundRegistry, profiles.pro, runtime.endpoint.instanceId, started, runtimeReplaced);
+      if (profiles.pro !== null) state = await this.ensureTunnel(state, 'pro', boundRegistry, profiles.pro, runtime.endpoint.instanceId, started, runtimeReplaced);
       await this.writeState(state);
       const result = await this.statusFrom(state, boundRegistry, credentials);
       if (result.localRuntime.state === 'FAILED' || result.tunnel.state === 'FAILED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `IRIS stack did not reach local and tunnel readiness: ${JSON.stringify({ runtime: result.runtime, localRuntime: result.localRuntime, tunnel: result.tunnel, connectors: result.connectors })}`);
@@ -355,7 +443,7 @@ export class Supervisor {
       }
     }
     await this.stopAdmin(state.admin);
-    const cleared = emptyState(state.supervisorId, state.workloadSourceRoot);
+    const cleared = { ...emptyState(state.supervisorId, state.workloadSourceRoot), workloadDesiredState: 'OFF' as const, stackDesiredState: 'DOWN' as const };
     await this.writeState(cleared);
     return this.status();
   }
@@ -363,7 +451,11 @@ export class Supervisor {
   public async restart(): Promise<SupervisorStackStatus> {
     await this.prepareDirectories();
     return this.withOperationLock('restart', async () => {
+      const state = await this.readState();
+      if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
       await this.downUnlocked();
+      const cleared = await this.readState();
+      await this.writeState({ ...cleared, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
       return this.upUnlocked();
     });
   }
@@ -445,7 +537,7 @@ export class Supervisor {
     }
     const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
     const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
-    if (full === undefined || pro === undefined || full.runtimeId === null || pro.runtimeId === null) {
+    if (full === undefined || full.runtimeId === null || (pro !== undefined && pro.runtimeId === null)) {
       throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'FULL and PRO runtime-bound connector identities are required before target catalog probing');
     }
     const baselineStatus = await this.catalogStatus();
@@ -462,9 +554,8 @@ export class Supervisor {
     try {
       await initializeConnectorRegistry(probeDataRoot, {
         fullTunnelId: full.tunnelId,
-        proTunnelId: pro.tunnelId,
         fullHealthPort: full.healthPort,
-        proHealthPort: pro.healthPort,
+        ...(pro === undefined ? { unified: true } : { proTunnelId: pro.tunnelId, proHealthPort: pro.healthPort }),
       });
       const probeRuntimeId = await loadOrCreateRuntimeId(probeDataRoot);
       await bindConnectorRuntime(probeDataRoot, probeRuntimeId);
@@ -475,7 +566,7 @@ export class Supervisor {
       }
       const probeFull = probeRegistry.connectors.find((connector) => connector.connectorId === 'iris-full');
       const probePro = probeRegistry.connectors.find((connector) => connector.connectorId === 'iris-pro');
-      if (probeFull === undefined || probePro === undefined) {
+      if (probeFull === undefined || (pro !== undefined && probePro === undefined)) {
         throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Isolated target catalog probe is missing FULL or PRO connector identity');
       }
 
@@ -498,35 +589,35 @@ export class Supervisor {
       });
       const [fullListed, proListed, fullIdentityResponse] = await Promise.all([
         postJson(`${probe.endpoint.apiUrl}${probeFull.mcpPath}`, { jsonrpc: '2.0', id: 1, method: 'tools/list' }, headersFor(probeFull, 'iris-supervisor-target-full')),
-        postJson(`${probe.endpoint.apiUrl}${probePro.mcpPath}`, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, headersFor(probePro, 'iris-supervisor-target-pro')),
+        probePro === undefined ? Promise.resolve(null) : postJson(`${probe.endpoint.apiUrl}${probePro.mcpPath}`, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, headersFor(probePro, 'iris-supervisor-target-pro')),
         postJson(`${probe.endpoint.apiUrl}${probeFull.mcpPath}`, {
           jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'catalog_identity', arguments: {} },
         }, { ...headersFor(probeFull, 'iris-supervisor-target-catalog'), 'Mcp-Name': 'catalog_identity' }),
       ]);
       const fullNames = toolNames(fullListed);
-      const proNames = toolNames(proListed);
-      if (fullNames.length === 0 || proNames.length === 0) {
+      const proNames = pro === undefined ? [] : toolNames(proListed);
+      if (fullNames.length === 0 || (pro !== undefined && proNames.length === 0)) {
         throw new RuntimeError('MCP_CATALOG_STALE', 'Target workload catalog probe did not return complete FULL and PRO tool lists');
       }
-      if (proNames.length !== pro.expectedToolNames.length || !proNames.every((name, index) => name === pro.expectedToolNames[index])) {
+      if (pro !== undefined && (proNames.length !== pro.expectedToolNames.length || !proNames.every((name, index) => name === pro.expectedToolNames[index]))) {
         throw new RuntimeError('PRECONDITION_FAILED', 'Target workload changes the PRO catalog; bounded Phase 5 activation permits a FULL catalog transition only');
       }
       const fullIdentity = catalogIdentityFromToolResponse(fullIdentityResponse);
       if (fullIdentity === null || fullIdentity.toolCount !== fullNames.length) {
         throw new RuntimeError('MCP_CATALOG_STALE', 'Target FULL catalog identity did not match its live tool list');
       }
-      const targetProDefinitions = listedToolDefinitions(proListed);
+      const targetProDefinitions = pro === undefined ? proMcpToolDefinitions() : listedToolDefinitions(proListed);
       const baselineVersionProIdentity = catalogIdentityAtVersion('PRO', targetProDefinitions, baselineFullIdentity.catalogVersion);
-      if (baselineVersionProIdentity.catalogHash !== pro.catalogHash) {
+      if (pro !== undefined && baselineVersionProIdentity.catalogHash !== pro.catalogHash) {
         throw new RuntimeError('PRECONDITION_FAILED', 'Target workload changes the bounded PRO catalog schema');
       }
       const proIdentity = catalogIdentityAtVersion('PRO', targetProDefinitions, fullIdentity.catalogVersion);
-      if (proIdentity.toolCount !== proNames.length) {
+      if (pro !== undefined && proIdentity.toolCount !== proNames.length) {
         throw new RuntimeError('MCP_CATALOG_STALE', 'Target PRO catalog identity did not match its live tool list');
       }
       manifest = {
         full: { expectedToolNames: fullNames, catalogHash: fullIdentity.catalogHash },
-        pro: { expectedToolNames: proNames, catalogHash: proIdentity.catalogHash },
+        pro: { expectedToolNames: pro === undefined ? catalogToolNames('PRO') : proNames, catalogHash: proIdentity.catalogHash },
       };
     } catch (error) {
       failure = error;
@@ -586,6 +677,7 @@ export class Supervisor {
       credentials: status.credentials,
       recovery: status.recovery,
       connectors: status.connectors,
+      workloadDesiredState: (await this.readState()).workloadDesiredState,
     };
   }
 
@@ -645,7 +737,9 @@ export class Supervisor {
     const serviceSecret = await readTunnelServiceSecret(this.dataRoot);
     if (serviceSecret === null) throw new RuntimeError('CREDENTIAL_MISSING', 'Tunnel service credential is required for runtime reconciliation');
     const full = await this.proveReconciledTunnel(state.tunnels.full, registry, 'full', runtime.endpoint, serviceSecret);
-    const pro = await this.proveReconciledTunnel(state.tunnels.pro, registry, 'pro', runtime.endpoint, serviceSecret);
+    const pro = registry.connectors.some((binding) => binding.mode === 'PRO')
+      ? await this.proveReconciledTunnel(state.tunnels.pro, registry, 'pro', runtime.endpoint, serviceSecret) : null;
+    if (pro === null && state.tunnels.pro !== null) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Unexpected tunnel in unified IRIS state');
     const before = {
       fullIdentity: ownedProcessIdentity(state.tunnels.full),
       proIdentity: ownedProcessIdentity(state.tunnels.pro),
@@ -658,7 +752,7 @@ export class Supervisor {
     if (currentRuntime.state !== 'running' || currentRuntime.endpoint === null || !sameEndpoint(currentRuntime.endpoint, runtime.endpoint)) {
       throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime identity changed before reconciliation could be persisted');
     }
-    if (await inspectProcess(full.record) !== 'running' || await inspectProcess(pro.record) !== 'running') {
+    if (await inspectProcess(full.record) !== 'running' || (pro !== null && await inspectProcess(pro.record) !== 'running')) {
       throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'A workload tunnel identity changed before reconciliation could be persisted');
     }
     state = {
@@ -666,7 +760,7 @@ export class Supervisor {
       runtime: adoptedRuntime,
       tunnels: {
         full: { ...full.record, instanceId: runtime.endpoint.instanceId },
-        pro: { ...pro.record, instanceId: runtime.endpoint.instanceId },
+        pro: pro === null ? null : { ...pro.record, instanceId: runtime.endpoint.instanceId },
       },
     };
     await this.writeState(state);
@@ -685,18 +779,18 @@ export class Supervisor {
       && ownedProcessIdentity(persisted.web) === before.webIdentity
       && persisted.runtime !== null && sameOwnedRuntime(persisted.runtime, adoptedRuntime)
       && persisted.tunnels.full?.instanceId === runtime.endpoint.instanceId
-      && persisted.tunnels.pro?.instanceId === runtime.endpoint.instanceId;
+      && (pro === null ? persisted.tunnels.pro === null : persisted.tunnels.pro?.instanceId === runtime.endpoint.instanceId);
     if (!anchorsPreserved) throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime reconciliation changed a protected process or workload anchor');
     await waitForTunnel(full.record.executable, full.binding.healthPort, 2_000);
-    await waitForTunnel(pro.record.executable, pro.binding.healthPort, 2_000);
+    if (pro !== null) await waitForTunnel(pro.record.executable, pro.binding.healthPort, 2_000);
     return {
       runtimePid: runtime.endpoint.pid,
       runtimeId: runtime.endpoint.runtimeId,
       instanceId: runtime.endpoint.instanceId,
       fullTunnelId: full.binding.tunnelId,
-      proTunnelId: pro.binding.tunnelId,
+      proTunnelId: pro?.binding.tunnelId ?? null,
       fullTunnelPid: full.record.pid,
-      proTunnelPid: pro.record.pid,
+      proTunnelPid: pro?.record.pid ?? null,
       deploymentEpoch: registry.deploymentEpoch,
       readiness: 'READY',
       workloadAnchorsPreserved: true,
@@ -721,6 +815,10 @@ export class Supervisor {
     }
     const nativeControl = await startSupervisorNativeControlServer(this.dataRoot, this.supervisorControlPort, {
       supervisorStatus: () => this.supervisorNativeStatus(),
+      supervisorDoctor: () => this.doctor(),
+      workloadOn: () => this.workloadOn(),
+      workloadOff: () => this.workloadOff(),
+      workloadRestart: () => this.workloadRestart(),
       adminStatus: () => this.adminNativeStatus(),
       runtimeReconcile: () => this.runtimeReconcile(),
       adminRecycle: (input) => this.adminRecycle(input),
@@ -733,7 +831,17 @@ export class Supervisor {
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     try {
-      await this.up();
+      const startupState = await this.readState();
+      if (startupState.stackDesiredState === 'UP' && startupState.workloadDesiredState === 'ON') await this.up();
+      else if (startupState.stackDesiredState === 'UP') {
+        try {
+          await this.withOperationLock('control-plane-off-recovery', () => this.recoverControlPlaneOffUnlocked());
+        } catch (error) {
+          const current = await this.readState().catch(() => null);
+          if (current?.stackDesiredState !== 'UP' || current.workloadDesiredState !== 'OFF') throw error;
+          // Keep the authenticated control path alive so the next recovery tick can retry.
+        }
+      }
       const state = await this.readState();
       if (state.recovery.windowStartedAt !== null && recoveryWindowExpired(state.recovery)) {
         await this.writeState({ ...state, recovery: emptyRecovery() });
@@ -756,8 +864,42 @@ export class Supervisor {
       await this.withOperationLock('automatic-recovery', () => this.monitorOnceUnlocked());
     } catch (error) {
       if (runtimeErrorCode(error) === 'SUPERVISOR_BUSY') return;
+      const state = await this.readState().catch(() => null);
+      if (state?.stackDesiredState === 'UP' && state.workloadDesiredState === 'OFF') return;
       throw error;
     }
+  }
+
+  private async recoverControlPlaneOffUnlocked(): Promise<SupervisorStackStatus> {
+    const credentials = await inspectCredentialStatus(this.dataRoot);
+    if (!credentials.controlPlaneApiKeyPresent) {
+      throw new RuntimeError(credentials.legacy.detected ? 'MIGRATION_REQUIRED' : 'CREDENTIAL_MISSING', 'A persistent control-plane credential is required before recovering the control plane');
+    }
+    const registry = await readConnectorRegistry(this.dataRoot);
+    if (registry === null) throw new RuntimeError('MIGRATION_REQUIRED', 'Connector registry is not initialized');
+    let state = await this.readState();
+    if (state.stackDesiredState !== 'UP') return this.status();
+    if (state.workloadDesiredState !== 'OFF') return this.upUnlocked();
+    const observed = await runtimeStatus(this.dataRoot);
+    if (state.runtime !== null || observed.state === 'running' || observed.state === 'indeterminate') {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Cannot recover an OFF control plane while workload runtime authority is active or ambiguous');
+    }
+    if (observed.state === 'stale') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Cannot recover an OFF control plane while workload runtime authority is stale');
+    const started: Array<'runtime' | 'web' | 'admin' | 'full' | 'pro' | 'admin-tunnel'> = [];
+    state = await this.ensureAdmin(state, started);
+    if (state.adminTunnel !== null && registry.admin !== null) {
+      state = await this.ensureAdminTunnel(state, registry, registry.admin.managedProfilePath, started);
+    }
+    for (const profile of ['full', 'pro'] as const) {
+      const current = state.tunnels[profile];
+      if (current === null) continue;
+      const binding = registry.connectors.find((candidate) => candidate.connectorId === (profile === 'full' ? 'iris-full' : 'iris-pro'));
+      if (binding === undefined || !existsSync(binding.managedProfilePath)) continue;
+      state = await this.ensureTunnel(state, profile, registry, binding.managedProfilePath, current.instanceId ?? '', started, false);
+    }
+    state = { ...state, runtime: null, workloadDesiredState: 'OFF', stackDesiredState: 'UP' };
+    await this.writeState(state);
+    return this.statusFrom(state, registry, credentials);
   }
 
   public async supervisorNativeStatus(): Promise<Record<string, unknown>> {
@@ -774,13 +916,24 @@ export class Supervisor {
     const adminChildEnvironmentDigest = state.admin?.environmentDigest ?? null;
     const adminChildWorkingDirectory = state.admin?.workingDirectory ?? null;
     const adminSourceCoherent = await adminProcessMatchesControlSource(state.admin, this.sourceRoot);
+    const workloadConnector = registry?.connectors.find((connector) => connector.connectorId === 'iris-full') ?? null;
+    const workloadTunnel = await this.probeTunnel(state.tunnels.full, workloadConnector);
+    const readiness = state.stackDesiredState === 'UP' && (observed.state === 'running' || (observed.state === 'stopped' && state.workloadDesiredState === 'OFF'))
+      && state.admin !== null && (registry?.connectors.length === 1 || state.adminTunnel !== null) && adminSourceCoherent && workloadTunnel.state === 'READY' ? 'READY' : 'DEGRADED';
     return {
       supervisorControlOwner: 'OUTER_SUPERVISOR_DAEMON',
       supervisorProcessId: process.pid,
       supervisorProcessIdentity: currentProcessIdentity(),
       controlSourceRoot: this.sourceRoot,
       protectedReferenceRoot: this.protectedReferenceRoot ?? null,
-      readiness: observed.state === 'running' && state.admin !== null && state.adminTunnel !== null && adminSourceCoherent ? 'READY' : 'DEGRADED',
+      state: readiness,
+      readiness,
+      machineId: workloadConnector?.machineId ?? registry?.admin?.machineId ?? null,
+      tunnel: workloadTunnel,
+      affectedJobs: null,
+      stackDesiredState: state.stackDesiredState,
+      workloadDesiredState: state.workloadDesiredState,
+      workloadState: observed.state === 'running' ? 'ON' : observed.state === 'stopped' && state.workloadDesiredState === 'OFF' ? 'OFF' : 'UNKNOWN',
       workloadRuntimeId: observed.endpoint?.runtimeId ?? null,
       workloadInstanceId: observed.endpoint?.instanceId ?? null,
       workloadCatalogId: typeof admin.fullCatalogId === 'string' ? admin.fullCatalogId : null,
@@ -1085,10 +1238,10 @@ export class Supervisor {
         : profile;
     }) ?? registry.connectors.map((binding) => catalogProfileStatus(binding, expectedSource(binding), null, [], false));
     const fullBinding = registry.connectors.find((binding) => binding.mode === 'FULL')!;
-    const proBinding = registry.connectors.find((binding) => binding.mode === 'PRO')!;
+    const proBinding = registry.connectors.find((binding) => binding.mode === 'PRO');
     const full = profiles.find((profile) => profile.profile === 'FULL') ?? catalogProfileStatus(fullBinding, expectedSource(fullBinding), null, [], false);
-    const pro = profiles.find((profile) => profile.profile === 'PRO') ?? catalogProfileStatus(proBinding, expectedSource(proBinding), null, [], false);
-    const state = catalogActivationState([full, pro]);
+    const pro = proBinding === undefined ? null : profiles.find((profile) => profile.profile === 'PRO') ?? catalogProfileStatus(proBinding, expectedSource(proBinding), null, [], false);
+    const state = catalogActivationState(pro === null ? [full] : [full, pro]);
     return {
       state,
       sourceMode: strictCatalog ? 'STRICT_CONTROL_SOURCE' : 'BOUND_WORKLOAD_COMPATIBILITY',
@@ -1120,6 +1273,12 @@ export class Supervisor {
   }
 
   private async monitorOnceUnlocked(): Promise<void> {
+    const state = await this.readState();
+    if (state.workloadDesiredState === 'OFF') {
+      if (state.stackDesiredState === 'DOWN') return;
+      await this.recoverControlPlaneOffUnlocked();
+      return;
+    }
     const current = await this.status();
     const controlledTransition = current.localRuntime.state === 'DEGRADED'
       && current.localRuntime.code === 'CATALOG_IDENTITY_UNVERIFIED';
@@ -1135,7 +1294,6 @@ export class Supervisor {
       }
       return;
     }
-    const state = await this.readState();
     if (state.recovery.terminal) return;
     if (state.recovery.nextAttemptAt !== null && Date.parse(state.recovery.nextAttemptAt) > Date.now()) return;
     const windowStartedAt = state.recovery.windowStartedAt === null || recoveryWindowExpired(state.recovery)
@@ -1161,23 +1319,26 @@ export class Supervisor {
   }
 
   private async statusFrom(state: SupervisorStateDocument, registry: ConnectorRegistryDocument, credentials: CredentialStatus): Promise<SupervisorStackStatus> {
+    const unified = registry.connectors.length === 1;
     const runtime = await runtimeStatus(this.dataRoot);
+    const controlGatewayRetained = state.stackDesiredState === 'UP' && (state.admin !== null || state.adminTunnel !== null || this.nativeControlActive);
     const runtimeLayer = runtime.state === 'running' && state.runtime !== null
       ? ownershipLayer(state.runtime, runtime)
-      : runtime.state === 'stopped' && state.runtime === null ? layer('FAILED', 'RUNTIME_NOT_RUNNING', 'IRIS runtime is stopped')
+      : runtime.state === 'stopped' && state.runtime === null && state.workloadDesiredState === 'OFF' && controlGatewayRetained ? layer('DEGRADED', 'WORKLOAD_OFF', 'IRIS workload is intentionally stopped; supervisor control remains available')
+        : runtime.state === 'stopped' && state.runtime === null ? layer('FAILED', 'RUNTIME_NOT_RUNNING', 'IRIS runtime is stopped')
         : layer('FAILED', runtime.reason === 'STALE_AUTHORITY' ? 'RUNTIME_IDENTITY_MISMATCH' : 'SUPERVISOR_NOT_RUNNING', runtime.reason ?? 'IRIS runtime is not supervisor-owned');
     const webLayer = await this.probeWeb(state.web);
     const adminLayer = await this.probeAdmin(state.admin);
     const tunnelResults = await Promise.all([
       this.probeTunnel(state.tunnels.full, registry.connectors.find((connector) => connector.connectorId === 'iris-full') ?? null),
-      this.probeTunnel(state.tunnels.pro, registry.connectors.find((connector) => connector.connectorId === 'iris-pro') ?? null),
+      unified && state.tunnels.pro === null ? Promise.resolve(layer('READY', 'NOT_REQUIRED', 'No second public tunnel is configured')) : this.probeTunnel(state.tunnels.pro, registry.connectors.find((connector) => connector.connectorId === 'iris-pro') ?? null),
     ]);
     const tunnelLayer = tunnelResults.every((result) => result.state === 'READY') ? layer('READY', 'READY', 'FULL and PRO workload tunnel clients are healthy') : combineLayers(tunnelResults, 'TUNNEL_NOT_RUNNING', 'One or more supervisor-owned workload tunnel clients is not ready');
-    const isolatedAdminRequired = this.nativeControlActive || state.adminTunnel !== null;
+    const isolatedAdminRequired = !unified && (this.nativeControlActive || state.adminTunnel !== null);
     const adminTunnelLayer = isolatedAdminRequired
       ? await this.probeAdminTunnel(state.adminTunnel)
       : layer('READY', 'LEGACY_ADMIN_TRANSPORT', 'Isolated admin tunnel is required only for the persistent native supervisor daemon');
-    const nativeControlLayer = isolatedAdminRequired
+    const nativeControlLayer = (this.nativeControlActive || isolatedAdminRequired)
       ? await this.probeNativeControl()
       : layer('READY', 'LEGACY_ADMIN_TRANSPORT', 'Native supervisor control is required only for the persistent native supervisor daemon');
     const local = runtimeLayer.state === 'READY' ? await this.localReadiness() : { status: layer('FAILED', runtimeLayer.code, 'L1 requires a ready runtime'), connectors: [], catalogs: [] };
@@ -1247,6 +1408,14 @@ export class Supervisor {
     } finally {
       await release();
     }
+  }
+
+  public async initializeUnified(tunnelId: string): Promise<ConnectorRegistryDocument> {
+    await this.prepareDirectories();
+    return this.withOperationLock('initialize-unified', async () => {
+      if (await readConnectorRegistry(this.dataRoot) !== null) throw new RuntimeError('PRECONDITION_FAILED', 'Connector setup already exists; explicit migration is required');
+      return initializeConnectorRegistry(this.dataRoot, { unified: true, fullTunnelId: tunnelId });
+    });
   }
 
   private async ensureRegistry(): Promise<{ readonly registry: ConnectorRegistryDocument; readonly changed: boolean }> {
@@ -1379,7 +1548,15 @@ export class Supervisor {
     const executable = path.join(state.workloadSourceRoot, 'apps/web/node_modules/.bin/vite');
     if (!existsSync(executable)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Web executable is unavailable; run pnpm install before iris up');
     if (await endpointResponds(`http://127.0.0.1:${this.webPort}/`)) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Web port ${this.webPort} is occupied by an unowned process`);
-    const record = await spawnManaged('web', executable, ['--host', '127.0.0.1', '--port', String(this.webPort)], path.join(state.workloadSourceRoot, 'apps/web'), { IRIS_RUNTIME_URL: runtimeUrl }, null, this.logDirectory(), 'vite');
+    const ownerAccessSecret = await readOwnerAccessSecret(this.dataRoot);
+    const tunnelServiceSecret = await readTunnelServiceSecret(this.dataRoot);
+    const webEnvironment = {
+      IRIS_RUNTIME_URL: runtimeUrl,
+      IRIS_SUPERVISOR_CONTROL_URL: `http://127.0.0.1:${this.supervisorControlPort}`,
+      ...(ownerAccessSecret === null ? {} : { IRIS_OWNER_ACCESS_SECRET: ownerAccessSecret }),
+      ...(tunnelServiceSecret === null ? {} : { IRIS_SUPERVISOR_CONTROL_SECRET: tunnelServiceSecret }),
+    };
+    const record = await spawnManaged('web', executable, ['--host', '127.0.0.1', '--port', String(this.webPort)], path.join(state.workloadSourceRoot, 'apps/web'), webEnvironment, null, this.logDirectory(), 'vite');
     const next = { ...state, web: record };
     await this.writeState(next);
     started.push('web');
@@ -1460,7 +1637,8 @@ export class Supervisor {
       throw new RuntimeError('PRECONDITION_FAILED', `${profile} tunnel binding metadata does not match the active runtime binding`);
     }
     const expectedProfile = managedProfile(binding, credentialPaths(this.dataRoot).controlPlaneApiKey, credentialPaths(this.dataRoot).tunnelServiceAuthorization,
-      this.logDirectory(), registry.deploymentEpoch, endpoint.apiUrl, null);
+      this.logDirectory(), registry.deploymentEpoch, endpoint.apiUrl,
+      this.nativeControlActive && registry.connectors.length === 1 ? `http://127.0.0.1:${this.supervisorControlPort}/mcp` : null);
     const actualProfile = await readFile(binding.managedProfilePath, 'utf8').catch(() => null);
     if (actualProfile !== expectedProfile || await fileSha256(binding.managedProfilePath) !== record.profileDigest) {
       throw new RuntimeError('PRECONDITION_FAILED', `${profile} tunnel profile is not the verified active runtime profile`);
@@ -1548,16 +1726,19 @@ export class Supervisor {
     }
   }
 
-  private async writeManagedProfiles(registry: ConnectorRegistryDocument, runtimeApiUrl: string): Promise<{ readonly full: string; readonly pro: string; readonly admin: string | null }> {
+  private async writeManagedProfiles(registry: ConnectorRegistryDocument, runtimeApiUrl: string): Promise<{ readonly full: string; readonly pro: string | null; readonly admin: string | null }> {
     const credentials = credentialPaths(this.dataRoot);
     const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
     const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
-    if (full === undefined || pro === undefined) throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'FULL and PRO connector bindings are required');
+    if (full === undefined) throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'IRIS connector binding is required');
     const fullPath = full.managedProfilePath;
-    const proPath = pro.managedProfilePath;
+    const proPath = pro?.managedProfilePath ?? null;
     const adminPath = registry.admin?.managedProfilePath ?? null;
-    await writePrivateText(fullPath, managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
-    await writePrivateText(proPath, managedProfile(pro, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
+    const unifiedSupervisorMcpUrl = this.nativeControlActive && registry.connectors.length === 1
+      ? `http://127.0.0.1:${this.supervisorControlPort}/mcp`
+      : null;
+    await writePrivateText(fullPath, managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, unifiedSupervisorMcpUrl));
+    if (pro !== undefined && proPath !== null) await writePrivateText(proPath, managedProfile(pro, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
     if (registry.admin !== null && adminPath !== null) {
       await writePrivateText(adminPath, managedAdminProfile(registry.admin, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), this.adminTunnelHealthPort, `http://127.0.0.1:${this.supervisorControlPort}/mcp`));
     }
@@ -1619,6 +1800,21 @@ export class Supervisor {
         ...value,
         schemaVersion: 3,
         workloadSourceRoot: value.workloadSourceRoot ?? this.sourceRoot,
+        workloadDesiredState: value.workloadDesiredState === 'OFF' ? 'OFF' : 'ON',
+        stackDesiredState: value.stackDesiredState === 'DOWN'
+          ? 'DOWN'
+          : value.stackDesiredState === 'UP'
+            ? 'UP'
+            : value.workloadDesiredState === 'OFF'
+              && value.runtime === null
+              && value.web === null
+              && (value.admin === undefined || value.admin === null)
+              && (value.adminTunnel === undefined || value.adminTunnel === null)
+              && isRecord(value.tunnels)
+              && value.tunnels.full === null
+              && value.tunnels.pro === null
+              ? 'DOWN'
+              : 'UP',
         admin: value.admin ?? null,
         adminTunnel: value.adminTunnel ?? null,
         recovery: { ...emptyRecovery(), ...(value.recovery ?? {}), windowStartedAt: value.recovery?.windowStartedAt ?? null },
@@ -2233,7 +2429,7 @@ function currentProcessIdentity(): string {
 }
 
 function emptyState(supervisorId: string, workloadSourceRoot: string): SupervisorStateDocument {
-  return { schemaVersion: 3, supervisorId, updatedAt: new Date().toISOString(), workloadSourceRoot, runtime: null, web: null, admin: null, adminTunnel: null, tunnels: { full: null, pro: null }, recovery: emptyRecovery() };
+  return { schemaVersion: 3, supervisorId, updatedAt: new Date().toISOString(), workloadSourceRoot, workloadDesiredState: 'ON', stackDesiredState: 'UP', runtime: null, web: null, admin: null, adminTunnel: null, tunnels: { full: null, pro: null }, recovery: emptyRecovery() };
 }
 
 function emptyRecovery(): RecoveryRecord { return { attempts: 0, terminal: false, lastFailureCode: null, nextAttemptAt: null, windowStartedAt: null }; }
@@ -2279,6 +2475,8 @@ function isNotFound(error: unknown): boolean { return typeof error === 'object' 
 function isState(value: unknown): value is SupervisorStateDocument {
   if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2 && value.schemaVersion !== 3) || typeof value.supervisorId !== 'string'
     || !(value.workloadSourceRoot === undefined || typeof value.workloadSourceRoot === 'string' && path.isAbsolute(value.workloadSourceRoot) && !value.workloadSourceRoot.includes('\0') && path.resolve(value.workloadSourceRoot) === value.workloadSourceRoot)
+    || !(value.workloadDesiredState === undefined || value.workloadDesiredState === 'ON' || value.workloadDesiredState === 'OFF')
+    || !(value.stackDesiredState === undefined || value.stackDesiredState === 'UP' || value.stackDesiredState === 'DOWN')
     || !isRecord(value.tunnels)) return false;
   if (value.recovery !== undefined && !isRecord(value.recovery)) return false;
   return (value.runtime === null || isOwnedProcess(value.runtime)) && (value.web === null || isOwnedProcess(value.web))

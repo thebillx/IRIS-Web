@@ -18,7 +18,7 @@ export type ConnectorMode = 'FULL' | 'PRO';
 
 export interface ConnectorBinding {
   readonly connectorId: string;
-  readonly label: 'IRIS FULL' | 'IRIS PRO';
+  readonly label: 'IRIS' | 'IRIS FULL' | 'IRIS PRO';
   readonly mode: ConnectorMode;
   readonly tunnelId: string;
   readonly runtime: 'iris-local-runtime';
@@ -77,7 +77,7 @@ export interface ConnectorRegistryInspection {
 
 interface RawConnectorBinding {
   readonly connectorId: string;
-  readonly label: 'IRIS FULL' | 'IRIS PRO';
+  readonly label: 'IRIS' | 'IRIS FULL' | 'IRIS PRO';
   readonly mode: ConnectorMode;
   readonly tunnelId: string;
   readonly runtime: 'iris-local-runtime';
@@ -106,7 +106,8 @@ interface RawAdminConnectorBinding {
 
 export interface ConnectorSeed {
   readonly fullTunnelId: string;
-  readonly proTunnelId: string;
+  readonly proTunnelId?: string;
+  readonly unified?: boolean;
   readonly adminTunnelId?: string;
   readonly fullHealthPort?: number;
   readonly proHealthPort?: number;
@@ -211,17 +212,17 @@ export function createConnectorRegistry(
     updatedAt: now,
     connectors: [
       {
-        connectorId: 'iris-full', label: 'IRIS FULL', mode: 'FULL', tunnelId: seed.fullTunnelId,
+        connectorId: 'iris-full', label: seed.unified ? 'IRIS' : 'IRIS FULL', mode: 'FULL', tunnelId: seed.fullTunnelId,
         runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', expectedToolNames: fullMcpToolNames(), catalogFingerprint: catalogFingerprint(fullMcpToolNames()), catalogHash: catalogIdentity('FULL', fullMcpToolDefinitionsV21()).catalogHash,
         healthPort: seed.fullHealthPort ?? 8080, managedProfilePath: path.join(dataRoot, 'tunnel-profiles', 'iris-full.yaml'),
         machineId, runtimeId: null, deploymentEpoch, leaseGeneration,
       },
-      {
-        connectorId: 'iris-pro', label: 'IRIS PRO', mode: 'PRO', tunnelId: seed.proTunnelId,
-        runtime: 'iris-local-runtime', mcpProfile: 'READ_ONLY', mcpPath: '/mcp-pro', expectedToolNames: [...PRO_TOOL_NAMES], catalogFingerprint: catalogFingerprint(PRO_TOOL_NAMES), catalogHash: catalogIdentity('PRO', proMcpToolDefinitions()).catalogHash,
+      ...(!seed.unified ? [{
+        connectorId: 'iris-pro' as const, label: 'IRIS PRO' as const, mode: 'PRO' as const, tunnelId: seed.proTunnelId!,
+        runtime: 'iris-local-runtime' as const, mcpProfile: 'READ_ONLY' as const, mcpPath: '/mcp-pro' as const, expectedToolNames: [...PRO_TOOL_NAMES], catalogFingerprint: catalogFingerprint(PRO_TOOL_NAMES), catalogHash: catalogIdentity('PRO', proMcpToolDefinitions()).catalogHash,
         healthPort: seed.proHealthPort ?? 8081, managedProfilePath: path.join(dataRoot, 'tunnel-profiles', 'iris-pro.yaml'),
         machineId, runtimeId: null, deploymentEpoch, leaseGeneration,
-      },
+      }] : []),
     ],
     admin: seed.adminTunnelId === undefined ? null : {
       connectorId: 'iris-admin',
@@ -242,6 +243,7 @@ export async function updateConnectorRuntime(dataRoot: string, runtimeId: string
 export async function bindAdminTunnelIdentity(dataRoot: string, tunnelId: string): Promise<ConnectorRegistryDocument> {
   validateTunnelId(tunnelId, 'adminTunnelId');
   const current = await requireConnectorRegistry(dataRoot);
+  if (current.connectors.length === 1) throw new RuntimeError('PRECONDITION_FAILED', 'Unified IRIS keeps lifecycle recovery local');
   if (current.connectors.some((connector) => connector.tunnelId === tunnelId)) {
     throw new RuntimeError('PRECONDITION_FAILED', 'ADMIN tunnel identity must be distinct from FULL and PRO tunnel identities');
   }
@@ -408,6 +410,13 @@ function scalar(content: string, key: string): string | null {
 
 function validateSeedTunnelIds(seed: ConnectorSeed): void {
   validateTunnelId(seed.fullTunnelId, 'fullTunnelId');
+  if (seed.unified) {
+    if (seed.proTunnelId !== undefined || seed.adminTunnelId !== undefined) {
+      throw new RuntimeError('INVALID_REQUEST', 'Unified IRIS accepts one public tunnel identity');
+    }
+    return;
+  }
+  if (seed.proTunnelId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Legacy setup requires a PRO tunnel identity');
   validateTunnelId(seed.proTunnelId, 'proTunnelId');
   if (seed.fullTunnelId === seed.proTunnelId) {
     throw new RuntimeError('INVALID_REQUEST', 'FULL and PRO tunnel identities must be distinct');
@@ -426,7 +435,7 @@ function validateTunnelId(value: string, name: string): void {
 
 function normalizeRegistry(value: unknown, dataRoot: string): { readonly registry: ConnectorRegistryDocument; readonly changed: boolean; readonly staleConnectorIds: readonly string[] } {
   if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2 && value.schemaVersion !== 3) || !isPositiveSafeInteger(value.deploymentEpoch)
-    || typeof value.updatedAt !== 'string' || !Array.isArray(value.connectors) || value.connectors.length !== 2) {
+    || typeof value.updatedAt !== 'string' || !Array.isArray(value.connectors) || ![1, 2].includes(value.connectors.length)) {
     throw new Error('invalid registry schema');
   }
   const deploymentEpoch = value.deploymentEpoch as number;
@@ -434,7 +443,7 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
   const validShape = value.connectors.every((candidate): candidate is RawConnectorBinding => {
     if (!isRawConnector(candidate) || ids.has(candidate.connectorId)) return false;
     ids.add(candidate.connectorId);
-    return (candidate.label === 'IRIS FULL' || candidate.label === 'IRIS PRO')
+    return (candidate.label === 'IRIS' || candidate.label === 'IRIS FULL' || candidate.label === 'IRIS PRO')
       && (candidate.mode === 'FULL' || candidate.mode === 'PRO')
       && typeof candidate.tunnelId === 'string' && TUNNEL_ID_PATTERN.test(candidate.tunnelId)
       && candidate.runtime === 'iris-local-runtime'
@@ -452,13 +461,15 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
   const full = rawConnectors.find((candidate) => candidate.connectorId === 'iris-full');
   const pro = rawConnectors.find((candidate) => candidate.connectorId === 'iris-pro');
   const rawAdmin = value.admin === undefined || value.admin === null ? null : isRawAdminConnector(value.admin) ? value.admin : undefined;
-  if (!validShape || full === undefined || pro === undefined
-    || !isExpectedBinding(full, 'iris-full', 'IRIS FULL', 'FULL', '/mcp')
-    || !isExpectedBinding(pro, 'iris-pro', 'IRIS PRO', 'PRO', '/mcp-pro') || rawAdmin === undefined) {
+  const unified = value.connectors.length === 1;
+  if (!validShape || full === undefined
+    || !isExpectedBinding(full, 'iris-full', unified ? 'IRIS' : 'IRIS FULL', 'FULL', '/mcp')
+    || (!unified && (pro === undefined || !isExpectedBinding(pro, 'iris-pro', 'IRIS PRO', 'PRO', '/mcp-pro')))
+    || (unified && rawAdmin !== null) || rawAdmin === undefined) {
     throw new Error('invalid connector identity');
   }
   if (rawAdmin !== null) {
-    if (rawAdmin.tunnelId === full.tunnelId || rawAdmin.tunnelId === pro.tunnelId) throw new Error('admin tunnel identity overlaps workload connector');
+    if (rawAdmin.tunnelId === full.tunnelId || rawAdmin.tunnelId === pro?.tunnelId) throw new Error('admin tunnel identity overlaps workload connector');
     if (!path.isAbsolute(rawAdmin.managedProfilePath)
       || !samePhysicalPath(rawAdmin.managedProfilePath, path.join(dataRoot, 'tunnel-profiles', 'iris-admin.yaml'))) {
       throw new Error('invalid admin connector profile path');
@@ -546,7 +557,7 @@ function normalizeRegistry(value: unknown, dataRoot: string): { readonly registr
 function isRawConnector(value: unknown): value is RawConnectorBinding {
   return isRecord(value)
     && typeof value.connectorId === 'string'
-    && (value.label === 'IRIS FULL' || value.label === 'IRIS PRO')
+    && (value.label === 'IRIS' || value.label === 'IRIS FULL' || value.label === 'IRIS PRO')
     && (value.mode === 'FULL' || value.mode === 'PRO')
     && typeof value.tunnelId === 'string'
     && value.runtime === 'iris-local-runtime'

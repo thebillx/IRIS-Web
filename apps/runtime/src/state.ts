@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -23,10 +24,13 @@ import { LocalDevelopmentAgentExecutor, type AgentExecutor } from './agent-execu
 import { FoundationStateStore } from './persistence.js';
 import { MissionLedgerStore, missionArchiveEligible } from './mission-store.js';
 import { inspectRegistrationRoot } from './project-path.js';
+import type { ProductionSafetyController } from './production-safety.js';
+import { primaryWorkspaceId, VNextResourceRegistry } from './resource-registry.js';
 
 const MAX_INSTRUCTION_CHARS = 8_000;
 const MAX_INTERACTION_EVENTS = 200;
 const MAX_EXECUTOR_OUTPUT_CHARS = 12_000;
+const SESSION_FILE = 'sessions.json';
 
 export interface MissionRebindInput {
   readonly missionId: string;
@@ -38,13 +42,38 @@ export interface MissionRebindInput {
   readonly principal?: 'owner' | 'tunnel-service';
 }
 
+interface PersistedSession {
+  readonly snapshot: RuntimeSessionSnapshot;
+  readonly submissions: readonly { readonly id: string; readonly instruction: string }[];
+  readonly binding?: SessionBinding;
+}
+
+interface SessionDocument {
+  readonly schemaVersion: 2;
+  readonly authority: SessionAuthority | null;
+  readonly sessions: readonly PersistedSession[];
+}
+
+export interface SessionBinding {
+  readonly projectId: string | null;
+  readonly workspaceId: string | null;
+}
+
+export interface SessionAuthority {
+  readonly machineId: string;
+  readonly runtimeId: string;
+}
+
 export class RuntimeState {
   private readonly sessions = new Map<string, RuntimeSessionSnapshot>();
   private readonly clients = new Map<string, RuntimeClientState>();
   private readonly activeSubmissions = new Map<string, string>();
   private readonly submissionBindings = new Map<string, Map<string, string>>();
+  private readonly sessionBindings = new Map<string, SessionBinding>();
+  private readonly invalidSessionBindings = new Set<string>();
   private mutationTail: Promise<void> = Promise.resolve();
   private missionMutationTail: Promise<void> = Promise.resolve();
+  private sessionsNeedPersistence = false;
 
   public readonly dataRoot: string;
 
@@ -52,8 +81,11 @@ export class RuntimeState {
     private readonly store: FoundationStateStore,
     private readonly executor: AgentExecutor = new LocalDevelopmentAgentExecutor(),
     private readonly missionStore: MissionLedgerStore = new MissionLedgerStore(store.dataRoot),
+    private readonly safety?: ProductionSafetyController,
+    private readonly sessionAuthority?: SessionAuthority,
   ) {
     this.dataRoot = store.dataRoot;
+    this.restoreSessions();
   }
 
   public executorDescriptor() {
@@ -167,21 +199,30 @@ export class RuntimeState {
         throw new RuntimeError('CONTROL_DENIED', 'Persisted mission project is no longer registered');
       }
     }
-    const now = new Date().toISOString();
-    const session: RuntimeSessionSnapshot = {
-      id: mission.sessionId,
-      clientId: mission.clientId,
-      agentId: mission.orchestratorMode === 'HERMES' ? 'hermes-loop-engineer' : 'chatgpt-direct-orchestrator',
-      agentRole: mission.orchestratorMode === 'HERMES' ? 'implementer' : 'owner',
-      createdAt: now,
-      currentProjectId: mission.projectId,
-      executionState: 'READY',
-      interactions: [],
-    };
-    this.sessions.set(session.id, session);
-    this.submissionBindings.set(session.id, new Map());
-    this.clients.set(session.clientId, { clientId: session.clientId, connected: true, lastSeenAt: now });
-    return session;
+    return this.serializeMachineMutation(async () => {
+      const current = this.sessions.get(mission.sessionId);
+      if (current !== undefined) return current;
+      const now = new Date().toISOString();
+      const session: RuntimeSessionSnapshot = {
+        id: mission.sessionId,
+        clientId: mission.clientId,
+        agentId: mission.orchestratorMode === 'HERMES' ? 'hermes-loop-engineer' : 'chatgpt-direct-orchestrator',
+        agentRole: mission.orchestratorMode === 'HERMES' ? 'implementer' : 'owner',
+        createdAt: now,
+        currentProjectId: mission.projectId,
+        executionState: 'READY',
+        interactions: [],
+      };
+      this.sessions.set(session.id, session);
+      this.submissionBindings.set(session.id, new Map());
+      this.sessionBindings.set(session.id, {
+        projectId: mission.projectId,
+        workspaceId: mission.projectId === null ? null : primaryWorkspaceId(mission.projectId),
+      });
+      this.clients.set(session.clientId, { clientId: session.clientId, connected: true, lastSeenAt: now });
+      this.persistSessions();
+      return session;
+    });
   }
 
   public createMission(clientIdInput: string, sessionIdInput: string, titleInput: string, orchestratorMode: OrchestratorMode = 'HERMES'): Promise<MissionSnapshot> {
@@ -620,6 +661,65 @@ export class RuntimeState {
   }
 
   public createSession(clientIdInput?: string, agentIdInput?: string, agentRoleInput: AgentRole = 'other'): RuntimeSessionSnapshot {
+    const session = this.createSessionInMemory(clientIdInput, agentIdInput, agentRoleInput);
+    if (this.safety === undefined) this.persistSessions();
+    else void this.serializeMachineMutation(async () => { this.persistSessions(); }).catch(() => undefined); // shortcut: legacy synchronous callers cannot await the fence; production capability routes use the durable API
+    return session;
+  }
+
+  public createSessionDurable(clientIdInput?: string, agentIdInput?: string, agentRoleInput: AgentRole = 'other'): Promise<RuntimeSessionSnapshot> {
+    return this.serializeMachineMutation(async () => {
+      const session = this.createSessionInMemory(clientIdInput, agentIdInput, agentRoleInput);
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.delete(session.id);
+        this.submissionBindings.delete(session.id);
+        this.sessionBindings.delete(session.id);
+        this.invalidSessionBindings.delete(session.id);
+        if (![...this.sessions.values()].some((candidate) => candidate.clientId === session.clientId)) this.clients.delete(session.clientId);
+        throw error;
+      }
+      return session;
+    });
+  }
+
+  public ensureSessionForProjectDurable(
+    clientIdInput: string,
+    agentIdInput: string,
+    agentRoleInput: AgentRole,
+    projectId: string,
+  ): Promise<RuntimeSessionSnapshot> {
+    return this.serializeMachineMutation(async () => {
+      const clientId = normalizeClientId(clientIdInput);
+      const existing = [...this.sessions.values()]
+        .filter((session) => session.clientId === clientId && session.agentId === agentIdInput && session.currentProjectId === projectId)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+      if (existing !== undefined) return existing;
+      if (!(await this.listProjects()).some((project) => project.id === projectId)) {
+        throw new RuntimeError('PROJECT_NOT_FOUND', 'Current project does not exist');
+      }
+      const previousClient = this.clients.get(clientId);
+      const created = this.createSessionInMemory(clientId, agentIdInput, agentRoleInput);
+      const session = { ...created, currentProjectId: projectId };
+      this.sessions.set(session.id, session);
+      this.sessionBindings.set(session.id, { projectId, workspaceId: primaryWorkspaceId(projectId) });
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.delete(session.id);
+        this.submissionBindings.delete(session.id);
+        this.sessionBindings.delete(session.id);
+        this.invalidSessionBindings.delete(session.id);
+        if (previousClient === undefined) this.clients.delete(clientId);
+        else this.clients.set(clientId, previousClient);
+        throw error;
+      }
+      return session;
+    });
+  }
+
+  private createSessionInMemory(clientIdInput?: string, agentIdInput?: string, agentRoleInput: AgentRole = 'other'): RuntimeSessionSnapshot {
     const clientId = normalizeClientId(clientIdInput ?? randomUUID());
     const agentId = normalizeAgentId(agentIdInput ?? randomUUID());
     const agentRole = normalizeAgentRole(agentRoleInput);
@@ -636,6 +736,7 @@ export class RuntimeState {
     };
     this.sessions.set(session.id, session);
     this.submissionBindings.set(session.id, new Map());
+    this.sessionBindings.set(session.id, { projectId: null, workspaceId: null });
     this.clients.set(clientId, { clientId, connected: true, lastSeenAt: now });
     return session;
   }
@@ -645,17 +746,174 @@ export class RuntimeState {
     const session = this.sessions.get(sessionId);
     if (session === undefined) throw new RuntimeError('SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
     if (session.clientId !== clientId) throw new RuntimeError('CONTROL_DENIED', 'Session does not belong to this client');
+    if (this.invalidSessionBindings.has(sessionId)) throw new RuntimeError('AUTHORITY_CHANGED', 'Session project or workspace binding is no longer authorized');
     this.touchClient(clientId);
     return session;
   }
 
-  public deleteSession(sessionId: string, clientIdInput: string): void {
+  public getSessionForDetach(sessionId: string, clientIdInput: string): RuntimeSessionSnapshot {
+    const clientId = normalizeClientId(clientIdInput);
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) throw new RuntimeError('SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
+    if (session.clientId !== clientId) throw new RuntimeError('CONTROL_DENIED', 'Session does not belong to this client');
+    this.touchClient(clientId);
+    return session;
+  }
+
+  public async revalidateSessionBindings(): Promise<void> {
+    const projects = await this.listProjects();
+    const resources = new VNextResourceRegistry(this, this.dataRoot);
+    for (const session of this.sessions.values()) {
+      const binding = this.sessionBindings.get(session.id);
+      if (binding === undefined || binding.projectId === null) {
+        this.invalidSessionBindings.delete(session.id);
+        continue;
+      }
+      if (!projects.some((project) => project.id === binding.projectId)) {
+        this.invalidSessionBindings.add(session.id);
+        continue;
+      }
+      try {
+        const workspace = await resources.getActiveWorkspace(binding.projectId, binding.workspaceId ?? '');
+        if (workspace.projectId !== binding.projectId || workspace.workspaceId !== binding.workspaceId) {
+          this.invalidSessionBindings.add(session.id);
+          continue;
+        }
+        this.invalidSessionBindings.delete(session.id);
+      } catch {
+        this.invalidSessionBindings.add(session.id);
+      }
+    }
+  }
+
+  public getSessionWorkspaceBinding(sessionId: string, clientIdInput: string): SessionBinding {
     const session = this.getSessionForClient(sessionId, clientIdInput);
+    return { ...(this.sessionBindings.get(session.id) ?? { projectId: session.currentProjectId, workspaceId: null }) };
+  }
+
+  public async assertSessionWorkspace(
+    sessionId: string,
+    clientIdInput: string,
+    projectId: string,
+    workspaceId: string,
+  ): Promise<void> {
+    const session = this.getSessionForClient(sessionId, clientIdInput);
+    const binding = this.sessionBindings.get(session.id);
+    if (session.currentProjectId !== projectId || binding?.projectId !== projectId || binding.workspaceId !== workspaceId) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Session is not authorized for the requested workspace');
+    }
+    try {
+      const workspace = await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(projectId, workspaceId);
+      if (workspace.projectId !== projectId || workspace.workspaceId !== workspaceId) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'Session workspace binding changed before use');
+      }
+    } catch (error) {
+      this.invalidSessionBindings.add(session.id);
+      if (error instanceof RuntimeError && error.code === 'AUTHORITY_CHANGED') throw error;
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Session workspace binding is no longer authorized', { cause: error });
+    }
+  }
+
+  public async bindSessionWorkspace(
+    sessionId: string,
+    clientIdInput: string,
+    projectId: string,
+    workspaceId: string,
+  ): Promise<RuntimeSessionSnapshot> {
+    return this.serializeMachineMutation(async () => {
+      const session = this.getSessionForClient(sessionId, clientIdInput);
+      if (session.currentProjectId !== projectId) throw new RuntimeError('CAPABILITY_DENIED', 'Workspace binding does not match the selected session project');
+      const workspace = await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(projectId, workspaceId);
+      const previous = this.sessionBindings.get(sessionId);
+      const previousInvalid = this.invalidSessionBindings.has(sessionId);
+      this.sessionBindings.set(sessionId, { projectId, workspaceId: workspace.workspaceId });
+      this.invalidSessionBindings.delete(sessionId);
+      try {
+        this.persistSessions();
+      } catch (error) {
+        if (previous === undefined) this.sessionBindings.delete(sessionId);
+        else this.sessionBindings.set(sessionId, previous);
+        if (previousInvalid) this.invalidSessionBindings.add(sessionId);
+        else this.invalidSessionBindings.delete(sessionId);
+        throw error;
+      }
+      return session;
+    });
+  }
+
+  public async selectSessionWorkspace(
+    sessionId: string,
+    clientIdInput: string,
+    projectId: string,
+    workspaceId: string,
+  ): Promise<RuntimeSessionSnapshot> {
+    return this.serializeMachineMutation(async () => {
+      const session = this.getSessionForClient(sessionId, clientIdInput);
+      if (!(await this.listProjects()).some((project) => project.id === projectId)) {
+        throw new RuntimeError('PROJECT_NOT_FOUND', 'Current project does not exist');
+      }
+      const workspace = await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(projectId, workspaceId);
+      const previousBinding = this.sessionBindings.get(sessionId);
+      const previousInvalid = this.invalidSessionBindings.has(sessionId);
+      const previousClient = this.clients.get(session.clientId);
+      const updated = { ...session, currentProjectId: projectId };
+      this.sessions.set(sessionId, updated);
+      this.sessionBindings.set(sessionId, { projectId, workspaceId: workspace.workspaceId });
+      this.invalidSessionBindings.delete(sessionId);
+      this.touchClient(session.clientId);
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.set(sessionId, session);
+        if (previousBinding === undefined) this.sessionBindings.delete(sessionId);
+        else this.sessionBindings.set(sessionId, previousBinding);
+        if (previousInvalid) this.invalidSessionBindings.add(sessionId);
+        else this.invalidSessionBindings.delete(sessionId);
+        if (previousClient === undefined) this.clients.delete(session.clientId);
+        else this.clients.set(session.clientId, previousClient);
+        throw error;
+      }
+      return updated;
+    });
+  }
+
+  public deleteSession(sessionId: string, clientIdInput: string): void {
+    this.deleteSessionInMemory(sessionId, clientIdInput);
+    if (this.safety === undefined) this.persistSessions();
+    else void this.serializeMachineMutation(async () => { this.persistSessions(); }).catch(() => undefined); // shortcut: legacy synchronous callers cannot await the fence; production capability routes use the durable API
+  }
+
+  public deleteSessionDurable(sessionId: string, clientIdInput: string): Promise<void> {
+    return this.serializeMachineMutation(async () => {
+      const session = this.getSessionForDetach(sessionId, clientIdInput);
+      const binding = this.sessionBindings.get(sessionId);
+      const submissions = this.submissionBindings.get(sessionId);
+      const invalid = this.invalidSessionBindings.has(sessionId);
+      const client = this.clients.get(session.clientId);
+      this.deleteSessionInMemory(sessionId, clientIdInput);
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.set(sessionId, session);
+        if (submissions !== undefined) this.submissionBindings.set(sessionId, submissions);
+        if (binding !== undefined) this.sessionBindings.set(sessionId, binding);
+        if (invalid) this.invalidSessionBindings.add(sessionId);
+        if (client !== undefined) this.clients.set(session.clientId, client);
+        else this.clients.delete(session.clientId);
+        throw error;
+      }
+    });
+  }
+
+  private deleteSessionInMemory(sessionId: string, clientIdInput: string): void {
+    const session = this.getSessionForDetach(sessionId, clientIdInput);
     if (this.activeSubmissions.has(sessionId)) {
       throw new RuntimeError('SESSION_BUSY', 'Cannot delete a session while its instruction is executing');
     }
     this.sessions.delete(sessionId);
     this.submissionBindings.delete(sessionId);
+    this.sessionBindings.delete(sessionId);
+    this.invalidSessionBindings.delete(sessionId);
     if (![...this.sessions.values()].some((candidate) => candidate.clientId === session.clientId)) {
       this.clients.set(session.clientId, {
         clientId: session.clientId,
@@ -674,14 +932,109 @@ export class RuntimeState {
     const clientId = normalizeClientId(clientIdInput);
     const submissionId = normalizeSubmissionId(submissionIdInput);
     const instruction = normalizeInstruction(instructionInput);
+    const started = this.safety === undefined
+      ? this.startInstructionInMemory(sessionId, clientId, submissionId, instruction)
+      : await this.serializeMachineMutation(async () => this.startInstructionInMemory(sessionId, clientId, submissionId, instruction));
+    if (started.duplicate !== null) return started.duplicate;
+    if (started.executionId === undefined || started.working === undefined) throw new RuntimeError('PERSISTENCE_FAILURE', 'Session execution admission returned an incomplete record');
+    const { executionId, working } = started;
+
+    try {
+      const project = working.currentProjectId === null
+        ? null
+        : (await this.listProjects()).find((candidate) => candidate.id === working.currentProjectId) ?? null;
+      if (working.currentProjectId !== null && project === null) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'Session project binding is no longer registered');
+      }
+      let result;
+      try {
+        result = await this.executor.execute({
+          executionId,
+          submissionId,
+          sessionId,
+          clientId,
+          agentId: working.agentId,
+          agentRole: working.agentRole,
+          project,
+          instruction,
+        });
+      } catch (error) {
+        throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Agent execution failed', { cause: error });
+      }
+      const text = normalizeExecutorOutput(result.text);
+      return await this.serializeMachineMutation(async () => {
+        const current = this.getSessionForClient(sessionId, clientId);
+        if (this.activeSubmissions.get(sessionId) !== submissionId) {
+          throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Session execution ownership changed before completion');
+        }
+        const assistantEvent: SessionInteractionEvent = {
+          id: randomUUID(),
+          timestamp: new Date().toISOString(),
+          kind: 'assistant',
+          text,
+          submissionId,
+          executionId,
+        };
+        const completed = appendInteraction({ ...current, executionState: 'READY' }, assistantEvent);
+        this.sessions.set(sessionId, completed);
+        try {
+          this.persistSessions();
+        } catch (error) {
+          const uncertainEvent: SessionInteractionEvent = {
+            id: randomUUID(),
+            timestamp: new Date().toISOString(),
+            kind: 'error',
+            text: 'Execution completed but publication was uncertain; verify durable state before retrying',
+            submissionId,
+            executionId,
+          };
+          this.sessions.set(sessionId, appendInteraction({ ...current, executionState: 'UNCERTAIN' }, uncertainEvent));
+          throw new RuntimeError('PERSISTENCE_FAILURE', 'Executor completed but session completion publication failed; execution outcome is uncertain', { cause: error });
+        }
+        return completed;
+      });
+    } catch (error) {
+      if (error instanceof RuntimeError && error.code === 'PERSISTENCE_FAILURE') throw error;
+      await this.serializeMachineMutation(async () => {
+        const current = this.getSessionForClient(sessionId, clientId);
+        const errorEvent: SessionInteractionEvent = {
+          id: randomUUID(),
+          timestamp: new Date().toISOString(),
+          kind: 'error',
+          text: executionFailureMessage(),
+          submissionId,
+          executionId,
+        };
+        this.sessions.set(sessionId, appendInteraction({ ...current, executionState: 'FAILED' }, errorEvent));
+        this.persistSessions();
+      });
+      if (error instanceof RuntimeError && (error.code === 'AGENT_EXECUTION_FAILED' || error.code === 'AUTHORITY_CHANGED')) throw error;
+      throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Agent execution failed', { cause: error });
+    } finally {
+      if (this.activeSubmissions.get(sessionId) === submissionId) this.activeSubmissions.delete(sessionId);
+    }
+  }
+
+  private startInstructionInMemory(
+    sessionId: string,
+    clientId: string,
+    submissionId: string,
+    instruction: string,
+  ): { readonly duplicate: RuntimeSessionSnapshot | null; readonly executionId?: string; readonly working?: RuntimeSessionSnapshot } {
     const session = this.getSessionForClient(sessionId, clientId);
-    const bindings = this.submissionBindings.get(sessionId) ?? new Map<string, string>();
+    const previousBindings = this.submissionBindings.get(sessionId);
+    const previousClient = this.clients.get(clientId);
+    const previousActiveSubmission = this.activeSubmissions.get(sessionId);
+    const bindings = new Map(this.submissionBindings.get(sessionId) ?? new Map<string, string>());
     const boundInstruction = bindings.get(submissionId);
     if (boundInstruction !== undefined) {
       if (boundInstruction !== instruction) {
         throw new RuntimeError('INVALID_REQUEST', 'submissionId is already bound to a different instruction');
       }
-      return session;
+      return { duplicate: session as RuntimeSessionSnapshot };
+    }
+    if (session.executionState === 'UNCERTAIN') {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Session execution outcome is uncertain; verify durable state before submitting new work');
     }
     if (this.activeSubmissions.has(sessionId)) {
       throw new RuntimeError('SESSION_BUSY', 'This session is already executing an instruction');
@@ -703,58 +1056,19 @@ export class RuntimeState {
     this.submissionBindings.set(sessionId, bindings);
     this.activeSubmissions.set(sessionId, submissionId);
     this.touchClient(clientId);
-
     try {
-      const project = working.currentProjectId === null
-        ? null
-        : (await this.listProjects()).find((candidate) => candidate.id === working.currentProjectId) ?? null;
-      let result;
-      try {
-        result = await this.executor.execute({
-          executionId,
-          submissionId,
-          sessionId,
-          clientId,
-          agentId: working.agentId,
-          agentRole: working.agentRole,
-          project,
-          instruction,
-        });
-      } catch (error) {
-        throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Agent execution failed', { cause: error });
-      }
-      const text = normalizeExecutorOutput(result.text);
-      const current = this.getSessionForClient(sessionId, clientId);
-      if (this.activeSubmissions.get(sessionId) !== submissionId) {
-        throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Session execution ownership changed before completion');
-      }
-      const assistantEvent: SessionInteractionEvent = {
-        id: randomUUID(),
-        timestamp: new Date().toISOString(),
-        kind: 'assistant',
-        text,
-        submissionId,
-        executionId,
-      };
-      const completed = appendInteraction({ ...current, executionState: 'READY' }, assistantEvent);
-      this.sessions.set(sessionId, completed);
-      return completed;
+      this.persistSessions();
     } catch (error) {
-      const current = this.getSessionForClient(sessionId, clientId);
-      const errorEvent: SessionInteractionEvent = {
-        id: randomUUID(),
-        timestamp: new Date().toISOString(),
-        kind: 'error',
-        text: executionFailureMessage(),
-        submissionId,
-        executionId,
-      };
-      this.sessions.set(sessionId, appendInteraction({ ...current, executionState: 'FAILED' }, errorEvent));
-      if (error instanceof RuntimeError && error.code === 'AGENT_EXECUTION_FAILED') throw error;
-      throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Agent execution failed', { cause: error });
-    } finally {
-      if (this.activeSubmissions.get(sessionId) === submissionId) this.activeSubmissions.delete(sessionId);
+      this.sessions.set(sessionId, session);
+      if (previousBindings === undefined) this.submissionBindings.delete(sessionId);
+      else this.submissionBindings.set(sessionId, previousBindings);
+      if (previousActiveSubmission === undefined) this.activeSubmissions.delete(sessionId);
+      else this.activeSubmissions.set(sessionId, previousActiveSubmission);
+      if (previousClient === undefined) this.clients.delete(clientId);
+      else this.clients.set(clientId, previousClient);
+      throw error;
     }
+    return { duplicate: null, executionId, working };
   }
 
   public async listProjects(): Promise<readonly ProjectReference[]> {
@@ -810,14 +1124,35 @@ export class RuntimeState {
     clientIdInput: string,
     projectId: string | null,
   ): Promise<RuntimeSessionSnapshot> {
-    const session = this.getSessionForClient(sessionId, clientIdInput);
-    if (projectId !== null && !(await this.listProjects()).some((project) => project.id === projectId)) {
-      throw new RuntimeError('PROJECT_NOT_FOUND', 'Current project does not exist');
-    }
-    const updated: RuntimeSessionSnapshot = { ...session, currentProjectId: projectId };
-    this.sessions.set(sessionId, updated);
-    this.touchClient(session.clientId);
-    return updated;
+    return this.serializeMachineMutation(async () => {
+      if (projectId !== null && !(await this.listProjects()).some((project) => project.id === projectId)) {
+        throw new RuntimeError('PROJECT_NOT_FOUND', 'Current project does not exist');
+      }
+      const session = this.getSessionForClient(sessionId, clientIdInput);
+      const updated: RuntimeSessionSnapshot = { ...session, currentProjectId: projectId };
+      const previousBinding = this.sessionBindings.get(sessionId);
+      const previousInvalid = this.invalidSessionBindings.has(sessionId);
+      const previousClient = this.clients.get(session.clientId);
+      this.sessions.set(sessionId, updated);
+      this.sessionBindings.set(sessionId, {
+        projectId,
+        workspaceId: projectId === null ? null : primaryWorkspaceId(projectId),
+      });
+      this.touchClient(session.clientId);
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.set(sessionId, session);
+        if (previousBinding === undefined) this.sessionBindings.delete(sessionId);
+        else this.sessionBindings.set(sessionId, previousBinding);
+        if (previousInvalid) this.invalidSessionBindings.add(sessionId);
+        else this.invalidSessionBindings.delete(sessionId);
+        if (previousClient === undefined) this.clients.delete(session.clientId);
+        else this.clients.set(session.clientId, previousClient);
+        throw error;
+      }
+      return updated;
+    });
   }
 
   private updateControlledMission(
@@ -874,15 +1209,112 @@ export class RuntimeState {
   }
 
   private serializeMissionMutation<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.missionMutationTail.then(operation, operation);
+    const result = this.missionMutationTail.then(() => this.withSafety('mission-state', operation), () => this.withSafety('mission-state', operation));
     this.missionMutationTail = result.then(() => undefined, () => undefined);
     return result;
   }
 
   private serializeMachineMutation<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.mutationTail.then(operation, operation);
+    const result = this.mutationTail.then(() => this.withSafety('runtime-state', operation), () => this.withSafety('runtime-state', operation));
     this.mutationTail = result.then(() => undefined, () => undefined);
     return result;
+  }
+
+  private async withSafety<T>(writer: string, operation: () => Promise<T>): Promise<T> {
+    const lease = this.safety === undefined ? null : await this.safety.beginMutation(writer);
+    try { return await operation(); } finally { await lease?.release(); }
+  }
+
+  private restoreSessions(): void {
+    const filename = path.join(this.dataRoot, SESSION_FILE);
+    let content: string;
+    try {
+      const inspected = lstatSync(filename);
+      if (!inspected.isFile() || inspected.isSymbolicLink()) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is not a regular file');
+      if (typeof process.getuid === 'function' && inspected.uid !== process.getuid()) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is not owned by the current user');
+      if ((inspected.mode & 0o077) !== 0) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is not private');
+      content = readFileSync(filename, 'utf8');
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === 'ENOENT') return;
+      if (error instanceof RuntimeError) throw error;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is unreadable', { cause: error });
+    }
+    let parsed: unknown;
+    try { parsed = JSON.parse(content) as unknown; } catch (error) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is invalid JSON', { cause: error });
+    }
+    if (!isSessionDocument(parsed)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is invalid');
+    if (this.sessionAuthority !== undefined) {
+      const persistedAuthority = parsed.authority ?? null;
+      if (persistedAuthority === null || persistedAuthority.machineId !== this.sessionAuthority.machineId || persistedAuthority.runtimeId !== this.sessionAuthority.runtimeId) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'Persisted session authority belongs to another machine or runtime');
+      }
+    }
+    const seen = new Set<string>();
+    let recovered = false;
+    for (const persisted of parsed.sessions) {
+      const session = persisted.snapshot.executionState === 'WORKING'
+        ? { ...persisted.snapshot, executionState: 'UNCERTAIN' as const }
+        : persisted.snapshot;
+      recovered ||= session !== persisted.snapshot;
+      if (seen.has(session.id)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store contains duplicate session identity');
+      seen.add(session.id);
+      const binding = persisted.binding ?? {
+        projectId: session.currentProjectId,
+        workspaceId: session.currentProjectId === null ? null : primaryWorkspaceId(session.currentProjectId),
+      };
+      if (binding.projectId !== session.currentProjectId || (binding.projectId === null ? binding.workspaceId !== null : binding.workspaceId === null)) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'Persisted session project/workspace binding is inconsistent');
+      }
+      this.sessions.set(session.id, session);
+      this.submissionBindings.set(session.id, new Map(persisted.submissions.map((submission) => [submission.id, submission.instruction])));
+      this.sessionBindings.set(session.id, binding);
+      this.clients.set(session.clientId, { clientId: session.clientId, connected: false, lastSeenAt: session.createdAt });
+    }
+    if (recovered) {
+      if (this.safety === undefined) this.persistSessions();
+      else this.sessionsNeedPersistence = true;
+    }
+  }
+
+  public reconcileSessionPersistence(): Promise<void> {
+    if (!this.sessionsNeedPersistence) return Promise.resolve();
+    return this.serializeMachineMutation(async () => {
+      if (!this.sessionsNeedPersistence) return;
+      this.persistSessions();
+      this.sessionsNeedPersistence = false;
+    });
+  }
+
+  private persistSessions(): void {
+    const document: SessionDocument = {
+      schemaVersion: 2,
+      authority: this.sessionAuthority ?? null,
+      sessions: [...this.sessions.values()].map((snapshot) => ({
+        snapshot,
+        submissions: [...(this.submissionBindings.get(snapshot.id) ?? new Map())].map(([id, instruction]) => ({ id, instruction })),
+        binding: this.sessionBindings.get(snapshot.id) ?? {
+          projectId: snapshot.currentProjectId,
+          workspaceId: snapshot.currentProjectId === null ? null : primaryWorkspaceId(snapshot.currentProjectId),
+        },
+      })),
+    };
+    const filename = path.join(this.dataRoot, SESSION_FILE);
+    const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(temporary, 'wx', 0o600);
+      writeFileSync(descriptor, `${JSON.stringify(document, null, 2)}\n`, 'utf8');
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = undefined;
+      renameSync(temporary, filename);
+    } catch (error: unknown) {
+      if (descriptor !== undefined) closeSync(descriptor);
+      try { unlinkSync(temporary); } catch { /* best effort cleanup */ }
+      if (error instanceof RuntimeError) throw error;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session state publication failed', { cause: error });
+    }
   }
 
   private touchClient(clientId: string): void {
@@ -898,6 +1330,94 @@ function appendInteraction(session: RuntimeSessionSnapshot, event: SessionIntera
       ? interactions.slice(interactions.length - MAX_INTERACTION_EVENTS)
       : interactions,
   };
+}
+
+function isSessionDocument(value: unknown): value is SessionDocument {
+  return isRecord(value)
+    && (value.schemaVersion === 1 || value.schemaVersion === 2)
+    && (value.schemaVersion === 1 || value.authority === null || isSessionAuthority(value.authority))
+    && Array.isArray(value.sessions)
+    && value.sessions.every(isPersistedSession)
+    && new Set(value.sessions.map((session) => session.snapshot.id)).size === value.sessions.length;
+}
+
+function isPersistedSession(value: unknown): value is PersistedSession {
+  if (!isRecord(value) || !isRuntimeSessionSnapshot(value.snapshot) || !Array.isArray(value.submissions)) return false;
+  if (value.binding !== undefined && !isSessionBinding(value.binding)) return false;
+  const ids = new Set<string>();
+  return value.submissions.every((submission) => {
+    if (!isRecord(submission) || !isBoundedIdentity(submission.id) || !isBoundedText(submission.instruction, MAX_INSTRUCTION_CHARS) || ids.has(submission.id)) return false;
+    ids.add(submission.id);
+    return true;
+  });
+}
+
+function isSessionBinding(value: unknown): value is SessionBinding {
+  return isRecord(value)
+    && (value.projectId === null || isUuid(value.projectId))
+    && (value.workspaceId === null || isUuid(value.workspaceId));
+}
+
+function isSessionAuthority(value: unknown): value is SessionAuthority {
+  return isRecord(value) && isUuid(value.machineId) && isUuid(value.runtimeId);
+}
+
+function isRuntimeSessionSnapshot(value: unknown): value is RuntimeSessionSnapshot {
+  if (!isRecord(value)
+    || !isUuid(value.id)
+    || !isBoundedIdentity(value.clientId)
+    || !isBoundedIdentity(value.agentId)
+    || !isAgentRole(value.agentRole)
+    || !isIsoDate(value.createdAt)
+    || (value.currentProjectId !== null && !isUuid(value.currentProjectId))
+    || !isSessionExecutionState(value.executionState)
+    || !Array.isArray(value.interactions)
+    || value.interactions.length > MAX_INTERACTION_EVENTS
+    || !value.interactions.every(isSessionInteractionEvent)) return false;
+  return true;
+}
+
+function isSessionInteractionEvent(value: unknown): value is SessionInteractionEvent {
+  return isRecord(value)
+    && isUuid(value.id)
+    && isIsoDate(value.timestamp)
+    && (value.kind === 'user' || value.kind === 'assistant' || value.kind === 'error')
+    && isBoundedText(value.text, MAX_EXECUTOR_OUTPUT_CHARS)
+    && isBoundedIdentity(value.submissionId)
+    && isUuid(value.executionId);
+}
+
+function isAgentRole(value: unknown): value is AgentRole {
+  return value === 'owner' || value === 'planner' || value === 'implementer' || value === 'reviewer'
+    || value === 'security' || value === 'explorer' || value === 'other';
+}
+
+function isSessionExecutionState(value: unknown): value is RuntimeSessionSnapshot['executionState'] {
+  return value === 'READY' || value === 'WORKING' || value === 'FAILED' || value === 'UNCERTAIN';
+}
+
+function isBoundedIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 200 && !value.includes('\0') && value === value.trim();
+}
+
+function isBoundedText(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= max && !value.includes('\0');
+}
+
+function isIsoDate(value: unknown): value is string {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value));
+}
+
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isNodeError(value: unknown): value is NodeJS.ErrnoException {
+  return value instanceof Error && 'code' in value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function missionHandoffSafety(mission: MissionSnapshot, externalHandoffSafe: boolean): { safe: boolean; reason: string } {

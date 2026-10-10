@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RuntimeError, type RuntimeIdentity } from '@iris/domain';
 import type { AgentExecutor } from './agent-executor.js';
 import type { CapabilityService } from './capability-service.js';
@@ -258,6 +258,62 @@ describe('runtime listener safety', () => {
     expect((await fetch(`${handle.apiUrl}/hermes-mcp/${missionId}`, {
       ...init, headers: { ...init.headers, authorization: 'Bearer wrong-mission-token' },
     })).status).toBe(403);
+  });
+
+  it('restricts repository reconciliation to authenticated owner requests and strict fields', async () => {
+    const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
+    const tunnelServiceSecret = 'test-tunnel-service-secret-that-is-not-public';
+    const execute = vi.fn(async () => ({ status: 'executed', value: { operation: 'repository_reconcile' } }));
+    handle = await startRuntimeServer({
+      identity, state: {} as RuntimeState,
+      capabilities: { execute } as unknown as CapabilityService,
+      missionBroker: {} as MissionBrokerService,
+      health: () => { throw new Error('Not used'); },
+      doctor: async () => ({ status: 'pass', checks: [] }),
+      isShuttingDown: () => false, controlSecret: 'control-secret',
+      ownerAccessSecret, tunnelServiceSecret, requestShutdown: () => undefined,
+    }, 0);
+    const body = { projectId: randomUUID(), previousRepositoryId: randomUUID(),
+      previousDevice: '16777229', expectedRepositoryId: randomUUID() };
+    const call = (secret: string, payload: unknown = body) => fetch(`${handle!.apiUrl}/repositories/reconcile`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}` },
+      body: JSON.stringify(payload),
+    });
+    expect((await call('')).status).toBe(403);
+    expect((await call(tunnelServiceSecret)).status).toBe(403);
+    expect(execute).not.toHaveBeenCalled();
+    expect((await call(ownerAccessSecret, { ...body, force: true })).status).toBe(400);
+    expect((await call(ownerAccessSecret, null)).status).toBe(400);
+    expect(execute).not.toHaveBeenCalled();
+    expect((await call(ownerAccessSecret)).status).toBe(200);
+    expect(execute).toHaveBeenCalledExactlyOnceWith({ capabilityId: 'repository.reconcile', ...body,
+      clientId: undefined, sessionId: undefined });
+  });
+
+  it('routes authenticated durable job status, output and cancellation through CapabilityService', async () => {
+    const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
+    const execute = vi.fn(async (operation: { capabilityId: string }) => {
+      if (operation.capabilityId === 'job.list') return { status: 'executed', value: { jobs: [{ jobId: 'job-a', projectId: 'project-a', workspaceId: 'workspace-a', state: 'RUNNING' }] } };
+      if (operation.capabilityId === 'job.logs') return { status: 'executed', value: { jobId: 'job-a', state: 'RUNNING', stream: 'stdout', cursor: 'stdout:5', text: 'hello', eof: true, bytes: 5 } };
+      return { status: 'executed', value: { jobId: 'job-a', state: 'RUNNING', cancelRequested: true } };
+    });
+    handle = await startRuntimeServer({
+      identity, state: {} as RuntimeState, capabilities: { execute } as unknown as CapabilityService,
+      missionBroker: {} as MissionBrokerService, health: () => { throw new Error('Not used'); }, doctor: async () => ({ status: 'pass', checks: [] }),
+      isShuttingDown: () => false, controlSecret: 'control-secret', ownerAccessSecret, requestShutdown: () => undefined,
+    }, 0);
+    const headers = { authorization: `Bearer ${ownerAccessSecret}`, 'x-iris-client-id': 'client-a', 'x-iris-session-id': 'session-a' };
+    const list = await fetch(`${handle.apiUrl}/jobs?projectId=project-a`, { headers });
+    expect(list.status).toBe(200);
+    expect(await list.json()).toMatchObject({ jobs: [{ jobId: 'job-a', projectId: 'project-a' }] });
+    const logs = await fetch(`${handle.apiUrl}/jobs/job-a/logs?projectId=project-a&stream=stdout`, { headers });
+    expect(logs.status).toBe(200);
+    expect(await logs.json()).toMatchObject({ jobId: 'job-a', text: 'hello', eof: true });
+    const cancel = await fetch(`${handle.apiUrl}/jobs/job-a/cancel`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ projectId: 'project-a' }) });
+    expect(cancel.status).toBe(200);
+    expect(await cancel.json()).toMatchObject({ jobId: 'job-a', cancelRequested: true });
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect((await fetch(`${handle.apiUrl}/jobs?projectId=project-a`)).status).toBe(403);
   });
 
   it('returns only a product-safe agent execution failure payload', async () => {

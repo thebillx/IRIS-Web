@@ -56,7 +56,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB], missions: Parameters<typeof RuntimePage>[0]['missions'] = []): string {
+function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB], missions: Parameters<typeof RuntimePage>[0]['missions'] = [], jobs: Parameters<typeof RuntimePage>[0]['jobs'] = []): string {
   return renderToStaticMarkup(createElement(RuntimePage, {
     health,
     projects: [projectA, projectB],
@@ -80,6 +80,10 @@ function renderWorkspace(selectedSession: Session | null, sessions: Session[] = 
     onRegisterProject: () => undefined,
     onSelectProject: () => undefined,
     onRequestMissionOrchestrator: () => undefined,
+    jobs,
+    jobLogs: { 'job-1': { text: 'hello from job\n', cursor: 'stdout:5', eof: true } },
+    onCancelJob: () => undefined,
+    onReadJobLogs: () => undefined,
   }));
 }
 
@@ -100,6 +104,24 @@ describe('daily workspace session experience', () => {
     expect(first).toContain('/Users/bill/iris');
     expect(second).toContain('/Users/bill/sandbox');
     expect(second).toContain('Sandbox');
+  });
+
+  it('renders owner-scoped Supervisor controls and truthful keep-awake blocking', () => {
+    const markup = renderWorkspace(sessionA);
+    expect(markup).toContain('Supervisor control');
+    expect(markup).toContain('Workload ON');
+    expect(markup).toContain('Workload OFF');
+    expect(markup).toContain('Keep-awake</dt><dd>BLOCKED');
+  });
+
+  it('renders captured durable job identity, output and cancellation controls', () => {
+    const markup = renderWorkspace(sessionA, [sessionA], [], [{ jobId: 'job-1', requestId: 'request-1', projectId: projectA.id, workspaceId: 'workspace-a', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null }]);
+    expect(markup).toContain('Durable jobs');
+    expect(markup).toContain('RUNNING');
+    expect(markup).toContain('project-a');
+    expect(markup).toContain('workspace-a');
+    expect(markup).toContain('hello from job');
+    expect(markup).toContain('Cancel job');
   });
 
   it('restores a selected session across refresh only while that authoritative session still exists', () => {
@@ -149,6 +171,11 @@ describe('daily workspace session experience', () => {
         runtimeSessions.push(created);
         return jsonResponse(created, 201);
       }
+      if (url === `/sessions/${sessionA.id}` && method === 'DELETE') {
+        const index = runtimeSessions.findIndex((session) => session.id === sessionA.id);
+        if (index >= 0) runtimeSessions.splice(index, 1);
+        return jsonResponse({ deleted: true });
+      }
       throw new Error(`Unexpected request: ${method} ${url}`);
     }));
 
@@ -174,6 +201,11 @@ describe('daily workspace session experience', () => {
     await clickButtonStartingWith('Session 1');
     expect(window.sessionStorage.getItem('iris.web.selectedSessionId')).toBe(sessionA.id);
     expect(document.body.textContent).toContain('/Users/bill/iris');
+
+    await clickButton('Detach session');
+    await settleApp();
+    expect(runtimeSessions.some((session) => session.id === sessionA.id)).toBe(false);
+    expect(window.sessionStorage.getItem('iris.web.selectedSessionId')).toBe(sessionB.id);
   });
 
   it('mounts App and clears stale selection when a restarted daemon reports no transient sessions while persisted projects remain', async () => {
@@ -196,8 +228,16 @@ describe('daily workspace session experience', () => {
 
     expect(window.sessionStorage.getItem('iris.web.selectedSessionId')).toBeNull();
     expect(document.body.textContent).toContain('No sessions yet.');
+    expect(document.querySelector('.header-status')?.textContent).toBe('Online');
     expect(document.body.textContent).toContain('IRIS');
     expect(document.body.textContent).toContain('/Users/bill/iris');
+  });
+
+  it('shows Offline when the local runtime cannot be reached', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('Runtime unavailable'); }));
+    await mountApp();
+    await settleApp();
+    expect(document.querySelector('.header-status')?.textContent).toBe('Offline');
   });
 
   it('binds approval UI to the selected session and drops the prior session approval when switching context', async () => {
@@ -220,6 +260,7 @@ describe('daily workspace session experience', () => {
 
     await mountApp();
     await settleApp();
+    expect(document.querySelector('.header-status')?.textContent).toBe('Needs Attention');
     await clickButton('Approval Center (1)');
     expect(document.body.textContent).toContain('session · current project · set');
     expect(document.body.textContent).not.toContain('session-b-action');
@@ -357,6 +398,26 @@ describe('daily workspace session experience', () => {
     expect(markup).toContain('No sessions yet.');
     expect(markup).toContain('Nothing selected');
     expect(markup).toContain('Create session');
+  });
+
+  it('keeps persistent Supervisor status visible when the workload health endpoint is unavailable', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return new Response(null, { status: 503 });
+      if (url === '/supervisor-control/healthz') return jsonResponse({ ok: true });
+      if (url === '/supervisor-control/mcp') return jsonResponse({ result: { structuredContent: {
+        state: 'DEGRADED', workloadState: 'OFF', machineId: 'machine-a', tunnel: { state: 'OFF' },
+        detail: 'Workload is OFF; the persistent Supervisor gateway remains available',
+      } } });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    expect(document.body.textContent).toContain('DEGRADED');
+    expect(document.body.textContent).toContain('Workload is OFF');
+    expect(document.body.textContent).toContain('machine-a');
   });
 });
 

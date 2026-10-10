@@ -36,6 +36,10 @@ export interface AdminTunnelRecycleInput {
 
 export interface SupervisorNativeOperations {
   supervisorStatus(): Promise<unknown>;
+  supervisorDoctor(): Promise<unknown>;
+  workloadOn(): Promise<unknown>;
+  workloadOff(): Promise<unknown>;
+  workloadRestart(): Promise<unknown>;
   adminStatus(): Promise<unknown>;
   runtimeReconcile(): Promise<unknown>;
   adminRecycle(input: AdminRecycleInput): Promise<unknown>;
@@ -174,6 +178,26 @@ async function handleRequest(
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.supervisorStatus()));
       return;
     }
+    if (name === 'supervisor_doctor') {
+      requireNoArguments(args);
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.supervisorDoctor()));
+      return;
+    }
+    if (name === 'workload_on') {
+      requireNoArguments(args);
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.workloadOn()));
+      return;
+    }
+    if (name === 'workload_off') {
+      requireNoArguments(args);
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.workloadOff()));
+      return;
+    }
+    if (name === 'workload_restart') {
+      requireNoArguments(args);
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.workloadRestart()));
+      return;
+    }
     if (name === 'admin_status') {
       requireNoArguments(args);
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.adminStatus()));
@@ -217,6 +241,30 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
       description: 'Read bounded identity, readiness, tunnel identity, and profile digest state owned by the outer supervisor daemon.',
       inputSchema: noArgs,
       annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'supervisor_doctor',
+      description: 'Read truthful supervisor status and recovery diagnostics while the workload is running or intentionally OFF.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'workload_on',
+      description: 'Start only the supervisor-owned workload; the authenticated control gateway remains the authority.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    {
+      name: 'workload_off',
+      description: 'Stop only the verified supervisor-owned workload and preserve the control gateway and ownership metadata.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    {
+      name: 'workload_restart',
+      description: 'Idempotently restart the supervisor-owned workload through the explicit whole-stack restart boundary.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: false, destructiveHint: true },
     },
     {
       name: 'admin_status',

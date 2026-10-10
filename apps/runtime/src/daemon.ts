@@ -15,6 +15,7 @@ import { assessConnectorRegistryIdentity } from './identity-coherence.js';
 import { startRuntimeServer, type RuntimeServerHandle } from './server.js';
 import { RuntimeState } from './state.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
+import { MissionLedgerStore } from './mission-store.js';
 import { DurableMissionLifecycleStore } from './durable-mission-store.js';
 import { DurableMissionLifecycleService } from './durable-mission-service.js';
 import { WorkerAdapterRegistry } from './durable-mission-workers.js';
@@ -29,6 +30,7 @@ import { recoverMultiWorkerRuns } from './multi-worker/recovery.js';
 import { AdoRequirementContextService } from './ado/runtime-context.js';
 import { SecurityAuditStore } from './security-audit/store.js';
 import { SecurityAuditService } from './security-audit/service.js';
+import { ProductionSafetyController } from './production-safety.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -81,6 +83,15 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     version: IRIS_VERSION,
   };
   const authority = await acquireRuntimeAuthority(dataRoot, identity);
+  const safety = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret });
+  for (const [writer, state] of [
+    ['runtime-state', 'IDLE'], ['mission-state', 'IDLE'], ['mission-broker', 'IDLE'], ['durable-jobs', 'IDLE'],
+    ['mission-lifecycle', 'UNKNOWN'], ['multi-worker', 'UNKNOWN'], ['security-audit', 'UNKNOWN'],
+    ['resource-registry', 'UNKNOWN'], ['permission-store', 'UNKNOWN'], ['permission-audit', 'UNKNOWN'],
+    ['activation', 'UNKNOWN'], ['supervisor', 'UNKNOWN'], ['external-runners', 'UNKNOWN'],
+  ] as const) {
+    await safety.registerWriter(writer, state);
+  }
   let server: RuntimeServerHandle | undefined;
   let shuttingDown = false;
   let closePromise: Promise<void> | undefined;
@@ -98,8 +109,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
 
   try {
     const store = new FoundationStateStore(dataRoot);
-    const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env));
-    const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
+    const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env), new MissionLedgerStore(dataRoot), safety, { machineId, runtimeId });
+    await state.reconcileSessionPersistence();
+    await state.revalidateSessionBindings();
+    const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot), safety);
     const lifecycleStore = new DurableMissionLifecycleStore(dataRoot);
     const lifecycleWorkers = new WorkerAdapterRegistry();
     const missionLifecycle = new DurableMissionLifecycleService(state, lifecycleStore, lifecycleWorkers);
@@ -145,7 +158,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     await recoverMultiWorkerRuns(state, resourceRegistry, multiWorkerStore, lifecycleWorkers);
     const securityAudit = new SecurityAuditService(state, multiWorker, resourceRegistry, new SecurityAuditStore(dataRoot), health);
     await securityAudit.recover();
-    const durableJobs = new DurableJobManager(dataRoot, resourceRegistry);
+    const durableJobs = new DurableJobManager(dataRoot, resourceRegistry, safety);
     await durableJobs.recover();
     missionLifecycle.setCompletionGuard(async (missionId) => {
       await durableJobs.assertMissionCodeReviewsFinalized(missionId);
@@ -200,6 +213,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         tunnelServiceSecret,
         ...(connectorRegistry === null ? {} : { connectorDeploymentEpoch: connectorRegistry.deploymentEpoch }),
         connectorRuntimeId: runtimeId,
+        singleConnector: connectorRegistry?.connectors.length === 1,
         catalogRuntimeContext: {
           machineId,
           runtimeId,

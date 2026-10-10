@@ -105,7 +105,7 @@ export interface RuntimeSession {
   readonly currentProjectId: string | null;
 }
 
-export type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED';
+export type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED' | 'UNCERTAIN';
 export type SessionInteractionKind = 'user' | 'assistant' | 'error';
 
 export interface SessionInteractionEvent {
@@ -643,6 +643,7 @@ export type CapabilityId =
   | 'session.delete'
   | 'session.current_project.set'
   | 'session.instruction.submit'
+  | 'repository.reconcile'
   | 'project.register'
   | 'project.default.set'
   | 'file.read'
@@ -671,6 +672,7 @@ export type CapabilityId =
   | 'shell.run'
   | 'shell.start'
   | 'job.status'
+  | 'job.list'
   | 'job.logs'
   | 'job.result'
   | 'job.cancel'

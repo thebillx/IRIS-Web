@@ -138,8 +138,8 @@ describe('IRIS supervisor', () => {
     expect(status.sourceMode).toBe('BOUND_WORKLOAD_COMPATIBILITY');
     expect(status.state).toBe('UNKNOWN');
     expect(status.recommendedAction).toBe('USE_CONTROLLED_ACTIVATION_BEFORE_CATALOG_RELOAD');
-    expect(status.pro.live).toBeNull();
-    expect(status.pro.liveToolCount).toBeNull();
+    expect(status.pro?.live).toBeNull();
+    expect(status.pro?.liveToolCount).toBeNull();
     await expect(supervisor.catalogReload()).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
@@ -313,6 +313,84 @@ describe('IRIS supervisor', () => {
     }
   });
 
+  it('owns one public tunnel with persistent local recovery in unified mode', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-unified-supervisor-'));
+    const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-unified-tunnel-'));
+    roots.push(dataRoot, fakeRoot);
+    await initializeConnectorRegistry(dataRoot, { unified: true, fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', fullHealthPort: await freePort() });
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const controlPort = await freePort();
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot, tunnelClientPath: await fakeTunnelClient(fakeRoot),
+      webPort: await freePort(), adminPort: await freePort(), supervisorControlPort: controlPort });
+    const native = await startSupervisorNativeControlServer(dataRoot, controlPort, {
+      supervisorStatus: () => supervisor.supervisorNativeStatus(), adminStatus: () => supervisor.adminNativeStatus(),
+      supervisorDoctor: () => supervisor.doctor(), workloadOn: () => supervisor.workloadOn(), workloadOff: () => supervisor.workloadOff(), workloadRestart: () => supervisor.workloadRestart(),
+      runtimeReconcile: () => supervisor.runtimeReconcile(), adminRecycle: (input) => supervisor.adminRecycle(input),
+      adminTunnelRecycle: (input) => supervisor.adminTunnelRecycle(input), adminToolCall: (name, args) => supervisor.adminToolCall(name, args),
+    });
+    (supervisor as unknown as { nativeControlActive: boolean }).nativeControlActive = true;
+    try {
+      const first = await supervisor.up();
+      expect(first.connectors.map((binding) => binding.label)).toEqual(['IRIS']);
+      expect(first.controlPlane.state).toBe('READY');
+      const fullProfile = await readFile(path.join(dataRoot, 'tunnel-profiles', 'iris-full.yaml'), 'utf8');
+      expect(fullProfile).toContain('channel: admin');
+      expect(fullProfile).toContain(`http://127.0.0.1:${controlPort}/mcp`);
+      const secret = await readTunnelServiceSecret(dataRoot);
+      if (secret === null) throw new Error('missing unified native control test secret');
+      const filename = path.join(dataRoot, 'supervisor/state.json');
+      const before = JSON.parse(await readFile(filename, 'utf8'));
+      expect(before.tunnels.full.pid).toBeGreaterThan(0);
+      expect(before.tunnels.pro).toBeNull();
+      expect(before.adminTunnel).toBeNull();
+      expect(before.admin.pid).toBeGreaterThan(0);
+      const off = await supervisor.workloadOff();
+      expect(off.runtime).toMatchObject({ state: 'DEGRADED', code: 'WORKLOAD_OFF' });
+      expect((await supervisor.doctor()).CODE).toBe('WORKLOAD_OFF');
+      expect(await nativeToolCall(native.mcpUrl, secret, 'supervisor_status', {})).toMatchObject({ workloadState: 'OFF', workloadDesiredState: 'OFF' });
+      expect((await fetch(native.healthUrl, { headers: { authorization: `Bearer ${(await readTunnelServiceSecret(dataRoot))!}` } })).status).toBe(200);
+      const stopped = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      expect(stopped.runtime).toBeNull();
+      expect(stopped.admin.pid).toBe(before.admin.pid);
+      expect(stopped.tunnels.full.pid).toBe(before.tunnels.full.pid);
+      const repeatedOff = await supervisor.workloadOff();
+      expect(repeatedOff.runtime).toMatchObject({ state: 'DEGRADED', code: 'WORKLOAD_OFF' });
+      const deadTunnel = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      const deadTunnelPid = deadTunnel.tunnels.full.pid;
+      if (deadTunnelPid === null) throw new Error('missing unified workload tunnel');
+      process.kill(deadTunnelPid, 'SIGTERM');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const recoveredOff = await (supervisor as unknown as { recoverControlPlaneOffUnlocked(): Promise<unknown> }).recoverControlPlaneOffUnlocked();
+      expect(recoveredOff).toMatchObject({ runtime: { state: 'DEGRADED', code: 'WORKLOAD_OFF' } });
+      const recoveredState = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      expect(recoveredState.runtime).toBeNull();
+      expect(recoveredState.tunnels.full.pid).not.toBe(deadTunnelPid);
+      const [on, concurrentOn] = await Promise.all([supervisor.workloadOn(), supervisor.workloadOn()]);
+      expect(on.runtime.state).toBe('READY');
+      expect(concurrentOn.runtime.state).toBe('READY');
+      const concurrentState = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      expect(concurrentState.runtime?.pid).toBeGreaterThan(0);
+      expect((await supervisor.doctor()).CODE).toBe('E2E_PROBE_UNAVAILABLE');
+      const beforeWorkloadRestart = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      const restarted = await supervisor.workloadRestart();
+      expect(restarted.runtime.state).toBe('READY');
+      const afterWorkloadRestart = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      expect(afterWorkloadRestart.admin.pid).toBe(beforeWorkloadRestart.admin.pid);
+      expect((await fetch(native.healthUrl, { headers: { authorization: `Bearer ${(await readTunnelServiceSecret(dataRoot))!}` } })).status).toBe(200);
+      await supervisor.up();
+      const after = JSON.parse(await readFile(filename, 'utf8'));
+      expect(after.runtime.pid).toBe(afterWorkloadRestart.runtime.pid);
+      expect(after.tunnels.full.pid).toBe(afterWorkloadRestart.tunnels.full.pid);
+      expect((await supervisor.catalogStatus()).pro).toBeNull();
+      expect((await supervisor.adminToolCall('activation_status', {})).isError).not.toBe(true);
+    } finally {
+      await supervisor.down().catch(() => undefined);
+      (supervisor as unknown as { nativeControlActive: boolean }).nativeControlActive = false;
+      await native.close();
+    }
+  }, 60_000);
+
   it('owns an idempotent runtime, web process, and two tunnel processes and stops only those records', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-up-'));
     const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-fake-'));
@@ -401,6 +479,15 @@ setInterval(() => undefined, 1000);
 
     const stopped = await supervisor.down();
     expect(stopped.runtime.state).toBe('FAILED');
+    const downState = JSON.parse(await readFile(statePath, 'utf8')) as {
+      stackDesiredState: string;
+      workloadDesiredState: string;
+      admin: unknown;
+      tunnels: { full: unknown; pro: unknown };
+    };
+    expect(downState).toMatchObject({ stackDesiredState: 'DOWN', workloadDesiredState: 'OFF', admin: null, tunnels: { full: null, pro: null } });
+    await (supervisor as unknown as { monitorOnceUnlocked(): Promise<void> }).monitorOnceUnlocked();
+    await expect(readFile(statePath, 'utf8').then((content) => JSON.parse(content))).resolves.toMatchObject({ stackDesiredState: 'DOWN', workloadDesiredState: 'OFF', admin: null, tunnels: { full: null, pro: null } });
   }, 30_000);
 
   it('probes verified owned tunnels with their recorded executable when the configured tunnel client is unavailable', async () => {
@@ -507,6 +594,10 @@ setInterval(() => undefined, 1000);
     });
     const native = await startSupervisorNativeControlServer(dataRoot, nativePort, {
       supervisorStatus: () => supervisor.supervisorNativeStatus(),
+      supervisorDoctor: () => supervisor.doctor(),
+      workloadOn: () => supervisor.workloadOn(),
+      workloadOff: () => supervisor.workloadOff(),
+      workloadRestart: () => supervisor.workloadRestart(),
       adminStatus: () => supervisor.adminNativeStatus(),
       runtimeReconcile: () => supervisor.runtimeReconcile(),
       adminRecycle: (input) => supervisor.adminRecycle(input),
@@ -1450,6 +1541,10 @@ setInterval(() => undefined, 1000);
     await outer.bindAdminTunnel('tunnel_cccccccccccccccccccccccccccccccc');
     const native = await startSupervisorNativeControlServer(dataRoot, options.supervisorControlPort, {
       supervisorStatus: () => outer.supervisorNativeStatus(),
+      supervisorDoctor: () => outer.doctor(),
+      workloadOn: () => outer.workloadOn(),
+      workloadOff: () => outer.workloadOff(),
+      workloadRestart: () => outer.workloadRestart(),
       adminStatus: () => outer.adminNativeStatus(),
       runtimeReconcile: () => outer.runtimeReconcile(),
       adminRecycle: (input) => outer.adminRecycle(input),
@@ -1697,6 +1792,7 @@ setInterval(() => undefined, 1000);
     expect(after.endpoint.instanceId).not.toBe(before.endpoint.instanceId);
     expect(restarted.localRuntime).toMatchObject({ state: 'READY' });
     expect(restarted.tunnel).toMatchObject({ state: 'READY' });
+    expect((JSON.parse(await readFile(path.join(dataRoot, 'supervisor', 'state.json'), 'utf8')) as { workloadDesiredState: string }).workloadDesiredState).toBe('ON');
     await supervisor.down();
   }, 30_000);
 

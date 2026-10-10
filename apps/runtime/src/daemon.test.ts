@@ -22,7 +22,7 @@ describe('daemon startup cleanup', () => {
     await expect(readRuntimeControl(dataRoot)).resolves.toBeNull();
   });
 
-  it('rehydrates only active broker-bound mission sessions across daemon restart and does not replay completed missions', async () => {
+  it('retains durable mission sessions across daemon restart and does not replay completed missions', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-daemon-mission-recovery-'));
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-daemon-mission-project-'));
     roots.push(dataRoot, projectRoot);
@@ -56,7 +56,7 @@ describe('daemon startup cleanup', () => {
     await second.close();
 
     const third = await startDaemon({ dataRoot, preferredPort: 0 });
-    expect(() => third.state.getSessionForClient(session.id, session.clientId)).toThrowError(/Session not found/);
+    expect(third.state.getSessionForClient(session.id, session.clientId)).toMatchObject({ id: session.id, clientId: session.clientId, currentProjectId: project.id, executionState: 'READY' });
     await expect(third.missionBroker.get(mission.id)).resolves.toMatchObject({ state: 'COMPLETED', missionVersion: 3, lastDirectiveSequence: 2 });
     await third.close();
   });

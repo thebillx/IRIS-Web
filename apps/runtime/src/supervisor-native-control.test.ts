@@ -49,7 +49,7 @@ describe('outer supervisor native control', () => {
         'Mcp-Method': 'tools/list',
       });
       expect(toolNames(listed)).toEqual([
-        'supervisor_status', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
+        'supervisor_status', 'supervisor_doctor', 'workload_on', 'workload_off', 'workload_restart', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
         'activation_status', 'activation_prepare', 'activation_apply', 'activation_confirm', 'activation_rollback',
       ]);
       expect(catalogToolNames('FULL')).not.toContain('admin_tunnel_recycle');
@@ -92,6 +92,10 @@ describe('outer supervisor native control', () => {
       const listed = await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
       expect(toolNames(listed)).toEqual([
         'supervisor_status',
+        'supervisor_doctor',
+        'workload_on',
+        'workload_off',
+        'workload_restart',
         'admin_status',
         'runtime_reconcile',
         'admin_recycle',
@@ -111,6 +115,10 @@ describe('outer supervisor native control', () => {
       }
       expect(adminToolDefinitions().map((tool) => tool.name)).toContain('admin_status');
       expect(structured(await rpcTool(harness, 'supervisor_status', {}))).toMatchObject({ supervisor: 'outer', workloadRuntimeId: 'runtime-a' });
+      expect(structured(await rpcTool(harness, 'supervisor_doctor', {}))).toMatchObject({ code: 'NONE' });
+      expect(structured(await rpcTool(harness, 'workload_off', {}))).toMatchObject({ workloadState: 'OFF' });
+      expect(structured(await rpcTool(harness, 'workload_on', {}))).toMatchObject({ workloadState: 'ON' });
+      expect(structured(await rpcTool(harness, 'workload_restart', {}))).toMatchObject({ workloadState: 'ON' });
       expect(structured(await rpcTool(harness, 'admin_status', {}))).toMatchObject({ adminIdentity: 'admin-a' });
       expect(structured(await rpcTool(harness, 'runtime_reconcile', {}))).toMatchObject({ readiness: 'READY', workloadAnchorsPreserved: true });
       expect(structured(await rpcTool(harness, 'activation_status', {}))).toMatchObject({ proxied: 'activation_status' });
@@ -177,6 +185,10 @@ async function startHarness() {
   const harness = { workloadRuntimeId: 'runtime-a' };
   const operations: SupervisorNativeOperations = {
     supervisorStatus: async () => ({ supervisor: 'outer', workloadRuntimeId: harness.workloadRuntimeId }),
+    supervisorDoctor: async () => ({ code: 'NONE' }),
+    workloadOn: async () => ({ workloadState: 'ON' }),
+    workloadOff: async () => ({ workloadState: 'OFF' }),
+    workloadRestart: async () => ({ workloadState: 'ON' }),
     adminStatus: async () => ({ adminIdentity: recycleInputs.length === 0 ? 'admin-a' : 'admin-b' }),
     runtimeReconcile: async () => ({ readiness: 'READY', workloadAnchorsPreserved: true }),
     adminRecycle: async (input) => {
