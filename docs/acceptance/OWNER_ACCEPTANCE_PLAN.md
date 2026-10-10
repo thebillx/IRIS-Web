@@ -141,27 +141,31 @@ profiles, kill or adopt an occupied process, or add a `--force` switch.
 The owner procedure is to obtain the provider's read-only non-production
 record, start the separately provisioned local provider process, capture its
 PID, executable path and managed profile path, and write a mode-`0600` evidence
-file with this shape (all values are owner-supplied):
+file with this shape (all values are owner-supplied). The `machineId` must be
+the canonical UUID stored on the single `iris-full` workload connector in the
+acceptance registry; a hostname or admin-only binding is rejected:
 
 ```json
 {
   "schemaVersion": 1,
   "environment": "non-production",
   "provider": "<documented-provider>",
-  "machineId": "<hostname>",
+  "machineId": "<canonical-registry-machine-uuid>",
   "sourceRoot": "<candidate-checkout>",
   "tunnelId": "<non-production-tunnel-id>",
   "pid": 12345,
   "executablePath": "/absolute/path/to/provider",
   "processStartMarker": "<exact ps lstart output>",
-  "binding": { "tunnelId": "<non-production-tunnel-id>", "profilePath": "/absolute/path/to/profile" }
+  "binding": { "connectorId": "iris-full", "machineId": "<canonical-registry-machine-uuid>", "tunnelId": "<non-production-tunnel-id>", "profilePath": "/absolute/path/to/profile" }
 }
 ```
 
 Export `IRIS_ACCEPTANCE_TUNNEL_EVIDENCE` to that file before invoking
-`iris_acceptance up` or `iris_acceptance restart`. The wrapper independently
+`iris_acceptance up --tunnel-id <non-production-tunnel-id>` or
+`iris_acceptance restart --tunnel-id <non-production-tunnel-id>`. The wrapper independently
 checks file mode/owner, current-user PID, executable identity and the provider
-command's profile/tunnel binding. Any missing, stale or contradictory field
+command's profile/tunnel binding, and requires the exact single unified
+`iris-full` connector binding plus its canonical machine UUID. Any missing, stale or contradictory field
 remains **BLOCKED**.
 Use `iris_acceptance down` only for the acceptance root whose identity was
 verified by the wrapper.
