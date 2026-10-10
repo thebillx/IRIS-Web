@@ -355,7 +355,7 @@ describe('runtime lifecycle integration', () => {
     const restartedSessions = await json<{ sessions: Array<{ id: string }> }>(`${second.endpoint.apiUrl}/sessions`, {
       headers: { 'x-iris-client-id': 'client-a' },
     });
-    expect(restartedSessions.sessions).toEqual([]);
+    expect(restartedSessions.sessions).toEqual([expect.objectContaining({ id: sessionA.id })]);
     await stopRuntime(dataRoot, 15_000);
   }, 45_000);
 });
