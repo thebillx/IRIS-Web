@@ -470,7 +470,7 @@ describe('runtime machine, client, and session state', () => {
     expect(() => replacement.getSessionForClient(session.id, 'another-client')).toThrowError(expect.objectContaining({ code: 'CONTROL_DENIED' }));
   });
 
-  it('marks an in-flight session failed after replacement without replaying its submission', async () => {
+  it('marks an in-flight session uncertain after replacement without replaying its submission', async () => {
     const dataRoot = await temp('iris-durable-session-interrupted-');
     let release: ((value: { text: string }) => void) | undefined;
     let executions = 0;
@@ -488,10 +488,11 @@ describe('runtime machine, client, and session state', () => {
     expect(persisted.sessions[0]?.snapshot.executionState).toBe('WORKING');
 
     const replacement = new RuntimeState(new FoundationStateStore(dataRoot), executor);
-    expect(replacement.getSessionForClient(session.id, session.clientId).executionState).toBe('FAILED');
+    expect(replacement.getSessionForClient(session.id, session.clientId).executionState).toBe('UNCERTAIN');
     const recovered = JSON.parse(await readFile(path.join(dataRoot, 'sessions.json'), 'utf8')) as { sessions: Array<{ snapshot: { executionState: string } }> };
-    expect(recovered.sessions[0]?.snapshot.executionState).toBe('FAILED');
-    await replacement.submitInstruction(session.id, session.clientId, 'interrupted-submission', 'do not replay');
+    expect(recovered.sessions[0]?.snapshot.executionState).toBe('UNCERTAIN');
+    await expect(replacement.submitInstruction(session.id, session.clientId, 'interrupted-submission', 'do not replay')).resolves.toMatchObject({ executionState: 'UNCERTAIN' });
+    await expect(replacement.submitInstruction(session.id, session.clientId, 'new-after-uncertain', 'do not start')).rejects.toThrowError(expect.objectContaining({ code: 'PERSISTENCE_FAILURE' }));
     expect(executions).toBe(1);
 
     release?.({ text: 'late result' });

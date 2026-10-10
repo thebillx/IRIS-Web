@@ -1219,7 +1219,7 @@ export class RuntimeState {
     let recovered = false;
     for (const persisted of parsed.sessions) {
       const session = persisted.snapshot.executionState === 'WORKING'
-        ? { ...persisted.snapshot, executionState: 'FAILED' as const }
+        ? { ...persisted.snapshot, executionState: 'UNCERTAIN' as const }
         : persisted.snapshot;
       recovered ||= session !== persisted.snapshot;
       if (seen.has(session.id)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store contains duplicate session identity');

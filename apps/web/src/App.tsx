@@ -19,11 +19,12 @@ type Health = {
 };
 type SupervisorStatus = {
   state?: string;
+  readiness?: string;
   workloadState?: string;
   workloadDesiredState?: string;
   code?: string;
   detail?: string;
-  affectedJobs?: number;
+  affectedJobs?: number | null;
   machineId?: string;
   tunnel?: { state?: string; code?: string; detail?: string };
 };
@@ -176,9 +177,15 @@ export function App(): ReactElement {
   }, [ownerAccessToken]);
 
   const refresh = useCallback(async () => {
+    const supervisorRefresh = refreshSupervisor();
     try {
       const healthResponse = await fetch('/health');
-      if (!healthResponse.ok) throw new Error('Runtime unavailable');
+      if (!healthResponse.ok) {
+        await supervisorRefresh;
+        setHealth(null);
+        setError('Runtime unavailable. Persistent Supervisor status was checked separately.');
+        return;
+      }
       setHealth(await healthResponse.json() as Health);
       if (ownerAccessToken.length === 0) {
         setProjects([]);
@@ -209,7 +216,7 @@ export function App(): ReactElement {
       setSelectedSessionId(nextSelectedSessionId);
       persistSelectedSessionId(nextSelectedSessionId);
       setPermissions(await permissionsResponse.json() as PermissionSnapshot);
-      await refreshSupervisor();
+      await supervisorRefresh;
       setError('');
     } catch (cause) {
       setHealth(null);
@@ -416,6 +423,28 @@ export function App(): ReactElement {
     setNotice('Session resumed.');
   };
 
+  const detachSession = async () => {
+    const target = selectedSession;
+    if (target === null) return;
+    if (target.executionState === 'WORKING' || target.executionState === 'UNCERTAIN') {
+      throw new Error('This session has an active or uncertain execution; verify it before detaching.');
+    }
+    const response = await authorizedFetch(ownerAccessToken, `/sessions/${encodeURIComponent(target.id)}`, {
+      method: 'DELETE', headers: { 'x-iris-client-id': target.clientId },
+    });
+    if (response.status === 409) {
+      setNotice('Detaching this session requires an owner decision. Nothing was detached.');
+      setView('approvals');
+      await refresh();
+      return;
+    }
+    if (!response.ok) throw new Error(await responseMessage(response, 'Could not detach session'));
+    persistSelectedSessionId(null);
+    setSelectedSessionId(null);
+    setNotice('Session detached. Its durable record was removed after runtime verification.');
+    await refresh();
+  };
+
   const run = (operation: () => Promise<void>) => {
     setError('');
     void operation().catch((cause) => setError(cause instanceof Error ? cause.message : 'Operation failed'));
@@ -474,6 +503,7 @@ export function App(): ReactElement {
         onCreateSession={() => run(createSession)}
         onSubmitInstruction={() => run(submitInstruction)}
         onSelectSession={selectSession}
+        onDetachSession={() => run(detachSession)}
         onRegisterProject={() => run(registerProject)}
         onSelectProject={(projectId) => run(() => selectProject(projectId))}
         onSupervisorOperation={(operation) => run(() => supervisorOperation(operation))}
@@ -513,6 +543,7 @@ export function RuntimePage(props: {
   onCreateSession(): void;
   onSubmitInstruction(): void;
   onSelectSession(sessionId: string): void;
+  onDetachSession?(): void;
   onRegisterProject(): void;
   onSelectProject(projectId: string): void;
   onSupervisorOperation?(operation: 'workload_on' | 'workload_off' | 'workload_restart' | 'supervisor_doctor'): void;
@@ -565,7 +596,7 @@ export function RuntimePage(props: {
           {props.selectedSession === null
             ? <div className="empty-state prominent"><p>Create a session or resume one from the list.</p><button onClick={props.onCreateSession}>Create session</button></div>
             : <>
-              <div className="session-summary"><div><span>Role</span><strong>{props.selectedSession.agentRole}</strong></div><div><span>Agent</span><strong>{humanAgentName(props.selectedSession.agentId)}</strong></div><div><span>Started</span><strong><time dateTime={props.selectedSession.createdAt}>{formatSessionTime(props.selectedSession.createdAt)}</time></strong></div></div>
+              <div className="session-summary"><div><span>Role</span><strong>{props.selectedSession.agentRole}</strong></div><div><span>Agent</span><strong>{humanAgentName(props.selectedSession.agentId)}</strong></div><div><span>Started</span><strong><time dateTime={props.selectedSession.createdAt}>{formatSessionTime(props.selectedSession.createdAt)}</time></strong></div><button type="button" onClick={props.onDetachSession} disabled={props.onDetachSession === undefined || props.selectedSession.executionState === 'WORKING' || props.selectedSession.executionState === 'UNCERTAIN'}>Detach session</button></div>
               <label>Active project<select value={props.selectedSession.currentProjectId ?? ''} onChange={(event) => props.onSelectProject(event.target.value)}><option value="">No active project</option>{props.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
               {props.health?.agentExecutorType === 'local-development-executor' && !props.health.productionModelConnected
                 ? <p className="executor-note">Development executor active · no production model connected.</p>
@@ -608,7 +639,7 @@ export function RuntimePage(props: {
         <section className="runtime-control-card" aria-labelledby="supervisor-control-heading">
           <div className="section-title-row"><div><p className="section-label">Supervisor control</p><h2 id="supervisor-control-heading">Machine and workload</h2></div><span className={`session-state ${props.supervisorStatus?.state === 'READY' ? 'is-ready' : ''}`}>{props.supervisorStatus?.state ?? 'BLOCKED'}</span></div>
           <dl>
-            <dt>Machine identity</dt><dd>{props.health?.machineId ?? 'Unverified'}</dd>
+            <dt>Machine identity</dt><dd>{props.supervisorStatus?.machineId ?? props.health?.machineId ?? 'Unverified'}</dd>
             <dt>Gateway</dt><dd>{props.supervisorStatus?.state === undefined ? 'Unavailable' : 'Authenticated owner bridge'}</dd>
             <dt>Workload</dt><dd>{props.supervisorStatus?.workloadState ?? props.supervisorStatus?.detail ?? 'Unknown'}</dd>
             <dt>Tunnel</dt><dd>{props.supervisorStatus?.tunnel?.state ?? 'Unknown'}</dd>

@@ -157,6 +157,11 @@ describe('daily workspace session experience', () => {
         runtimeSessions.push(created);
         return jsonResponse(created, 201);
       }
+      if (url === `/sessions/${sessionA.id}` && method === 'DELETE') {
+        const index = runtimeSessions.findIndex((session) => session.id === sessionA.id);
+        if (index >= 0) runtimeSessions.splice(index, 1);
+        return jsonResponse({ deleted: true });
+      }
       throw new Error(`Unexpected request: ${method} ${url}`);
     }));
 
@@ -182,6 +187,11 @@ describe('daily workspace session experience', () => {
     await clickButtonStartingWith('Session 1');
     expect(window.sessionStorage.getItem('iris.web.selectedSessionId')).toBe(sessionA.id);
     expect(document.body.textContent).toContain('/Users/bill/iris');
+
+    await clickButton('Detach session');
+    await settleApp();
+    expect(runtimeSessions.some((session) => session.id === sessionA.id)).toBe(false);
+    expect(window.sessionStorage.getItem('iris.web.selectedSessionId')).toBe(sessionB.id);
   });
 
   it('mounts App and clears stale selection when a restarted daemon reports no transient sessions while persisted projects remain', async () => {
@@ -374,6 +384,26 @@ describe('daily workspace session experience', () => {
     expect(markup).toContain('No sessions yet.');
     expect(markup).toContain('Nothing selected');
     expect(markup).toContain('Create session');
+  });
+
+  it('keeps persistent Supervisor status visible when the workload health endpoint is unavailable', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return new Response(null, { status: 503 });
+      if (url === '/supervisor-control/healthz') return jsonResponse({ ok: true });
+      if (url === '/supervisor-control/mcp') return jsonResponse({ result: { structuredContent: {
+        state: 'DEGRADED', workloadState: 'OFF', machineId: 'machine-a', tunnel: { state: 'OFF' },
+        detail: 'Workload is OFF; the persistent Supervisor gateway remains available',
+      } } });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    expect(document.body.textContent).toContain('DEGRADED');
+    expect(document.body.textContent).toContain('Workload is OFF');
+    expect(document.body.textContent).toContain('machine-a');
   });
 });
 

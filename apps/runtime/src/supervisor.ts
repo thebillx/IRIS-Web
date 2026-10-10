@@ -916,14 +916,25 @@ export class Supervisor {
     const adminChildEnvironmentDigest = state.admin?.environmentDigest ?? null;
     const adminChildWorkingDirectory = state.admin?.workingDirectory ?? null;
     const adminSourceCoherent = await adminProcessMatchesControlSource(state.admin, this.sourceRoot);
+    const workloadConnector = registry?.connectors.find((connector) => connector.connectorId === 'iris-full') ?? null;
+    const workloadTunnel = state.workloadDesiredState === 'OFF'
+      ? { state: 'OFF', code: 'WORKLOAD_OFF', detail: 'Workload is OFF; the persistent Supervisor gateway remains available' }
+      : state.tunnels.full !== null && workloadConnector !== null && state.tunnels.full.tunnelId === workloadConnector.tunnelId
+        ? { state: 'READY', code: 'READY', detail: 'Supervisor-owned workload tunnel identity is bound' }
+        : { state: 'UNKNOWN', code: 'TUNNEL_IDENTITY_UNVERIFIED', detail: 'Workload tunnel ownership is not verified' };
+    const readiness = state.stackDesiredState === 'UP' && (observed.state === 'running' || (observed.state === 'stopped' && state.workloadDesiredState === 'OFF'))
+      && state.admin !== null && (registry?.connectors.length === 1 || state.adminTunnel !== null) && adminSourceCoherent ? 'READY' : 'DEGRADED';
     return {
       supervisorControlOwner: 'OUTER_SUPERVISOR_DAEMON',
       supervisorProcessId: process.pid,
       supervisorProcessIdentity: currentProcessIdentity(),
       controlSourceRoot: this.sourceRoot,
       protectedReferenceRoot: this.protectedReferenceRoot ?? null,
-      readiness: state.stackDesiredState === 'UP' && (observed.state === 'running' || (observed.state === 'stopped' && state.workloadDesiredState === 'OFF'))
-        && state.admin !== null && (registry?.connectors.length === 1 || state.adminTunnel !== null) && adminSourceCoherent ? 'READY' : 'DEGRADED',
+      state: readiness,
+      readiness,
+      machineId: workloadConnector?.machineId ?? registry?.admin?.machineId ?? null,
+      tunnel: workloadTunnel,
+      affectedJobs: null,
       stackDesiredState: state.stackDesiredState,
       workloadDesiredState: state.workloadDesiredState,
       workloadState: observed.state === 'running' ? 'ON' : observed.state === 'stopped' && state.workloadDesiredState === 'OFF' ? 'OFF' : 'UNKNOWN',

@@ -85,7 +85,22 @@ export function validateAcceptanceCommand(command) {
     if (!tunnelId) reject();
     return command;
   }
-  if (['up', 'down', 'restart', 'status', 'doctor', 'logs', 'supervisor'].includes(name)) {
+  if (['up', 'restart', 'supervisor'].includes(name)) {
+    let tunnelId = false;
+    for (let index = 0; index < argumentsList.length; index += 1) {
+      const option = argumentsList[index];
+      if (option === '--tunnel-id') {
+        if (tunnelId) reject();
+        requireValue(index + 1);
+        tunnelId = true;
+        index += 1;
+      } else {
+        reject();
+      }
+    }
+    return command;
+  }
+  if (['down', 'status', 'doctor', 'logs'].includes(name)) {
     requireExact(0);
     return command;
   }
@@ -149,6 +164,7 @@ export async function inspectAcceptanceEnvironment(options) {
   if (tunnelClaims.length > 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_CONFLICT', `Acceptance tunnel identity is already claimed by protected installation ${tunnelClaims[0]}`);
   let tunnelIdentity = tunnelClaims.length > 0 ? 'CONFLICT' : 'UNVERIFIED';
   if (startsRemoteTunnel(command)) {
+    if (requestedTunnelId === null) throw new AcceptanceError('ACCEPTANCE_TUNNEL_ID_REQUIRED', 'Remote acceptance startup requires the exact non-production workload tunnel id');
     const evidencePath = environment.IRIS_ACCEPTANCE_TUNNEL_EVIDENCE?.trim();
     if (evidencePath === undefined || evidencePath.length === 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_UNVERIFIED', 'Acceptance tunnel ownership is UNVERIFIED; provide authoritative non-production tunnel ownership evidence');
     await verifyAcceptanceTunnelEvidence({
@@ -186,7 +202,7 @@ async function main() {
       return;
     }
     const childEnvironment = buildChildEnvironment(report.dataRoot, process.env);
-    const child = spawn(process.execPath, [path.join(REPO_ROOT, 'scripts', 'iris.mjs'), ...parsed.command], {
+    const child = spawn(process.execPath, [path.join(REPO_ROOT, 'scripts', 'iris.mjs'), ...stripAcceptanceArguments(parsed.command)], {
       cwd: REPO_ROOT,
       env: childEnvironment,
       stdio: 'inherit',
@@ -213,12 +229,14 @@ export async function verifyAcceptanceTunnelEvidence(options) {
   if (typeof process.getuid === 'function' && metadata.uid !== process.getuid()) throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence is not owned by the current user');
   let evidence;
   try { evidence = JSON.parse(await (options.readTextFile ?? readFile)(filename, 'utf8')); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence is not valid JSON'); }
+  const workloadBinding = options.dataRoot === undefined ? null : await readAcceptanceWorkloadBinding(options.dataRoot);
   const expectedTunnelId = options.tunnelId;
+  if (typeof expectedTunnelId !== 'string' || expectedTunnelId.length === 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_ID_REQUIRED', 'Tunnel evidence must name the exact workload tunnel');
   if (!isRecord(evidence)
     || evidence.schemaVersion !== 1
     || evidence.environment !== 'non-production'
     || typeof evidence.provider !== 'string' || evidence.provider.length === 0 || evidence.provider.length > 200
-    || typeof evidence.machineId !== 'string' || evidence.machineId.length === 0 || evidence.machineId !== (options.machineName ?? os.hostname())
+    || typeof evidence.machineId !== 'string' || evidence.machineId.length === 0 || evidence.machineId !== (workloadBinding?.machineId ?? options.machineId ?? options.machineName ?? os.hostname())
     || typeof evidence.sourceRoot !== 'string' || path.resolve(evidence.sourceRoot) !== path.resolve(options.sourceRoot)
     || typeof evidence.tunnelId !== 'string' || evidence.tunnelId.length === 0 || (typeof expectedTunnelId === 'string' && evidence.tunnelId !== expectedTunnelId)
     || !Number.isSafeInteger(evidence.pid) || evidence.pid <= 0
@@ -227,6 +245,9 @@ export async function verifyAcceptanceTunnelEvidence(options) {
     || !isRecord(evidence.binding) || evidence.binding.tunnelId !== evidence.tunnelId
     || (evidence.binding.profilePath !== undefined && (typeof evidence.binding.profilePath !== 'string' || !path.isAbsolute(evidence.binding.profilePath)))) {
     throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence does not bind the expected non-production provider, machine, source or tunnel');
+  }
+  if (workloadBinding !== null && (evidence.tunnelId !== workloadBinding.tunnelId || evidence.binding.connectorId !== workloadBinding.connectorId || evidence.binding.machineId !== workloadBinding.machineId)) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Evidence does not bind the canonical unified workload connector');
   }
   const isAlive = options.isPidAlive ?? pidExists;
   if (!await isAlive(evidence.pid)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_UNAVAILABLE', 'The evidenced local tunnel process is not alive');
@@ -240,17 +261,23 @@ export async function verifyAcceptanceTunnelEvidence(options) {
   }
   const bindingNeedle = evidence.binding.profilePath ?? evidence.tunnelId;
   if (!processInfo.command.includes(bindingNeedle)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'The local provider process does not expose the evidenced tunnel binding');
-  if (options.dataRoot !== undefined) {
-    const registryPath = path.join(options.dataRoot, 'connector-registry.json');
-    const registryContent = await readFile(registryPath, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
-    if (registryContent === null) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance connector registry is required for remote startup');
-    let parsedRegistry;
-    try { parsedRegistry = JSON.parse(registryContent); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Acceptance connector registry is invalid'); }
-    const registry = parsedRegistry?.registry ?? parsedRegistry;
-    const bindings = [...(Array.isArray(registry?.connectors) ? registry.connectors : []), registry?.admin].filter(Boolean);
-    if (!bindings.some((binding) => isRecord(binding) && binding.tunnelId === evidence.tunnelId)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Evidence tunnel identity is not bound to the acceptance registry');
-  }
   return { provider: evidence.provider, machineId: evidence.machineId, tunnelId: evidence.tunnelId, pid: evidence.pid };
+}
+
+async function readAcceptanceWorkloadBinding(dataRoot) {
+  const registryPath = path.join(dataRoot, 'connector-registry.json');
+  const registryContent = await readFile(registryPath, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
+  if (registryContent === null) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance connector registry is required for remote startup');
+  let parsedRegistry;
+  try { parsedRegistry = JSON.parse(registryContent); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Acceptance connector registry is invalid'); }
+  const registry = parsedRegistry?.registry ?? parsedRegistry;
+  const connectors = Array.isArray(registry?.connectors) ? registry.connectors : null;
+  if (connectors === null || connectors.length !== 1) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance requires exactly one unified workload connector');
+  const workload = connectors[0];
+  if (!isRecord(workload) || workload.connectorId !== 'iris-full' || workload.mode !== 'FULL' || !/^tunnel_[a-f0-9]{32}$/.test(workload.tunnelId) || !isUuid(workload.machineId)) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance registry does not contain a canonical unified workload connector');
+  }
+  return { connectorId: workload.connectorId, tunnelId: workload.tunnelId, machineId: workload.machineId };
 }
 
 export function buildChildEnvironment(dataRoot, environment = process.env) {
@@ -348,6 +375,16 @@ function commandValue(command, flag) {
   return index < 0 ? null : command[index + 1] ?? null;
 }
 
+function stripAcceptanceArguments(command) {
+  if (!['up', 'restart', 'supervisor'].includes(command[0])) return command;
+  const stripped = [];
+  for (let index = 0; index < command.length; index += 1) {
+    if (command[index] === '--tunnel-id') { index += 1; continue; }
+    stripped.push(command[index]);
+  }
+  return stripped;
+}
+
 async function existingPrivateDirectory(input, code) {
   const canonical = await existingDirectory(input, code);
   const metadata = await stat(canonical);
@@ -437,6 +474,10 @@ function isWithin(root, candidate) {
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isUuid(value) {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function sameIdentity(actual, expected) {
