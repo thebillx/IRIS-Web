@@ -138,8 +138,8 @@ describe('IRIS supervisor', () => {
     expect(status.sourceMode).toBe('BOUND_WORKLOAD_COMPATIBILITY');
     expect(status.state).toBe('UNKNOWN');
     expect(status.recommendedAction).toBe('USE_CONTROLLED_ACTIVATION_BEFORE_CATALOG_RELOAD');
-    expect(status.pro.live).toBeNull();
-    expect(status.pro.liveToolCount).toBeNull();
+    expect(status.pro?.live).toBeNull();
+    expect(status.pro?.liveToolCount).toBeNull();
     await expect(supervisor.catalogReload()).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
@@ -312,6 +312,45 @@ describe('IRIS supervisor', () => {
       await daemon.close();
     }
   });
+
+  it('owns one public tunnel with persistent local recovery in unified mode', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-unified-supervisor-'));
+    const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-unified-tunnel-'));
+    roots.push(dataRoot, fakeRoot);
+    await initializeConnectorRegistry(dataRoot, { unified: true, fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', fullHealthPort: await freePort() });
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const controlPort = await freePort();
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot, tunnelClientPath: await fakeTunnelClient(fakeRoot),
+      webPort: await freePort(), adminPort: await freePort(), supervisorControlPort: controlPort });
+    const native = await startSupervisorNativeControlServer(dataRoot, controlPort, {
+      supervisorStatus: () => supervisor.supervisorNativeStatus(), adminStatus: () => supervisor.adminNativeStatus(),
+      runtimeReconcile: () => supervisor.runtimeReconcile(), adminRecycle: (input) => supervisor.adminRecycle(input),
+      adminTunnelRecycle: (input) => supervisor.adminTunnelRecycle(input), adminToolCall: (name, args) => supervisor.adminToolCall(name, args),
+    });
+    (supervisor as unknown as { nativeControlActive: boolean }).nativeControlActive = true;
+    try {
+      const first = await supervisor.up();
+      expect(first.connectors.map((binding) => binding.label)).toEqual(['IRIS']);
+      expect(first.controlPlane.state).toBe('READY');
+      const filename = path.join(dataRoot, 'supervisor/state.json');
+      const before = JSON.parse(await readFile(filename, 'utf8'));
+      expect(before.tunnels.full.pid).toBeGreaterThan(0);
+      expect(before.tunnels.pro).toBeNull();
+      expect(before.adminTunnel).toBeNull();
+      expect(before.admin.pid).toBeGreaterThan(0);
+      await supervisor.up();
+      const after = JSON.parse(await readFile(filename, 'utf8'));
+      expect(after.runtime.pid).toBe(before.runtime.pid);
+      expect(after.tunnels.full.pid).toBe(before.tunnels.full.pid);
+      expect((await supervisor.catalogStatus()).pro).toBeNull();
+      expect((await supervisor.adminToolCall('activation_status', {})).isError).not.toBe(true);
+    } finally {
+      await supervisor.down().catch(() => undefined);
+      (supervisor as unknown as { nativeControlActive: boolean }).nativeControlActive = false;
+      await native.close();
+    }
+  }, 60_000);
 
   it('owns an idempotent runtime, web process, and two tunnel processes and stops only those records', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-up-'));

@@ -397,14 +397,10 @@ export function App(): ReactElement {
     ? []
     : (permissions?.recentDecisions ?? []).filter((event) => event.sessionId === selectedSession.id).slice(0, 5);
   const productStatus = health === null
-    ? 'Disconnected'
-    : visibleApprovals.length > 0
-      ? 'Approval required'
-      : selectedSession?.executionState === 'WORKING'
-        ? 'Working'
-        : selectedSession?.executionState === 'FAILED'
-          ? 'Error'
-          : health.status === 'ready' ? 'Ready' : 'Working';
+    ? 'Offline'
+    : visibleApprovals.length > 0 || selectedSession?.executionState === 'FAILED' || health.status !== 'ready'
+      ? 'Needs Attention'
+      : 'Online';
 
   return <div className="app-frame">
     <header className="web-header">

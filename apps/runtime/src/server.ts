@@ -42,6 +42,7 @@ export interface RuntimeServerContext {
   readonly tunnelServiceSecret?: string;
   readonly connectorDeploymentEpoch?: number;
   readonly connectorRuntimeId?: string;
+  readonly singleConnector?: boolean;
   readonly catalogRuntimeContext?: McpCatalogRuntimeContext;
   readonly requestShutdown: () => void;
 }
@@ -123,6 +124,10 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   }
 
   const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+  if (context.singleConnector && url.pathname === '/mcp-pro') {
+    writeEmptyNotFound(response);
+    return;
+  }
   const runtimeOrigin = `http://${request.headers.host!}`;
   if (request.method === 'GET' && url.pathname === '/.well-known/oauth-protected-resource/mcp') {
     writeJson(response, 200, {
