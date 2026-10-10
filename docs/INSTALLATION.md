@@ -74,6 +74,13 @@ authorized implementation must first provide authoritative non-production
 tunnel evidence. An unreadable protected registry is an evidence failure, not
 an unclaimed tunnel.
 
+Provider ownership evidence is a separate read-only step. For the exact
+non-production tunnel, an owner may run
+`tunnel-client admin tunnels get <tunnel-id> --json` with an approved runtime
+or admin key reference. Keep only redacted metadata. This lookup does not prove
+local process ownership and does not authorize `up`; the acceptance wrapper
+continues to block remote startup while ownership is `UNVERIFIED`.
+
 ## C. Existing installation migration
 
 Fresh setup is not migration. Do not delete a registry, point a fresh command

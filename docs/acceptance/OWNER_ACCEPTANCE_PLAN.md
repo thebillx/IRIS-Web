@@ -18,6 +18,12 @@ LaunchAgent collision.
   the default tunnel profile directory and the candidate source checkout.
 - Provision a separate non-production tunnel profile and tunnel ID. Never copy
   a production credential or reuse a production tunnel identity.
+- Obtain owner-approved, read-only provider evidence for that exact tunnel with
+  `tunnel-client admin tunnels get <tunnel-id> --json`. This lookup accepts a
+  runtime key from `CONTROL_PLANE_API_KEY` or `OPENAI_API_KEY`, or an explicitly
+  approved admin key. Do not paste keys into commands or record the response
+  body; retain only the redacted tunnel ID, name, scope and status needed for
+  the evidence record.
 - Do not proceed if the root, process, port, tunnel, credential or LaunchAgent
   identity cannot be proved. Preserve the evidence and ask the owner.
 
@@ -99,10 +105,12 @@ remote tunnel ownership.
 
 Starting or restarting a remote tunnel is blocked while ownership is
 `UNVERIFIED`. The wrapper does not accept an owner-provided bypass: obtain
-authoritative non-production tunnel ownership evidence and a separately
-approved implementation before enabling any remote startup. If a port is
-occupied, do not kill or adopt the process; stop and schedule a separately
-isolated window.
+authoritative non-production tunnel ownership evidence through the provider's
+read-only lookup and a separately approved implementation before enabling any
+remote startup. The lookup proves provider metadata for the requested tunnel;
+it does not by itself prove that a local process owns the tunnel or authorize
+startup. If a port is occupied, do not kill or adopt the process; stop and
+schedule a separately isolated window.
 Use `iris_acceptance down` only for the acceptance root whose identity was
 verified by the wrapper.
 
@@ -111,6 +119,13 @@ must re-export `IRIS_ACCEPTANCE_ROOT` and rerun `iris_acceptance preflight`; an
 existing guard with a replaced directory, symlink, owner or mode is not repaired
 in place. Passing local preflight proves only disposable local identity and
 storage checks; it does not prove production safety or remote tunnel ownership.
+
+On a host where the live stack already owns ports `43110–43113` or `5173`, or
+where `com.iris.supervisor` is loaded, use the controlled acceptance window
+procedure. The owner must quiesce and fence the intended installation, record
+the process and LaunchAgent identities, run a fresh wrapper preflight, and
+restore the same installation after the evidence is captured. This plan does
+not authorize that window.
 
 ## LaunchAgent and two-machine isolation
 
