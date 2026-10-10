@@ -68,6 +68,7 @@ const BASE_EFFECTS: Readonly<Record<CapabilityId, readonly CapabilityEffect[]>> 
   'shell.run': ['EXECUTE'],
   'shell.start': ['EXECUTE'],
   'job.status': ['READ'],
+  'job.list': ['READ'],
   'job.logs': ['READ'],
   'job.result': ['READ'],
   'job.cancel': ['WRITE', 'EXECUTE', 'DESTRUCTIVE'],

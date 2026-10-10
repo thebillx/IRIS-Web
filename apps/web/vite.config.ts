@@ -113,6 +113,7 @@ export default defineConfig({
       '/status': runtimeUrl,
       '/projects': runtimeUrl,
       '/sessions': runtimeUrl,
+      '/jobs': runtimeUrl,
       '/missions': runtimeUrl,
       '/permissions': runtimeUrl,
       '/approvals': runtimeUrl,

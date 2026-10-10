@@ -434,6 +434,50 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return;
   }
 
+  if (request.method === 'GET' && url.pathname === '/jobs') {
+    const projectId = requiredQueryProjectId(url);
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'job.list', projectId, clientId: requiredClientId(request), sessionId: requiredSessionId(request),
+    }));
+    return;
+  }
+  const jobLogsMatch = /^\/jobs\/([^/]+)\/logs$/.exec(url.pathname);
+  if (jobLogsMatch !== null && request.method === 'GET') {
+    const projectId = requiredQueryProjectId(url);
+    const stream = url.searchParams.get('stream');
+    if (stream !== 'stdout' && stream !== 'stderr') throw new RuntimeError('INVALID_REQUEST', 'stream must be stdout or stderr');
+    const cursor = url.searchParams.get('cursor') ?? undefined;
+    const maxBytesValue = url.searchParams.get('maxBytes');
+    const maxBytes = maxBytesValue === null ? undefined : Number(maxBytesValue);
+    if (maxBytes !== undefined && !Number.isSafeInteger(maxBytes)) throw new RuntimeError('INVALID_REQUEST', 'maxBytes must be an integer');
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'job.logs', projectId, jobId: decodeURIComponent(jobLogsMatch[1]!), stream, cursor, maxBytes,
+      clientId: requiredClientId(request), sessionId: requiredSessionId(request),
+    }));
+    return;
+  }
+  const jobMatch = /^\/jobs\/([^/]+)$/.exec(url.pathname);
+  if (jobMatch !== null && request.method === 'GET') {
+    const projectId = requiredQueryProjectId(url);
+    const jobId = decodeURIComponent(jobMatch[1]!);
+    const view = url.searchParams.get('view') ?? 'status';
+    if (view !== 'status' && view !== 'result') throw new RuntimeError('INVALID_REQUEST', 'view must be status or result');
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: view === 'status' ? 'job.status' : 'job.result', projectId, jobId,
+      clientId: requiredClientId(request), sessionId: requiredSessionId(request),
+    }));
+    return;
+  }
+  const jobCancelMatch = /^\/jobs\/([^/]+)\/cancel$/.exec(url.pathname);
+  if (jobCancelMatch !== null && request.method === 'POST') {
+    const body = await readJsonBody(request);
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'job.cancel', projectId: stringField(body, 'projectId'), jobId: decodeURIComponent(jobCancelMatch[1]!),
+      clientId: requiredClientId(request), sessionId: requiredSessionId(request),
+    }));
+    return;
+  }
+
   const sessionMatch = /^\/sessions\/([^/]+)$/.exec(url.pathname);
   if (sessionMatch !== null) {
     const sessionId = decodeURIComponent(sessionMatch[1]!);
@@ -555,6 +599,12 @@ function optionalClientId(request: IncomingMessage): string | undefined {
 function requiredSessionId(request: IncomingMessage): string {
   const value = optionalSessionId(request);
   if (value === undefined) throw new RuntimeError('CONTROL_DENIED', `${SESSION_ID_HEADER} is required for capability execution`);
+  return value;
+}
+
+function requiredQueryProjectId(url: URL): string {
+  const value = url.searchParams.get('projectId')?.trim() ?? '';
+  if (value.length === 0 || value.length > 200 || value.includes('\0')) throw new RuntimeError('INVALID_REQUEST', 'projectId query parameter is required');
   return value;
 }
 

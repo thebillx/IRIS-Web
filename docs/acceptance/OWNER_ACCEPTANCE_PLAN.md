@@ -262,3 +262,23 @@ Record only redacted status, Project/Workspace IDs, source commit, root label,
 process ownership, port checks, tunnel ID suffix, LaunchAgent result and
 authenticated `/mcp` evidence. Mark real ChatGPT, login persistence and
 RARW/bill rows `PASS` only after both owner-authorized machines supply evidence.
+
+## Keep-awake owner decision package (R06)
+
+R06 remains **BLOCKED** because the inspected Amphetamine 5.3.2 automation
+surface exposes global start/end session commands without an IRIS-owned lease
+identifier. Ending such a session could terminate a user-owned session, so the
+candidate does not call it. No Power Protect helper, sudoers change, TCC bypass
+or privileged power setting is authorized.
+
+| Option | Feasibility | Permissions and limits | Rollback | Recommendation |
+|---|---|---|---|---|
+| A. Supervisor-owned native macOS power assertion | A documented non-privileged process-owned assertion can keep the machine awake while the Supervisor process is alive | Requires a small macOS-native provider contract and owner verification; it does not guarantee closed-lid wake or bypass Apple Silicon/OS display-sleep limits | Disable the assertion and remove only the Supervisor-owned process lease | Preferred for ordinary idle-sleep prevention if the owner accepts the closed-lid limitation |
+| B. Amphetamine with an ownership-scoped lease API | Not feasible with the inspected 5.3.2 dictionary; becomes feasible only if the owner supplies a documented lease/resource ID and permission path | Must preserve user sessions and report denied Automation permission or unsupported closed-display behavior | Release only the returned IRIS lease ID | Do not approve the current global start/end interface |
+| C. Remain blocked | Safe and immediately available | No keep-awake claim or enable control; physical closed-lid evidence remains unperformed | None | Required until A is approved or B supplies an ownership-safe interface |
+
+Owner decision required: approve Option A's ordinary idle-sleep contract, provide
+the documented provider/permission evidence for Option B, or keep R06/A07
+blocked. Any physical lid-close, battery/charger, restart and continued
+connectivity test must name the target Mac, candidate SHA, expected impact,
+rollback and evidence to capture before execution.

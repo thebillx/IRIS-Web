@@ -212,6 +212,32 @@ describe('production safety foundation', () => {
     expect(verifier.activeFences.size).toBe(0);
   });
 
+  it('keeps a committed reservation held when fence release fails and completes only after recovery', async () => {
+    const verifier = createTrustedWriterVerifier();
+    const { controller, token, root } = await fixture(true, verifier);
+    for (const writer of requiredWriters) await registerWriter(controller, writer);
+    await controller.quiesce(token);
+    const reservation = await controller.reserveBackup(token, path.join(root, 'release-retry-backup'));
+    const evidence = {
+      backupId: 'release-retry',
+      destination: reservation.fence.reservation!.destination,
+      manifestDigest: 'digest',
+      sourceIdentity: reservation.fence.identity,
+      fenceEpoch: reservation.fence.fenceEpoch,
+      checkpointDigest: null,
+      verifiedAt: new Date().toISOString(),
+    };
+    verifier.releaseAvailable = false;
+    await expect(controller.completeBackup(token, reservation.id, evidence)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    expect((await controller.inspect()).reservation?.status).toBe('COMMITTED');
+    expect((await controller.inspect()).state).toBe('BLOCKED');
+    expect(verifier.activeFences.size).toBe(1);
+    verifier.releaseAvailable = true;
+    await controller.completeBackup(token, reservation.id, evidence);
+    expect((await controller.inspect()).reservation).toBeNull();
+    expect(verifier.activeFences.size).toBe(0);
+  });
+
   it('does not let observations erase an active lease during quiesce or recovery', async () => {
     const { controller, token } = await fixture();
     await registerWriter(controller, 'runtime-state');
@@ -413,7 +439,7 @@ describe('production safety foundation', () => {
   });
 });
 
-type TestWriterVerifier = TrustedWriterVerifier & { available: boolean; fail: boolean; generationOffset: number; runtimeIdOverride?: string; state: 'IDLE' | 'ACTIVE'; inFlight: number; fenceAvailable: boolean; fenceCount: number; activeFences: Set<string> };
+type TestWriterVerifier = TrustedWriterVerifier & { available: boolean; fail: boolean; generationOffset: number; runtimeIdOverride?: string; state: 'IDLE' | 'ACTIVE'; inFlight: number; fenceAvailable: boolean; releaseAvailable: boolean; fenceCount: number; activeFences: Set<string> };
 
 function createTrustedWriterVerifier(): TestWriterVerifier {
   const verifier: TestWriterVerifier = {
@@ -423,6 +449,7 @@ function createTrustedWriterVerifier(): TestWriterVerifier {
     state: 'IDLE' as 'IDLE' | 'ACTIVE',
     inFlight: 0,
     fenceAvailable: true,
+    releaseAvailable: true,
     fenceCount: 0,
     activeFences: new Set(),
     verify: async (_writer: Parameters<TrustedWriterVerifier['verify']>[0], identity: Parameters<TrustedWriterVerifier['verify']>[1], context: Parameters<TrustedWriterVerifier['verify']>[2]): Promise<TrustedWriterVerification | null> => {
@@ -445,7 +472,10 @@ function createTrustedWriterVerifier(): TestWriterVerifier {
       return {
         fenceId,
         revalidate: async () => verifier.activeFences.has(fenceId) && verifier.available && !verifier.fail && verifier.state === 'IDLE' && verifier.inFlight === 0,
-        release: async () => { verifier.activeFences.delete(fenceId); },
+        release: async () => {
+          if (!verifier.releaseAvailable) throw new Error('test fence release unavailable');
+          verifier.activeFences.delete(fenceId);
+        },
       };
     },
   };

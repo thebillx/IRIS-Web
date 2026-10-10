@@ -28,6 +28,8 @@ type SupervisorStatus = {
   machineId?: string;
   tunnel?: { state?: string; code?: string; detail?: string };
 };
+type DurableJob = { jobId: string; requestId: string; projectId: string; workspaceId: string; state: string; startedAt: string; finishedAt: string | null; cancelRequested?: boolean };
+type JobLog = { text: string; cursor: string; eof: boolean };
 
 type Project = { id: string; name: string; rootPath: string };
 type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED' | 'UNCERTAIN';
@@ -163,6 +165,8 @@ export function App(): ReactElement {
   const [submittingSessionIds, setSubmittingSessionIds] = useState<Set<string>>(() => new Set());
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [jobs, setJobs] = useState<DurableJob[]>([]);
+  const [jobLogs, setJobLogs] = useState<Record<string, JobLog>>({});
 
   const refreshSupervisor = useCallback(async () => {
     if (ownerAccessToken.length === 0) { setSupervisorStatus(null); return; }
@@ -231,6 +235,30 @@ export function App(): ReactElement {
   }, [refresh]);
 
   const selectedSession = sessions.find((candidate) => candidate.id === selectedSessionId) ?? null;
+  const refreshJobs = useCallback(async () => {
+    const projectId = selectedSession?.currentProjectId;
+    if (ownerAccessToken.length === 0 || selectedSession === null || projectId === null || projectId === undefined) { setJobs([]); return; }
+    const response = await authorizedFetch(ownerAccessToken, `/jobs?projectId=${encodeURIComponent(projectId)}`, { headers: { 'x-iris-client-id': selectedSession.clientId, 'x-iris-session-id': selectedSession.id } });
+    if (!response.ok) throw new Error('Durable job status is unavailable');
+    setJobs((await response.json() as { jobs: DurableJob[] }).jobs);
+  }, [ownerAccessToken, selectedSession]);
+
+  useEffect(() => { void refreshJobs().catch(() => setJobs([])); }, [refreshJobs]);
+
+  const cancelJob = useCallback(async (job: DurableJob) => {
+    if (selectedSession === null) return;
+    const response = await authorizedFetch(ownerAccessToken, `/jobs/${encodeURIComponent(job.jobId)}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-iris-client-id': selectedSession.clientId, 'x-iris-session-id': selectedSession.id }, body: JSON.stringify({ projectId: job.projectId }) });
+    if (!response.ok) throw new Error(await responseMessage(response, 'Job cancellation was not verified'));
+    await refreshJobs();
+  }, [ownerAccessToken, refreshJobs, selectedSession]);
+
+  const readJobLogs = useCallback(async (job: DurableJob) => {
+    if (selectedSession === null) return;
+    const response = await authorizedFetch(ownerAccessToken, `/jobs/${encodeURIComponent(job.jobId)}/logs?projectId=${encodeURIComponent(job.projectId)}&stream=stdout`, { headers: { 'x-iris-client-id': selectedSession.clientId, 'x-iris-session-id': selectedSession.id } });
+    if (!response.ok) throw new Error(await responseMessage(response, 'Job output is unavailable'));
+    const log = await response.json() as JobLog;
+    setJobLogs((current) => ({ ...current, [job.jobId]: log }));
+  }, [ownerAccessToken, selectedSession]);
   const visibleApprovals = (permissions?.pendingApprovals ?? []).filter((approval) =>
     approvalBelongsToSessionContext(approval, clientId, selectedSessionId),
   );
@@ -507,6 +535,10 @@ export function App(): ReactElement {
         onRegisterProject={() => run(registerProject)}
         onSelectProject={(projectId) => run(() => selectProject(projectId))}
         onSupervisorOperation={(operation) => run(() => supervisorOperation(operation))}
+        jobs={jobs}
+        jobLogs={jobLogs}
+        onCancelJob={(job) => run(() => cancelJob(job))}
+        onReadJobLogs={(job) => run(() => readJobLogs(job))}
         onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
         onRequestMissionLifecycleAction={(mission, action) => run(() => requestMissionLifecycleAction(mission, action))}
       />}
@@ -547,6 +579,10 @@ export function RuntimePage(props: {
   onRegisterProject(): void;
   onSelectProject(projectId: string): void;
   onSupervisorOperation?(operation: 'workload_on' | 'workload_off' | 'workload_restart' | 'supervisor_doctor'): void;
+  jobs?: DurableJob[];
+  jobLogs?: Record<string, JobLog>;
+  onCancelJob?(job: DurableJob): void;
+  onReadJobLogs?(job: DurableJob): void;
   onRequestMissionOrchestrator(mission: Mission, targetMode: OrchestratorMode): void;
   onRequestMissionLifecycleAction?(mission: Mission, action: MissionLifecycleAction): void;
 }): ReactElement {
@@ -653,6 +689,13 @@ export function RuntimePage(props: {
             <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('supervisor_doctor')}>Doctor</button>
           </div>
           {props.supervisorStatus?.detail ? <p className="muted">{props.supervisorStatus.detail}</p> : null}
+        </section>
+
+        <section className="jobs-card" aria-labelledby="jobs-heading">
+          <div className="section-title-row"><div><p className="section-label">Durable jobs</p><h2 id="jobs-heading">Authoritative job status</h2></div><span>{props.jobs?.length ?? 0}</span></div>
+          {(props.jobs ?? []).length === 0
+            ? <p className="muted">No durable jobs reported for this project.</p>
+            : <ul className="project-list">{(props.jobs ?? []).map((job) => <li key={job.jobId}><div><strong>{job.state}{job.cancelRequested ? ' · CANCEL_PENDING' : ''}</strong><code>{job.jobId} · project {job.projectId} · workspace {job.workspaceId}</code>{props.jobLogs?.[job.jobId] ? <pre>{props.jobLogs[job.jobId]!.text}</pre> : null}</div><div><button onClick={() => props.onReadJobLogs?.(job)}>Output</button><button disabled={job.state !== 'RUNNING' && job.state !== 'QUEUED'} onClick={() => props.onCancelJob?.(job)}>Cancel job</button></div></li>)}</ul>}
         </section>
 
         {props.health && <details className="runtime-details"><summary>Runtime details</summary><dl>

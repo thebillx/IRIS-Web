@@ -69,7 +69,7 @@ interface SafetyReservation {
   readonly destination: string;
   readonly checkpointTarget: string | null;
   readonly startedAt: string;
-  readonly status: 'ACTIVE' | 'FAILED';
+  readonly status: 'ACTIVE' | 'COMMITTED' | 'RELEASED' | 'FAILED';
   readonly maintenanceFenceId: string | null;
 }
 
@@ -97,6 +97,7 @@ export interface WriterObservation {
 export interface TrustedWriterVerificationContext {
   readonly fenceEpoch: number;
   readonly generation: number;
+  readonly reservationId?: string;
 }
 
 export interface TrustedWriterVerification {
@@ -118,7 +119,10 @@ export interface TrustedMaintenanceFence {
 export interface TrustedWriterVerifier {
   verify(writer: SafetyWriterName, identity: SafetyIdentity, context: TrustedWriterVerificationContext): Promise<TrustedWriterVerification | null>;
   acquireMaintenanceFence?(writers: readonly SafetyWriterName[], identity: SafetyIdentity, context: TrustedWriterVerificationContext): Promise<TrustedMaintenanceFence | null>;
+  recoverMaintenanceFence?(fenceId: string, writers: readonly SafetyWriterName[], identity: SafetyIdentity, context: TrustedWriterVerificationContext): Promise<TrustedMaintenanceFence | null>;
 }
+
+type HeldMaintenanceFence = { readonly fence: TrustedMaintenanceFence; released: boolean };
 
 export interface ProductionSafetyOpenOptions {
   readonly dataRoot: string;
@@ -170,7 +174,8 @@ export interface RestoreBackupInput {
 
 export class ProductionSafetyController {
   private operationTail: Promise<void> = Promise.resolve();
-  private readonly heldMaintenanceFences = new Map<string, TrustedMaintenanceFence>();
+  private completionTail: Promise<void> = Promise.resolve();
+  private readonly heldMaintenanceFences = new Map<string, HeldMaintenanceFence>();
 
   private constructor(
     private readonly dataRoot: string,
@@ -418,7 +423,7 @@ export class ProductionSafetyController {
         return { value: { id: reservation.id, fence: next }, document: next };
       });
       if (held === undefined) throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance fence was not retained for backup reservation');
-      this.heldMaintenanceFences.set(result.id, held);
+      this.heldMaintenanceFences.set(result.id, { fence: held, released: false });
       return result;
     } catch (error) {
       if (held !== undefined) await held.release().catch(() => undefined);
@@ -426,19 +431,58 @@ export class ProductionSafetyController {
     }
   }
 
-  public async completeBackup(ownerAccessToken: string, reservationId: string, evidence: BackupEvidence): Promise<void> {
+  public completeBackup(ownerAccessToken: string, reservationId: string, evidence: BackupEvidence): Promise<void> {
+    return this.serializeCompletion(() => this.completeBackupUnlocked(ownerAccessToken, reservationId, evidence));
+  }
+
+  private async completeBackupUnlocked(ownerAccessToken: string, reservationId: string, evidence: BackupEvidence): Promise<void> {
+    const action = await this.transaction(async (current) => {
+      this.authorize(current, ownerAccessToken);
+      const reservation = this.assertReservation(current, reservationId, 'BACKUP', true);
+      if (reservation.status === 'RELEASED') {
+        if (current.backup === null || !sameBackupRecord(current.backup, evidence) || path.resolve(evidence.destination) !== reservation.destination) throw new RuntimeError('PRECONDITION_FAILED', 'Backup completion retry does not match the durable evidence');
+        return { value: 'CLEAR' as const, document: { ...current, reservation: null } };
+      }
+      const held = await this.assertHeldMaintenanceFence(reservation);
+      if (reservation.status === 'ACTIVE') {
+        if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Backup completion requires a QUIESCED fence');
+        if (!await held.fence.revalidate()) throw new RuntimeError('AUTHORITY_CHANGED', 'Maintenance fence became stale before backup completion');
+        if (!sameIdentity(evidence.sourceIdentity, current.identity) || evidence.fenceEpoch !== current.fenceEpoch || path.resolve(evidence.destination) !== reservation.destination) throw new RuntimeError('AUTHORITY_CHANGED', 'Backup evidence does not match the fenced reservation');
+        const next = { ...current, backup: evidence, restore: null, reservation: { ...reservation, status: 'COMMITTED' as const } };
+        return { value: 'RELEASE' as const, document: next };
+      }
+      if (current.backup === null || !sameBackupRecord(current.backup, evidence) || path.resolve(evidence.destination) !== reservation.destination) throw new RuntimeError('PRECONDITION_FAILED', 'Backup completion retry does not match the durable evidence');
+      if (!this.heldMaintenanceFences.get(reservationId)?.released && !await held.fence.revalidate()) throw new RuntimeError('AUTHORITY_CHANGED', 'Maintenance fence became stale before backup completion retry');
+      return { value: 'RELEASE' as const, document: current };
+    });
+    if (action === 'CLEAR') {
+      this.heldMaintenanceFences.delete(reservationId);
+      return;
+    }
+    const held = this.heldMaintenanceFences.get(reservationId);
+    if (held === undefined) throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance fence release state is unavailable; reservation remains durable');
+    if (!held.released) {
+      try { await held.fence.release(); }
+      catch (error) {
+        await this.markCompletionBlocked(reservationId, error instanceof Error ? error.message : 'maintenance fence release outcome is unknown').catch(() => undefined);
+        throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance fence release failed; reservation remains held', { cause: error });
+      }
+      held.released = true;
+    }
     await this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      const reservation = this.assertReservation(current, reservationId, 'BACKUP');
-      const held = this.assertHeldMaintenanceFence(reservation);
-      if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Backup completion requires a QUIESCED fence');
-      if (!await held.revalidate()) throw new RuntimeError('AUTHORITY_CHANGED', 'Maintenance fence became stale before backup completion');
-      if (!sameIdentity(evidence.sourceIdentity, current.identity) || evidence.fenceEpoch !== current.fenceEpoch || path.resolve(evidence.destination) !== reservation.destination) throw new RuntimeError('AUTHORITY_CHANGED', 'Backup evidence does not match the fenced reservation');
-      await held.release();
-      const next = { ...current, backup: evidence, restore: null, reservation: null };
-      return { value: undefined, document: next };
+      const reservation = this.assertReservation(current, reservationId, 'BACKUP', true);
+      if (reservation.status === 'COMMITTED') return { value: undefined, document: { ...current, reservation: { ...reservation, status: 'RELEASED' as const } } };
+      if (reservation.status !== 'RELEASED') throw new RuntimeError('PERSISTENCE_FAILURE', 'Backup completion release state is not durable');
+      return { value: undefined, document: current };
     });
-    this.heldMaintenanceFences.delete(reservationId);
+    await this.transaction(async (current) => {
+      this.authorize(current, ownerAccessToken);
+      const reservation = this.assertReservation(current, reservationId, 'BACKUP', true);
+      if (reservation.status !== 'RELEASED') throw new RuntimeError('PERSISTENCE_FAILURE', 'Backup completion release state is not durable');
+      return { value: undefined, document: { ...current, reservation: null } };
+    });
+    if ((await this.inspect()).reservation === null) this.heldMaintenanceFences.delete(reservationId);
   }
 
   public async reserveRestore(ownerAccessToken: string, destination: string, checkpointTarget: string | null): Promise<{ readonly id: string; readonly fence: SafetySnapshot }> {
@@ -454,7 +498,7 @@ export class ProductionSafetyController {
         return { value: { id: reservation.id, fence: next }, document: next };
       });
       if (held === undefined) throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance fence was not retained for restore reservation');
-      this.heldMaintenanceFences.set(result.id, held);
+      this.heldMaintenanceFences.set(result.id, { fence: held, released: false });
       return result;
     } catch (error) {
       if (held !== undefined) await held.release().catch(() => undefined);
@@ -462,32 +506,98 @@ export class ProductionSafetyController {
     }
   }
 
-  public async completeRestore(ownerAccessToken: string, reservationId: string, evidence: RestoreEvidence): Promise<void> {
+  public completeRestore(ownerAccessToken: string, reservationId: string, evidence: RestoreEvidence): Promise<void> {
+    return this.serializeCompletion(() => this.completeRestoreUnlocked(ownerAccessToken, reservationId, evidence));
+  }
+
+  private async completeRestoreUnlocked(ownerAccessToken: string, reservationId: string, evidence: RestoreEvidence): Promise<void> {
+    const action = await this.transaction(async (current) => {
+      this.authorize(current, ownerAccessToken);
+      const reservation = this.assertReservation(current, reservationId, 'RESTORE', true);
+      if (reservation.status === 'RELEASED') {
+        if (current.backup === null || current.restore === null || !sameBackupEvidence(current.backup, current.restore) || !sameBackupEvidence(current.backup, evidence) || path.resolve(evidence.destination) !== reservation.destination) throw new RuntimeError('PRECONDITION_FAILED', 'Restore completion retry does not match the durable evidence');
+        return { value: 'CLEAR' as const, document: { ...current, reservation: null } };
+      }
+      const held = await this.assertHeldMaintenanceFence(reservation);
+      if (reservation.status === 'ACTIVE') {
+        if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Restore completion requires a QUIESCED fence');
+        if (!await held.fence.revalidate()) throw new RuntimeError('AUTHORITY_CHANGED', 'Maintenance fence became stale before restore completion');
+        if (current.backup === null || !sameBackupEvidence(current.backup, evidence) || !sameIdentity(evidence.sourceIdentity, current.identity) || evidence.fenceEpoch !== current.fenceEpoch || path.resolve(evidence.destination) !== reservation.destination || evidence.checkpointTarget !== reservation.checkpointTarget) throw new RuntimeError('PRECONDITION_FAILED', 'Restore evidence does not match the current verified backup or reservation');
+        const next = { ...current, restore: evidence, reservation: { ...reservation, status: 'COMMITTED' as const } };
+        return { value: 'RELEASE' as const, document: next };
+      }
+      if (current.backup === null || current.restore === null || !sameBackupEvidence(current.backup, current.restore) || !sameBackupEvidence(current.backup, evidence) || path.resolve(evidence.destination) !== reservation.destination) throw new RuntimeError('PRECONDITION_FAILED', 'Restore completion retry does not match the durable evidence');
+      if (!this.heldMaintenanceFences.get(reservationId)?.released && !await held.fence.revalidate()) throw new RuntimeError('AUTHORITY_CHANGED', 'Maintenance fence became stale before restore completion retry');
+      return { value: 'RELEASE' as const, document: current };
+    });
+    if (action === 'CLEAR') {
+      this.heldMaintenanceFences.delete(reservationId);
+      return;
+    }
+    const held = this.heldMaintenanceFences.get(reservationId);
+    if (held === undefined) throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance fence release state is unavailable; reservation remains durable');
+    if (!held.released) {
+      try { await held.fence.release(); }
+      catch (error) {
+        await this.markCompletionBlocked(reservationId, error instanceof Error ? error.message : 'maintenance fence release outcome is unknown').catch(() => undefined);
+        throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance fence release failed; reservation remains held', { cause: error });
+      }
+      held.released = true;
+    }
     await this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      const reservation = this.assertReservation(current, reservationId, 'RESTORE');
-      const held = this.assertHeldMaintenanceFence(reservation);
-      if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Restore completion requires a QUIESCED fence');
-      if (!await held.revalidate()) throw new RuntimeError('AUTHORITY_CHANGED', 'Maintenance fence became stale before restore completion');
-      if (current.backup === null || !sameBackupEvidence(current.backup, evidence) || !sameIdentity(evidence.sourceIdentity, current.identity) || evidence.fenceEpoch !== current.fenceEpoch || path.resolve(evidence.destination) !== reservation.destination || evidence.checkpointTarget !== reservation.checkpointTarget) throw new RuntimeError('PRECONDITION_FAILED', 'Restore evidence does not match the current verified backup or reservation');
-      await held.release();
-      const next = { ...current, restore: evidence, reservation: null };
-      return { value: undefined, document: next };
+      const reservation = this.assertReservation(current, reservationId, 'RESTORE', true);
+      if (reservation.status === 'COMMITTED') return { value: undefined, document: { ...current, reservation: { ...reservation, status: 'RELEASED' as const } } };
+      if (reservation.status !== 'RELEASED') throw new RuntimeError('PERSISTENCE_FAILURE', 'Restore completion release state is not durable');
+      return { value: undefined, document: current };
     });
+    await this.transaction(async (current) => {
+      this.authorize(current, ownerAccessToken);
+      const reservation = this.assertReservation(current, reservationId, 'RESTORE', true);
+      if (reservation.status !== 'RELEASED') throw new RuntimeError('PERSISTENCE_FAILURE', 'Restore completion release state is not durable');
+      return { value: undefined, document: { ...current, reservation: null } };
+    });
+    if ((await this.inspect()).reservation === null) this.heldMaintenanceFences.delete(reservationId);
+  }
+
+  public failReservation(ownerAccessToken: string, reservationId: string, reason: string): Promise<void> {
+    return this.serializeCompletion(() => this.failReservationUnlocked(ownerAccessToken, reservationId, reason));
+  }
+
+  private async failReservationUnlocked(ownerAccessToken: string, reservationId: string, reason: string): Promise<void> {
+    const held = await this.transaction(async (current) => {
+      this.authorize(current, ownerAccessToken);
+      const reservation = current.reservation;
+      if (reservation?.id !== reservationId || reservation.ownerInstanceId !== this.identity.instanceId) return { value: null as HeldMaintenanceFence | null, document: current };
+      if (reservation.status !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', 'A completion-committed reservation must be verified through completion retry');
+      const entry = this.heldMaintenanceFences.get(reservationId) ?? null;
+      if (entry === null) {
+        return {
+          value: null as HeldMaintenanceFence | null,
+          document: { ...current, state: 'BLOCKED' as const, blockedReason: `Safety reservation ${reservationId} cannot be released without its held maintenance fence` },
+        };
+      }
+      const next = { ...current, state: 'BLOCKED' as const, blockedReason: `Safety reservation ${reservationId} failed: ${reason}`, reservation: { ...reservation, status: 'FAILED' as const } };
+      return { value: entry, document: next };
+    });
+    if (held === null) {
+      const current = await this.inspect();
+      if (current.reservation?.id === reservationId) throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance fence ownership is unavailable; reservation remains blocked');
+      return;
+    }
+    if (!held.released) {
+      try { await held.fence.release(); }
+      catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance fence release failed after reservation failure; reservation remains blocked', { cause: error }); }
+      held.released = true;
+    }
     this.heldMaintenanceFences.delete(reservationId);
   }
 
-  public async failReservation(ownerAccessToken: string, reservationId: string, reason: string): Promise<void> {
+  private async markCompletionBlocked(reservationId: string, reason: string): Promise<void> {
     await this.transaction(async (current) => {
-      this.authorize(current, ownerAccessToken);
-      if (current.reservation?.id !== reservationId || current.reservation.ownerInstanceId !== this.identity.instanceId) return { value: undefined, document: current };
-      const held = this.heldMaintenanceFences.get(reservationId);
-      if (held !== undefined) {
-        await held.release();
-        this.heldMaintenanceFences.delete(reservationId);
-      }
-      const next = { ...current, state: 'BLOCKED' as const, blockedReason: `Safety reservation ${reservationId} failed: ${reason}`, reservation: { ...current.reservation, status: 'FAILED' as const } };
-      return { value: undefined, document: next };
+      const reservation = current.reservation;
+      if (reservation?.id !== reservationId || (reservation.status !== 'COMMITTED' && reservation.status !== 'RELEASED')) return { value: undefined, document: current };
+      return { value: undefined, document: { ...current, state: 'BLOCKED' as const, blockedReason: `Maintenance fence release for ${reservationId} failed: ${reason}` } };
     });
   }
 
@@ -521,15 +631,28 @@ export class ProductionSafetyController {
     return fence;
   }
 
-  private assertHeldMaintenanceFence(reservation: SafetyReservation): TrustedMaintenanceFence {
+  private async assertHeldMaintenanceFence(reservation: SafetyReservation): Promise<{ readonly fence: TrustedMaintenanceFence; readonly released: boolean }> {
     const held = this.heldMaintenanceFences.get(reservation.id);
-    if (held === undefined || reservation.maintenanceFenceId === null || held.fenceId !== reservation.maintenanceFenceId) throw new RuntimeError('PRECONDITION_FAILED', 'Held maintenance fence is unavailable; preserve the reservation and recover explicitly');
-    return held;
+    if (held !== undefined && reservation.maintenanceFenceId !== null && held.fence.fenceId === reservation.maintenanceFenceId) return held;
+    if (reservation.status !== 'COMMITTED' || reservation.maintenanceFenceId === null) throw new RuntimeError('PRECONDITION_FAILED', 'Held maintenance fence is unavailable; preserve the reservation and recover explicitly');
+    const recover = this.writerVerifier?.recoverMaintenanceFence;
+    if (recover === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Committed maintenance fence requires owner recovery evidence');
+    let recovered: TrustedMaintenanceFence | null;
+    try {
+      recovered = await recover(reservation.maintenanceFenceId, EXTERNAL_WRITERS, this.identity, { fenceEpoch: reservation.fenceEpoch, generation: this.document.generation, reservationId: reservation.id });
+    } catch {
+      throw new RuntimeError('PRECONDITION_FAILED', 'Committed maintenance fence recovery is unavailable');
+    }
+    if (recovered === null || recovered.fenceId !== reservation.maintenanceFenceId || !await recovered.revalidate()) throw new RuntimeError('PRECONDITION_FAILED', 'Committed maintenance fence could not be revalidated');
+    const entry = { fence: recovered, released: false };
+    this.heldMaintenanceFences.set(reservation.id, entry);
+    return entry;
   }
 
-  private assertReservation(current: SafetyDocument, reservationId: string, operation: SafetyReservation['operation']): SafetyReservation {
+  private assertReservation(current: SafetyDocument, reservationId: string, operation: SafetyReservation['operation'], allowCompleted = false): SafetyReservation {
     const reservation = current.reservation;
-    if (reservation === null || reservation.id !== reservationId || reservation.operation !== operation || reservation.ownerInstanceId !== this.identity.instanceId || reservation.status !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation is not owned by this runtime instance');
+    const validStatus = reservation?.status === 'ACTIVE' || (allowCompleted && (reservation?.status === 'COMMITTED' || reservation?.status === 'RELEASED'));
+    if (reservation === null || reservation.id !== reservationId || reservation.operation !== operation || reservation.ownerInstanceId !== this.identity.instanceId || !validStatus) throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation is not owned by this runtime instance');
     return reservation;
   }
 
@@ -543,6 +666,12 @@ export class ProductionSafetyController {
       this.document = next;
       return result.value;
     }, this.identity));
+  }
+
+  private serializeCompletion(operation: () => Promise<void>): Promise<void> {
+    const result = this.completionTail.then(operation, operation);
+    this.completionTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   private authorize(document: SafetyDocument, token: string): void {
@@ -782,6 +911,15 @@ async function freshQuiescenceReasons(document: SafetyDocument, verifier: Truste
 
 function sameIdentity(left: SafetyIdentity, right: SafetyIdentity): boolean {
   return left.runtimeId === right.runtimeId && left.instanceId === right.instanceId && path.resolve(left.dataRoot) === path.resolve(right.dataRoot);
+}
+
+function sameBackupRecord(left: BackupEvidence, right: BackupEvidence): boolean {
+  return left.backupId === right.backupId
+    && left.destination === right.destination
+    && left.manifestDigest === right.manifestDigest
+    && left.fenceEpoch === right.fenceEpoch
+    && left.checkpointDigest === right.checkpointDigest
+    && sameIdentity(left.sourceIdentity, right.sourceIdentity);
 }
 
 function sameBackupEvidence(backup: BackupEvidence, restore: RestoreEvidence): boolean {
@@ -1033,8 +1171,8 @@ function parseRestoreEvidence(value: unknown): RestoreEvidence {
 }
 
 function parseReservation(value: unknown): SafetyReservation {
-  if (!isRecord(value) || typeof value.id !== 'string' || (value.operation !== 'BACKUP' && value.operation !== 'RESTORE') || typeof value.ownerInstanceId !== 'string' || !Number.isSafeInteger(value.fenceEpoch) || (value.fenceEpoch as number) < 0 || typeof value.destination !== 'string' || !path.isAbsolute(value.destination) || (value.checkpointTarget !== null && (typeof value.checkpointTarget !== 'string' || !path.isAbsolute(value.checkpointTarget))) || typeof value.startedAt !== 'string' || (value.status !== 'ACTIVE' && value.status !== 'FAILED') || (value.maintenanceFenceId !== undefined && value.maintenanceFenceId !== null && typeof value.maintenanceFenceId !== 'string')) throw new Error('reservation schema');
-  return { id: value.id, operation: value.operation, ownerInstanceId: value.ownerInstanceId, fenceEpoch: value.fenceEpoch as number, destination: value.destination, checkpointTarget: value.checkpointTarget as string | null, startedAt: value.startedAt, status: value.status, maintenanceFenceId: typeof value.maintenanceFenceId === 'string' ? value.maintenanceFenceId : null };
+  if (!isRecord(value) || typeof value.id !== 'string' || (value.operation !== 'BACKUP' && value.operation !== 'RESTORE') || typeof value.ownerInstanceId !== 'string' || !Number.isSafeInteger(value.fenceEpoch) || (value.fenceEpoch as number) < 0 || typeof value.destination !== 'string' || !path.isAbsolute(value.destination) || (value.checkpointTarget !== null && (typeof value.checkpointTarget !== 'string' || !path.isAbsolute(value.checkpointTarget))) || typeof value.startedAt !== 'string' || !['ACTIVE', 'COMMITTED', 'RELEASED', 'FAILED'].includes(value.status as string) || (value.maintenanceFenceId !== undefined && value.maintenanceFenceId !== null && typeof value.maintenanceFenceId !== 'string')) throw new Error('reservation schema');
+  return { id: value.id, operation: value.operation, ownerInstanceId: value.ownerInstanceId, fenceEpoch: value.fenceEpoch as number, destination: value.destination, checkpointTarget: value.checkpointTarget as string | null, startedAt: value.startedAt, status: value.status as SafetyReservation['status'], maintenanceFenceId: typeof value.maintenanceFenceId === 'string' ? value.maintenanceFenceId : null };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

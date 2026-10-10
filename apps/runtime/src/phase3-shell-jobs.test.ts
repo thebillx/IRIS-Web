@@ -218,6 +218,11 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
       executionProfile: 'node-script', envOverrides: {}, timeoutMs: 5000, requestId, expectedEffects: ALL_EXECUTION_EFFECTS,
     }));
     expect(second.jobId).toBe(first.jobId);
+    const listed = executedValue<{ jobs: Array<Record<string, unknown>> }>(await fixture.service.execute({
+      capabilityId: 'job.list', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
+      projectId: fixture.projectA.id, expectedEffects: ['READ'],
+    }));
+    expect(listed.jobs.some((job) => job.jobId === first.jobId && job.projectId === fixture.projectA.id && job.workspaceId === primary.workspaceId)).toBe(true);
 
     let cursor: string | undefined;
     let log = '';

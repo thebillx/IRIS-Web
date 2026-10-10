@@ -7,6 +7,7 @@ describe('Vite runtime proxy', () => {
       server: {
         proxy: {
           '/missions': expect.any(String),
+          '/jobs': expect.any(String),
         },
       },
     });

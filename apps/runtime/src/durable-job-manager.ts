@@ -419,6 +419,12 @@ export class DurableJobManager {
     return statusView(await this.reconcile(job));
   }
 
+  public async list(projectId: string): Promise<readonly Record<string, unknown>[]> {
+    const document = await this.readDocument();
+    const jobs = document.jobs.filter((job) => job.projectId === projectId && job.executionProfile !== 'codex-review');
+    return Promise.all(jobs.map(async (job) => statusView(await this.reconcile(job))));
+  }
+
   public async logs(projectId: string, jobId: string, stream: 'stdout' | 'stderr', cursor?: string, maxBytes = 16 * 1024): Promise<Record<string, unknown>> {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > LOG_WINDOW_MAX) throw new RuntimeError('INVALID_REQUEST', 'maxBytes is outside the bounded log window');
     const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId));

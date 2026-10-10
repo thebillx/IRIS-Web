@@ -107,6 +107,7 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'shell.run'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly workspaceId: string; readonly executable: string; readonly argv: readonly string[]; readonly cwd: string; readonly executionProfile: string; readonly envOverrides: Readonly<Record<string, string>>; readonly timeoutMs: number; readonly stdinArtifactId?: string | undefined }
   | { readonly capabilityId: 'shell.start'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly workspaceId: string; readonly executable: string; readonly argv: readonly string[]; readonly cwd: string; readonly executionProfile: string; readonly envOverrides: Readonly<Record<string, string>>; readonly timeoutMs: number; readonly requestId: string; readonly stdinArtifactId?: string | undefined }
   | { readonly capabilityId: 'job.status'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly jobId: string }
+  | { readonly capabilityId: 'job.list'; readonly clientId: string; readonly sessionId: string; readonly projectId: string }
   | { readonly capabilityId: 'job.logs'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly jobId: string; readonly stream: 'stdout' | 'stderr'; readonly cursor?: string | undefined; readonly maxBytes?: number | undefined }
   | { readonly capabilityId: 'job.result'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly jobId: string }
   | { readonly capabilityId: 'job.cancel'; readonly clientId: string; readonly sessionId: string; readonly projectId: string; readonly jobId: string }
@@ -515,6 +516,7 @@ export class CapabilityService {
 
   private async phase3Preflight(operation: Phase3Operation): Promise<Phase2Preflight> {
     await this.authorizedProject(operation);
+    if (operation.capabilityId === 'job.list') return { workspaceId: null, resourceId: null, target: null };
     if (operation.capabilityId === 'shell.run' || operation.capabilityId === 'shell.start') {
       const prepared = await this.jobManager().prepare(shellExecutionInput(operation));
       return {
@@ -821,6 +823,7 @@ export class CapabilityService {
       return jobs.start(prepared, operation.requestId, effects, operation.mission);
     }
     if (operation.capabilityId === 'job.status') return jobs.status(operation.projectId, operation.jobId);
+    if (operation.capabilityId === 'job.list') return { jobs: await jobs.list(operation.projectId) };
     if (operation.capabilityId === 'job.logs') return jobs.logs(operation.projectId, operation.jobId, operation.stream, operation.cursor, operation.maxBytes);
     if (operation.capabilityId === 'job.result') return jobs.result(operation.projectId, operation.jobId);
     if (operation.capabilityId === 'job.cancel') return jobs.cancel(operation.projectId, operation.jobId);
@@ -986,7 +989,7 @@ type Phase4GitOperation = Extract<CapabilityOperation, { capabilityId: Phase4Git
 
 type Phase3Operation = Extract<CapabilityOperation,
   | { capabilityId: 'shell.run' | 'shell.start' }
-  | { capabilityId: 'job.status' | 'job.logs' | 'job.result' | 'job.cancel' }
+  | { capabilityId: 'job.status' | 'job.list' | 'job.logs' | 'job.result' | 'job.cancel' }
 >;
 
 type ShellPhase3Operation = Extract<Phase3Operation, { capabilityId: 'shell.run' | 'shell.start' }>;
@@ -1016,6 +1019,7 @@ function phase4GitCapabilityId(operation: Phase4GitOperationName): Phase4GitCapa
 function isPhase3Operation(operation: CapabilityOperation): operation is Phase3Operation {
   return operation.capabilityId === 'shell.run' || operation.capabilityId === 'shell.start'
     || operation.capabilityId === 'job.status' || operation.capabilityId === 'job.logs'
+    || operation.capabilityId === 'job.list'
     || operation.capabilityId === 'job.result' || operation.capabilityId === 'job.cancel';
 }
 
@@ -1173,6 +1177,7 @@ function describeOperation(operation: CapabilityOperation): string {
       return `${operation.capabilityId} projectId=${operation.projectId} workspaceId=${operation.workspaceId} profile=${operation.executionProfile} executable=${operation.executable} cwd=${operation.cwd} argvSha256=${argvHash} envKeys=${envKeys} timeoutMs=${operation.timeoutMs}${operation.capabilityId === 'shell.start' ? ` requestId=${operation.requestId}` : ''}`;
     }
     if (operation.capabilityId === 'job.logs') return `job.logs projectId=${operation.projectId} jobId=${operation.jobId} stream=${operation.stream} maxBytes=${operation.maxBytes ?? 'default'}`;
+    if (operation.capabilityId === 'job.list') return `job.list projectId=${operation.projectId}`;
     return `${operation.capabilityId} projectId=${operation.projectId} jobId=${operation.jobId}`;
   }
   if (isPhase2Operation(operation)) {

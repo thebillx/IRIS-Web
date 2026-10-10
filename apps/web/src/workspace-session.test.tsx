@@ -56,7 +56,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB], missions: Parameters<typeof RuntimePage>[0]['missions'] = []): string {
+function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB], missions: Parameters<typeof RuntimePage>[0]['missions'] = [], jobs: Parameters<typeof RuntimePage>[0]['jobs'] = []): string {
   return renderToStaticMarkup(createElement(RuntimePage, {
     health,
     projects: [projectA, projectB],
@@ -80,6 +80,10 @@ function renderWorkspace(selectedSession: Session | null, sessions: Session[] = 
     onRegisterProject: () => undefined,
     onSelectProject: () => undefined,
     onRequestMissionOrchestrator: () => undefined,
+    jobs,
+    jobLogs: { 'job-1': { text: 'hello from job\n', cursor: 'stdout:5', eof: true } },
+    onCancelJob: () => undefined,
+    onReadJobLogs: () => undefined,
   }));
 }
 
@@ -108,6 +112,16 @@ describe('daily workspace session experience', () => {
     expect(markup).toContain('Workload ON');
     expect(markup).toContain('Workload OFF');
     expect(markup).toContain('Keep-awake</dt><dd>BLOCKED');
+  });
+
+  it('renders captured durable job identity, output and cancellation controls', () => {
+    const markup = renderWorkspace(sessionA, [sessionA], [], [{ jobId: 'job-1', requestId: 'request-1', projectId: projectA.id, workspaceId: 'workspace-a', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null }]);
+    expect(markup).toContain('Durable jobs');
+    expect(markup).toContain('RUNNING');
+    expect(markup).toContain('project-a');
+    expect(markup).toContain('workspace-a');
+    expect(markup).toContain('hello from job');
+    expect(markup).toContain('Cancel job');
   });
 
   it('restores a selected session across refresh only while that authoritative session still exists', () => {

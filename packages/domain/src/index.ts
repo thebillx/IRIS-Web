@@ -672,6 +672,7 @@ export type CapabilityId =
   | 'shell.run'
   | 'shell.start'
   | 'job.status'
+  | 'job.list'
   | 'job.logs'
   | 'job.result'
   | 'job.cancel'
