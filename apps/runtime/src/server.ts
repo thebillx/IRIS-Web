@@ -377,6 +377,21 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     );
     return;
   }
+  if (request.method === 'POST' && url.pathname === '/repositories/reconcile') {
+    const body = await readJsonBody(request);
+    const keys = ['projectId', 'previousRepositoryId', 'previousDevice', 'expectedRepositoryId'];
+    if (body === null || Object.keys(body).some((key) => !keys.includes(key))) throw new RuntimeError('INVALID_REQUEST', 'Unsupported repository reconciliation field');
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'repository.reconcile',
+      projectId: stringField(body, 'projectId'),
+      previousRepositoryId: stringField(body, 'previousRepositoryId'),
+      previousDevice: stringField(body, 'previousDevice'),
+      expectedRepositoryId: stringField(body, 'expectedRepositoryId'),
+      clientId: optionalClientId(request),
+      sessionId: optionalSessionId(request),
+    }));
+    return;
+  }
   if (request.method === 'POST' && url.pathname === '/projects') {
     const body = await readJsonBody(request);
     await writeCapabilityOutcome(response, await context.capabilities.execute({

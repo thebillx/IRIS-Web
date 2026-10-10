@@ -16,6 +16,7 @@ export interface EffectAssertionResult {
 }
 
 const BASE_EFFECTS: Readonly<Record<CapabilityId, readonly CapabilityEffect[]>> = {
+  'repository.reconcile': ['READ', 'WRITE', 'EXECUTE'],
   'runtime.status': ['READ'],
   'project.list': ['READ'],
   'project.info': ['READ'],

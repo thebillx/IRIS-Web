@@ -1,6 +1,7 @@
 import type { CapabilityDefinition, CapabilityId } from '@iris/domain';
 
 const DEFINITIONS: readonly CapabilityDefinition[] = [
+  { id: 'repository.reconcile', title: 'Reconcile repository device identity', riskClass: 'HIGH', requiredScope: 'OWNER', mutation: true, implemented: true },
   { id: 'runtime.status', title: 'Read runtime status', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },
   { id: 'project.list', title: 'List registered projects', riskClass: 'LOW', requiredScope: 'MACHINE', mutation: false, implemented: true },
   { id: 'project.info', title: 'Read registered project metadata', riskClass: 'LOW', requiredScope: 'PROJECT', mutation: false, implemented: true },

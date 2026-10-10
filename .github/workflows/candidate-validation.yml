@@ -1,0 +1,81 @@
+name: Candidate validation
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck runtime and web
+        run: |
+          pnpm --filter @iris/runtime typecheck
+          pnpm --filter @iris/web typecheck
+
+      - name: Run setup and continuity tests
+        run: |
+          if [ -f apps/runtime/src/control-setup.test.ts ]; then
+            pnpm --filter @iris/runtime exec tsx src/control-setup.test.ts
+          fi
+          if [ -f scripts/task-checkpoint.test.mjs ]; then
+            node --test scripts/task-checkpoint.test.mjs
+          fi
+
+      - name: Run focused runtime suites
+        run: |
+          if [ -f apps/runtime/src/repository-reconcile.test.ts ]; then
+            pnpm --filter @iris/runtime exec vitest run src/repository-reconcile.test.ts src/server.test.ts src/mcp-catalog.test.ts src/phase8-catalog-compat.test.ts src/activation-controller.test.ts src/supervisor-admin-activation.test.ts src/phase4-git-worktree.test.ts src/permissions.test.ts
+          fi
+          if [ -f apps/runtime/src/unified-iris.test.ts ]; then
+            pnpm --filter @iris/runtime exec vitest run src/unified-iris.test.ts src/connector-registry.test.ts src/server.test.ts src/permissions.test.ts src/mcp-catalog.test.ts
+          fi
+
+      - name: Run affected lint and diff checks
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          base_sha="${PR_BASE_SHA:-$(git rev-parse 'origin/main^{commit}')}"
+          head_sha="${PR_HEAD_SHA:-$(git rev-parse 'HEAD^{commit}')}"
+          git rev-parse --verify "$base_sha^{commit}" >/dev/null
+          git rev-parse --verify "$head_sha^{commit}" >/dev/null
+          git diff --check "$base_sha" "$head_sha"
+          changed_sources=()
+          while IFS= read -r file; do
+            [ -n "$file" ] && changed_sources+=("$file")
+          done < <(git diff --name-only --diff-filter=ACMR "$base_sha" "$head_sha" -- '*.js' '*.mjs' '*.ts' '*.tsx')
+          if [ "${#changed_sources[@]}" -gt 0 ]; then
+            pnpm exec eslint "${changed_sources[@]}"
+          else
+            echo "No changed JavaScript or TypeScript source files to lint."
+          fi
