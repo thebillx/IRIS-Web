@@ -509,7 +509,7 @@ export function RuntimePage(props: {
         <section className="sessions-card" aria-labelledby="sessions-heading">
           <div className="section-title-row"><div><p className="section-label">Sessions</p><h2 id="sessions-heading">Your sessions</h2></div><button onClick={props.onCreateSession}>+ New</button></div>
           {props.sessions.length === 0
-            ? <div className="empty-state"><p>No sessions yet.</p><span>Start one to work with a project. Sessions live in the local daemon and resume across browser refreshes while that daemon is running.</span></div>
+            ? <div className="empty-state"><p>No sessions yet.</p><span>Start one to work with a project. Sessions live in the local daemon and resume across supported runtime replacement.</span></div>
             : <div className="session-list">{props.sessions.map((session, index) => {
               const selected = session.id === props.selectedSession?.id;
               const project = session.currentProjectId === null ? null : props.projects.find((candidate) => candidate.id === session.currentProjectId) ?? null;

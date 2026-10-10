@@ -46,6 +46,12 @@ try {
       process.stdout.write(`${JSON.stringify({ label: 'IRIS', tunnelId, mcpPath: '/mcp', deploymentEpoch: registry.deploymentEpoch }, null, 2)}\n`);
     } else if (command === 'up') {
       printStatus(await supervisor.up());
+    } else if (command === 'workload-on') {
+      printStatus(await supervisor.workloadOn());
+    } else if (command === 'workload-off') {
+      printStatus(await supervisor.workloadOff());
+    } else if (command === 'workload-restart') {
+      printStatus(await supervisor.workloadRestart());
     } else if (command === 'down') {
       printStatus(await supervisor.down());
     } else if (command === 'restart') {
@@ -92,7 +98,7 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'status') {
       process.stdout.write(`${JSON.stringify({ loaded: await launchAgentLoaded(), paths: launchdPaths(dataRoot) }, null, 2)}\n`);
     } else {
-      process.stderr.write('Usage: iris <setup --tunnel-id <registered-tunnel-id>|up|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|runtime-reconcile|supervisor|credentials|launchd>\n');
+      process.stderr.write('Usage: iris <setup --tunnel-id <registered-tunnel-id>|up|workload-on|workload-off|workload-restart|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|runtime-reconcile|supervisor|credentials|launchd>\n');
       process.exitCode = 2;
     }
   }

@@ -331,6 +331,58 @@ describe('runtime machine, client, and session state', () => {
     ]);
     expect(new Set((await state.listProjects()).map((project) => project.id))).toEqual(new Set([first.id, second.id]));
   });
+
+  it('rehydrates an ordinary session across runtime replacement and keeps submission deduplication owner-scoped', async () => {
+    const dataRoot = await temp('iris-durable-session-');
+    let executions = 0;
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async ({ instruction }) => { executions += 1; return { text: `result:${instruction}` }; },
+    };
+    const first = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const session = first.createSession('durable-client', 'durable-agent', 'owner');
+    await first.submitInstruction(session.id, session.clientId, 'durable-submission', 'persist this session');
+
+    const replacement = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    expect(replacement.getSessionForClient(session.id, session.clientId)).toMatchObject({
+      id: session.id,
+      clientId: session.clientId,
+      executionState: 'READY',
+      interactions: expect.arrayContaining([expect.objectContaining({ submissionId: 'durable-submission', kind: 'assistant' })]),
+    });
+    await replacement.submitInstruction(session.id, session.clientId, 'durable-submission', 'persist this session');
+    expect(executions).toBe(1);
+    expect(() => replacement.getSessionForClient(session.id, 'another-client')).toThrowError(expect.objectContaining({ code: 'CONTROL_DENIED' }));
+  });
+
+  it('marks an in-flight session failed after replacement without replaying its submission', async () => {
+    const dataRoot = await temp('iris-durable-session-interrupted-');
+    let release: ((value: { text: string }) => void) | undefined;
+    let executions = 0;
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async () => {
+        executions += 1;
+        return new Promise<{ text: string }>((resolve) => { release = resolve; });
+      },
+    };
+    const first = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const session = first.createSession('interrupted-client', 'interrupted-agent', 'owner');
+    const pending = first.submitInstruction(session.id, session.clientId, 'interrupted-submission', 'do not replay');
+    const persisted = JSON.parse(await readFile(path.join(dataRoot, 'sessions.json'), 'utf8')) as { sessions: Array<{ snapshot: { executionState: string } }> };
+    expect(persisted.sessions[0]?.snapshot.executionState).toBe('WORKING');
+
+    const replacement = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    expect(replacement.getSessionForClient(session.id, session.clientId).executionState).toBe('FAILED');
+    const recovered = JSON.parse(await readFile(path.join(dataRoot, 'sessions.json'), 'utf8')) as { sessions: Array<{ snapshot: { executionState: string } }> };
+    expect(recovered.sessions[0]?.snapshot.executionState).toBe('FAILED');
+    await replacement.submitInstruction(session.id, session.clientId, 'interrupted-submission', 'do not replay');
+    expect(executions).toBe(1);
+
+    release?.({ text: 'late result' });
+    await pending;
+  });
+
 });
 
 function seededMission(

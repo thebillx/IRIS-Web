@@ -325,6 +325,7 @@ describe('IRIS supervisor', () => {
       webPort: await freePort(), adminPort: await freePort(), supervisorControlPort: controlPort });
     const native = await startSupervisorNativeControlServer(dataRoot, controlPort, {
       supervisorStatus: () => supervisor.supervisorNativeStatus(), adminStatus: () => supervisor.adminNativeStatus(),
+      supervisorDoctor: () => supervisor.doctor(), workloadOn: () => supervisor.workloadOn(), workloadOff: () => supervisor.workloadOff(), workloadRestart: () => supervisor.workloadRestart(),
       runtimeReconcile: () => supervisor.runtimeReconcile(), adminRecycle: (input) => supervisor.adminRecycle(input),
       adminTunnelRecycle: (input) => supervisor.adminTunnelRecycle(input), adminToolCall: (name, args) => supervisor.adminToolCall(name, args),
     });
@@ -339,10 +340,32 @@ describe('IRIS supervisor', () => {
       expect(before.tunnels.pro).toBeNull();
       expect(before.adminTunnel).toBeNull();
       expect(before.admin.pid).toBeGreaterThan(0);
+      const off = await supervisor.workloadOff();
+      expect(off.runtime).toMatchObject({ state: 'DEGRADED', code: 'WORKLOAD_OFF' });
+      expect((await supervisor.doctor()).CODE).toBe('WORKLOAD_OFF');
+      expect((await fetch(native.healthUrl, { headers: { authorization: `Bearer ${(await readTunnelServiceSecret(dataRoot))!}` } })).status).toBe(200);
+      const stopped = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      expect(stopped.runtime).toBeNull();
+      expect(stopped.admin.pid).toBe(before.admin.pid);
+      expect(stopped.tunnels.full.pid).toBe(before.tunnels.full.pid);
+      const repeatedOff = await supervisor.workloadOff();
+      expect(repeatedOff.runtime).toMatchObject({ state: 'DEGRADED', code: 'WORKLOAD_OFF' });
+      const [on, concurrentOn] = await Promise.all([supervisor.workloadOn(), supervisor.workloadOn()]);
+      expect(on.runtime.state).toBe('READY');
+      expect(concurrentOn.runtime.state).toBe('READY');
+      const concurrentState = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      expect(concurrentState.runtime?.pid).toBeGreaterThan(0);
+      expect((await supervisor.doctor()).CODE).toBe('E2E_PROBE_UNAVAILABLE');
+      const beforeWorkloadRestart = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      const restarted = await supervisor.workloadRestart();
+      expect(restarted.runtime.state).toBe('READY');
+      const afterWorkloadRestart = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      expect(afterWorkloadRestart.admin.pid).toBe(beforeWorkloadRestart.admin.pid);
+      expect((await fetch(native.healthUrl, { headers: { authorization: `Bearer ${(await readTunnelServiceSecret(dataRoot))!}` } })).status).toBe(200);
       await supervisor.up();
       const after = JSON.parse(await readFile(filename, 'utf8'));
-      expect(after.runtime.pid).toBe(before.runtime.pid);
-      expect(after.tunnels.full.pid).toBe(before.tunnels.full.pid);
+      expect(after.runtime.pid).toBe(afterWorkloadRestart.runtime.pid);
+      expect(after.tunnels.full.pid).toBe(afterWorkloadRestart.tunnels.full.pid);
       expect((await supervisor.catalogStatus()).pro).toBeNull();
       expect((await supervisor.adminToolCall('activation_status', {})).isError).not.toBe(true);
     } finally {
@@ -546,6 +569,10 @@ setInterval(() => undefined, 1000);
     });
     const native = await startSupervisorNativeControlServer(dataRoot, nativePort, {
       supervisorStatus: () => supervisor.supervisorNativeStatus(),
+      supervisorDoctor: () => supervisor.doctor(),
+      workloadOn: () => supervisor.workloadOn(),
+      workloadOff: () => supervisor.workloadOff(),
+      workloadRestart: () => supervisor.workloadRestart(),
       adminStatus: () => supervisor.adminNativeStatus(),
       runtimeReconcile: () => supervisor.runtimeReconcile(),
       adminRecycle: (input) => supervisor.adminRecycle(input),
@@ -1489,6 +1516,10 @@ setInterval(() => undefined, 1000);
     await outer.bindAdminTunnel('tunnel_cccccccccccccccccccccccccccccccc');
     const native = await startSupervisorNativeControlServer(dataRoot, options.supervisorControlPort, {
       supervisorStatus: () => outer.supervisorNativeStatus(),
+      supervisorDoctor: () => outer.doctor(),
+      workloadOn: () => outer.workloadOn(),
+      workloadOff: () => outer.workloadOff(),
+      workloadRestart: () => outer.workloadRestart(),
       adminStatus: () => outer.adminNativeStatus(),
       runtimeReconcile: () => outer.runtimeReconcile(),
       adminRecycle: (input) => outer.adminRecycle(input),

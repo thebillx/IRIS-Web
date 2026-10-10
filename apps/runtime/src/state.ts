@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -28,6 +29,7 @@ import type { ProductionSafetyController } from './production-safety.js';
 const MAX_INSTRUCTION_CHARS = 8_000;
 const MAX_INTERACTION_EVENTS = 200;
 const MAX_EXECUTOR_OUTPUT_CHARS = 12_000;
+const SESSION_FILE = 'sessions.json';
 
 export interface MissionRebindInput {
   readonly missionId: string;
@@ -37,6 +39,16 @@ export interface MissionRebindInput {
   readonly expectedBindingRevision: number;
   readonly reason: string;
   readonly principal?: 'owner' | 'tunnel-service';
+}
+
+interface PersistedSession {
+  readonly snapshot: RuntimeSessionSnapshot;
+  readonly submissions: readonly { readonly id: string; readonly instruction: string }[];
+}
+
+interface SessionDocument {
+  readonly schemaVersion: 1;
+  readonly sessions: readonly PersistedSession[];
 }
 
 export class RuntimeState {
@@ -56,6 +68,7 @@ export class RuntimeState {
     private readonly safety?: ProductionSafetyController,
   ) {
     this.dataRoot = store.dataRoot;
+    this.restoreSessions();
   }
 
   public executorDescriptor() {
@@ -183,6 +196,7 @@ export class RuntimeState {
     this.sessions.set(session.id, session);
     this.submissionBindings.set(session.id, new Map());
     this.clients.set(session.clientId, { clientId: session.clientId, connected: true, lastSeenAt: now });
+    this.persistSessions();
     return session;
   }
 
@@ -639,6 +653,7 @@ export class RuntimeState {
     this.sessions.set(session.id, session);
     this.submissionBindings.set(session.id, new Map());
     this.clients.set(clientId, { clientId, connected: true, lastSeenAt: now });
+    this.persistSessions();
     return session;
   }
 
@@ -665,6 +680,7 @@ export class RuntimeState {
         lastSeenAt: new Date().toISOString(),
       });
     }
+    this.persistSessions();
   }
 
   public async submitInstruction(
@@ -705,6 +721,7 @@ export class RuntimeState {
     this.submissionBindings.set(sessionId, bindings);
     this.activeSubmissions.set(sessionId, submissionId);
     this.touchClient(clientId);
+    this.persistSessions();
 
     try {
       const project = working.currentProjectId === null
@@ -740,6 +757,7 @@ export class RuntimeState {
       };
       const completed = appendInteraction({ ...current, executionState: 'READY' }, assistantEvent);
       this.sessions.set(sessionId, completed);
+      this.persistSessions();
       return completed;
     } catch (error) {
       const current = this.getSessionForClient(sessionId, clientId);
@@ -752,6 +770,7 @@ export class RuntimeState {
         executionId,
       };
       this.sessions.set(sessionId, appendInteraction({ ...current, executionState: 'FAILED' }, errorEvent));
+      this.persistSessions();
       if (error instanceof RuntimeError && error.code === 'AGENT_EXECUTION_FAILED') throw error;
       throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Agent execution failed', { cause: error });
     } finally {
@@ -819,6 +838,7 @@ export class RuntimeState {
     const updated: RuntimeSessionSnapshot = { ...session, currentProjectId: projectId };
     this.sessions.set(sessionId, updated);
     this.touchClient(session.clientId);
+    this.persistSessions();
     return updated;
   }
 
@@ -892,6 +912,67 @@ export class RuntimeState {
     try { return await operation(); } finally { await lease?.release(); }
   }
 
+  private restoreSessions(): void {
+    const filename = path.join(this.dataRoot, SESSION_FILE);
+    let content: string;
+    try {
+      const inspected = lstatSync(filename);
+      if (!inspected.isFile() || inspected.isSymbolicLink()) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is not a regular file');
+      if (typeof process.getuid === 'function' && inspected.uid !== process.getuid()) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is not owned by the current user');
+      if ((inspected.mode & 0o077) !== 0) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is not private');
+      content = readFileSync(filename, 'utf8');
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === 'ENOENT') return;
+      if (error instanceof RuntimeError) throw error;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is unreadable', { cause: error });
+    }
+    let parsed: unknown;
+    try { parsed = JSON.parse(content) as unknown; } catch (error) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is invalid JSON', { cause: error });
+    }
+    if (!isSessionDocument(parsed)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store is invalid');
+    const seen = new Set<string>();
+    let recovered = false;
+    for (const persisted of parsed.sessions) {
+      const session = persisted.snapshot.executionState === 'WORKING'
+        ? { ...persisted.snapshot, executionState: 'FAILED' as const }
+        : persisted.snapshot;
+      recovered ||= session !== persisted.snapshot;
+      if (seen.has(session.id)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session store contains duplicate session identity');
+      seen.add(session.id);
+      this.sessions.set(session.id, session);
+      this.submissionBindings.set(session.id, new Map(persisted.submissions.map((submission) => [submission.id, submission.instruction])));
+      this.clients.set(session.clientId, { clientId: session.clientId, connected: false, lastSeenAt: session.createdAt });
+    }
+    if (recovered) this.persistSessions();
+  }
+
+  private persistSessions(): void {
+    const document: SessionDocument = {
+      schemaVersion: 1,
+      sessions: [...this.sessions.values()].map((snapshot) => ({
+        snapshot,
+        submissions: [...(this.submissionBindings.get(snapshot.id) ?? new Map())].map(([id, instruction]) => ({ id, instruction })),
+      })),
+    };
+    const filename = path.join(this.dataRoot, SESSION_FILE);
+    const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(temporary, 'wx', 0o600);
+      writeFileSync(descriptor, `${JSON.stringify(document, null, 2)}\n`, 'utf8');
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = undefined;
+      renameSync(temporary, filename);
+    } catch (error: unknown) {
+      if (descriptor !== undefined) closeSync(descriptor);
+      try { unlinkSync(temporary); } catch { /* best effort cleanup */ }
+      if (error instanceof RuntimeError) throw error;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Runtime session state publication failed', { cause: error });
+    }
+  }
+
   private touchClient(clientId: string): void {
     this.clients.set(clientId, { clientId, connected: true, lastSeenAt: new Date().toISOString() });
   }
@@ -905,6 +986,82 @@ function appendInteraction(session: RuntimeSessionSnapshot, event: SessionIntera
       ? interactions.slice(interactions.length - MAX_INTERACTION_EVENTS)
       : interactions,
   };
+}
+
+function isSessionDocument(value: unknown): value is SessionDocument {
+  return isRecord(value)
+    && value.schemaVersion === 1
+    && Array.isArray(value.sessions)
+    && value.sessions.every(isPersistedSession)
+    && new Set(value.sessions.map((session) => session.snapshot.id)).size === value.sessions.length;
+}
+
+function isPersistedSession(value: unknown): value is PersistedSession {
+  if (!isRecord(value) || !isRuntimeSessionSnapshot(value.snapshot) || !Array.isArray(value.submissions)) return false;
+  const ids = new Set<string>();
+  return value.submissions.every((submission) => {
+    if (!isRecord(submission) || !isBoundedIdentity(submission.id) || !isBoundedText(submission.instruction, MAX_INSTRUCTION_CHARS) || ids.has(submission.id)) return false;
+    ids.add(submission.id);
+    return true;
+  });
+}
+
+function isRuntimeSessionSnapshot(value: unknown): value is RuntimeSessionSnapshot {
+  if (!isRecord(value)
+    || !isUuid(value.id)
+    || !isBoundedIdentity(value.clientId)
+    || !isBoundedIdentity(value.agentId)
+    || !isAgentRole(value.agentRole)
+    || !isIsoDate(value.createdAt)
+    || (value.currentProjectId !== null && !isUuid(value.currentProjectId))
+    || !isSessionExecutionState(value.executionState)
+    || !Array.isArray(value.interactions)
+    || value.interactions.length > MAX_INTERACTION_EVENTS
+    || !value.interactions.every(isSessionInteractionEvent)) return false;
+  return true;
+}
+
+function isSessionInteractionEvent(value: unknown): value is SessionInteractionEvent {
+  return isRecord(value)
+    && isUuid(value.id)
+    && isIsoDate(value.timestamp)
+    && (value.kind === 'user' || value.kind === 'assistant' || value.kind === 'error')
+    && isBoundedText(value.text, MAX_EXECUTOR_OUTPUT_CHARS)
+    && isBoundedIdentity(value.submissionId)
+    && isUuid(value.executionId);
+}
+
+function isAgentRole(value: unknown): value is AgentRole {
+  return value === 'owner' || value === 'planner' || value === 'implementer' || value === 'reviewer'
+    || value === 'security' || value === 'explorer' || value === 'other';
+}
+
+function isSessionExecutionState(value: unknown): value is RuntimeSessionSnapshot['executionState'] {
+  return value === 'READY' || value === 'WORKING' || value === 'FAILED';
+}
+
+function isBoundedIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 200 && !value.includes('\0') && value === value.trim();
+}
+
+function isBoundedText(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= max && !value.includes('\0');
+}
+
+function isIsoDate(value: unknown): value is string {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value));
+}
+
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isNodeError(value: unknown): value is NodeJS.ErrnoException {
+  return value instanceof Error && 'code' in value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function missionHandoffSafety(mission: MissionSnapshot, externalHandoffSafe: boolean): { safe: boolean; reason: string } {
