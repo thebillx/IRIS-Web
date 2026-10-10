@@ -93,6 +93,12 @@ export interface WriterObservation {
   readonly fenceEpoch?: number;
 }
 
+export interface WriterRegistrationEvidence {
+  readonly runtimeId: string;
+  readonly instanceId: string;
+  readonly fenceEpoch: number;
+}
+
 export interface ProductionSafetyOpenOptions {
   readonly dataRoot: string;
   readonly identity: SafetyIdentity | RuntimeIdentity;
@@ -171,7 +177,8 @@ export class ProductionSafetyController {
       }
       const current = parseDocument(inspected.content);
       if (current.identity.runtimeId !== identity.runtimeId || current.identity.instanceId === identity.instanceId) return current;
-      const recoverable = current.state === 'ACTIVE' && current.reservation === null;
+      const unresolvedWriter = Object.values(current.writers).some((writer) => writer.state === 'ACTIVE' || writer.inFlight > 0 || writer.leaseIds.length > 0);
+      const recoverable = current.state === 'ACTIVE' && current.reservation === null && !unresolvedWriter;
       const next = {
         ...current,
         state: recoverable ? 'ACTIVE' as const : 'RECOVERY_REQUIRED' as const,
@@ -205,11 +212,27 @@ export class ProductionSafetyController {
     return parseDocument(await readPrivateFile(path.join(this.dataRoot, SAFETY_FILE), 'Production safety state'));
   }
 
-  public registerWriter(name: string, state: SafetyWriterState = 'IDLE'): Promise<void> {
+  public registerWriter(name: string, state: SafetyWriterState = 'IDLE', evidence?: WriterRegistrationEvidence): Promise<void> {
     if (!name || !WRITER_STATES.includes(state)) throw new RuntimeError('INVALID_REQUEST', 'Writer registration is invalid');
+    if (!REQUIRED_WRITERS.includes(name as SafetyWriterName)) throw new RuntimeError('INVALID_REQUEST', `Writer ${name} is not supported`);
     return this.transaction(async (current) => {
       this.assertIdentity(current);
-      if (current.writers[name] !== undefined && current.writers[name]!.inFlight > 0) return { value: undefined, document: current };
+      if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'Writer registration is blocked by an unresolved safety reservation');
+      const existing = current.writers[name];
+      if (existing === undefined) throw new RuntimeError('PERSISTENCE_FAILURE', `Writer ${name} is missing from the authoritative inventory`);
+      const identityEvidence = evidence !== undefined
+        && evidence.runtimeId === this.identity.runtimeId
+        && evidence.instanceId === this.identity.instanceId
+        && evidence.fenceEpoch === current.fenceEpoch;
+      const unchanged = existing.state === state
+        && existing.ownerInstanceId === (state === 'UNKNOWN' ? null : this.identity.instanceId)
+        && existing.leaseIds.length === existing.inFlight
+        && (state === 'UNKNOWN' ? existing.inFlight === 0 : identityEvidence);
+      if (unchanged && (state === 'UNKNOWN' || identityEvidence)) return { value: undefined, document: current };
+      if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Writer registration cannot change a ${current.state} fence`);
+      if (existing.inFlight > 0) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} has active mutation leases`);
+      if (state !== 'UNKNOWN' && !identityEvidence) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} requires independently verified runtime ownership evidence`);
+      if (state === 'UNKNOWN' && existing.state !== 'UNKNOWN') throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} cannot be weakened to UNKNOWN`);
       const writers = {
         ...current.writers,
         [name]: { state, inFlight: 0, ownerInstanceId: state === 'UNKNOWN' ? null : this.identity.instanceId, leaseIds: [] },
@@ -232,14 +255,27 @@ export class ProductionSafetyController {
           writer,
           release: async () => {
           if (released) return;
-          released = true;
-          await this.transaction(async (latest) => {
-            const active = latest.writers[writer];
-            if (active === undefined || !active.leaseIds.includes(leaseId) || active.inFlight < 1) throw new RuntimeError('PERSISTENCE_FAILURE', `Writer ${writer} lease accounting is inconsistent`);
-            const nextCount = active.inFlight - 1;
-            const leaseIds = active.leaseIds.filter((id) => id !== leaseId);
-            return { value: undefined, document: { ...latest, writers: { ...latest.writers, [writer]: { ...active, state: nextCount === 0 ? 'IDLE' : 'ACTIVE', inFlight: nextCount, leaseIds } } } };
-          });
+            try {
+              await this.transaction(async (latest) => {
+                const active = latest.writers[writer];
+                if (active === undefined || !active.leaseIds.includes(leaseId) || active.inFlight < 1) throw new RuntimeError('PERSISTENCE_FAILURE', `Writer ${writer} lease accounting is inconsistent`);
+                const nextCount = active.inFlight - 1;
+                const leaseIds = active.leaseIds.filter((id) => id !== leaseId);
+                return { value: undefined, document: { ...latest, writers: { ...latest.writers, [writer]: { ...active, state: nextCount === 0 ? 'IDLE' : 'ACTIVE', inFlight: nextCount, leaseIds } } } };
+              });
+              released = true;
+            } catch (error) {
+              const latest = await this.inspect().catch(() => null);
+              if (latest !== null) {
+                this.assertIdentity(latest);
+                const active = latest.writers[writer];
+                if (active !== undefined && !active.leaseIds.includes(leaseId)) {
+                  released = true;
+                  return;
+                }
+              }
+              throw error;
+            }
           },
         },
         document: { ...current, writers },
@@ -290,21 +326,26 @@ export class ProductionSafetyController {
     const reasons: string[] = [];
     if (fence.state !== 'QUIESCED') reasons.push(`fence state is ${fence.state}`);
     if (fence.reservation !== null) reasons.push(`reservation ${fence.reservation.id} is ${fence.reservation.status.toLowerCase()}`);
+    reasons.push(...quiescenceReasons(fence, {}));
     if (fence.backup === null) reasons.push('a verified backup is not recorded');
     if (fence.restore === null) reasons.push('a disposable restore drill is not recorded');
     if (fence.backup !== null) {
       if (fence.backup.fenceEpoch !== fence.fenceEpoch) reasons.push('backup evidence is from an earlier fence epoch');
+      if (!sameIdentity(fence.backup.sourceIdentity, fence.identity)) reasons.push('backup evidence belongs to another runtime identity');
       try {
         const manifest = await verifyRuntimeBackup(fence.backup.destination);
-        if (manifestDigest(manifest) !== fence.backup.manifestDigest || manifest.backupId !== fence.backup.backupId) reasons.push('backup evidence does not match its verified artifact');
+        if (manifestDigest(manifest) !== fence.backup.manifestDigest || manifest.backupId !== fence.backup.backupId || !sameIdentity(manifest.sourceIdentity, fence.backup.sourceIdentity)) reasons.push('backup evidence does not match its verified artifact');
         if (manifest.checkpoint === null || fence.backup.checkpointDigest !== manifest.checkpoint.sha256) reasons.push('backup does not include verified task checkpoint evidence');
       } catch { reasons.push('recorded backup is no longer verifiable'); }
     }
     if (fence.restore !== null) {
+      if (fence.backup === null) reasons.push('restore evidence has no current backup');
+      else if (!sameBackupEvidence(fence.backup, fence.restore)) reasons.push('restore evidence does not match the current verified backup');
       if (fence.restore.fenceEpoch !== fence.fenceEpoch) reasons.push('restore evidence is from an earlier fence epoch');
+      if (!sameIdentity(fence.restore.sourceIdentity, fence.identity)) reasons.push('restore evidence belongs to another runtime identity');
       try {
         const manifest = await verifyRuntimeBackup(fence.restore.destination);
-        if (manifestDigest(manifest) !== fence.restore.manifestDigest || manifest.backupId !== fence.restore.backupId) reasons.push('restore evidence does not match its verified artifact');
+        if (manifestDigest(manifest) !== fence.restore.manifestDigest || manifest.backupId !== fence.restore.backupId || !sameIdentity(manifest.sourceIdentity, fence.restore.sourceIdentity)) reasons.push('restore evidence does not match its verified artifact');
         if (manifest.checkpoint === null || fence.restore.checkpointDigest !== manifest.checkpoint.sha256) reasons.push('restore drill does not include verified task checkpoint evidence');
         if (fence.restore.checkpointTarget === null || await hashFile(fence.restore.checkpointTarget) !== fence.restore.checkpointDigest) reasons.push('restored task checkpoint is unavailable or changed');
       } catch { reasons.push('restored runtime is no longer verifiable'); }
@@ -335,9 +376,10 @@ export class ProductionSafetyController {
   public async completeBackup(ownerAccessToken: string, reservationId: string, evidence: BackupEvidence): Promise<void> {
     await this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      this.assertReservation(current, reservationId, 'BACKUP');
+      const reservation = this.assertReservation(current, reservationId, 'BACKUP');
       if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Backup completion requires a QUIESCED fence');
-      const next = { ...current, backup: evidence, reservation: null };
+      if (!sameIdentity(evidence.sourceIdentity, current.identity) || evidence.fenceEpoch !== current.fenceEpoch || path.resolve(evidence.destination) !== reservation.destination) throw new RuntimeError('AUTHORITY_CHANGED', 'Backup evidence does not match the fenced reservation');
+      const next = { ...current, backup: evidence, restore: null, reservation: null };
       return { value: undefined, document: next };
     });
   }
@@ -346,6 +388,7 @@ export class ProductionSafetyController {
     return this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
       this.assertQuiescedForReservation(current);
+      if (current.backup === null) throw new RuntimeError('PRECONDITION_FAILED', 'Restore requires a current verified backup');
       const reservation: SafetyReservation = { id: randomUUID(), operation: 'RESTORE', ownerInstanceId: this.identity.instanceId, fenceEpoch: current.fenceEpoch, destination: path.resolve(destination), checkpointTarget: checkpointTarget === null ? null : path.resolve(checkpointTarget), startedAt: new Date().toISOString(), status: 'ACTIVE' };
       const next = { ...current, reservation };
       return { value: { id: reservation.id, fence: next }, document: next };
@@ -355,8 +398,9 @@ export class ProductionSafetyController {
   public async completeRestore(ownerAccessToken: string, reservationId: string, evidence: RestoreEvidence): Promise<void> {
     await this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      this.assertReservation(current, reservationId, 'RESTORE');
+      const reservation = this.assertReservation(current, reservationId, 'RESTORE');
       if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Restore completion requires a QUIESCED fence');
+      if (current.backup === null || !sameBackupEvidence(current.backup, evidence) || !sameIdentity(evidence.sourceIdentity, current.identity) || evidence.fenceEpoch !== current.fenceEpoch || path.resolve(evidence.destination) !== reservation.destination || evidence.checkpointTarget !== reservation.checkpointTarget) throw new RuntimeError('PRECONDITION_FAILED', 'Restore evidence does not match the current verified backup or reservation');
       const next = { ...current, restore: evidence, reservation: null };
       return { value: undefined, document: next };
     });
@@ -377,8 +421,10 @@ export class ProductionSafetyController {
     if (quiescenceReasons(current, {}).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'Writer inventory is not idle and verified');
   }
 
-  private assertReservation(current: SafetyDocument, reservationId: string, operation: SafetyReservation['operation']): void {
-    if (current.reservation === null || current.reservation.id !== reservationId || current.reservation.operation !== operation || current.reservation.ownerInstanceId !== this.identity.instanceId || current.reservation.status !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation is not owned by this runtime instance');
+  private assertReservation(current: SafetyDocument, reservationId: string, operation: SafetyReservation['operation']): SafetyReservation {
+    const reservation = current.reservation;
+    if (reservation === null || reservation.id !== reservationId || reservation.operation !== operation || reservation.ownerInstanceId !== this.identity.instanceId || reservation.status !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation is not owned by this runtime instance');
+    return reservation;
   }
 
   private async transaction<T>(operation: (current: SafetyDocument) => Promise<{ readonly value: T; readonly document: SafetyDocument }> | { readonly value: T; readonly document: SafetyDocument }): Promise<T> {
@@ -568,10 +614,24 @@ function quiescenceReasons(document: SafetyDocument, observations: Readonly<Reco
     const record = document.writers[writer];
     if (record === undefined || record.state === 'UNKNOWN') reasons.push(`writer ${writer} is unknown`);
     else if (record.inFlight > 0 || record.state === 'ACTIVE') reasons.push(`writer ${writer} is active`);
+    if (record !== undefined && record.state !== 'UNKNOWN' && record.ownerInstanceId !== document.identity.instanceId) reasons.push(`writer ${writer} belongs to another runtime instance`);
+    if (record !== undefined && record.leaseIds.length !== record.inFlight) reasons.push(`writer ${writer} lease accounting is inconsistent`);
     const observed = observations[writer];
     if (observed?.state === 'ACTIVE' || (observed?.inFlight ?? 0) > 0) reasons.push(`observation reports ${writer} active`);
   }
   return [...new Set(reasons)];
+}
+
+function sameIdentity(left: SafetyIdentity, right: SafetyIdentity): boolean {
+  return left.runtimeId === right.runtimeId && left.instanceId === right.instanceId && path.resolve(left.dataRoot) === path.resolve(right.dataRoot);
+}
+
+function sameBackupEvidence(backup: BackupEvidence, restore: RestoreEvidence): boolean {
+  return backup.backupId === restore.backupId
+    && backup.manifestDigest === restore.manifestDigest
+    && backup.fenceEpoch === restore.fenceEpoch
+    && backup.checkpointDigest === restore.checkpointDigest
+    && sameIdentity(backup.sourceIdentity, restore.sourceIdentity);
 }
 
 async function copyTree(source: string, destination: string): Promise<BackupManifest['files'][number][]> {
@@ -743,11 +803,13 @@ async function releaseLock(lock: OwnedLock): Promise<void> {
 function parseDocument(content: string): SafetyDocument {
   try {
     const value = JSON.parse(content) as Partial<SafetyDocument> & { writers?: Record<string, Partial<WriterRecord>> };
-    if (value.schemaVersion !== 1 || !FENCE_STATES.includes(value.state as ProductionFenceState) || !value.identity || typeof value.identity.runtimeId !== 'string' || typeof value.identity.instanceId !== 'string' || !path.isAbsolute(value.identity.dataRoot) || !Number.isSafeInteger(value.generation) || !value.writers || typeof value.writers !== 'object') throw new Error('schema');
+    if (value.schemaVersion !== 1 || !FENCE_STATES.includes(value.state as ProductionFenceState) || !Number.isSafeInteger(value.generation) || !value.writers || typeof value.writers !== 'object') throw new Error('schema');
     const generation = value.generation as number;
-    const fenceEpoch = Number.isSafeInteger(value.fenceEpoch) ? value.fenceEpoch as number : 0;
+    const identity = parseIdentityValue(value.identity);
+    const fenceEpoch = Number.isSafeInteger(value.fenceEpoch) && (value.fenceEpoch as number) >= 0 ? value.fenceEpoch as number : 0;
     const writers: Record<string, WriterRecord> = {};
     for (const [name, record] of Object.entries(value.writers)) {
+      if (!REQUIRED_WRITERS.includes(name as SafetyWriterName)) throw new Error('writer name');
       if (!record || !WRITER_STATES.includes(record.state as SafetyWriterState) || !Number.isSafeInteger(record.inFlight) || record.inFlight < 0) throw new Error('writer schema');
       const leaseIds = record.leaseIds ?? [];
       if (!Array.isArray(leaseIds) || leaseIds.some((id) => typeof id !== 'string') || leaseIds.length !== record.inFlight) throw new Error('lease schema');
@@ -757,22 +819,46 @@ function parseDocument(content: string): SafetyDocument {
       schemaVersion: 1,
       generation,
       state: value.state as ProductionFenceState,
-      identity: value.identity,
+      identity,
       writers,
       blockedReason: typeof value.blockedReason === 'string' ? value.blockedReason : null,
       fenceEpoch,
-      backup: value.backup ?? null,
-      restore: value.restore ?? null,
-      reservation: value.reservation ?? null,
+      backup: value.backup === null || value.backup === undefined ? null : parseBackupEvidence(value.backup),
+      restore: value.restore === null || value.restore === undefined ? null : parseRestoreEvidence(value.restore),
+      reservation: value.reservation === null || value.reservation === undefined ? null : parseReservation(value.reservation),
       updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date(0).toISOString(),
     };
   } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Production safety state is invalid', { cause: error }); }
 }
+
+function parseIdentityValue(value: unknown): SafetyIdentity {
+  if (!isRecord(value) || typeof value.runtimeId !== 'string' || typeof value.instanceId !== 'string' || typeof value.dataRoot !== 'string' || !path.isAbsolute(value.dataRoot)) throw new Error('identity schema');
+  return { runtimeId: value.runtimeId, instanceId: value.instanceId, dataRoot: value.dataRoot };
+}
+
+function parseBackupEvidence(value: unknown): BackupEvidence {
+  if (!isRecord(value) || typeof value.backupId !== 'string' || typeof value.destination !== 'string' || !path.isAbsolute(value.destination) || typeof value.manifestDigest !== 'string' || !Number.isSafeInteger(value.fenceEpoch) || (value.fenceEpoch as number) < 0 || (value.checkpointDigest !== null && typeof value.checkpointDigest !== 'string') || typeof value.verifiedAt !== 'string') throw new Error('backup evidence schema');
+  return { backupId: value.backupId, destination: value.destination, manifestDigest: value.manifestDigest, sourceIdentity: parseIdentityValue(value.sourceIdentity), fenceEpoch: value.fenceEpoch as number, checkpointDigest: value.checkpointDigest as string | null, verifiedAt: value.verifiedAt };
+}
+
+function parseRestoreEvidence(value: unknown): RestoreEvidence {
+  if (!isRecord(value) || typeof value.backupId !== 'string' || typeof value.destination !== 'string' || !path.isAbsolute(value.destination) || (value.checkpointTarget !== null && (typeof value.checkpointTarget !== 'string' || !path.isAbsolute(value.checkpointTarget))) || typeof value.manifestDigest !== 'string' || !Number.isSafeInteger(value.fenceEpoch) || (value.fenceEpoch as number) < 0 || (value.checkpointDigest !== null && typeof value.checkpointDigest !== 'string') || typeof value.verifiedAt !== 'string') throw new Error('restore evidence schema');
+  return { backupId: value.backupId, destination: value.destination, checkpointTarget: value.checkpointTarget as string | null, manifestDigest: value.manifestDigest, sourceIdentity: parseIdentityValue(value.sourceIdentity), fenceEpoch: value.fenceEpoch as number, checkpointDigest: value.checkpointDigest as string | null, verifiedAt: value.verifiedAt };
+}
+
+function parseReservation(value: unknown): SafetyReservation {
+  if (!isRecord(value) || typeof value.id !== 'string' || (value.operation !== 'BACKUP' && value.operation !== 'RESTORE') || typeof value.ownerInstanceId !== 'string' || !Number.isSafeInteger(value.fenceEpoch) || (value.fenceEpoch as number) < 0 || typeof value.destination !== 'string' || !path.isAbsolute(value.destination) || (value.checkpointTarget !== null && (typeof value.checkpointTarget !== 'string' || !path.isAbsolute(value.checkpointTarget))) || typeof value.startedAt !== 'string' || (value.status !== 'ACTIVE' && value.status !== 'FAILED')) throw new Error('reservation schema');
+  return { id: value.id, operation: value.operation, ownerInstanceId: value.ownerInstanceId, fenceEpoch: value.fenceEpoch as number, destination: value.destination, checkpointTarget: value.checkpointTarget as string | null, startedAt: value.startedAt, status: value.status };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 function parseManifest(content: string): BackupManifest {
   try {
-    const value = JSON.parse(content) as BackupManifest;
-    if (value.schemaVersion !== 1 || typeof value.backupId !== 'string' || !Array.isArray(value.files) || (value.checkpoint !== null && (value.checkpoint === undefined || !Number.isSafeInteger(value.checkpoint.size) || typeof value.checkpoint.sha256 !== 'string' || !Number.isSafeInteger(value.checkpoint.mode))) || value.files.some((file) => typeof file.path !== 'string' || !Number.isSafeInteger(file.size) || typeof file.sha256 !== 'string' || !Number.isSafeInteger(file.mode))) throw new Error('schema');
-    return value;
+    const value = JSON.parse(content) as Partial<BackupManifest>;
+    if (value.schemaVersion !== 1 || typeof value.backupId !== 'string' || typeof value.createdAt !== 'string' || !Number.isSafeInteger(value.fenceGeneration) || !Array.isArray(value.files) || (value.checkpoint !== null && (value.checkpoint === undefined || !Number.isSafeInteger(value.checkpoint.size) || typeof value.checkpoint.sha256 !== 'string' || !Number.isSafeInteger(value.checkpoint.mode))) || value.files.some((file) => !file || typeof file.path !== 'string' || path.isAbsolute(file.path) || file.path.split('/').some((part: string) => part === '' || part === '..') || !Number.isSafeInteger(file.size) || typeof file.sha256 !== 'string' || !Number.isSafeInteger(file.mode))) throw new Error('schema');
+    return { ...value, sourceIdentity: parseIdentityValue(value.sourceIdentity), files: value.files, checkpoint: value.checkpoint ?? null } as BackupManifest;
   } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Backup manifest is invalid', { cause: error }); }
 }
 function isWithin(root: string, candidate: string): boolean { const relative = path.relative(root, candidate); return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`)); }
