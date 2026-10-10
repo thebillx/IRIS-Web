@@ -1,5 +1,6 @@
 import { writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
+import { RuntimeError } from '@iris/domain';
 import { ProductionSafetyController } from './production-safety.js';
 import { observeProcessStart } from './macos-safety.js';
 
@@ -21,12 +22,38 @@ if (mode === 'lock') {
     dataRoot,
     identity: { runtimeId: 'runtime-test', instanceId: 'instance-test', dataRoot: path.resolve(dataRoot) },
     ownerAccessSecret: 'owner-token-for-test',
+    writerVerifier: {
+      verify: async (_writer, identity, context) => ({
+        state: 'IDLE' as const,
+        inFlight: 0,
+        runtimeId: identity.runtimeId,
+        instanceId: identity.instanceId,
+        dataRoot: identity.dataRoot,
+        fenceEpoch: context.fenceEpoch,
+        generation: context.generation,
+      }),
+    },
   });
   const reservation = await controller.reserveBackup('owner-token-for-test', destination);
   process.stdout.write('READY\n');
   process.stdin.resume();
   await new Promise<void>((resolve) => process.stdin.once('data', () => resolve()));
   await controller.failReservation('owner-token-for-test', reservation.id, 'test cleanup');
+} else if (mode === 'registration') {
+  const controller = await ProductionSafetyController.open({
+    dataRoot,
+    identity: { runtimeId: 'runtime-test', instanceId: 'instance-test', dataRoot: path.resolve(dataRoot) },
+    ownerAccessSecret: 'owner-token-for-test',
+  });
+  try {
+    await controller.registerWriter('runtime-state');
+    throw new Error('registration unexpectedly succeeded');
+  } catch (error) {
+    if (!(error instanceof RuntimeError) || error.code !== 'PRECONDITION_FAILED') throw error;
+  }
+  process.stdout.write('READY\n');
+  process.stdin.resume();
+  await new Promise<void>((resolve) => process.stdin.once('data', () => resolve()));
 } else {
   const controller = await ProductionSafetyController.open({
     dataRoot,

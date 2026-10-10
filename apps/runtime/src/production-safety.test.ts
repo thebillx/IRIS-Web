@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ProductionSafetyController, createRuntimeBackup, restoreRuntimeBackup, verifyRuntimeBackup } from './production-safety.js';
+import { ProductionSafetyController, createRuntimeBackup, restoreRuntimeBackup, verifyRuntimeBackup, type TrustedWriterVerification, type TrustedWriterVerifier } from './production-safety.js';
 import { FoundationStateStore } from './persistence.js';
 import { RuntimeState } from './state.js';
 
@@ -32,7 +32,7 @@ describe('production safety foundation', () => {
 
   it('requires the current owner identity and detects interrupted quiescence on reopen', async () => {
     const fixtureData = await dataFixture();
-    const first = await ProductionSafetyController.open({ dataRoot: fixtureData.dataRoot, identity: fixtureData.identity, ownerAccessSecret: fixtureData.token, writerVerifier: trustedWriterVerifier });
+    const first = await ProductionSafetyController.open({ dataRoot: fixtureData.dataRoot, identity: fixtureData.identity, ownerAccessSecret: fixtureData.token, writerVerifier: createTrustedWriterVerifier() });
     for (const writer of ['runtime-state', 'mission-state', 'mission-broker', 'durable-jobs', 'supervisor']) await registerWriter(first, writer);
     await expect(first.quiesce('wrong-token')).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
     const lease = await first.beginMutation('runtime-state');
@@ -135,6 +135,8 @@ describe('production safety foundation', () => {
     await child.ready;
     const parentLease = await controller.beginMutation('runtime-state');
     expect((await controller.inspect()).writers['runtime-state']?.inFlight).toBe(2);
+    await expect(controller.quiesce('owner-token-for-test', { 'runtime-state': { state: 'IDLE', inFlight: 0 } })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    expect((await controller.inspect()).writers['runtime-state']?.inFlight).toBe(2);
     await parentLease.release();
     expect((await controller.inspect()).writers['runtime-state']?.inFlight).toBe(1);
     child.process.stdin!.end('\n');
@@ -163,6 +165,19 @@ describe('production safety foundation', () => {
     await expect(controller.recover(token, {})).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
+  it('does not let observations erase an active lease during quiesce or recovery', async () => {
+    const { controller, token } = await fixture();
+    await registerWriter(controller, 'runtime-state');
+    const lease = await controller.beginMutation('runtime-state');
+    await expect(controller.quiesce(token, { 'runtime-state': { state: 'IDLE', inFlight: 0 } })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    expect((await controller.inspect()).writers['runtime-state']?.inFlight).toBe(1);
+    const blocked = await controller.quiesce(token);
+    expect(blocked.state).toBe('BLOCKED');
+    await expect(controller.recover(token, { 'runtime-state': { state: 'IDLE', inFlight: 0 } })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    expect((await controller.inspect()).writers['runtime-state']?.inFlight).toBe(1);
+    await lease.release();
+  });
+
   it('requires verified registration and preserves fenced writer state', async () => {
     const { controller } = await untrustedFixture();
     await expect(controller.registerWriter('external-runners')).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
@@ -188,12 +203,49 @@ describe('production safety foundation', () => {
     const { controller, token, dataRoot, root } = await fixture();
     for (const writer of requiredWriters) await registerWriter(controller, writer);
     await controller.quiesce(token);
-    const child = startChild(dataRoot, 'reservation', path.join(root, 'cross-process-backup'));
+    const reservation = await controller.reserveBackup(token, path.join(root, 'cross-process-backup'));
+    const child = startChild(dataRoot, 'registration');
     await child.ready;
     await expect(registerWriter(controller, 'runtime-state')).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
-    expect((await controller.inspect()).reservation?.operation).toBe('BACKUP');
+    expect((await controller.inspect()).reservation?.id).toBe(reservation.id);
     child.process.stdin!.end('\n');
     await child.exit;
+    await controller.failReservation(token, reservation.id, 'test cleanup');
+  });
+
+  it('requires a trusted current writer proof for backup and restore reservations', async () => {
+    const live = await readyBackupFixture();
+    const unverified = await ProductionSafetyController.open({ dataRoot: live.dataRoot, identity: live.identity, ownerAccessSecret: live.token });
+    const before = await unverified.inspect();
+    await expect(unverified.reserveBackup(live.token, path.join(live.root, 'unverified-backup'))).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    await expect(unverified.reserveRestore(live.token, path.join(live.root, 'unverified-restore'), null)).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    expect((await unverified.inspect()).generation).toBe(before.generation);
+  });
+
+  it('rejects unavailable, stale, or conflicting verifier evidence for reservations', async () => {
+    const unavailableVerifier = createTrustedWriterVerifier();
+    const unavailable = await fixture(true, unavailableVerifier);
+    for (const writer of requiredWriters) await registerWriter(unavailable.controller, writer);
+    await unavailable.controller.quiesce(unavailable.token);
+    unavailableVerifier.available = false;
+    await expect(unavailable.controller.reserveBackup(unavailable.token, path.join(unavailable.root, 'unavailable-backup'))).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    unavailableVerifier.available = true;
+    unavailableVerifier.fail = true;
+    await expect(unavailable.controller.reserveBackup(unavailable.token, path.join(unavailable.root, 'failed-backup'))).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    const staleVerifier = createTrustedWriterVerifier();
+    const stale = await fixture(true, staleVerifier);
+    for (const writer of requiredWriters) await registerWriter(stale.controller, writer);
+    await stale.controller.quiesce(stale.token);
+    staleVerifier.generationOffset = 1;
+    await expect(stale.controller.reserveBackup(stale.token, path.join(stale.root, 'stale-backup'))).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    const conflictingVerifier = createTrustedWriterVerifier();
+    const conflicting = await fixture(true, conflictingVerifier);
+    for (const writer of requiredWriters) await registerWriter(conflicting.controller, writer);
+    await conflicting.controller.quiesce(conflicting.token);
+    conflictingVerifier.runtimeIdOverride = 'different-runtime';
+    await expect(conflicting.controller.reserveBackup(conflicting.token, path.join(conflicting.root, 'conflicting-backup'))).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
   it('binds restore evidence to the current backup', async () => {
@@ -280,13 +332,35 @@ describe('production safety foundation', () => {
   });
 });
 
-const trustedWriterVerifier = {
-  verify: async () => ({ state: 'IDLE' as const, inFlight: 0 }),
-};
+type TestWriterVerifier = TrustedWriterVerifier & { available: boolean; fail: boolean; generationOffset: number; runtimeIdOverride?: string; state: 'IDLE' | 'ACTIVE' };
 
-async function fixture(trusted = true): Promise<{ root: string; dataRoot: string; controller: ProductionSafetyController; token: string }> {
+function createTrustedWriterVerifier(): TestWriterVerifier {
+  const verifier: TestWriterVerifier = {
+    available: true,
+    fail: false,
+    generationOffset: 0,
+    state: 'IDLE' as 'IDLE' | 'ACTIVE',
+    verify: async (_writer: Parameters<TrustedWriterVerifier['verify']>[0], identity: Parameters<TrustedWriterVerifier['verify']>[1], context: Parameters<TrustedWriterVerifier['verify']>[2]): Promise<TrustedWriterVerification | null> => {
+      if (!verifier.available) return null;
+      if (verifier.fail) throw new Error('test verifier unavailable');
+      return {
+        state: verifier.state,
+        inFlight: 0,
+        runtimeId: verifier.runtimeIdOverride ?? identity.runtimeId,
+        instanceId: identity.instanceId,
+        dataRoot: identity.dataRoot,
+        fenceEpoch: context.fenceEpoch,
+        generation: context.generation + verifier.generationOffset,
+      };
+    },
+  };
+  return verifier;
+}
+
+async function fixture(trusted = true, verifier?: TestWriterVerifier): Promise<{ root: string; dataRoot: string; controller: ProductionSafetyController; token: string; identity: { runtimeId: string; instanceId: string; dataRoot: string } }> {
   const data = await dataFixture();
-  const controller = await ProductionSafetyController.open({ dataRoot: data.dataRoot, identity: data.identity, ownerAccessSecret: data.token, ...(trusted ? { writerVerifier: trustedWriterVerifier } : {}) });
+  const writerVerifier = trusted ? (verifier ?? createTrustedWriterVerifier()) : undefined;
+  const controller = await ProductionSafetyController.open({ dataRoot: data.dataRoot, identity: data.identity, ownerAccessSecret: data.token, ...(writerVerifier === undefined ? {} : { writerVerifier }) });
   return { ...data, controller };
 }
 
@@ -305,7 +379,7 @@ async function verifiedObservations(_controller: ProductionSafetyController, wri
   }]));
 }
 
-async function readyBackupFixture(): Promise<{ root: string; dataRoot: string; token: string; controller: ProductionSafetyController; backup: string }> {
+async function readyBackupFixture(): Promise<{ root: string; dataRoot: string; token: string; identity: { runtimeId: string; instanceId: string; dataRoot: string }; controller: ProductionSafetyController; backup: string }> {
   const data = await fixture();
   for (const writer of requiredWriters) await registerWriter(data.controller, writer);
   await writeFile(path.join(data.dataRoot, 'state.json'), 'safe\n', { mode: 0o600 });
@@ -321,7 +395,7 @@ const requiredWriters = [
   'activation', 'supervisor', 'external-runners',
 ] as const;
 
-function startChild(dataRoot: string, mode: 'lock' | 'lease' | 'reservation', destination?: string): { readonly process: ChildProcess; readonly ready: Promise<void>; readonly exit: Promise<void> } {
+function startChild(dataRoot: string, mode: 'lock' | 'lease' | 'reservation' | 'registration', destination?: string): { readonly process: ChildProcess; readonly ready: Promise<void>; readonly exit: Promise<void> } {
   const root = path.resolve(import.meta.dirname, '../../..');
   const tsxDirectory = path.join(root, 'apps', 'runtime', 'node_modules', 'tsx', 'dist');
   const child = spawn(process.execPath, ['--require', path.join(tsxDirectory, 'preflight.cjs'), '--import', path.join(tsxDirectory, 'loader.mjs'), path.resolve(import.meta.dirname, 'production-safety-process-child.ts'), dataRoot, mode, destination ?? ''], { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
