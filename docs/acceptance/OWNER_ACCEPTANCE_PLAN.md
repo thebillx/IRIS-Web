@@ -27,6 +27,29 @@ LaunchAgent collision.
 - Do not proceed if the root, process, port, tunnel, credential or LaunchAgent
   identity cannot be proved. Preserve the evidence and ask the owner.
 
+## Read-only RARW identity baseline
+
+The maintenance registration IDs currently identify the physical root
+`/Users/RARW/iris-repository-recovery` and its own Git common directory. Local
+metadata and ordinary Git inspection produced this record; no reconciliation
+command was run:
+
+| Item | Observed value | Evidence / confidence |
+|---|---|---|
+| Project | `4ae13c3f-01b8-4cd8-b978-8ed3414c8fee` (`iris-repository-recovery`) | Local `state.json` and `vnext-resources.json`; high |
+| Workspace | `ff81df0f-8f89-5894-b9a3-231e23625ecc` | Local `vnext-resources.json`; high |
+| Repository | `c933c222-54ba-565b-936f-6555acdc45e6` | Local `vnext-resources.json`; high |
+| Registered common Git directory | `/Users/RARW/iris-repository-recovery/.git` | Local repository metadata; high |
+| Current branch / HEAD | `iris/repository-identity-recovery` / `6978164715ba0d01144f95de9cd02442ec3d0218` | Read-only Git; high |
+| Working tree | One owner handoff file modified | Read-only Git; preserve it |
+| Earlier recorded HEAD | `9bbcee97fdb5fb70a57f1d4a5f48e2480ac46052` | This is the current commit's parent and the Enhance01 integration HEAD; it is not interchangeable with `69781647…` |
+
+The local registration record does not store the governed branch and HEAD, so
+registration freshness for the new commit remains **UNVERIFIED**. Do not reset
+the handoff file, execute `/repositories/reconcile`, or claim original
+Enhance01 authorization is restored until governed Git access is independently
+verified.
+
 ## Guarded session setup
 
 Run from the expected candidate checkout. The root must not already exist; if
@@ -126,6 +149,38 @@ procedure. The owner must quiesce and fence the intended installation, record
 the process and LaunchAgent identities, run a fresh wrapper preflight, and
 restore the same installation after the evidence is captured. This plan does
 not authorize that window.
+
+## Controlled acceptance window — prepare only
+
+The current RARW observation selects **Option B**. At the latest read-only
+check, the live source was `/Users/RARW/iris`, the data root was
+`/Users/RARW/Library/Application Support/IRIS`, the machine identity was
+`e4da24b5-7560-4be1-a294-275b401c97b8`, and the runtime identity was
+`bf524159-5912-4cb5-9453-c8d247b07960`. Ports `43110`, `43111`, `43112`, and
+`5173` were occupied; no listener was present on `43113`, although the live
+tunnel client processes remained. `com.iris.supervisor` was loaded and running
+from `/Users/RARW/iris`. The data files showed 20 `RUNNING` mission records;
+supported quiescence of jobs, sessions and writers was not established.
+
+`LIVE_QUIESCENCE = BLOCKED` until the owner supplies a supported fence and
+observes the resulting idle state. The candidate has no production snapshot or
+writer-fence command. A normal recursive copy, PID removal, or LaunchAgent
+removal is not a backup or quiescence procedure.
+
+| Window step | Expected observation | Abort condition | Recovery / evidence | Approval boundary |
+|---|---|---|---|---|
+| Before window | Owner names the Mac, candidate checkout/HEAD, maintenance period, backup destination, tunnel identity, live source/data roots, ports, LaunchAgent and active jobs/sessions | Any identity, backup, provider or active-work ambiguity | Leave live IRIS untouched; retain redacted inventory and ask the owner | Owner authorizes downtime and the exact candidate |
+| Reconfirm baseline | Read-only identity and process/port/LaunchAgent records match the recorded baseline | Source, runtime, machine, port or LaunchAgent identity differs unexpectedly | Stop before mutation; record the difference | Owner reviews the discrepancy |
+| Quiesce and fence | A supported owner-controlled lifecycle reports writers stopped and active work handled | No supported fence, `RUNNING` work cannot be explained, or sessions remain active | Keep the live stack running; mark `LIVE_QUIESCENCE = BLOCKED` | Owner supplies or approves the supported fence |
+| Backup and verify | An approved backup product or supported snapshot returns a complete manifest and independently verified hashes | No consistency guarantee, incomplete manifest, failed restore drill, or secret exposure | Do not start the candidate; preserve live state | Owner approves the backup evidence |
+| Candidate preflight/start | Fresh wrapper preflight passes; all required ports are free; provider ownership and local process ownership are proven | Any occupied port, global LaunchAgent collision, stale tunnel, or wrapper block | Do not adopt or kill the owner; preserve the candidate root and diagnostics | Separate approval is required for real startup |
+| Validate | Owner UI selects the intended connector; one read-only `/mcp` identity/status call returns the expected machine/runtime/tunnel; wrong credential is rejected | Connector ambiguity, identity mismatch, mutation, or unknown result | Stop only the owned candidate through its supported lifecycle; inspect before retrying | Owner observes and records the result |
+| Restore live IRIS | Original source/data/LaunchAgent identities, catalog and durable state are verified after supported restart | Any failed or ambiguous restoration | Stop; do not replay mutations or restore state blindly | Owner confirms the maintenance window is closed |
+
+The current wrapper intentionally blocks real remote startup while tunnel
+ownership is `UNVERIFIED`; no bypass is permitted. Source rollback and data
+restoration remain separate operations. If any step lacks the stated supported
+operation, mark it **BLOCKED** rather than substituting a guessed command.
 
 ## LaunchAgent and two-machine isolation
 
