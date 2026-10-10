@@ -128,11 +128,12 @@ describe('local MCP transport and permission boundary', () => {
     });
 
     const listed = await handleMcpRequest(rpc('tools/list', 2), fixture.service);
-    const listedBody = await listed.json() as { result: { tools: Array<{ name: string; inputSchema: { required?: string[] } }> } };
+    const listedBody = await listed.json() as { result: { tools: Array<{ name: string; inputSchema: { required?: string[]; properties?: Record<string, unknown> } }> } };
     expect(listedBody.result.tools.map((tool) => tool.name)).toEqual([
       'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete', 'catalog_identity',
     ]);
     expect(listedBody.result.tools.find((tool) => tool.name === 'session_open')?.inputSchema.required).toBeUndefined();
+    expect(listedBody.result.tools.find((tool) => tool.name === 'workspace_select')?.inputSchema.properties?.workspaceId).toMatchObject({ type: 'string' });
 
     const status = await handleMcpRequest(rpc('tools/call', 3, { name: 'runtime_status', arguments: {} }, true, 'runtime_status'), fixture.service);
     expect(await status.json()).toMatchObject({ result: { isError: false, structuredContent: { status: 'ready' } } });
@@ -256,6 +257,7 @@ describe('local MCP transport and permission boundary', () => {
     const sessionA = await open(31);
     const sessionB = await open(32);
     const otherClientSession = await open(33, 'other-client');
+    const resources = new VNextResourceRegistry(fixture.state, fixture.dataRoot);
 
     const listed = await handleMcpRequest(rpc('tools/call', 34, {
       name: 'list_projects', arguments: {},
@@ -264,10 +266,16 @@ describe('local MCP transport and permission boundary', () => {
     expect(listedBody.result.isError).toBe(false);
     expect(listedBody.result.structuredContent.projects.map((project) => project.id)).toEqual(expect.arrayContaining([fixture.project.id, secondProject.id]));
 
-    const select = async (id: number, sessionId: string, projectId: string) => handleMcpRequest(rpc('tools/call', id, {
-      name: 'workspace_select', arguments: { sessionId, projectId },
+    const select = async (id: number, sessionId: string, projectId: string, workspaceId?: string) => handleMcpRequest(rpc('tools/call', id, {
+      name: 'workspace_select', arguments: { sessionId, projectId, ...(workspaceId === undefined ? {} : { workspaceId }) },
     }, true, 'workspace_select', 'chatgpt'), fixture.service, fixture.state);
     expect(await (await select(35, sessionA, fixture.project.id)).json()).toMatchObject({ result: { isError: false, structuredContent: { currentProjectId: fixture.project.id } } });
+    const scratch = await resources.createScratch(fixture.project.id);
+    expect(await (await select(351, sessionA, fixture.project.id, scratch.workspaceId)).json()).toMatchObject({ result: { isError: false, structuredContent: { currentProjectId: fixture.project.id } } });
+    expect(fixture.state.getSessionWorkspaceBinding(sessionA, 'chatgpt')).toEqual({ projectId: fixture.project.id, workspaceId: scratch.workspaceId });
+    expect(await (await select(352, sessionA, fixture.project.id)).json()).toMatchObject({ result: { isError: false, structuredContent: { currentProjectId: fixture.project.id } } });
+    expect(await (await select(353, sessionA, secondProject.id, randomUUID())).json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'WORKSPACE_NOT_FOUND' } } });
+    expect(fixture.state.getSessionForClient(sessionA, 'chatgpt').currentProjectId).toBe(fixture.project.id);
     expect(await (await select(36, sessionB, secondProject.id)).json()).toMatchObject({ result: { isError: false, structuredContent: { currentProjectId: secondProject.id } } });
     expect(fixture.state.getSessionForClient(sessionA, 'chatgpt').currentProjectId).toBe(fixture.project.id);
     expect(fixture.state.getSessionForClient(sessionB, 'chatgpt').currentProjectId).toBe(secondProject.id);

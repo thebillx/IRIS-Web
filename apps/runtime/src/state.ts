@@ -797,6 +797,42 @@ export class RuntimeState {
     });
   }
 
+  public async selectSessionWorkspace(
+    sessionId: string,
+    clientIdInput: string,
+    projectId: string,
+    workspaceId: string,
+  ): Promise<RuntimeSessionSnapshot> {
+    return this.serializeMachineMutation(async () => {
+      const session = this.getSessionForClient(sessionId, clientIdInput);
+      if (!(await this.listProjects()).some((project) => project.id === projectId)) {
+        throw new RuntimeError('PROJECT_NOT_FOUND', 'Current project does not exist');
+      }
+      const workspace = await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(projectId, workspaceId);
+      const previousBinding = this.sessionBindings.get(sessionId);
+      const previousInvalid = this.invalidSessionBindings.has(sessionId);
+      const previousClient = this.clients.get(session.clientId);
+      const updated = { ...session, currentProjectId: projectId };
+      this.sessions.set(sessionId, updated);
+      this.sessionBindings.set(sessionId, { projectId, workspaceId: workspace.workspaceId });
+      this.invalidSessionBindings.delete(sessionId);
+      this.touchClient(session.clientId);
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.set(sessionId, session);
+        if (previousBinding === undefined) this.sessionBindings.delete(sessionId);
+        else this.sessionBindings.set(sessionId, previousBinding);
+        if (previousInvalid) this.invalidSessionBindings.add(sessionId);
+        else this.invalidSessionBindings.delete(sessionId);
+        if (previousClient === undefined) this.clients.delete(session.clientId);
+        else this.clients.set(session.clientId, previousClient);
+        throw error;
+      }
+      return updated;
+    });
+  }
+
   public deleteSession(sessionId: string, clientIdInput: string): void {
     this.deleteSessionInMemory(sessionId, clientIdInput);
     if (this.safety === undefined) this.persistSessions();
@@ -900,7 +936,15 @@ export class RuntimeState {
         try {
           this.persistSessions();
         } catch (error) {
-          this.sessions.set(sessionId, current);
+          const uncertainEvent: SessionInteractionEvent = {
+            id: randomUUID(),
+            timestamp: new Date().toISOString(),
+            kind: 'error',
+            text: 'Execution completed but publication was uncertain; verify durable state before retrying',
+            submissionId,
+            executionId,
+          };
+          this.sessions.set(sessionId, appendInteraction({ ...current, executionState: 'UNCERTAIN' }, uncertainEvent));
           throw new RuntimeError('PERSISTENCE_FAILURE', 'Executor completed but session completion publication failed; execution outcome is uncertain', { cause: error });
         }
         return completed;
@@ -1302,7 +1346,7 @@ function isAgentRole(value: unknown): value is AgentRole {
 }
 
 function isSessionExecutionState(value: unknown): value is RuntimeSessionSnapshot['executionState'] {
-  return value === 'READY' || value === 'WORKING' || value === 'FAILED';
+  return value === 'READY' || value === 'WORKING' || value === 'FAILED' || value === 'UNCERTAIN';
 }
 
 function isBoundedIdentity(value: unknown): value is string {

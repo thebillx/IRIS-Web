@@ -78,6 +78,12 @@ describe('runtime machine, client, and session state', () => {
     await expect(first.assertSessionWorkspace(session.id, session.clientId, project.id, workspace.workspaceId)).resolves.toBeUndefined();
     await expect(first.assertSessionWorkspace(session.id, session.clientId, project.id, primaryWorkspaceId(project.id)))
       .rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    const otherProjectRoot = await realpath(await temp('iris-session-workspace-other-project-'));
+    const otherProject = await first.registerProject('Other workspace binding project', otherProjectRoot);
+    await expect(first.selectSessionWorkspace(session.id, session.clientId, otherProject.id, randomUUID()))
+      .rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
+    expect(first.getSessionForClient(session.id, session.clientId).currentProjectId).toBe(project.id);
+    expect(first.getSessionWorkspaceBinding(session.id, session.clientId)).toEqual({ projectId: project.id, workspaceId: workspace.workspaceId });
 
     const replacement = new RuntimeState(new FoundationStateStore(dataRoot));
     expect(replacement.getSessionWorkspaceBinding(session.id, session.clientId)).toEqual({ projectId: project.id, workspaceId: workspace.workspaceId });
@@ -127,14 +133,14 @@ describe('runtime machine, client, and session state', () => {
     await expect(state.submitInstruction(session.id, session.clientId, 'completion-uncertain', 'complete once'))
       .rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE', message: expect.stringContaining('outcome is uncertain') });
     expect(executions).toBe(1);
-    expect(state.getSessionForClient(session.id, session.clientId)).toMatchObject({ executionState: 'WORKING' });
-    expect(state.getSessionForClient(session.id, session.clientId).interactions.map((event) => event.kind)).toEqual(['user']);
+    expect(state.getSessionForClient(session.id, session.clientId)).toMatchObject({ executionState: 'UNCERTAIN' });
+    expect(state.getSessionForClient(session.id, session.clientId).interactions.map((event) => event.kind)).toEqual(['user', 'error']);
     expect(JSON.parse(await readFile(path.join(dataRoot, 'sessions.json'), 'utf8'))).toMatchObject({ sessions: [{ snapshot: { executionState: 'WORKING' } }] });
 
     publication.mockRestore();
     const duplicate = await state.submitInstruction(session.id, session.clientId, 'completion-uncertain', 'complete once');
     expect(executions).toBe(1);
-    expect(duplicate.executionState).toBe('WORKING');
+    expect(duplicate.executionState).toBe('UNCERTAIN');
   });
 
   it('supports concurrent agent roles on one daemon without sharing session identity', async () => {

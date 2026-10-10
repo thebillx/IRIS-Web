@@ -730,9 +730,10 @@ export class CapabilityService {
     if (operation.capabilityId === 'session.create') return this.state.createSessionDurable(operation.clientId, operation.agentId, operation.agentRole);
     if (operation.capabilityId === 'session.delete') { await this.state.deleteSessionDurable(operation.sessionId, operation.clientId); return { deleted: true }; }
     if (operation.capabilityId === 'session.current_project.set') {
-      const session = await this.state.setSessionCurrentProject(operation.sessionId, operation.clientId, operation.projectId);
-      if (operation.workspaceId === undefined || operation.projectId === null) return session;
-      return this.state.bindSessionWorkspace(operation.sessionId, operation.clientId, operation.projectId, operation.workspaceId);
+      if (operation.workspaceId === undefined || operation.projectId === null) {
+        return this.state.setSessionCurrentProject(operation.sessionId, operation.clientId, operation.projectId);
+      }
+      return this.state.selectSessionWorkspace(operation.sessionId, operation.clientId, operation.projectId, operation.workspaceId);
     }
     if (operation.capabilityId === 'session.instruction.submit') return this.state.submitInstruction(operation.sessionId, operation.clientId, operation.submissionId, operation.instruction);
     if (operation.capabilityId === 'project.register') {

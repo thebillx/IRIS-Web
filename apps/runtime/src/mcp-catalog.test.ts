@@ -7,7 +7,7 @@ describe('canonical MCP catalog', () => {
   it('preserves the GitHub main FULL and PRO contracts during repository recovery', () => {
     expect(catalogIdentity('FULL', fullMcpToolDefinitionsV21())).toEqual({
       profile: 'FULL', catalogVersion: '2.7.0', toolCount: 56,
-      catalogHash: 'sha256:cd51971fa290453e7d70e7eda30961ac0d8f66cfb56c34b65b72a4066374e30a',
+      catalogHash: 'sha256:6cc422d3dbee638c5ff03e41792540ee82830469af56e9f6a4cfb0d30d99375a',
     });
     expect(catalogIdentity('PRO', proMcpToolDefinitions())).toEqual({
       profile: 'PRO', catalogVersion: '2.7.0', toolCount: 5,
@@ -26,7 +26,7 @@ describe('canonical MCP catalog', () => {
       } },
     } : tool);
     expect(catalogIdentity('FULL', liveDefinitions).catalogHash)
-      .toBe('sha256:c047d48ffbe57ea1d4e0af505e435809a400462f1f3e565e5fee52811686f879');
+      .toBe('sha256:4258584918bddf674e8b7558ae067daa0889408a2122fc6d57838e769cce6a8c');
   });
 
   it('produces a deterministic identity and changes it for schema changes', () => {
