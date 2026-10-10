@@ -643,6 +643,7 @@ export type CapabilityId =
   | 'session.delete'
   | 'session.current_project.set'
   | 'session.instruction.submit'
+  | 'repository.reconcile'
   | 'project.register'
   | 'project.default.set'
   | 'file.read'

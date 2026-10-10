@@ -42,7 +42,6 @@ export interface RuntimeServerContext {
   readonly tunnelServiceSecret?: string;
   readonly connectorDeploymentEpoch?: number;
   readonly connectorRuntimeId?: string;
-  readonly singleConnector?: boolean;
   readonly catalogRuntimeContext?: McpCatalogRuntimeContext;
   readonly requestShutdown: () => void;
 }
@@ -124,10 +123,6 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   }
 
   const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-  if (context.singleConnector && url.pathname === '/mcp-pro') {
-    writeEmptyNotFound(response);
-    return;
-  }
   const runtimeOrigin = `http://${request.headers.host!}`;
   if (request.method === 'GET' && url.pathname === '/.well-known/oauth-protected-resource/mcp') {
     writeJson(response, 200, {
@@ -380,6 +375,21 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
       response,
       await context.capabilities.resolveApproval(decodeURIComponent(approvalMatch[1]!), approvalChoiceField(body, 'decision')),
     );
+    return;
+  }
+  if (request.method === 'POST' && url.pathname === '/repositories/reconcile') {
+    const body = await readJsonBody(request);
+    const keys = ['projectId', 'previousRepositoryId', 'previousDevice', 'expectedRepositoryId'];
+    if (body === null || Object.keys(body).some((key) => !keys.includes(key))) throw new RuntimeError('INVALID_REQUEST', 'Unsupported repository reconciliation field');
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'repository.reconcile',
+      projectId: stringField(body, 'projectId'),
+      previousRepositoryId: stringField(body, 'previousRepositoryId'),
+      previousDevice: stringField(body, 'previousDevice'),
+      expectedRepositoryId: stringField(body, 'expectedRepositoryId'),
+      clientId: optionalClientId(request),
+      sessionId: optionalSessionId(request),
+    }));
     return;
   }
   if (request.method === 'POST' && url.pathname === '/projects') {
