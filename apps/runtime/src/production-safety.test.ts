@@ -61,6 +61,7 @@ describe('production safety foundation', () => {
     const checkpointFile = path.join(root, 'task-checkpoint.json');
     await writeFile(checkpointFile, '{"revision":1}\n', { mode: 0o600 });
     await controller.quiesce(token, { 'external-runners': { state: 'IDLE' } });
+    expect((await controller.readiness()).status).toBe('BLOCKED');
     const backupRoot = path.join(root, 'backup');
     const manifest = await createRuntimeBackup({ controller, ownerAccessToken: token, destination: backupRoot, checkpointFile });
     expect(manifest.files.map((file) => file.path)).toContain('state.json');

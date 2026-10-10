@@ -348,6 +348,7 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
   await assertDestinationAvailable(backupRoot, destination);
   const staging = path.join(path.dirname(destination), `.${path.basename(destination)}.${randomUUID()}.staging`);
   await mkdir(staging, { mode: 0o700 });
+  let checkpointStaging: string | undefined;
   try {
     for (const file of manifest.files) {
       const source = safeJoin(backupRoot, file.path);
@@ -360,7 +361,7 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
       if (input.checkpointFile === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Restore requires a disposable checkpoint target');
       await assertNewPrivateFile(input.checkpointFile);
       const checkpointTarget = path.resolve(input.checkpointFile);
-      const checkpointStaging = `${checkpointTarget}.${process.pid}.${randomUUID()}.staging`;
+      checkpointStaging = `${checkpointTarget}.${process.pid}.${randomUUID()}.staging`;
       await copyFile(safeJoin(backupRoot, CHECKPOINT_FILE), checkpointStaging);
       await chmod(checkpointStaging, manifest.checkpoint.mode);
       await copyFile(safeJoin(backupRoot, CHECKPOINT_FILE), path.join(staging, CHECKPOINT_FILE));
@@ -379,6 +380,7 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
     return manifest;
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    if (checkpointStaging !== undefined) await rm(checkpointStaging, { force: true }).catch(() => undefined);
     throw error;
   }
 }
@@ -433,6 +435,8 @@ async function copyCheckpoint(sourceInput: string, destination: string): Promise
   const metadata = await safeFileMetadata(source, 'Checkpoint file');
   if (isWithin(path.resolve(destination), source)) throw new RuntimeError('PRECONDITION_FAILED', 'Checkpoint source overlaps backup staging');
   const content = await readFile(source);
+  const after = await safeFileMetadata(source, 'Checkpoint file');
+  if (metadata.size !== after.size || metadata.mode !== after.mode || metadata.mtimeMs !== after.mtimeMs) throw new RuntimeError('PERSISTENCE_FAILURE', 'Checkpoint changed while backing up');
   const target = path.join(destination, CHECKPOINT_FILE);
   await writeFile(target, content, { mode: metadata.mode, flag: 'wx' });
   await chmod(target, metadata.mode);
