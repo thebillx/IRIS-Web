@@ -154,6 +154,7 @@ export async function inspectAcceptanceEnvironment(options) {
     await verifyAcceptanceTunnelEvidence({
       filename: evidencePath,
       tunnelId: requestedTunnelId,
+      dataRoot,
       sourceRoot,
       machineName: options.machineName,
       isPidAlive: options.isPidAlive,
@@ -237,6 +238,17 @@ export async function verifyAcceptanceTunnelEvidence(options) {
   }
   const bindingNeedle = evidence.binding.profilePath ?? evidence.tunnelId;
   if (!processInfo.command.includes(bindingNeedle)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'The local provider process does not expose the evidenced tunnel binding');
+  if (options.dataRoot !== undefined) {
+    const registryPath = path.join(options.dataRoot, 'connector-registry.json');
+    const registryContent = await readFile(registryPath, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
+    if (registryContent !== null) {
+      let parsedRegistry;
+      try { parsedRegistry = JSON.parse(registryContent); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Acceptance connector registry is invalid'); }
+      const registry = parsedRegistry?.registry ?? parsedRegistry;
+      const bindings = [...(Array.isArray(registry?.connectors) ? registry.connectors : []), registry?.admin].filter(Boolean);
+      if (!bindings.some((binding) => isRecord(binding) && binding.tunnelId === evidence.tunnelId)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Evidence tunnel identity is not bound to the acceptance registry');
+    }
+  }
   return { provider: evidence.provider, machineId: evidence.machineId, tunnelId: evidence.tunnelId, pid: evidence.pid };
 }
 
