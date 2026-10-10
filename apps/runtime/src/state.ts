@@ -831,15 +831,17 @@ export class RuntimeState {
     clientIdInput: string,
     projectId: string | null,
   ): Promise<RuntimeSessionSnapshot> {
-    const session = this.getSessionForClient(sessionId, clientIdInput);
-    if (projectId !== null && !(await this.listProjects()).some((project) => project.id === projectId)) {
-      throw new RuntimeError('PROJECT_NOT_FOUND', 'Current project does not exist');
-    }
-    const updated: RuntimeSessionSnapshot = { ...session, currentProjectId: projectId };
-    this.sessions.set(sessionId, updated);
-    this.touchClient(session.clientId);
-    this.persistSessions();
-    return updated;
+    return this.serializeMachineMutation(async () => {
+      const session = this.getSessionForClient(sessionId, clientIdInput);
+      if (projectId !== null && !(await this.listProjects()).some((project) => project.id === projectId)) {
+        throw new RuntimeError('PROJECT_NOT_FOUND', 'Current project does not exist');
+      }
+      const updated: RuntimeSessionSnapshot = { ...session, currentProjectId: projectId };
+      this.sessions.set(sessionId, updated);
+      this.touchClient(session.clientId);
+      this.persistSessions();
+      return updated;
+    });
   }
 
   private updateControlledMission(
