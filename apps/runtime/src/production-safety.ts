@@ -305,6 +305,7 @@ export async function createRuntimeBackup(input: CreateBackupInput): Promise<Bac
     const manifest: BackupManifest = { schemaVersion: 1, backupId: randomUUID(), createdAt: new Date().toISOString(), sourceIdentity: fence.identity, fenceGeneration: fence.generation, files: files.sort((a, b) => a.path.localeCompare(b.path)), checkpoint };
     await writePrivateJson(path.join(staging, MANIFEST_FILE), manifest);
     await chmod(staging, 0o700);
+    await verifyRuntimeBackup(staging);
     await rename(staging, destination);
     await verifyRuntimeBackup(destination);
     await input.controller.recordBackupEvidence(input.ownerAccessToken, `${manifest.backupId}:${manifest.files.length} files;checkpoint=${manifest.checkpoint === null ? 'UNVERIFIED' : 'VERIFIED'}`);
@@ -367,6 +368,7 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
       await copyFile(safeJoin(backupRoot, CHECKPOINT_FILE), path.join(staging, CHECKPOINT_FILE));
       await chmod(path.join(staging, CHECKPOINT_FILE), manifest.checkpoint.mode);
       await writePrivateJson(path.join(staging, MANIFEST_FILE), manifest);
+      await verifyRuntimeBackup(staging);
       await rename(staging, destination);
       await rename(checkpointStaging, checkpointTarget);
       await verifyRuntimeBackup(destination);
@@ -374,6 +376,7 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
       return manifest;
     }
     await writePrivateJson(path.join(staging, MANIFEST_FILE), manifest);
+    await verifyRuntimeBackup(staging);
     await rename(staging, destination);
     await verifyRuntimeBackup(destination);
     await input.controller.recordRestoreEvidence(input.ownerAccessToken, `${manifest.backupId}:${destination};checkpoint=UNVERIFIED`);
