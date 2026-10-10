@@ -257,8 +257,8 @@ async function gitIdentity(sourceRoot) {
     execFileAsync('git', ['-C', sourceRoot, 'rev-parse', 'HEAD']).then((result) => result.stdout.trim()),
     execFileAsync('git', ['-C', sourceRoot, 'branch', '--show-current']).then((result) => result.stdout.trim()),
   ]).catch(() => { throw new AcceptanceError('ACCEPTANCE_SOURCE_INVALID', 'Acceptance source is not a readable Git checkout'); });
-  if (!/^[a-f0-9]{40}$/.test(head) || branch.length === 0) throw new AcceptanceError('ACCEPTANCE_SOURCE_INVALID', 'Acceptance source must have a named branch and a verified HEAD');
-  return { head, branch };
+  if (!/^[a-f0-9]{40}$/.test(head)) throw new AcceptanceError('ACCEPTANCE_SOURCE_INVALID', 'Acceptance source must have a verified HEAD');
+  return { head, branch: branch.length === 0 ? 'DETACHED' : branch };
 }
 
 async function pidExists(pid) {
