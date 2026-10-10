@@ -32,6 +32,11 @@ if (mode === 'lock') {
         fenceEpoch: context.fenceEpoch,
         generation: context.generation,
       }),
+      acquireMaintenanceFence: async () => ({
+        fenceId: `child-fence-${process.pid}`,
+        revalidate: async () => true,
+        release: async () => undefined,
+      }),
     },
   });
   const reservation = await controller.reserveBackup('owner-token-for-test', destination);

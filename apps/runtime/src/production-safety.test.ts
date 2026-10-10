@@ -184,6 +184,34 @@ describe('production safety foundation', () => {
     await expect(controller.recover(token, {})).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
+  it('holds a trusted maintenance fence across backup publication and fails closed when it becomes stale', async () => {
+    const verifier = createTrustedWriterVerifier();
+    const { controller, token, root } = await fixture(true, verifier);
+    for (const writer of requiredWriters) await registerWriter(controller, writer);
+    await controller.quiesce(token);
+    verifier.fenceAvailable = false;
+    await expect(controller.reserveBackup(token, path.join(root, 'no-fence-backup'))).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    verifier.fenceAvailable = true;
+    const reservation = await controller.reserveBackup(token, path.join(root, 'held-backup'));
+    expect(verifier.activeFences.size).toBe(1);
+    await expect(controller.beginMutation('runtime-state')).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    verifier.state = 'ACTIVE';
+    await expect(controller.completeBackup(token, reservation.id, {
+      backupId: 'unpublished',
+      destination: reservation.fence.reservation!.destination,
+      manifestDigest: 'digest',
+      sourceIdentity: reservation.fence.identity,
+      fenceEpoch: reservation.fence.fenceEpoch,
+      checkpointDigest: null,
+      verifiedAt: new Date().toISOString(),
+    })).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
+    expect((await controller.inspect()).reservation?.id).toBe(reservation.id);
+    expect(verifier.activeFences.size).toBe(1);
+    verifier.state = 'IDLE';
+    await controller.failReservation(token, reservation.id, 'test cleanup');
+    expect(verifier.activeFences.size).toBe(0);
+  });
+
   it('does not let observations erase an active lease during quiesce or recovery', async () => {
     const { controller, token } = await fixture();
     await registerWriter(controller, 'runtime-state');
@@ -385,7 +413,7 @@ describe('production safety foundation', () => {
   });
 });
 
-type TestWriterVerifier = TrustedWriterVerifier & { available: boolean; fail: boolean; generationOffset: number; runtimeIdOverride?: string; state: 'IDLE' | 'ACTIVE'; inFlight: number };
+type TestWriterVerifier = TrustedWriterVerifier & { available: boolean; fail: boolean; generationOffset: number; runtimeIdOverride?: string; state: 'IDLE' | 'ACTIVE'; inFlight: number; fenceAvailable: boolean; fenceCount: number; activeFences: Set<string> };
 
 function createTrustedWriterVerifier(): TestWriterVerifier {
   const verifier: TestWriterVerifier = {
@@ -394,6 +422,9 @@ function createTrustedWriterVerifier(): TestWriterVerifier {
     generationOffset: 0,
     state: 'IDLE' as 'IDLE' | 'ACTIVE',
     inFlight: 0,
+    fenceAvailable: true,
+    fenceCount: 0,
+    activeFences: new Set(),
     verify: async (_writer: Parameters<TrustedWriterVerifier['verify']>[0], identity: Parameters<TrustedWriterVerifier['verify']>[1], context: Parameters<TrustedWriterVerifier['verify']>[2]): Promise<TrustedWriterVerification | null> => {
       if (!verifier.available) return null;
       if (verifier.fail) throw new Error('test verifier unavailable');
@@ -405,6 +436,16 @@ function createTrustedWriterVerifier(): TestWriterVerifier {
         dataRoot: identity.dataRoot,
         fenceEpoch: context.fenceEpoch,
         generation: context.generation + verifier.generationOffset,
+      };
+    },
+    acquireMaintenanceFence: async (_writers, _identity, _context) => {
+      if (!verifier.fenceAvailable || !verifier.available || verifier.fail) return null;
+      const fenceId = `test-fence-${verifier.fenceCount += 1}`;
+      verifier.activeFences.add(fenceId);
+      return {
+        fenceId,
+        revalidate: async () => verifier.activeFences.has(fenceId) && verifier.available && !verifier.fail && verifier.state === 'IDLE' && verifier.inFlight === 0,
+        release: async () => { verifier.activeFences.delete(fenceId); },
       };
     },
   };
