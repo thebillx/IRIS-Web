@@ -15,7 +15,7 @@ import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, isSupporte
 import { observeProcessStart } from './macos-safety.js';
 import { proMcpToolDefinitions } from './mcp.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
-import { loadOrCreateRuntimeId, readEndpoint, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
+import { loadOrCreateRuntimeId, readEndpoint, readOwnerAccessSecret, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
 import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
@@ -1541,7 +1541,15 @@ export class Supervisor {
     const executable = path.join(state.workloadSourceRoot, 'apps/web/node_modules/.bin/vite');
     if (!existsSync(executable)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Web executable is unavailable; run pnpm install before iris up');
     if (await endpointResponds(`http://127.0.0.1:${this.webPort}/`)) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Web port ${this.webPort} is occupied by an unowned process`);
-    const record = await spawnManaged('web', executable, ['--host', '127.0.0.1', '--port', String(this.webPort)], path.join(state.workloadSourceRoot, 'apps/web'), { IRIS_RUNTIME_URL: runtimeUrl }, null, this.logDirectory(), 'vite');
+    const ownerAccessSecret = await readOwnerAccessSecret(this.dataRoot);
+    const tunnelServiceSecret = await readTunnelServiceSecret(this.dataRoot);
+    const webEnvironment = {
+      IRIS_RUNTIME_URL: runtimeUrl,
+      IRIS_SUPERVISOR_CONTROL_URL: `http://127.0.0.1:${this.supervisorControlPort}`,
+      ...(ownerAccessSecret === null ? {} : { IRIS_OWNER_ACCESS_SECRET: ownerAccessSecret }),
+      ...(tunnelServiceSecret === null ? {} : { IRIS_SUPERVISOR_CONTROL_SECRET: tunnelServiceSecret }),
+    };
+    const record = await spawnManaged('web', executable, ['--host', '127.0.0.1', '--port', String(this.webPort)], path.join(state.workloadSourceRoot, 'apps/web'), webEnvironment, null, this.logDirectory(), 'vite');
     const next = { ...state, web: record };
     await this.writeState(next);
     started.push('web');

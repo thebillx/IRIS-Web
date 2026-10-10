@@ -311,6 +311,29 @@ describe('production safety foundation', () => {
     expect((await controller.readiness()).status).toBe('BLOCKED');
   });
 
+  it('freshly verifies external writers before claiming quiescence', async () => {
+    const verified = createTrustedWriterVerifier();
+    const { controller, token } = await fixture(true, verified);
+    for (const writer of requiredWriters) await registerWriter(controller, writer);
+    verified.state = 'ACTIVE';
+    const blocked = await controller.quiesce(token);
+    expect(blocked.state).toBe('BLOCKED');
+    expect(blocked.blockedReason).toContain('fresh verification');
+  });
+
+  it('persists external activity separately from controller lease accounting', async () => {
+    const verified = createTrustedWriterVerifier();
+    const { controller, token } = await fixture(true, verified);
+    for (const writer of requiredWriters) await registerWriter(controller, writer);
+    verified.state = 'ACTIVE';
+    verified.inFlight = 1;
+    const blocked = await controller.quiesce(token, { 'external-runners': { state: 'ACTIVE', inFlight: 1 } });
+    expect(blocked.state).toBe('BLOCKED');
+    const record = (await controller.inspect()).writers['external-runners'];
+    expect(record).toMatchObject({ state: 'ACTIVE', inFlight: 0, observedState: 'ACTIVE', observedInFlight: 1, leaseIds: [] });
+    await expect(controller.inspect()).resolves.toMatchObject({ state: 'BLOCKED' });
+  });
+
   it('blocks readiness when verified backup or restored checkpoint changes', async () => {
     const { controller, token, dataRoot, root } = await fixture();
     for (const writer of requiredWriters) await registerWriter(controller, writer);
@@ -351,7 +374,7 @@ describe('production safety foundation', () => {
   });
 });
 
-type TestWriterVerifier = TrustedWriterVerifier & { available: boolean; fail: boolean; generationOffset: number; runtimeIdOverride?: string; state: 'IDLE' | 'ACTIVE' };
+type TestWriterVerifier = TrustedWriterVerifier & { available: boolean; fail: boolean; generationOffset: number; runtimeIdOverride?: string; state: 'IDLE' | 'ACTIVE'; inFlight: number };
 
 function createTrustedWriterVerifier(): TestWriterVerifier {
   const verifier: TestWriterVerifier = {
@@ -359,12 +382,13 @@ function createTrustedWriterVerifier(): TestWriterVerifier {
     fail: false,
     generationOffset: 0,
     state: 'IDLE' as 'IDLE' | 'ACTIVE',
+    inFlight: 0,
     verify: async (_writer: Parameters<TrustedWriterVerifier['verify']>[0], identity: Parameters<TrustedWriterVerifier['verify']>[1], context: Parameters<TrustedWriterVerifier['verify']>[2]): Promise<TrustedWriterVerification | null> => {
       if (!verifier.available) return null;
       if (verifier.fail) throw new Error('test verifier unavailable');
       return {
         state: verifier.state,
-        inFlight: 0,
+        inFlight: verifier.inFlight,
         runtimeId: verifier.runtimeIdOverride ?? identity.runtimeId,
         instanceId: identity.instanceId,
         dataRoot: identity.dataRoot,

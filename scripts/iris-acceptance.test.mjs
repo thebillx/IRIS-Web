@@ -156,6 +156,33 @@ describe('acceptance isolation preflight', () => {
     assert.equal(report.dataRoot, await realpath(root));
   });
 
+  it('allows remote startup only with independently checked non-production tunnel evidence', async () => {
+    const root = await fixtureRoot();
+    const evidence = path.join(root, 'tunnel-evidence.json');
+    const tunnelId = 'tunnel_0123456789abcdef0123456789abcdef';
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
+    await writeFile(evidence, `${JSON.stringify({
+      schemaVersion: 1,
+      environment: 'non-production',
+      provider: 'fixture-provider',
+      machineId: 'fixture-machine',
+      sourceRoot,
+      tunnelId,
+      pid: 4242,
+      executablePath: '/usr/local/bin/fixture-provider',
+      binding: { tunnelId, profilePath: '/tmp/fixture-profile.yaml' },
+    })}\n`, { mode: 0o600 });
+    const report = await inspectAcceptanceEnvironment({
+      ...baseOptions(root, ['up']),
+      environment: { IRIS_ACCEPTANCE_ROOT: root, IRIS_ACCEPTANCE_TUNNEL_EVIDENCE: evidence },
+      machineName: 'fixture-machine',
+      isPidAlive: async (pid) => pid === 4242,
+      inspectProcess: async (pid) => pid === 4242 ? { uid: process.getuid(), executable: '/usr/local/bin/fixture-provider', command: 'fixture-provider --profile /tmp/fixture-profile.yaml' } : null,
+      probePort: async () => false,
+    });
+    assert.equal(report.tunnelIdentity, 'VERIFIED');
+  });
+
   it('rejects connector mutation and unsupported commands before child execution', async () => {
     const root = await fixtureRoot();
     const protectedRoot = await fixtureRoot();

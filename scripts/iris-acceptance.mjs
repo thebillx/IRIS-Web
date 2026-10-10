@@ -147,7 +147,21 @@ export async function inspectAcceptanceEnvironment(options) {
   const requestedTunnelId = commandValue(command, '--tunnel-id');
   const tunnelClaims = requestedTunnelId === null ? [] : await findTunnelClaims(protectedRoots, requestedTunnelId, options.readTextFile);
   if (tunnelClaims.length > 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_CONFLICT', `Acceptance tunnel identity is already claimed by protected installation ${tunnelClaims[0]}`);
-  if (startsRemoteTunnel(command)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_UNVERIFIED', 'Acceptance tunnel ownership is UNVERIFIED; remote acceptance startup is blocked until authoritative non-production tunnel ownership evidence exists');
+  let tunnelIdentity = tunnelClaims.length > 0 ? 'CONFLICT' : 'UNVERIFIED';
+  if (startsRemoteTunnel(command)) {
+    const evidencePath = environment.IRIS_ACCEPTANCE_TUNNEL_EVIDENCE?.trim();
+    if (evidencePath === undefined || evidencePath.length === 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_UNVERIFIED', 'Acceptance tunnel ownership is UNVERIFIED; provide authoritative non-production tunnel ownership evidence');
+    await verifyAcceptanceTunnelEvidence({
+      filename: evidencePath,
+      tunnelId: requestedTunnelId,
+      sourceRoot,
+      machineName: options.machineName,
+      isPidAlive: options.isPidAlive,
+      inspectProcess: options.inspectProcess,
+      readTextFile: options.readTextFile,
+    });
+    tunnelIdentity = 'VERIFIED';
+  }
 
   if (commandName === 'credentials' && command[1] === 'migrate') await validateCredentialProfile(command[2], protectedRoots);
   return {
@@ -157,7 +171,7 @@ export async function inspectAcceptanceEnvironment(options) {
     git,
     protectedRoots,
     processState,
-    tunnelIdentity: tunnelClaims.length > 0 ? 'CONFLICT' : 'UNVERIFIED',
+    tunnelIdentity,
     ports: PORTS.map(([name, port]) => ({ name, port })),
   };
 }
@@ -186,6 +200,44 @@ async function main() {
     process.stderr.write(`IRIS_ACCEPTANCE_BLOCKED code=${code} message=${message}\n`);
     process.exitCode = 1;
   }
+}
+
+export async function verifyAcceptanceTunnelEvidence(options) {
+  const filename = options.filename;
+  if (typeof filename !== 'string' || !path.isAbsolute(filename)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence must be an absolute private file');
+  const metadata = await lstat(filename).catch(() => null);
+  if (metadata === null || !metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || (metadata.mode & 0o077) !== 0) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence must be a private physical file');
+  }
+  if (typeof process.getuid === 'function' && metadata.uid !== process.getuid()) throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence is not owned by the current user');
+  let evidence;
+  try { evidence = JSON.parse(await (options.readTextFile ?? readFile)(filename, 'utf8')); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence is not valid JSON'); }
+  const expectedTunnelId = options.tunnelId;
+  if (!isRecord(evidence)
+    || evidence.schemaVersion !== 1
+    || evidence.environment !== 'non-production'
+    || typeof evidence.provider !== 'string' || evidence.provider.length === 0 || evidence.provider.length > 200
+    || typeof evidence.machineId !== 'string' || evidence.machineId.length === 0 || evidence.machineId !== (options.machineName ?? os.hostname())
+    || typeof evidence.sourceRoot !== 'string' || path.resolve(evidence.sourceRoot) !== path.resolve(options.sourceRoot)
+    || typeof evidence.tunnelId !== 'string' || evidence.tunnelId.length === 0 || (typeof expectedTunnelId === 'string' && evidence.tunnelId !== expectedTunnelId)
+    || !Number.isSafeInteger(evidence.pid) || evidence.pid <= 0
+    || typeof evidence.executablePath !== 'string' || !path.isAbsolute(evidence.executablePath)
+    || !isRecord(evidence.binding) || evidence.binding.tunnelId !== evidence.tunnelId
+    || (evidence.binding.profilePath !== undefined && (typeof evidence.binding.profilePath !== 'string' || !path.isAbsolute(evidence.binding.profilePath)))) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence does not bind the expected non-production provider, machine, source or tunnel');
+  }
+  const isAlive = options.isPidAlive ?? pidExists;
+  if (!await isAlive(evidence.pid)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_UNAVAILABLE', 'The evidenced local tunnel process is not alive');
+  const inspectProcess = options.inspectProcess ?? inspectProcessIdentity;
+  const processInfo = await inspectProcess(evidence.pid);
+  if (processInfo === null
+    || processInfo.uid !== (typeof process.getuid === 'function' ? process.getuid() : processInfo.uid)
+    || path.resolve(processInfo.executable) !== path.resolve(evidence.executablePath)) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_MISMATCH', 'The local process identity does not match the evidenced provider');
+  }
+  const bindingNeedle = evidence.binding.profilePath ?? evidence.tunnelId;
+  if (!processInfo.command.includes(bindingNeedle)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'The local provider process does not expose the evidenced tunnel binding');
+  return { provider: evidence.provider, machineId: evidence.machineId, tunnelId: evidence.tunnelId, pid: evidence.pid };
 }
 
 export function buildChildEnvironment(dataRoot, environment = process.env) {
@@ -340,6 +392,18 @@ async function pidExists(pid) {
   try { process.kill(pid, 0); return true; } catch (error) { return error?.code === 'EPERM'; }
 }
 
+async function inspectProcessIdentity(pid) {
+  try {
+    const [uid, executable, command] = await Promise.all([
+      execFileAsync('ps', ['-p', String(pid), '-o', 'uid=']).then((result) => Number(result.stdout.trim())),
+      execFileAsync('ps', ['-p', String(pid), '-o', 'comm=']).then((result) => result.stdout.trim()),
+      execFileAsync('ps', ['-p', String(pid), '-o', 'command=']).then((result) => result.stdout.trim()),
+    ]);
+    if (!Number.isSafeInteger(uid) || executable.length === 0 || command.length === 0) return null;
+    return { uid, executable, command };
+  } catch { return null; }
+}
+
 async function probePort(port, host) {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host, port });
@@ -354,6 +418,10 @@ async function probePort(port, host) {
 function isWithin(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
+function isRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function sameIdentity(actual, expected) {

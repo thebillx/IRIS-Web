@@ -13,8 +13,19 @@ type Health = {
   connectedSessions: number;
   agentExecutorType: 'local-development-executor' | 'production-provider-executor' | 'other';
   productionModelConnected: boolean;
+  machineId?: string;
   apiUrl: string;
   mcpUrl: string;
+};
+type SupervisorStatus = {
+  state?: string;
+  workloadState?: string;
+  workloadDesiredState?: string;
+  code?: string;
+  detail?: string;
+  affectedJobs?: number;
+  machineId?: string;
+  tunnel?: { state?: string; code?: string; detail?: string };
 };
 
 type Project = { id: string; name: string; rootPath: string };
@@ -137,6 +148,7 @@ export function App(): ReactElement {
   const [ownerAccessToken] = useState(readOwnerAccessToken);
   const [view, setView] = useState<View>('runtime');
   const [health, setHealth] = useState<Health | null>(null);
+  const [supervisorStatus, setSupervisorStatus] = useState<SupervisorStatus | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [defaultProjectId, setDefaultProjectId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -150,6 +162,18 @@ export function App(): ReactElement {
   const [submittingSessionIds, setSubmittingSessionIds] = useState<Set<string>>(() => new Set());
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+
+  const refreshSupervisor = useCallback(async () => {
+    if (ownerAccessToken.length === 0) { setSupervisorStatus(null); return; }
+    try {
+      const response = await authorizedFetch(ownerAccessToken, '/supervisor-control/healthz');
+      if (!response.ok) throw new Error('Supervisor bridge unavailable');
+      const control = await supervisorCall<SupervisorStatus>(ownerAccessToken, 'supervisor_status');
+      setSupervisorStatus(control);
+    } catch {
+      setSupervisorStatus({ state: 'BLOCKED', code: 'SUPERVISOR_BRIDGE_UNAVAILABLE', detail: 'Authenticated Supervisor control is unavailable' });
+    }
+  }, [ownerAccessToken]);
 
   const refresh = useCallback(async () => {
     try {
@@ -185,12 +209,13 @@ export function App(): ReactElement {
       setSelectedSessionId(nextSelectedSessionId);
       persistSelectedSessionId(nextSelectedSessionId);
       setPermissions(await permissionsResponse.json() as PermissionSnapshot);
+      await refreshSupervisor();
       setError('');
     } catch (cause) {
       setHealth(null);
       setError(cause instanceof Error ? cause.message : 'Runtime unavailable');
     }
-  }, [clientId, ownerAccessToken]);
+  }, [clientId, ownerAccessToken, refreshSupervisor]);
 
   useEffect(() => {
     void refresh();
@@ -354,6 +379,13 @@ export function App(): ReactElement {
     await refresh();
   };
 
+  const supervisorOperation = async (name: 'workload_on' | 'workload_off' | 'workload_restart' | 'supervisor_doctor') => {
+    const result = await supervisorCall<SupervisorStatus>(ownerAccessToken, name);
+    setSupervisorStatus(result);
+    setNotice(`${name.replaceAll('_', ' ')} completed only after Supervisor verification.`);
+    await refresh();
+  };
+
   const resolveApproval = async (approval: PendingApproval, decision: ApprovalChoice) => {
     if (!approvalBelongsToSessionContext(approval, clientId, selectedSessionId)) {
       throw new Error('Switch to the session that owns this approval before resolving it.');
@@ -423,6 +455,7 @@ export function App(): ReactElement {
       {notice && <p className="notice" role="status">{notice}</p>}
       {view === 'runtime' && <RuntimePage
         health={health}
+        supervisorStatus={supervisorStatus}
         projects={projects}
         defaultProject={defaultProject}
         activeProject={activeProject}
@@ -443,6 +476,7 @@ export function App(): ReactElement {
         onSelectSession={selectSession}
         onRegisterProject={() => run(registerProject)}
         onSelectProject={(projectId) => run(() => selectProject(projectId))}
+        onSupervisorOperation={(operation) => run(() => supervisorOperation(operation))}
         onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
         onRequestMissionLifecycleAction={(mission, action) => run(() => requestMissionLifecycleAction(mission, action))}
       />}
@@ -460,6 +494,7 @@ export function App(): ReactElement {
 
 export function RuntimePage(props: {
   health: Health | null;
+  supervisorStatus?: SupervisorStatus | null;
   projects: Project[];
   defaultProject: Project | null;
   activeProject: Project | null;
@@ -480,6 +515,7 @@ export function RuntimePage(props: {
   onSelectSession(sessionId: string): void;
   onRegisterProject(): void;
   onSelectProject(projectId: string): void;
+  onSupervisorOperation?(operation: 'workload_on' | 'workload_off' | 'workload_restart' | 'supervisor_doctor'): void;
   onRequestMissionOrchestrator(mission: Mission, targetMode: OrchestratorMode): void;
   onRequestMissionLifecycleAction?(mission: Mission, action: MissionLifecycleAction): void;
 }): ReactElement {
@@ -567,6 +603,25 @@ export function RuntimePage(props: {
         <section className="projects-card"><div className="section-title-row"><div><p className="section-label">Projects</p><h2>Registered locally</h2></div></div>
           {props.projects.length === 0 ? <div className="empty-state"><p>No registered projects.</p><span>Register an existing local folder. IRIS never scans your filesystem implicitly.</span></div> : <ul className="project-list">{props.projects.map((project) => <li key={project.id}><div><strong>{project.name}</strong><code>{project.rootPath}</code></div>{project.id === props.defaultProject?.id ? <span>Default</span> : null}</li>)}</ul>}
           <div className="project-register"><label>Name<input value={props.name} onChange={(event) => props.setName(event.target.value)} /></label><label>Absolute path<input value={props.rootPath} onChange={(event) => props.setRootPath(event.target.value)} /></label><button onClick={props.onRegisterProject}>Register project</button></div>
+        </section>
+
+        <section className="runtime-control-card" aria-labelledby="supervisor-control-heading">
+          <div className="section-title-row"><div><p className="section-label">Supervisor control</p><h2 id="supervisor-control-heading">Machine and workload</h2></div><span className={`session-state ${props.supervisorStatus?.state === 'READY' ? 'is-ready' : ''}`}>{props.supervisorStatus?.state ?? 'BLOCKED'}</span></div>
+          <dl>
+            <dt>Machine identity</dt><dd>{props.health?.machineId ?? 'Unverified'}</dd>
+            <dt>Gateway</dt><dd>{props.supervisorStatus?.state === undefined ? 'Unavailable' : 'Authenticated owner bridge'}</dd>
+            <dt>Workload</dt><dd>{props.supervisorStatus?.workloadState ?? props.supervisorStatus?.detail ?? 'Unknown'}</dd>
+            <dt>Tunnel</dt><dd>{props.supervisorStatus?.tunnel?.state ?? 'Unknown'}</dd>
+            <dt>Keep-awake</dt><dd>BLOCKED · no ownership-safe provider contract</dd>
+            <dt>Jobs affected by OFF</dt><dd>{props.supervisorStatus?.affectedJobs ?? 'Verified by Supervisor after operation'}</dd>
+          </dl>
+          <div className="composer-actions">
+            <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('workload_on')}>Workload ON</button>
+            <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('workload_off')}>Workload OFF</button>
+            <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('workload_restart')}>Restart</button>
+            <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('supervisor_doctor')}>Doctor</button>
+          </div>
+          {props.supervisorStatus?.detail ? <p className="muted">{props.supervisorStatus.detail}</p> : null}
         </section>
 
         {props.health && <details className="runtime-details"><summary>Runtime details</summary><dl>
@@ -789,6 +844,18 @@ function authorizedFetch(token: string, input: RequestInfo | URL, init: RequestI
   const headers = new Headers(init.headers);
   headers.set('authorization', `Bearer ${token}`);
   return fetch(input, { ...init, headers });
+}
+
+async function supervisorCall<T>(token: string, name: 'supervisor_status' | 'supervisor_doctor' | 'workload_on' | 'workload_off' | 'workload_restart'): Promise<T> {
+  const response = await authorizedFetch(token, '/supervisor-control/mcp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'mcp-protocol-version': '2025-06-18', 'mcp-method': 'tools/call', 'mcp-name': name },
+    body: JSON.stringify({ jsonrpc: '2.0', id: crypto.randomUUID(), method: 'tools/call', params: { name, arguments: {} } }),
+  });
+  if (!response.ok) throw new Error(await responseMessage(response, 'Supervisor control is unavailable'));
+  const body = await response.json() as { result?: { isError?: boolean; structuredContent?: T }; error?: { message?: string } };
+  if (body.error !== undefined || body.result?.isError === true || body.result?.structuredContent === undefined) throw new Error(body.error?.message ?? 'Supervisor operation was not verified');
+  return body.result.structuredContent;
 }
 
 export function webClientId(): string {

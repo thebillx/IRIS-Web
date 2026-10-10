@@ -127,13 +127,39 @@ contents. Setup is local and may create the registry, but it does not prove
 remote tunnel ownership.
 
 Starting or restarting a remote tunnel is blocked while ownership is
-`UNVERIFIED`. The wrapper does not accept an owner-provided bypass: obtain
-authoritative non-production tunnel ownership evidence through the provider's
-read-only lookup and a separately approved implementation before enabling any
-remote startup. The lookup proves provider metadata for the requested tunnel;
-it does not by itself prove that a local process owns the tunnel or authorize
-startup. If a port is occupied, do not kill or adopt the process; stop and
-schedule a separately isolated window.
+`UNVERIFIED`. The supported positive path requires a private JSON evidence file
+whose `schemaVersion` is `1`, `environment` is `non-production`, and whose
+provider, machine, source checkout, tunnel ID, executable path, PID and binding
+profile are recorded. The wrapper checks the current-user process identity with
+`ps`, verifies that the live command exposes the evidenced tunnel binding, and
+requires `IRIS_ACCEPTANCE_TUNNEL_EVIDENCE` to point to that file. Provider
+metadata alone is insufficient. Do not invent evidence, reuse production
+profiles, kill or adopt an occupied process, or add a `--force` switch.
+
+The owner procedure is to obtain the provider's read-only non-production
+record, start the separately provisioned local provider process, capture its
+PID, executable path and managed profile path, and write a mode-`0600` evidence
+file with this shape (all values are owner-supplied):
+
+```json
+{
+  "schemaVersion": 1,
+  "environment": "non-production",
+  "provider": "<documented-provider>",
+  "machineId": "<hostname>",
+  "sourceRoot": "<candidate-checkout>",
+  "tunnelId": "<non-production-tunnel-id>",
+  "pid": 12345,
+  "executablePath": "/absolute/path/to/provider",
+  "binding": { "tunnelId": "<non-production-tunnel-id>", "profilePath": "/absolute/path/to/profile" }
+}
+```
+
+Export `IRIS_ACCEPTANCE_TUNNEL_EVIDENCE` to that file before invoking
+`iris_acceptance up` or `iris_acceptance restart`. The wrapper independently
+checks file mode/owner, current-user PID, executable identity and the provider
+command's profile/tunnel binding. Any missing, stale or contradictory field
+remains **BLOCKED**.
 Use `iris_acceptance down` only for the acceptance root whose identity was
 verified by the wrapper.
 

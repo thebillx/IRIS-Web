@@ -10,5 +10,6 @@ describe('Vite runtime proxy', () => {
         },
       },
     });
+    expect(config.plugins).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'iris-supervisor-owner-bridge' })]));
   });
 });

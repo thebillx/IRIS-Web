@@ -102,6 +102,14 @@ describe('daily workspace session experience', () => {
     expect(second).toContain('Sandbox');
   });
 
+  it('renders owner-scoped Supervisor controls and truthful keep-awake blocking', () => {
+    const markup = renderWorkspace(sessionA);
+    expect(markup).toContain('Supervisor control');
+    expect(markup).toContain('Workload ON');
+    expect(markup).toContain('Workload OFF');
+    expect(markup).toContain('Keep-awake</dt><dd>BLOCKED');
+  });
+
   it('restores a selected session across refresh only while that authoritative session still exists', () => {
     expect(reconcileSelectedSessionId(sessionB.id, [sessionA, sessionB])).toBe(sessionB.id);
     expect(reconcileSelectedSessionId('stale-session', [sessionA, sessionB])).toBe(sessionA.id);
