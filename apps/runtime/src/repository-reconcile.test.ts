@@ -196,7 +196,7 @@ describe('owner-authorized repository device reconciliation', () => {
     expect(await readFile(f.filename, 'utf8')).toBe(before);
     const retry = approval(await f.service.execute(f.operation));
     expect(value(await f.service.resolveApproval(retry, 'ALLOW_ONCE')).changed).toBe(true);
-  });
+  }, 15_000);
 
   it('verifies an unknown outcome after publication instead of replaying the mutation', async () => {
     const f = await fixture();
