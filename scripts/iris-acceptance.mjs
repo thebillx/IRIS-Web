@@ -243,13 +243,12 @@ export async function verifyAcceptanceTunnelEvidence(options) {
   if (options.dataRoot !== undefined) {
     const registryPath = path.join(options.dataRoot, 'connector-registry.json');
     const registryContent = await readFile(registryPath, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
-    if (registryContent !== null) {
-      let parsedRegistry;
-      try { parsedRegistry = JSON.parse(registryContent); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Acceptance connector registry is invalid'); }
-      const registry = parsedRegistry?.registry ?? parsedRegistry;
-      const bindings = [...(Array.isArray(registry?.connectors) ? registry.connectors : []), registry?.admin].filter(Boolean);
-      if (!bindings.some((binding) => isRecord(binding) && binding.tunnelId === evidence.tunnelId)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Evidence tunnel identity is not bound to the acceptance registry');
-    }
+    if (registryContent === null) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance connector registry is required for remote startup');
+    let parsedRegistry;
+    try { parsedRegistry = JSON.parse(registryContent); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Acceptance connector registry is invalid'); }
+    const registry = parsedRegistry?.registry ?? parsedRegistry;
+    const bindings = [...(Array.isArray(registry?.connectors) ? registry.connectors : []), registry?.admin].filter(Boolean);
+    if (!bindings.some((binding) => isRecord(binding) && binding.tunnelId === evidence.tunnelId)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Evidence tunnel identity is not bound to the acceptance registry');
   }
   return { provider: evidence.provider, machineId: evidence.machineId, tunnelId: evidence.tunnelId, pid: evidence.pid };
 }
