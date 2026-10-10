@@ -12,6 +12,7 @@ import { resolveExecutionProfile, resolveServerOwnedCodeReviewExecutionProfile, 
 import { boundedTail, StreamingRedactor } from './output-redaction.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { observeProcessStart } from './macos-safety.js';
+import type { ProductionSafetyController } from './production-safety.js';
 
 const execFileAsync = promisify(execFile);
 const JOB_FILE = 'vnext-jobs.json';
@@ -114,7 +115,7 @@ interface RunnerResult {
 export class DurableJobManager {
   private mutationTail: Promise<void> = Promise.resolve();
 
-  public constructor(private readonly dataRoot: string, private readonly resources: VNextResourceRegistry) {}
+  public constructor(private readonly dataRoot: string, private readonly resources: VNextResourceRegistry, private readonly safety?: ProductionSafetyController) {}
 
   public async prepare(input: ShellExecutionInput): Promise<PreparedShellExecution> {
     return this.prepareWithResolver(input, resolveExecutionProfile);
@@ -276,6 +277,10 @@ export class DurableJobManager {
   }
 
   public async start(prepared: PreparedShellExecution, requestId: string, effects: readonly CapabilityEffect[], mission?: MissionExecutionAssociation): Promise<Record<string, unknown>> {
+    return this.withSafety(() => this.startUnlocked(prepared, requestId, effects, mission));
+  }
+
+  private async startUnlocked(prepared: PreparedShellExecution, requestId: string, effects: readonly CapabilityEffect[], mission?: MissionExecutionAssociation): Promise<Record<string, unknown>> {
     if (!REQUEST_ID.test(requestId)) {
       await cleanupServerOwnedPaths(prepared.plan.cleanupPaths);
       throw new RuntimeError('INVALID_REQUEST', 'requestId is invalid');
@@ -511,10 +516,12 @@ export class DurableJobManager {
   }
 
   public async markCodeReviewFinalized(projectId: string, jobId: string): Promise<void> {
-    const job = await this.getOwnedCodeReviewJob(projectId, jobId);
-    if (!isTerminal(job.state)) throw new RuntimeError('PRECONDITION_FAILED', 'Native code review is not terminal');
-    if (job.reviewFinalizedAt !== null && job.reviewFinalizedAt !== undefined) return;
-    await this.replaceJob({ ...job, reviewFinalizedAt: new Date().toISOString() });
+    await this.withSafety(async () => {
+      const job = await this.getOwnedCodeReviewJob(projectId, jobId);
+      if (!isTerminal(job.state)) throw new RuntimeError('PRECONDITION_FAILED', 'Native code review is not terminal');
+      if (job.reviewFinalizedAt !== null && job.reviewFinalizedAt !== undefined) return;
+      await this.replaceJob({ ...job, reviewFinalizedAt: new Date().toISOString() });
+    });
   }
 
   public async assertMissionCodeReviewsFinalized(missionId: string): Promise<void> {
@@ -579,6 +586,10 @@ export class DurableJobManager {
   }
 
   public async cancel(projectId: string, jobId: string): Promise<Record<string, unknown>> {
+    return this.withSafety(() => this.cancelUnlocked(projectId, jobId));
+  }
+
+  private async cancelUnlocked(projectId: string, jobId: string): Promise<Record<string, unknown>> {
     const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId));
     if (job.state !== 'RUNNING') return { jobId, state: job.state, cancelRequested: false };
     const claim = await readClaim(job.claimPath);
@@ -597,8 +608,10 @@ export class DurableJobManager {
   }
 
   public async recover(): Promise<void> {
-    const document = await this.readDocument();
-    for (const job of document.jobs) if (job.state === 'RUNNING' || job.state === 'QUEUED') await this.reconcile(job);
+    await this.withSafety(async () => {
+      const document = await this.readDocument();
+      for (const job of document.jobs) if (job.state === 'RUNNING' || job.state === 'QUEUED') await this.reconcile(job);
+    });
   }
 
   private async reconcile(job: DurableJobRecord): Promise<DurableJobRecord> {
@@ -734,7 +747,11 @@ export class DurableJobManager {
     return this.serialized(async () => { const document = await this.readDocument(); await this.writeDocument({ schemaVersion: 1, jobs: document.jobs.map((candidate) => candidate.jobId === job.jobId ? job : candidate) }); });
   }
   private serialized(operation: () => Promise<void>): Promise<void> {
-    const result = this.mutationTail.then(operation, operation); this.mutationTail = result.then(() => undefined, () => undefined); return result;
+    const result = this.mutationTail.then(() => this.withSafety(operation), () => this.withSafety(operation)); this.mutationTail = result.then(() => undefined, () => undefined); return result;
+  }
+  private async withSafety<T>(operation: () => Promise<T>): Promise<T> {
+    const lease = this.safety === undefined ? null : await this.safety.beginMutation('durable-jobs');
+    try { return await operation(); } finally { await lease?.release(); }
   }
   private async writeDocument(document: JobDocument): Promise<void> {
     const filename = path.join(this.dataRoot, JOB_FILE); const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
