@@ -1,6 +1,6 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, realpath, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { buildChildEnvironment, inspectAcceptanceEnvironment, parseAcceptanceArgs } from './iris-acceptance.mjs';
@@ -17,8 +17,15 @@ describe('acceptance isolation preflight', () => {
     assert.throws(() => parseAcceptanceArgs(['--protected-root', '/tmp/live', '--', 'status']), (error) => error.code === 'ACCEPTANCE_USAGE');
   });
 
+  it('requires the explicit preflight before a command can create guard state', async () => {
+    const root = await fixtureRoot();
+    await assert.rejects(inspectAcceptanceEnvironment(baseOptions(root, ['status'])), (error) => error.code === 'ACCEPTANCE_PREFLIGHT_REQUIRED');
+    assert.deepEqual(await readdir(root), []);
+  });
+
   it('binds every command to one explicit session root', async () => {
     const root = await fixtureRoot();
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
     const options = baseOptions(root, ['status']);
     const report = await inspectAcceptanceEnvironment(options);
     assert.equal(report.dataRoot, await realpath(root));
@@ -46,6 +53,8 @@ describe('acceptance isolation preflight', () => {
   it('keeps two isolated roots independent', async () => {
     const first = await fixtureRoot();
     const second = await fixtureRoot();
+    await inspectAcceptanceEnvironment(baseOptions(first, ['preflight']));
+    await inspectAcceptanceEnvironment(baseOptions(second, ['preflight']));
     const firstReport = await inspectAcceptanceEnvironment(baseOptions(first, ['status']));
     const secondReport = await inspectAcceptanceEnvironment(baseOptions(second, ['status']));
     assert.notEqual(firstReport.dataRoot, secondReport.dataRoot);
@@ -56,22 +65,26 @@ describe('acceptance isolation preflight', () => {
     const root = await fixtureRoot();
     const protectedRoot = await fixtureRoot();
     await writeFile(path.join(protectedRoot, 'connector-registry.json'), JSON.stringify({ connectors: [{ tunnelId: 'tunnel_0123456789abcdef0123456789abcdef' }], admin: null }));
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
     await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, ['setup', '--tunnel-id', 'tunnel_0123456789abcdef0123456789abcdef']), protectedRoots: [protectedRoot] }), (error) => error.code === 'ACCEPTANCE_TUNNEL_CONFLICT');
   });
 
   it('rejects a controlled port conflict without adopting the process', async () => {
     const root = await fixtureRoot();
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
     await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, ['up']), probePort: async (port) => port === 43110 }), (error) => error.code === 'ACCEPTANCE_PORT_CONFLICT');
   });
 
   it('blocks LaunchAgent install and uninstall for parallel acceptance', async () => {
     const root = await fixtureRoot();
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
     await assert.rejects(inspectAcceptanceEnvironment(baseOptions(root, ['launchd', 'install'])), (error) => error.code === 'ACCEPTANCE_LAUNCHD_BLOCKED');
     await assert.rejects(inspectAcceptanceEnvironment(baseOptions(root, ['launchd', 'uninstall'])), (error) => error.code === 'ACCEPTANCE_LAUNCHD_BLOCKED');
   });
 
   it('propagates the explicit root and rejects unverified remote startup', async () => {
     const root = await fixtureRoot();
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
     await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, ['up']), probePort: async () => false }), (error) => error.code === 'ACCEPTANCE_TUNNEL_UNVERIFIED');
     const report = await inspectAcceptanceEnvironment({ ...baseOptions(root, ['status']), environment: { IRIS_ACCEPTANCE_ROOT: root } });
     assert.equal(report.dataRoot, await realpath(root));
@@ -82,6 +95,7 @@ describe('acceptance isolation preflight', () => {
     const profileRoot = await fixtureRoot();
     const profile = path.join(profileRoot, 'profile.yaml');
     await writeFile(profile, 'control_plane:\n  api_key: "fixture-only-credential-1234567890"\n', { mode: 0o600 });
+    await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
     const report = await inspectAcceptanceEnvironment({ ...baseOptions(root, ['credentials', 'migrate', profile]), protectedRoots: ['/tmp/live'] });
     assert.equal(report.dataRoot, await realpath(root));
     await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, ['credentials', 'migrate', profile]), protectedRoots: [profileRoot] }), (error) => error.code === 'ACCEPTANCE_PROFILE_PROTECTED');

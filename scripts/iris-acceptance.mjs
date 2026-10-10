@@ -59,6 +59,7 @@ export function parseAcceptanceArgs(argumentsList) {
 
 export async function inspectAcceptanceEnvironment(options) {
   const environment = options.environment ?? process.env;
+  const command = options.command ?? [];
   const dataRoot = await existingPrivateDirectory(options.runtimeDataRoot, 'ACCEPTANCE_ROOT_INVALID');
   const sourceRoot = await existingDirectory(options.sourceRoot ?? REPO_ROOT, 'ACCEPTANCE_SOURCE_INVALID');
   const sessionRoot = environment.IRIS_ACCEPTANCE_ROOT?.trim();
@@ -83,10 +84,9 @@ export async function inspectAcceptanceEnvironment(options) {
   const expectedBranch = environment.IRIS_ACCEPTANCE_EXPECTED_BRANCH?.trim();
   if (expectedHead !== undefined && expectedHead.length > 0 && git.head !== expectedHead) throw new AcceptanceError('ACCEPTANCE_SOURCE_HEAD_MISMATCH', `Acceptance checkout HEAD is ${git.head}, expected ${expectedHead}`);
   if (expectedBranch !== undefined && expectedBranch.length > 0 && git.branch !== expectedBranch) throw new AcceptanceError('ACCEPTANCE_SOURCE_BRANCH_MISMATCH', `Acceptance checkout branch is ${git.branch}, expected ${expectedBranch}`);
-  await bindIdentity(dataRoot, sourceRoot, git);
+  await bindIdentity(dataRoot, sourceRoot, git, command[0] === 'preflight');
 
   const processState = await inspectProcessState(dataRoot, sourceRoot, options.isPidAlive);
-  const command = options.command ?? [];
   const commandName = command[0] ?? '';
   if (['install', 'uninstall'].includes(command[1] ?? '') && commandName === 'launchd') {
     throw new AcceptanceError('ACCEPTANCE_LAUNCHD_BLOCKED', 'LaunchAgent install/uninstall is blocked during parallel acceptance; inspect artifacts only in a separately authorized window');
@@ -147,7 +147,7 @@ export function buildChildEnvironment(dataRoot, environment = process.env) {
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) await main();
 
-async function bindIdentity(dataRoot, sourceRoot, git) {
+async function bindIdentity(dataRoot, sourceRoot, git, allowCreate) {
   const filename = path.join(dataRoot, IDENTITY_FILE);
   const current = await readFile(filename, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
   const expected = { schemaVersion: 1, dataRoot, sourceRoot, branch: git.branch, head: git.head };
@@ -159,6 +159,7 @@ async function bindIdentity(dataRoot, sourceRoot, git) {
   }
   const entries = await readdir(dataRoot);
   if (entries.length > 0) throw new AcceptanceError('ACCEPTANCE_ROOT_REUSED', 'Acceptance data root already contains state but no IRIS acceptance identity; choose a new private root');
+  if (!allowCreate) throw new AcceptanceError('ACCEPTANCE_PREFLIGHT_REQUIRED', 'Run the explicit acceptance preflight before any acceptance command');
   const file = `${JSON.stringify({ ...expected, sessionId: randomUUID(), createdAt: new Date().toISOString() }, null, 2)}\n`;
   await writeFile(filename, file, { flag: 'wx', mode: 0o600 });
   await chmod(filename, 0o600);
