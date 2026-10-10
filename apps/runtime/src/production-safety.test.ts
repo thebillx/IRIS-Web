@@ -321,6 +321,17 @@ describe('production safety foundation', () => {
     expect(blocked.blockedReason).toContain('fresh verification');
   });
 
+  it('rechecks external writers when quiesce is called again after a fence', async () => {
+    const verified = createTrustedWriterVerifier();
+    const { controller, token } = await fixture(true, verified);
+    for (const writer of requiredWriters) await registerWriter(controller, writer);
+    expect((await controller.quiesce(token)).state).toBe('QUIESCED');
+    verified.state = 'ACTIVE';
+    const blocked = await controller.quiesce(token);
+    expect(blocked.state).toBe('BLOCKED');
+    expect(blocked.blockedReason).toContain('fresh verification');
+  });
+
   it('persists external activity separately from controller lease accounting', async () => {
     const verified = createTrustedWriterVerifier();
     const { controller, token } = await fixture(true, verified);

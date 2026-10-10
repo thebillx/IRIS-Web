@@ -305,7 +305,12 @@ export class ProductionSafetyController {
   public async quiesce(ownerAccessToken: string, observations: Readonly<Record<string, WriterObservation>> = {}): Promise<SafetySnapshot> {
     return this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      if (current.state === 'QUIESCED') return { value: current, document: current };
+      if (current.state === 'QUIESCED') {
+        const reasons = [...quiescenceReasons(current, {}), ...await freshQuiescenceReasons(current, this.writerVerifier)];
+        if (reasons.length === 0) return { value: current, document: current };
+        const next = { ...current, state: 'BLOCKED' as const, blockedReason: reasons.join('; ') };
+        return { value: next, document: next };
+      }
       if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
       const observed = await applyObservations(current, observations, this.identity, this.writerVerifier);
       const reasons = [...quiescenceReasons(observed, observations), ...await freshQuiescenceReasons(observed, this.writerVerifier)];

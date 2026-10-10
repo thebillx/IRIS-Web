@@ -223,6 +223,7 @@ export async function verifyAcceptanceTunnelEvidence(options) {
     || typeof evidence.tunnelId !== 'string' || evidence.tunnelId.length === 0 || (typeof expectedTunnelId === 'string' && evidence.tunnelId !== expectedTunnelId)
     || !Number.isSafeInteger(evidence.pid) || evidence.pid <= 0
     || typeof evidence.executablePath !== 'string' || !path.isAbsolute(evidence.executablePath)
+    || typeof evidence.processStartMarker !== 'string' || evidence.processStartMarker.length === 0 || evidence.processStartMarker.length > 128
     || !isRecord(evidence.binding) || evidence.binding.tunnelId !== evidence.tunnelId
     || (evidence.binding.profilePath !== undefined && (typeof evidence.binding.profilePath !== 'string' || !path.isAbsolute(evidence.binding.profilePath)))) {
     throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence does not bind the expected non-production provider, machine, source or tunnel');
@@ -233,7 +234,8 @@ export async function verifyAcceptanceTunnelEvidence(options) {
   const processInfo = await inspectProcess(evidence.pid);
   if (processInfo === null
     || processInfo.uid !== (typeof process.getuid === 'function' ? process.getuid() : processInfo.uid)
-    || path.resolve(processInfo.executable) !== path.resolve(evidence.executablePath)) {
+    || path.resolve(processInfo.executable) !== path.resolve(evidence.executablePath)
+    || processInfo.processStartMarker !== evidence.processStartMarker) {
     throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_MISMATCH', 'The local process identity does not match the evidenced provider');
   }
   const bindingNeedle = evidence.binding.profilePath ?? evidence.tunnelId;
@@ -412,7 +414,9 @@ async function inspectProcessIdentity(pid) {
       execFileAsync('ps', ['-p', String(pid), '-o', 'command=']).then((result) => result.stdout.trim()),
     ]);
     if (!Number.isSafeInteger(uid) || executable.length === 0 || command.length === 0) return null;
-    return { uid, executable, command };
+    const processStartMarker = await execFileAsync('ps', ['-p', String(pid), '-o', 'lstart=']).then((result) => result.stdout.trim());
+    if (processStartMarker.length === 0) return null;
+    return { uid, executable, command, processStartMarker };
   } catch { return null; }
 }
 

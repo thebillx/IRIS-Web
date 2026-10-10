@@ -129,9 +129,10 @@ remote tunnel ownership.
 Starting or restarting a remote tunnel is blocked while ownership is
 `UNVERIFIED`. The supported positive path requires a private JSON evidence file
 whose `schemaVersion` is `1`, `environment` is `non-production`, and whose
-provider, machine, source checkout, tunnel ID, executable path, PID and binding
+provider, machine, source checkout, tunnel ID, executable path, PID, process-start marker and binding
 profile are recorded. The wrapper checks the current-user process identity with
 `ps`, verifies that the live command exposes the evidenced tunnel binding, and
+matches the process-start marker from `ps -p <pid> -o lstart=` to prevent PID reuse,
 requires `IRIS_ACCEPTANCE_TUNNEL_EVIDENCE` to point to that file. Provider
 metadata alone is insufficient. Do not invent evidence, reuse production
 profiles, kill or adopt an occupied process, or add a `--force` switch.
@@ -151,6 +152,7 @@ file with this shape (all values are owner-supplied):
   "tunnelId": "<non-production-tunnel-id>",
   "pid": 12345,
   "executablePath": "/absolute/path/to/provider",
+  "processStartMarker": "<exact ps lstart output>",
   "binding": { "tunnelId": "<non-production-tunnel-id>", "profilePath": "/absolute/path/to/profile" }
 }
 ```

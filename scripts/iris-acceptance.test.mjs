@@ -170,6 +170,7 @@ describe('acceptance isolation preflight', () => {
       tunnelId,
       pid: 4242,
       executablePath: '/usr/local/bin/fixture-provider',
+      processStartMarker: 'Sun Oct 11 01:00:00 2026',
       binding: { tunnelId, profilePath: '/tmp/fixture-profile.yaml' },
     })}\n`, { mode: 0o600 });
     const report = await inspectAcceptanceEnvironment({
@@ -177,7 +178,7 @@ describe('acceptance isolation preflight', () => {
       environment: { IRIS_ACCEPTANCE_ROOT: root, IRIS_ACCEPTANCE_TUNNEL_EVIDENCE: evidence },
       machineName: 'fixture-machine',
       isPidAlive: async (pid) => pid === 4242,
-      inspectProcess: async (pid) => pid === 4242 ? { uid: process.getuid(), executable: '/usr/local/bin/fixture-provider', command: 'fixture-provider --profile /tmp/fixture-profile.yaml' } : null,
+      inspectProcess: async (pid) => pid === 4242 ? { uid: process.getuid(), executable: '/usr/local/bin/fixture-provider', command: 'fixture-provider --profile /tmp/fixture-profile.yaml', processStartMarker: 'Sun Oct 11 01:00:00 2026' } : null,
       probePort: async () => false,
     });
     assert.equal(report.tunnelIdentity, 'VERIFIED');
