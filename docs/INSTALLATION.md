@@ -93,6 +93,8 @@ Reinstalling an existing installation is an owner-reviewed migration and rollbac
 
 The detailed later-operation contract is [the migration and rollback runbook](acceptance/MIGRATION_ROLLBACK_RUNBOOK.md). It is a design and checklist for a separately authorized exercise, not a command to run during a fresh install.
 
+The real-machine handoff is [the owner acceptance plan](acceptance/OWNER_ACCEPTANCE_PLAN.md). It requires separate owner authorization for Owner UI connection, login persistence, and any existing-installation migration.
+
 ## Recovery decisions
 
 Run the checkpoint helper from the verified Git root before taking over a task:

@@ -20,6 +20,8 @@ This matrix records candidate evidence only. Disposable tests do not establish p
 | RARW/bill two-Mac acceptance | RARW and bill each use only their own machine identity, tunnel and connector. | No physical-machine operation authorized in this mission | UNVERIFIED | Owner must perform separately authorized acceptance on both Macs. |
 | Existing-installation migration | Existing state is preserved until an explicit migration and rollback plan is approved. | Setup intentionally refuses an existing registry; [migration and rollback runbook](MIGRATION_ROLLBACK_RUNBOOK.md) documents the contract | BLOCKED | Design is documented; separately authorize and execute the migration/rollback procedure before destructive reinstall. |
 
+The executable real-machine handoff is [the owner acceptance plan](OWNER_ACCEPTANCE_PLAN.md). It keeps real ChatGPT, login persistence, two-Mac isolation, and existing-installation migration in the owner-authorized portion of the matrix.
+
 ## Combined candidate
 
 The disposable integration candidate combines PR #30 with the complete PR #29 commit chain without modifying either PR history. It is used only for compilation and focused acceptance. Neither PR is merged into `main`, and no live registry, tunnel, deployment epoch, LaunchAgent, or credential was changed.
