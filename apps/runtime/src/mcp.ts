@@ -225,12 +225,19 @@ async function executeTool(
     const identity = resolveSessionIdentity(args, request, state, true);
     return capabilities.execute({ capabilityId: 'session.delete', clientId: identity.clientId, sessionId: identity.sessionId });
   }
-  if (name === 'workspace_select' || name === 'workspace_select_v27') {
+  if (name === 'workspace_select') {
+    if (optionalString(args, 'workspaceId') !== undefined) throw new RuntimeError('INVALID_REQUEST', 'workspaceId requires workspace_select_v27');
     const identity = resolveSessionIdentity(args, request, state);
+    return capabilities.execute({ capabilityId: 'session.current_project.set', clientId: identity.clientId, sessionId: identity.sessionId,
+      projectId: requiredString(args, 'projectId') });
+  }
+  if (name === 'workspace_select_v27') {
+    const identity = resolveSessionIdentity(args, request, state);
+    const workspaceId = optionalString(args, 'workspaceId');
     return capabilities.execute({
       capabilityId: 'session.current_project.set', clientId: identity.clientId, sessionId: identity.sessionId,
       projectId: requiredString(args, 'projectId'),
-      ...(optionalString(args, 'workspaceId') === undefined ? {} : { workspaceId: optionalString(args, 'workspaceId') }),
+      ...(workspaceId === undefined ? {} : { workspaceId }),
     });
   }
   if (name === 'mission_list_waiting_supervisor') {

@@ -278,6 +278,12 @@ describe('local MCP transport and permission boundary', () => {
     expect(await (await select(351, sessionA, fixture.project.id, scratch.workspaceId)).json()).toMatchObject({ result: { isError: false, structuredContent: { currentProjectId: fixture.project.id } } });
     expect(fixture.state.getSessionWorkspaceBinding(sessionA, 'chatgpt')).toEqual({ projectId: fixture.project.id, workspaceId: scratch.workspaceId });
     expect(await (await select(352, sessionA, fixture.project.id)).json()).toMatchObject({ result: { isError: false, structuredContent: { currentProjectId: fixture.project.id } } });
+    const bindingBeforeLegacyWorkspaceArgument = fixture.state.getSessionWorkspaceBinding(sessionA, 'chatgpt');
+    const legacyWorkspaceArgument = await handleMcpRequest(rpc('tools/call', 3521, {
+      name: 'workspace_select', arguments: { sessionId: sessionA, projectId: fixture.project.id, workspaceId: scratch.workspaceId },
+    }, true, 'workspace_select', 'chatgpt'), fixture.service, fixture.state);
+    expect(await legacyWorkspaceArgument.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'INVALID_REQUEST' } } });
+    expect(fixture.state.getSessionWorkspaceBinding(sessionA, 'chatgpt')).toEqual(bindingBeforeLegacyWorkspaceArgument);
     expect(await (await select(353, sessionA, secondProject.id, randomUUID())).json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'WORKSPACE_NOT_FOUND' } } });
     expect(fixture.state.getSessionForClient(sessionA, 'chatgpt').currentProjectId).toBe(fixture.project.id);
     expect(await (await select(36, sessionB, secondProject.id)).json()).toMatchObject({ result: { isError: false, structuredContent: { currentProjectId: secondProject.id } } });
