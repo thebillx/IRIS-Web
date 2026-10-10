@@ -290,6 +290,32 @@ describe('runtime listener safety', () => {
       clientId: undefined, sessionId: undefined });
   });
 
+  it('routes authenticated durable job status, output and cancellation through CapabilityService', async () => {
+    const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
+    const execute = vi.fn(async (operation: { capabilityId: string }) => {
+      if (operation.capabilityId === 'job.list') return { status: 'executed', value: { jobs: [{ jobId: 'job-a', projectId: 'project-a', workspaceId: 'workspace-a', state: 'RUNNING' }] } };
+      if (operation.capabilityId === 'job.logs') return { status: 'executed', value: { jobId: 'job-a', state: 'RUNNING', stream: 'stdout', cursor: 'stdout:5', text: 'hello', eof: true, bytes: 5 } };
+      return { status: 'executed', value: { jobId: 'job-a', state: 'RUNNING', cancelRequested: true } };
+    });
+    handle = await startRuntimeServer({
+      identity, state: {} as RuntimeState, capabilities: { execute } as unknown as CapabilityService,
+      missionBroker: {} as MissionBrokerService, health: () => { throw new Error('Not used'); }, doctor: async () => ({ status: 'pass', checks: [] }),
+      isShuttingDown: () => false, controlSecret: 'control-secret', ownerAccessSecret, requestShutdown: () => undefined,
+    }, 0);
+    const headers = { authorization: `Bearer ${ownerAccessSecret}`, 'x-iris-client-id': 'client-a', 'x-iris-session-id': 'session-a' };
+    const list = await fetch(`${handle.apiUrl}/jobs?projectId=project-a`, { headers });
+    expect(list.status).toBe(200);
+    expect(await list.json()).toMatchObject({ jobs: [{ jobId: 'job-a', projectId: 'project-a' }] });
+    const logs = await fetch(`${handle.apiUrl}/jobs/job-a/logs?projectId=project-a&stream=stdout`, { headers });
+    expect(logs.status).toBe(200);
+    expect(await logs.json()).toMatchObject({ jobId: 'job-a', text: 'hello', eof: true });
+    const cancel = await fetch(`${handle.apiUrl}/jobs/job-a/cancel`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ projectId: 'project-a' }) });
+    expect(cancel.status).toBe(200);
+    expect(await cancel.json()).toMatchObject({ jobId: 'job-a', cancelRequested: true });
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect((await fetch(`${handle.apiUrl}/jobs?projectId=project-a`)).status).toBe(403);
+  });
+
   it('returns only a product-safe agent execution failure payload', async () => {
     const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
     const sensitiveDiagnostic = 'provider failed api_key=secret internal_path=/private/example';
