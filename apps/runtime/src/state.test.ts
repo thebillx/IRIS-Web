@@ -118,6 +118,23 @@ describe('runtime machine, client, and session state', () => {
     expect(retried.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
   });
 
+  it('atomically ensures one durable tunnel session per client and project', async () => {
+    const dataRoot = await temp('iris-session-ensure-');
+    const projectRoot = await temp('iris-session-ensure-project-');
+    const state = new RuntimeState(new FoundationStateStore(dataRoot));
+    const project = await state.registerProject('Ensure project', projectRoot);
+    const ensured = await Promise.all(Array.from({ length: 8 }, () => state.ensureSessionForProjectDurable('tunnel-client', 'iris-tunnel-service', 'other', project.id)));
+    expect(new Set(ensured.map((session) => session.id)).size).toBe(1);
+    expect(state.listSessionsForClient('tunnel-client')).toHaveLength(1);
+    const publication = vi.spyOn(state as unknown as { persistSessions: () => void }, 'persistSessions')
+      .mockImplementationOnce(() => { throw new RuntimeError('PERSISTENCE_FAILURE', 'injected ensure publication failure'); });
+    await expect(state.ensureSessionForProjectDurable('new-tunnel-client', 'iris-tunnel-service', 'other', project.id))
+      .rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    publication.mockRestore();
+    expect(state.listSessionsForClient('new-tunnel-client')).toHaveLength(0);
+    await expect(state.ensureSessionForProjectDurable('new-tunnel-client', 'iris-tunnel-service', 'other', project.id)).resolves.toMatchObject({ currentProjectId: project.id });
+  });
+
   it('returns an uncertain persistence outcome without appending a false failure after executor completion', async () => {
     const dataRoot = await temp('iris-session-completion-publication-');
     let executions = 0;

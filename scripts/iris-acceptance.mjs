@@ -230,6 +230,10 @@ export async function verifyAcceptanceTunnelEvidence(options) {
   let evidence;
   try { evidence = JSON.parse(await (options.readTextFile ?? readFile)(filename, 'utf8')); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence is not valid JSON'); }
   const workloadBinding = options.dataRoot === undefined ? null : await readAcceptanceWorkloadBinding(options.dataRoot);
+  let evidenceProfilePath = null;
+  if (isRecord(evidence?.binding) && typeof evidence.binding.profilePath === 'string' && path.isAbsolute(evidence.binding.profilePath)) {
+    try { evidenceProfilePath = await canonicalPath(evidence.binding.profilePath); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence profile path is not canonicalizable'); }
+  }
   const expectedTunnelId = options.tunnelId;
   if (typeof expectedTunnelId !== 'string' || expectedTunnelId.length === 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_ID_REQUIRED', 'Tunnel evidence must name the exact workload tunnel');
   if (!isRecord(evidence)
@@ -246,7 +250,7 @@ export async function verifyAcceptanceTunnelEvidence(options) {
     || (evidence.binding.profilePath !== undefined && (typeof evidence.binding.profilePath !== 'string' || !path.isAbsolute(evidence.binding.profilePath)))) {
     throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Tunnel evidence does not bind the expected non-production provider, machine, source or tunnel');
   }
-  if (workloadBinding !== null && (evidence.tunnelId !== workloadBinding.tunnelId || evidence.binding.connectorId !== workloadBinding.connectorId || evidence.binding.machineId !== workloadBinding.machineId)) {
+  if (workloadBinding !== null && (evidence.tunnelId !== workloadBinding.tunnelId || evidence.binding.connectorId !== workloadBinding.connectorId || evidence.binding.machineId !== workloadBinding.machineId || evidenceProfilePath !== workloadBinding.managedProfilePath)) {
     throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Evidence does not bind the canonical unified workload connector');
   }
   const isAlive = options.isPidAlive ?? pidExists;
@@ -259,9 +263,9 @@ export async function verifyAcceptanceTunnelEvidence(options) {
     || processInfo.processStartMarker !== evidence.processStartMarker) {
     throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_MISMATCH', 'The local process identity does not match the evidenced provider');
   }
-  const bindingNeedle = evidence.binding.profilePath ?? evidence.tunnelId;
+  const bindingNeedle = workloadBinding?.managedProfilePath ?? evidenceProfilePath ?? evidence.tunnelId;
   if (!processInfo.command.includes(bindingNeedle)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'The local provider process does not expose the evidenced tunnel binding');
-  return { provider: evidence.provider, machineId: evidence.machineId, tunnelId: evidence.tunnelId, pid: evidence.pid };
+  return { provider: evidence.provider, machineId: evidence.machineId, tunnelId: evidence.tunnelId, managedProfilePath: workloadBinding?.managedProfilePath ?? evidenceProfilePath, pid: evidence.pid };
 }
 
 async function readAcceptanceWorkloadBinding(dataRoot) {
@@ -274,10 +278,18 @@ async function readAcceptanceWorkloadBinding(dataRoot) {
   const connectors = Array.isArray(registry?.connectors) ? registry.connectors : null;
   if (connectors === null || connectors.length !== 1) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance requires exactly one unified workload connector');
   const workload = connectors[0];
-  if (!isRecord(workload) || workload.connectorId !== 'iris-full' || workload.mode !== 'FULL' || !/^tunnel_[a-f0-9]{32}$/.test(workload.tunnelId) || !isUuid(workload.machineId)) {
+  let managedProfilePath = null;
+  if (isRecord(workload) && typeof workload.managedProfilePath === 'string' && path.isAbsolute(workload.managedProfilePath)) {
+    try { managedProfilePath = await canonicalPath(workload.managedProfilePath); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance connector profile path is not canonicalizable'); }
+  }
+  if (!isRecord(workload) || workload.connectorId !== 'iris-full' || workload.label !== 'IRIS' || workload.mode !== 'FULL'
+    || workload.runtime !== 'iris-local-runtime' || workload.mcpProfile !== 'FULL' || workload.mcpPath !== '/mcp'
+    || !Number.isSafeInteger(workload.healthPort) || workload.healthPort <= 0 || workload.healthPort > 65_535
+    || managedProfilePath !== path.resolve(dataRoot, 'tunnel-profiles', 'iris-full.yaml')
+    || !/^tunnel_[a-f0-9]{32}$/.test(workload.tunnelId) || !isUuid(workload.machineId)) {
     throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance registry does not contain a canonical unified workload connector');
   }
-  return { connectorId: workload.connectorId, tunnelId: workload.tunnelId, machineId: workload.machineId };
+  return { connectorId: workload.connectorId, tunnelId: workload.tunnelId, machineId: workload.machineId, managedProfilePath };
 }
 
 export function buildChildEnvironment(dataRoot, environment = process.env) {

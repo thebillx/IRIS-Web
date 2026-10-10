@@ -684,6 +684,41 @@ export class RuntimeState {
     });
   }
 
+  public ensureSessionForProjectDurable(
+    clientIdInput: string,
+    agentIdInput: string,
+    agentRoleInput: AgentRole,
+    projectId: string,
+  ): Promise<RuntimeSessionSnapshot> {
+    return this.serializeMachineMutation(async () => {
+      const clientId = normalizeClientId(clientIdInput);
+      const existing = [...this.sessions.values()]
+        .filter((session) => session.clientId === clientId && session.agentId === agentIdInput && session.currentProjectId === projectId)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+      if (existing !== undefined) return existing;
+      if (!(await this.listProjects()).some((project) => project.id === projectId)) {
+        throw new RuntimeError('PROJECT_NOT_FOUND', 'Current project does not exist');
+      }
+      const previousClient = this.clients.get(clientId);
+      const created = this.createSessionInMemory(clientId, agentIdInput, agentRoleInput);
+      const session = { ...created, currentProjectId: projectId };
+      this.sessions.set(session.id, session);
+      this.sessionBindings.set(session.id, { projectId, workspaceId: primaryWorkspaceId(projectId) });
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.delete(session.id);
+        this.submissionBindings.delete(session.id);
+        this.sessionBindings.delete(session.id);
+        this.invalidSessionBindings.delete(session.id);
+        if (previousClient === undefined) this.clients.delete(clientId);
+        else this.clients.set(clientId, previousClient);
+        throw error;
+      }
+      return session;
+    });
+  }
+
   private createSessionInMemory(clientIdInput?: string, agentIdInput?: string, agentRoleInput: AgentRole = 'other'): RuntimeSessionSnapshot {
     const clientId = normalizeClientId(clientIdInput ?? randomUUID());
     const agentId = normalizeAgentId(agentIdInput ?? randomUUID());

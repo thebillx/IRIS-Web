@@ -40,14 +40,8 @@ export async function resolveDirectSessionIdentity(
   const project = (await state.listProjects()).find((candidate) => candidate.id === projectId);
   if (project === undefined) throw new RuntimeError('PROJECT_NOT_FOUND', 'Requested project is not registered');
 
-  const reusable = state.listSessionsForClient(clientId)
-    .filter((session) => session.agentId === 'iris-tunnel-service' && session.currentProjectId === projectId)
-    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
-  if (reusable !== undefined) return { clientId, sessionId: reusable.id };
-
-  const created = await state.createSessionDurable(clientId, 'iris-tunnel-service', 'other');
-  await state.setSessionCurrentProject(created.id, created.clientId, projectId);
-  return { clientId, sessionId: created.id };
+  const ensured = await state.ensureSessionForProjectDurable(clientId, 'iris-tunnel-service', 'other', projectId);
+  return { clientId, sessionId: ensured.id };
 }
 
 function requiredHeader(request: Request, name: string): string {

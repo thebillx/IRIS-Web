@@ -7,6 +7,7 @@ import { PermissionAuditStore } from './audit.js';
 import { CapabilityService, type CapabilityOutcome } from './capability-service.js';
 import { DurableJobManager } from './durable-job-manager.js';
 import { executePhase3GroupedTool, phase3GroupedToolDefinitions } from './mcp-phase3.js';
+import { resolveDirectSessionIdentity } from './mcp-direct-context.js';
 import { catalogToolNames } from './mcp-catalog.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
@@ -24,6 +25,14 @@ afterEach(async () => {
 });
 
 describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
+  it('atomically reuses one tunnel session when direct calls race', async () => {
+    const fixture = await serviceFixture();
+    const request = new Request('http://127.0.0.1/mcp', { headers: { 'x-iris-client-id': 'phase3-racing-client' } });
+    const identities = await Promise.all(Array.from({ length: 8 }, () => resolveDirectSessionIdentity({}, request, fixture.state, fixture.projectA.id, 'tunnel-service')));
+    expect(new Set(identities.map((identity) => identity.sessionId)).size).toBe(1);
+    expect(fixture.state.listSessionsForClient('phase3-racing-client')).toHaveLength(1);
+  });
+
   it('AC-SEC-009 + AC-RDJ-006 rejects unknown/raw/inline execution forms and still runs a physical script in a project without package.json', async () => {
     const fixture = await serviceFixture();
     const primary = await fixture.resources.primaryWorkspace(fixture.projectA.id);
