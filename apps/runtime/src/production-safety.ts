@@ -1,5 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { RuntimeError, type RuntimeIdentity } from '@iris/domain';
@@ -16,6 +16,7 @@ const REQUIRED_WRITERS = [
   'mission-lifecycle', 'multi-worker', 'security-audit', 'resource-registry',
   'permission-store', 'permission-audit', 'activation', 'supervisor', 'external-runners',
 ] as const;
+const INSTRUMENTED_WRITERS = ['runtime-state', 'mission-state', 'mission-broker', 'durable-jobs'] as const;
 const WRITER_STATES = ['IDLE', 'ACTIVE', 'UNKNOWN'] as const;
 const FENCE_STATES = ['ACTIVE', 'QUIESCING', 'QUIESCED', 'BLOCKED', 'RECOVERY_REQUIRED'] as const;
 
@@ -87,22 +88,17 @@ export type SafetySnapshot = SafetyDocument;
 export interface WriterObservation {
   readonly state: SafetyWriterState;
   readonly inFlight?: number;
-  readonly verified?: boolean;
-  readonly runtimeId?: string;
-  readonly instanceId?: string;
-  readonly fenceEpoch?: number;
 }
 
-export interface WriterRegistrationEvidence {
-  readonly runtimeId: string;
-  readonly instanceId: string;
-  readonly fenceEpoch: number;
+export interface TrustedWriterVerifier {
+  verify(writer: SafetyWriterName, identity: SafetyIdentity): Promise<{ readonly state: Exclude<SafetyWriterState, 'UNKNOWN'>; readonly inFlight: number } | null>;
 }
 
 export interface ProductionSafetyOpenOptions {
   readonly dataRoot: string;
   readonly identity: SafetyIdentity | RuntimeIdentity;
   readonly ownerAccessSecret: string;
+  readonly writerVerifier?: TrustedWriterVerifier;
 }
 
 export interface MutationLease {
@@ -153,6 +149,7 @@ export class ProductionSafetyController {
     private readonly dataRoot: string,
     private readonly identity: SafetyIdentity,
     private readonly ownerAccessSecret: string,
+    private readonly writerVerifier: TrustedWriterVerifier | undefined,
     private document: SafetyDocument,
   ) {}
 
@@ -192,7 +189,7 @@ export class ProductionSafetyController {
       await writeDocument(filename, published);
       return published;
     }, identity);
-    return new ProductionSafetyController(dataRoot, identity, options.ownerAccessSecret, document);
+    return new ProductionSafetyController(dataRoot, identity, options.ownerAccessSecret, options.writerVerifier, document);
   }
 
   public static async openReadOnly(options: ReadOnlySafetyControllerOptions): Promise<ProductionSafetyController | null> {
@@ -203,7 +200,7 @@ export class ProductionSafetyController {
     if (inspected.state === 'missing') return null;
     if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
     const document = parseDocument(inspected.content);
-    return new ProductionSafetyController(dataRoot, document.identity, '', document);
+    return new ProductionSafetyController(dataRoot, document.identity, '', undefined, document);
   }
 
   public snapshot(): SafetySnapshot { return structuredClone(this.document); }
@@ -212,7 +209,7 @@ export class ProductionSafetyController {
     return parseDocument(await readPrivateFile(path.join(this.dataRoot, SAFETY_FILE), 'Production safety state'));
   }
 
-  public registerWriter(name: string, state: SafetyWriterState = 'IDLE', evidence?: WriterRegistrationEvidence): Promise<void> {
+  public registerWriter(name: string, state: SafetyWriterState = 'IDLE'): Promise<void> {
     if (!name || !WRITER_STATES.includes(state)) throw new RuntimeError('INVALID_REQUEST', 'Writer registration is invalid');
     if (!REQUIRED_WRITERS.includes(name as SafetyWriterName)) throw new RuntimeError('INVALID_REQUEST', `Writer ${name} is not supported`);
     return this.transaction(async (current) => {
@@ -220,18 +217,18 @@ export class ProductionSafetyController {
       if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'Writer registration is blocked by an unresolved safety reservation');
       const existing = current.writers[name];
       if (existing === undefined) throw new RuntimeError('PERSISTENCE_FAILURE', `Writer ${name} is missing from the authoritative inventory`);
-      const identityEvidence = evidence !== undefined
-        && evidence.runtimeId === this.identity.runtimeId
-        && evidence.instanceId === this.identity.instanceId
-        && evidence.fenceEpoch === current.fenceEpoch;
       const unchanged = existing.state === state
         && existing.ownerInstanceId === (state === 'UNKNOWN' ? null : this.identity.instanceId)
         && existing.leaseIds.length === existing.inFlight
-        && (state === 'UNKNOWN' ? existing.inFlight === 0 : identityEvidence);
-      if (unchanged && (state === 'UNKNOWN' || identityEvidence)) return { value: undefined, document: current };
+        && (state === 'UNKNOWN' ? existing.inFlight === 0 : true);
+      if (unchanged) return { value: undefined, document: current };
       if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Writer registration cannot change a ${current.state} fence`);
       if (existing.inFlight > 0) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} has active mutation leases`);
-      if (state !== 'UNKNOWN' && !identityEvidence) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} requires independently verified runtime ownership evidence`);
+      if (state !== 'UNKNOWN' && !INSTRUMENTED_WRITERS.includes(name as typeof INSTRUMENTED_WRITERS[number])) {
+        if (this.writerVerifier === undefined) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} has no trusted verifier`);
+        const verified = await this.writerVerifier.verify(name as SafetyWriterName, this.identity);
+        if (verified === null || verified.state !== state || verified.inFlight !== existing.inFlight) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} is not independently verified`);
+      }
       if (state === 'UNKNOWN' && existing.state !== 'UNKNOWN') throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} cannot be weakened to UNKNOWN`);
       const writers = {
         ...current.writers,
@@ -247,6 +244,11 @@ export class ProductionSafetyController {
       if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Production writer fence is ${current.state}`);
       const record = current.writers[writer];
       if (record === undefined || record.state === 'UNKNOWN') throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} is not verified for mutation`);
+      if (!INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) {
+        if (this.writerVerifier === undefined) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} has no trusted verifier`);
+        const verified = await this.writerVerifier.verify(writer as SafetyWriterName, this.identity);
+        if (verified === null || verified.state !== record.state || verified.inFlight !== record.inFlight) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} is not independently verified for mutation`);
+      }
       const leaseId = randomUUID();
       const writers = { ...current.writers, [writer]: { ...record, state: 'ACTIVE' as const, inFlight: record.inFlight + 1, ownerInstanceId: this.identity.instanceId, leaseIds: [...record.leaseIds, leaseId] } };
       let released = false;
@@ -288,8 +290,8 @@ export class ProductionSafetyController {
       this.authorize(current, ownerAccessToken);
       if (current.state === 'QUIESCED') return { value: current, document: current };
       if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
-      const observed = applyObservations(current, observations, this.identity);
-      const reasons = quiescenceReasons(observed, observations);
+      const observed = await applyObservations(current, observations, this.identity, this.writerVerifier);
+      const reasons = quiescenceReasons(observed, observations, this.writerVerifier);
       const state: ProductionFenceState = reasons.length === 0 ? 'QUIESCED' : 'BLOCKED';
       const next = { ...observed, state, blockedReason: reasons.length === 0 ? null : reasons.join('; '), fenceEpoch: reasons.length === 0 ? observed.fenceEpoch + 1 : observed.fenceEpoch };
       return { value: next, document: next };
@@ -301,8 +303,8 @@ export class ProductionSafetyController {
       this.authorize(current, ownerAccessToken);
       if (!['BLOCKED', 'RECOVERY_REQUIRED'].includes(current.state)) throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
       if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation outcome must be verified before recovery');
-      const observed = applyObservations(current, observations, this.identity);
-      const reasons = quiescenceReasons(observed, observations);
+      const observed = await applyObservations(current, observations, this.identity, this.writerVerifier);
+      const reasons = quiescenceReasons(observed, observations, this.writerVerifier);
       if (reasons.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Recovery is not verified: ${reasons.join('; ')}`);
       const next = { ...observed, state: 'ACTIVE' as const, blockedReason: null, backup: null, restore: null, reservation: null };
       return { value: next, document: next };
@@ -314,7 +316,7 @@ export class ProductionSafetyController {
       this.authorize(current, ownerAccessToken);
       if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Only a verified QUIESCED fence can be released');
       if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A backup or restore reservation is active');
-      const reasons = quiescenceReasons(current, {});
+      const reasons = quiescenceReasons(current, {}, this.writerVerifier);
       if (reasons.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Cannot release fence: ${reasons.join('; ')}`);
       const next = { ...current, state: 'ACTIVE' as const, backup: null, restore: null };
       return { value: next, document: next };
@@ -326,7 +328,7 @@ export class ProductionSafetyController {
     const reasons: string[] = [];
     if (fence.state !== 'QUIESCED') reasons.push(`fence state is ${fence.state}`);
     if (fence.reservation !== null) reasons.push(`reservation ${fence.reservation.id} is ${fence.reservation.status.toLowerCase()}`);
-    reasons.push(...quiescenceReasons(fence, {}));
+    reasons.push(...quiescenceReasons(fence, {}, this.writerVerifier));
     if (fence.backup === null) reasons.push('a verified backup is not recorded');
     if (fence.restore === null) reasons.push('a disposable restore drill is not recorded');
     if (fence.backup !== null) {
@@ -350,6 +352,15 @@ export class ProductionSafetyController {
         if (fence.restore.checkpointTarget === null || await hashFile(fence.restore.checkpointTarget) !== fence.restore.checkpointDigest) reasons.push('restored task checkpoint is unavailable or changed');
       } catch { reasons.push('restored runtime is no longer verifiable'); }
     }
+    try {
+      const latest = await withLock(this.dataRoot, () => readDocument(this.dataRoot), this.identity);
+      if (latest.generation !== fence.generation) reasons.push('safety state changed during readiness evaluation');
+      if (latest.state !== 'QUIESCED') reasons.push(`fence state changed to ${latest.state} during readiness evaluation`);
+      if (latest.reservation !== null) reasons.push('a safety reservation became active during readiness evaluation');
+      reasons.push(...quiescenceReasons(latest, {}, this.writerVerifier));
+    } catch {
+      reasons.push('safety state could not be rechecked after artifact verification');
+    }
     return { status: reasons.length === 0 ? 'READY_FOR_OWNER_WINDOW' : 'BLOCKED', reasons, fence };
   }
 
@@ -358,7 +369,7 @@ export class ProductionSafetyController {
       this.authorize(current, ownerAccessToken);
       if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'A verified QUIESCED fence is required');
       if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A safety reservation is already active');
-      if (quiescenceReasons(current, {}).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'Writer inventory is not idle and verified');
+      if (quiescenceReasons(current, {}, this.writerVerifier).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'Writer inventory is not idle and verified');
       return { value: current, document: current };
     });
   }
@@ -418,7 +429,7 @@ export class ProductionSafetyController {
   private assertQuiescedForReservation(current: SafetyDocument): void {
     if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'A verified QUIESCED fence is required');
     if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A safety reservation is already active');
-    if (quiescenceReasons(current, {}).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'Writer inventory is not idle and verified');
+    if (quiescenceReasons(current, {}, undefined, false).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'Writer inventory is not idle and verified');
   }
 
   private assertReservation(current: SafetyDocument, reservationId: string, operation: SafetyReservation['operation']): SafetyReservation {
@@ -468,7 +479,7 @@ export async function createRuntimeBackup(input: CreateBackupInput): Promise<Bac
   const source = fence.identity.dataRoot;
   const staging = path.join(path.dirname(destination), `.${path.basename(destination)}.${randomUUID()}.staging`);
   try {
-    await assertDestinationAvailable(source, destination);
+    await assertDestinationAvailable([source], destination);
     await mkdir(staging, { mode: 0o700 });
     const files = await copyTree(source, staging);
     if (input.checkpointFile !== undefined && isWithin(source, path.resolve(input.checkpointFile))) throw new RuntimeError('PRECONDITION_FAILED', 'Checkpoint source must be outside the runtime data root');
@@ -502,7 +513,7 @@ export async function verifyRuntimeBackup(destinationInput: string): Promise<Bac
   if (problem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', problem);
   const manifestPath = path.join(destination, MANIFEST_FILE);
   const manifest = parseManifest(await readPrivateFile(manifestPath, 'Backup manifest'));
-  const actual = (await listFiles(destination)).filter((file) => file !== MANIFEST_FILE);
+  const actual = (await listFiles(destination)).filter((file) => file !== MANIFEST_FILE && file !== SAFETY_LOCK);
   const expected = new Set(manifest.files.map((file) => file.path));
   if (manifest.checkpoint !== null) expected.add(CHECKPOINT_FILE);
   const actualSet = new Set(actual);
@@ -531,7 +542,8 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
   try {
     const manifest = await verifyRuntimeBackup(backupRoot);
     if (manifest.sourceIdentity.dataRoot !== fence.identity.dataRoot || manifest.sourceIdentity.runtimeId !== fence.identity.runtimeId || manifest.sourceIdentity.instanceId !== fence.identity.instanceId) throw new RuntimeError('AUTHORITY_CHANGED', 'Backup identity does not match the fenced runtime instance');
-    await assertDestinationAvailable(backupRoot, destination);
+    await assertDestinationAvailable([fence.identity.dataRoot, backupRoot], destination);
+    if (checkpointTarget !== null) await assertCheckpointTargetAvailable(checkpointTarget, [fence.identity.dataRoot, backupRoot, destination]);
     await mkdir(staging, { mode: 0o700 });
     for (const file of manifest.files) {
       const source = safeJoin(backupRoot, file.path);
@@ -596,24 +608,28 @@ function emptyDocument(identity: SafetyIdentity): SafetyDocument {
   return { schemaVersion: 1, generation: 0, state: 'ACTIVE', identity, writers, blockedReason: null, fenceEpoch: 0, backup: null, restore: null, reservation: null, updatedAt: new Date().toISOString() };
 }
 
-function applyObservations(document: SafetyDocument, observations: Readonly<Record<string, WriterObservation>>, identity: SafetyIdentity): SafetyDocument {
+async function applyObservations(document: SafetyDocument, observations: Readonly<Record<string, WriterObservation>>, identity: SafetyIdentity, verifier: TrustedWriterVerifier | undefined): Promise<SafetyDocument> {
   const writers = { ...document.writers };
   for (const [name, observation] of Object.entries(observations)) {
+    if (!REQUIRED_WRITERS.includes(name as SafetyWriterName)) throw new RuntimeError('INVALID_REQUEST', `Writer observation for ${name} is not supported`);
     if (!WRITER_STATES.includes(observation.state) || !Number.isSafeInteger(observation.inFlight ?? 0) || (observation.inFlight ?? 0) < 0) throw new RuntimeError('INVALID_REQUEST', `Writer observation for ${name} is invalid`);
-    if (observation.verified !== true || observation.runtimeId !== identity.runtimeId || observation.instanceId !== identity.instanceId || observation.fenceEpoch !== document.fenceEpoch) {
-      throw new RuntimeError('PRECONDITION_FAILED', `Writer observation for ${name} is not independently verified for this runtime epoch`);
-    }
-    if (writers[name] !== undefined) writers[name] = { ...writers[name], state: observation.state, inFlight: observation.inFlight ?? writers[name]!.inFlight, ownerInstanceId: identity.instanceId };
+    const candidate = observation as WriterObservation & Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(candidate, 'verified') || Object.prototype.hasOwnProperty.call(candidate, 'runtimeId') || Object.prototype.hasOwnProperty.call(candidate, 'instanceId') || Object.prototype.hasOwnProperty.call(candidate, 'fenceEpoch')) throw new RuntimeError('PRECONDITION_FAILED', `Writer observation for ${name} contains caller-supplied proof`);
+    if (verifier === undefined) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} has no trusted verifier`);
+    const verified = await verifier.verify(name as SafetyWriterName, identity);
+    if (verified === null || verified.state !== observation.state || verified.inFlight !== (observation.inFlight ?? 0)) throw new RuntimeError('PRECONDITION_FAILED', `Writer observation for ${name} is not independently verified`);
+    if (writers[name] !== undefined) writers[name] = { ...writers[name], state: verified.state, inFlight: verified.inFlight, ownerInstanceId: identity.instanceId, leaseIds: [] };
   }
   return { ...document, writers };
 }
 
-function quiescenceReasons(document: SafetyDocument, observations: Readonly<Record<string, WriterObservation>>): string[] {
+function quiescenceReasons(document: SafetyDocument, observations: Readonly<Record<string, WriterObservation>>, verifier?: TrustedWriterVerifier, requireExternalVerifier = true): string[] {
   const reasons: string[] = [];
   for (const writer of REQUIRED_WRITERS) {
     const record = document.writers[writer];
     if (record === undefined || record.state === 'UNKNOWN') reasons.push(`writer ${writer} is unknown`);
     else if (record.inFlight > 0 || record.state === 'ACTIVE') reasons.push(`writer ${writer} is active`);
+    else if (requireExternalVerifier && !INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number]) && verifier === undefined) reasons.push(`writer ${writer} has no trusted verifier`);
     if (record !== undefined && record.state !== 'UNKNOWN' && record.ownerInstanceId !== document.identity.instanceId) reasons.push(`writer ${writer} belongs to another runtime instance`);
     if (record !== undefined && record.leaseIds.length !== record.inFlight) reasons.push(`writer ${writer} lease accounting is inconsistent`);
     const observed = observations[writer];
@@ -638,6 +654,7 @@ async function copyTree(source: string, destination: string): Promise<BackupMani
   const files: BackupManifest['files'][number][] = [];
   for (const relative of await listFiles(source)) {
     if (relative === CHECKPOINT_FILE) throw new RuntimeError('PERSISTENCE_FAILURE', `${CHECKPOINT_FILE} is reserved for checkpoint evidence`);
+    if (relative === SAFETY_LOCK) continue;
     const from = safeJoin(source, relative);
     const to = safeJoin(destination, relative);
     const before = await safeFileMetadata(from, 'Runtime data file');
@@ -686,8 +703,10 @@ async function listFiles(root: string, prefix = ''): Promise<string[]> {
   return output;
 }
 
-async function assertDestinationAvailable(source: string, destination: string): Promise<void> {
-  if (destination === source || isWithin(source, destination) || isWithin(destination, source)) throw new RuntimeError('PRECONDITION_FAILED', 'Backup or restore destination overlaps the runtime data root');
+async function assertDestinationAvailable(protectedRoots: readonly string[], destination: string): Promise<void> {
+  const canonicalDestination = await canonicalNewPath(destination, 'Backup destination parent');
+  const canonicalRoots = await Promise.all(protectedRoots.map(async (root) => realpath(root).catch(() => path.resolve(root))));
+  if (canonicalRoots.some((root) => canonicalDestination === root || isWithin(root, canonicalDestination) || isWithin(canonicalDestination, root))) throw new RuntimeError('PRECONDITION_FAILED', 'Backup or restore destination overlaps protected safety data');
   try { await lstat(destination); throw new RuntimeError('PRECONDITION_FAILED', 'Backup or restore destination already exists'); }
   catch (error: unknown) { if (!isNotFound(error)) throw error; }
   const parent = path.dirname(destination);
@@ -701,6 +720,29 @@ async function assertNewPrivateFile(filenameInput: string): Promise<void> {
   catch (error: unknown) { if (!isNotFound(error)) throw error; }
   const problem = await privateDirectoryProblem(path.dirname(filename), 'Checkpoint restore parent');
   if (problem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', problem);
+  await canonicalNewPath(filename, 'Checkpoint restore parent');
+}
+
+async function assertCheckpointTargetAvailable(filenameInput: string, protectedRoots: readonly string[]): Promise<void> {
+  const filename = path.resolve(filenameInput);
+  const canonicalFilename = await canonicalNewPath(filename, 'Checkpoint restore parent');
+  const canonicalRoots = await Promise.all(protectedRoots.map(async (root) => realpath(root).catch(() => path.resolve(root))));
+  if (canonicalRoots.some((root) => canonicalFilename === root || isWithin(root, canonicalFilename) || isWithin(canonicalFilename, root))) throw new RuntimeError('PRECONDITION_FAILED', 'Checkpoint restore target overlaps protected safety data');
+  await assertNewPrivateFile(filename);
+}
+
+async function canonicalNewPath(filename: string, label: string): Promise<string> {
+  const parent = path.dirname(path.resolve(filename));
+  const parts = parent.split(path.sep).filter(Boolean);
+  let current = path.parse(parent).root;
+  for (const part of parts) {
+    current = path.join(current, part);
+    const metadata = await lstat(current).catch(() => null);
+    if (metadata?.isSymbolicLink() && current !== '/var' && current !== '/tmp') throw new RuntimeError('PERSISTENCE_FAILURE', `${label} is not a canonical physical path`);
+  }
+  const canonical = await realpath(parent).catch(() => null);
+  if (canonical === null) throw new RuntimeError('PERSISTENCE_FAILURE', `${label} is not an existing physical path`);
+  return path.join(canonical, path.basename(filename));
 }
 
 async function safeFileMetadata(filename: string, label: string): Promise<{ size: number; mode: number; mtimeMs: number }> {
@@ -857,7 +899,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function parseManifest(content: string): BackupManifest {
   try {
     const value = JSON.parse(content) as Partial<BackupManifest>;
-    if (value.schemaVersion !== 1 || typeof value.backupId !== 'string' || typeof value.createdAt !== 'string' || !Number.isSafeInteger(value.fenceGeneration) || !Array.isArray(value.files) || (value.checkpoint !== null && (value.checkpoint === undefined || !Number.isSafeInteger(value.checkpoint.size) || typeof value.checkpoint.sha256 !== 'string' || !Number.isSafeInteger(value.checkpoint.mode))) || value.files.some((file) => !file || typeof file.path !== 'string' || path.isAbsolute(file.path) || file.path.split('/').some((part: string) => part === '' || part === '..') || !Number.isSafeInteger(file.size) || typeof file.sha256 !== 'string' || !Number.isSafeInteger(file.mode))) throw new Error('schema');
+    if (value.schemaVersion !== 1 || typeof value.backupId !== 'string' || typeof value.createdAt !== 'string' || !Number.isSafeInteger(value.fenceGeneration) || !Array.isArray(value.files) || (value.checkpoint !== null && (value.checkpoint === undefined || !Number.isSafeInteger(value.checkpoint.size) || typeof value.checkpoint.sha256 !== 'string' || !Number.isSafeInteger(value.checkpoint.mode))) || value.files.some((file) => !file || typeof file.path !== 'string' || file.path === SAFETY_LOCK || path.isAbsolute(file.path) || file.path.split('/').some((part: string) => part === '' || part === '..') || !Number.isSafeInteger(file.size) || typeof file.sha256 !== 'string' || !Number.isSafeInteger(file.mode))) throw new Error('schema');
     return { ...value, sourceIdentity: parseIdentityValue(value.sourceIdentity), files: value.files, checkpoint: value.checkpoint ?? null } as BackupManifest;
   } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Backup manifest is invalid', { cause: error }); }
 }

@@ -30,7 +30,7 @@ import { recoverMultiWorkerRuns } from './multi-worker/recovery.js';
 import { AdoRequirementContextService } from './ado/runtime-context.js';
 import { SecurityAuditStore } from './security-audit/store.js';
 import { SecurityAuditService } from './security-audit/service.js';
-import { ProductionSafetyController, type WriterRegistrationEvidence } from './production-safety.js';
+import { ProductionSafetyController } from './production-safety.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -84,14 +84,13 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   };
   const authority = await acquireRuntimeAuthority(dataRoot, identity);
   const safety = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret });
-  const registrationEvidence: WriterRegistrationEvidence = { runtimeId: identity.runtimeId, instanceId: identity.instanceId, fenceEpoch: safety.snapshot().fenceEpoch };
   for (const [writer, state] of [
     ['runtime-state', 'IDLE'], ['mission-state', 'IDLE'], ['mission-broker', 'IDLE'], ['durable-jobs', 'IDLE'],
     ['mission-lifecycle', 'UNKNOWN'], ['multi-worker', 'UNKNOWN'], ['security-audit', 'UNKNOWN'],
     ['resource-registry', 'UNKNOWN'], ['permission-store', 'UNKNOWN'], ['permission-audit', 'UNKNOWN'],
     ['activation', 'UNKNOWN'], ['supervisor', 'UNKNOWN'], ['external-runners', 'UNKNOWN'],
   ] as const) {
-    await safety.registerWriter(writer, state, state === 'UNKNOWN' ? undefined : registrationEvidence);
+    await safety.registerWriter(writer, state);
   }
   let server: RuntimeServerHandle | undefined;
   let shuttingDown = false;

@@ -32,7 +32,7 @@ describe('production safety foundation', () => {
 
   it('requires the current owner identity and detects interrupted quiescence on reopen', async () => {
     const fixtureData = await dataFixture();
-    const first = await ProductionSafetyController.open({ dataRoot: fixtureData.dataRoot, identity: fixtureData.identity, ownerAccessSecret: fixtureData.token });
+    const first = await ProductionSafetyController.open({ dataRoot: fixtureData.dataRoot, identity: fixtureData.identity, ownerAccessSecret: fixtureData.token, writerVerifier: trustedWriterVerifier });
     for (const writer of ['runtime-state', 'mission-state', 'mission-broker', 'durable-jobs', 'supervisor']) await registerWriter(first, writer);
     await expect(first.quiesce('wrong-token')).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
     const lease = await first.beginMutation('runtime-state');
@@ -87,6 +87,11 @@ describe('production safety foundation', () => {
     expect(await readFile(path.join(restored, 'nested', 'jobs.json'), 'utf8')).toContain('jobs');
     expect(await readFile(restoredCheckpoint, 'utf8')).toContain('revision');
     expect((await controller.readiness()).status).toBe('READY_FOR_OWNER_WINDOW');
+    const readOnly = await ProductionSafetyController.openReadOnly({ dataRoot });
+    expect(readOnly).not.toBeNull();
+    expect((await readOnly!.readiness()).status).toBe('BLOCKED');
+    await controller.unfence(token);
+    expect((await controller.readiness()).status).toBe('BLOCKED');
     await expect(restoreRuntimeBackup({ controller, ownerAccessToken: token, backupRoot, destination: restored, disposable: true })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
@@ -99,6 +104,18 @@ describe('production safety foundation', () => {
     await expect(createRuntimeBackup({ controller, ownerAccessToken: token, destination: path.join(root, 'backup') })).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
     await rm(path.join(dataRoot, 'alias.json'));
     await expect(createRuntimeBackup({ controller, ownerAccessToken: token, destination: path.join(dataRoot, 'nested-backup') })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+  });
+
+  it('isolates disposable restore destinations and checkpoint targets', async () => {
+    const live = await readyBackupFixture();
+    await expect(restoreRuntimeBackup({ controller: live.controller, ownerAccessToken: live.token, backupRoot: live.backup, destination: live.dataRoot, disposable: true, checkpointFile: path.join(live.root, 'live-checkpoint.json') })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    const backupOverlap = await readyBackupFixture();
+    await expect(restoreRuntimeBackup({ controller: backupOverlap.controller, ownerAccessToken: backupOverlap.token, backupRoot: backupOverlap.backup, destination: path.join(backupOverlap.backup, 'child'), disposable: true, checkpointFile: path.join(backupOverlap.root, 'child-checkpoint.json') })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    const checkpointOverlap = await readyBackupFixture();
+    await expect(restoreRuntimeBackup({ controller: checkpointOverlap.controller, ownerAccessToken: checkpointOverlap.token, backupRoot: checkpointOverlap.backup, destination: path.join(checkpointOverlap.root, 'restored'), disposable: true, checkpointFile: path.join(checkpointOverlap.dataRoot, 'checkpoint-target.json') })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    const symlinked = await readyBackupFixture();
+    await symlink(symlinked.root, path.join(symlinked.root, 'alias-parent'));
+    await expect(restoreRuntimeBackup({ controller: symlinked.controller, ownerAccessToken: symlinked.token, backupRoot: symlinked.backup, destination: path.join(symlinked.root, 'alias-parent', 'restored'), disposable: true, checkpointFile: path.join(symlinked.root, 'alias-checkpoint.json') })).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
   });
 
   it('keeps a winning lock when an independent contender is rejected', async () => {
@@ -147,15 +164,24 @@ describe('production safety foundation', () => {
   });
 
   it('requires verified registration and preserves fenced writer state', async () => {
-    const { controller, token } = await fixture();
+    const { controller } = await untrustedFixture();
     await expect(controller.registerWriter('external-runners')).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
-    await registerWriter(controller, 'external-runners');
-    const before = (await controller.inspect()).generation;
-    await registerWriter(controller, 'external-runners');
-    expect((await controller.inspect()).generation).toBe(before);
-    await controller.quiesce(token);
-    await expect(registerWriter(controller, 'external-runners', 'ACTIVE')).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    const trusted = await fixture();
+    await registerWriter(trusted.controller, 'external-runners');
+    const before = (await trusted.controller.inspect()).generation;
+    await registerWriter(trusted.controller, 'external-runners');
+    expect((await trusted.controller.inspect()).generation).toBe(before);
+    await trusted.controller.quiesce(trusted.token);
+    await expect(registerWriter(trusted.controller, 'external-runners', 'ACTIVE')).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
     expect(() => controller.registerWriter('unexpected-writer', 'UNKNOWN')).toThrow('not supported');
+  });
+
+  it('rejects self-generated writer identity observations without a trusted verifier', async () => {
+    const { controller, token } = await untrustedFixture();
+    const snapshot = await controller.inspect();
+    const fabricated = { state: 'IDLE' as const, inFlight: 0 as const, verified: true, runtimeId: snapshot.identity.runtimeId, instanceId: snapshot.identity.instanceId, fenceEpoch: snapshot.fenceEpoch };
+    await expect(controller.quiesce(token, { 'external-runners': fabricated })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    expect((await controller.inspect()).writers['external-runners']?.state).toBe('UNKNOWN');
   });
 
   it('rejects registration from an independent process while backup is reserved', async () => {
@@ -184,6 +210,17 @@ describe('production safety foundation', () => {
     await expect(restoreRuntimeBackup({ controller, ownerAccessToken: token, backupRoot: backupA, destination: path.join(root, 'restored-a'), disposable: true, checkpointFile: path.join(root, 'restored-a-checkpoint.json') })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
     expect((await controller.inspect()).state).toBe('BLOCKED');
     expect((await controller.readiness()).status).toBe('BLOCKED');
+  });
+
+  it('excludes transient safety locks from backup manifests', async () => {
+    const { controller, token, dataRoot, root } = await fixture();
+    for (const writer of requiredWriters) await registerWriter(controller, writer);
+    await writeFile(path.join(dataRoot, 'state.json'), 'safe\n', { mode: 0o600 });
+    await controller.quiesce(token);
+    const backup = await createRuntimeBackup({ controller, ownerAccessToken: token, destination: path.join(root, 'backup') });
+    expect(backup.files.map((file) => file.path)).not.toContain('production-safety.lock');
+    await writeFile(path.join(root, 'backup', 'production-safety.lock'), 'transient\n', { mode: 0o600 });
+    await expect(verifyRuntimeBackup(path.join(root, 'backup'))).resolves.toMatchObject({ backupId: backup.backupId });
   });
 
   it('rechecks writer inventory before readiness', async () => {
@@ -229,8 +266,7 @@ describe('production safety foundation', () => {
     const { controller, dataRoot } = await fixture();
     await registerWriter(controller, 'runtime-state');
     const lease = await controller.beginMutation('runtime-state');
-    const registration = await controller.inspect();
-    await controller.registerWriter('runtime-state', 'ACTIVE', { runtimeId: registration.identity.runtimeId, instanceId: registration.identity.instanceId, fenceEpoch: registration.fenceEpoch });
+    await controller.registerWriter('runtime-state', 'ACTIVE');
     expect((await controller.inspect()).writers['runtime-state']?.inFlight).toBe(1);
     const child = startChild(dataRoot, 'lock');
     await child.ready;
@@ -244,31 +280,39 @@ describe('production safety foundation', () => {
   });
 });
 
-async function fixture(): Promise<{ root: string; dataRoot: string; controller: ProductionSafetyController; token: string }> {
+const trustedWriterVerifier = {
+  verify: async () => ({ state: 'IDLE' as const, inFlight: 0 }),
+};
+
+async function fixture(trusted = true): Promise<{ root: string; dataRoot: string; controller: ProductionSafetyController; token: string }> {
   const data = await dataFixture();
-  const controller = await ProductionSafetyController.open({ dataRoot: data.dataRoot, identity: data.identity, ownerAccessSecret: data.token });
+  const controller = await ProductionSafetyController.open({ dataRoot: data.dataRoot, identity: data.identity, ownerAccessSecret: data.token, ...(trusted ? { writerVerifier: trustedWriterVerifier } : {}) });
   return { ...data, controller };
 }
 
-async function registerWriter(controller: ProductionSafetyController, writer: string, state: 'IDLE' | 'ACTIVE' | 'UNKNOWN' = 'IDLE'): Promise<void> {
-  const snapshot = await controller.inspect();
-  await controller.registerWriter(writer, state, state === 'UNKNOWN' ? undefined : {
-    runtimeId: snapshot.identity.runtimeId,
-    instanceId: snapshot.identity.instanceId,
-    fenceEpoch: snapshot.fenceEpoch,
-  });
+async function untrustedFixture(): Promise<{ root: string; dataRoot: string; controller: ProductionSafetyController; token: string }> {
+  return fixture(false);
 }
 
-async function verifiedObservations(controller: ProductionSafetyController, writers: readonly string[]): Promise<Record<string, { state: 'IDLE'; inFlight: 0; verified: true; runtimeId: string; instanceId: string; fenceEpoch: number }>> {
-  const snapshot = await controller.inspect();
+async function registerWriter(controller: ProductionSafetyController, writer: string, state: 'IDLE' | 'ACTIVE' | 'UNKNOWN' = 'IDLE'): Promise<void> {
+  await controller.registerWriter(writer, state);
+}
+
+async function verifiedObservations(_controller: ProductionSafetyController, writers: readonly string[]): Promise<Record<string, { state: 'IDLE'; inFlight: 0 }>> {
   return Object.fromEntries(writers.map((writer) => [writer, {
     state: 'IDLE' as const,
     inFlight: 0 as const,
-    verified: true as const,
-    runtimeId: snapshot.identity.runtimeId,
-    instanceId: snapshot.identity.instanceId,
-    fenceEpoch: snapshot.fenceEpoch,
   }]));
+}
+
+async function readyBackupFixture(): Promise<{ root: string; dataRoot: string; token: string; controller: ProductionSafetyController; backup: string }> {
+  const data = await fixture();
+  for (const writer of requiredWriters) await registerWriter(data.controller, writer);
+  await writeFile(path.join(data.dataRoot, 'state.json'), 'safe\n', { mode: 0o600 });
+  await data.controller.quiesce(data.token);
+  const backup = path.join(data.root, 'backup');
+  await createRuntimeBackup({ controller: data.controller, ownerAccessToken: data.token, destination: backup });
+  return { ...data, backup };
 }
 
 const requiredWriters = [
