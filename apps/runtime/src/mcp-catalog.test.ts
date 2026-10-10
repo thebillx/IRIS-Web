@@ -6,8 +6,8 @@ import { proMcpToolDefinitions } from './mcp.js';
 describe('canonical MCP catalog', () => {
   it('preserves the GitHub main FULL and PRO contracts during repository recovery', () => {
     expect(catalogIdentity('FULL', fullMcpToolDefinitionsV21())).toEqual({
-      profile: 'FULL', catalogVersion: '2.7.0', toolCount: 56,
-      catalogHash: 'sha256:6cc422d3dbee638c5ff03e41792540ee82830469af56e9f6a4cfb0d30d99375a',
+      profile: 'FULL', catalogVersion: '2.7.0', toolCount: 57,
+      catalogHash: 'sha256:a9d25826cd82c6b57902acdbf2df21bcac00f17079953bdd6a0abb07aa7f53b2',
     });
     expect(catalogIdentity('PRO', proMcpToolDefinitions())).toEqual({
       profile: 'PRO', catalogVersion: '2.7.0', toolCount: 5,
@@ -26,7 +26,7 @@ describe('canonical MCP catalog', () => {
       } },
     } : tool);
     expect(catalogIdentity('FULL', liveDefinitions).catalogHash)
-      .toBe('sha256:4258584918bddf674e8b7558ae067daa0889408a2122fc6d57838e769cce6a8c');
+      .toBe('sha256:6338f04bcc1be9b3d40d569e11bc5f970d4eaf1e0762dc5fcc97a892ed8078f7');
   });
 
   it('produces a deterministic identity and changes it for schema changes', () => {

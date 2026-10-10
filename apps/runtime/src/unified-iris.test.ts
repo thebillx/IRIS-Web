@@ -53,13 +53,13 @@ describe('unified IRIS fresh setup', () => {
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
       });
       expect(response.status).toBe(200);
-      expect((await response.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(56);
+      expect((await response.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(57);
       expect((await fetch(daemon.apiUrl + '/mcp')).status).toBe(401);
       expect((await fetch(daemon.apiUrl + '/mcp-pro')).status).toBe(404);
       const supervisor = await createSupervisor({ dataRoot, sourceRoot: path.resolve(import.meta.dirname, '../../..') });
       expect((await supervisor.localReadiness()).connectors).toHaveLength(1);
       expect((await supervisor.catalogStatus()).pro).toBeNull();
-      expect(await readSupervisorAdminSnapshot(dataRoot)).toMatchObject({ readiness: 'READY', fullToolCount: 56, proToolCount: 0 });
+      expect(await readSupervisorAdminSnapshot(dataRoot)).toMatchObject({ readiness: 'READY', fullToolCount: 57, proToolCount: 0 });
       await (supervisor as unknown as { writeManagedProfiles: (binding: ConnectorRegistryDocument, url: string) => Promise<unknown> }).writeManagedProfiles(registry, daemon.apiUrl);
       expect(await readdir(path.join(dataRoot, 'tunnel-profiles'))).toEqual(['iris-full.yaml']);
     } finally { await daemon.close(); }

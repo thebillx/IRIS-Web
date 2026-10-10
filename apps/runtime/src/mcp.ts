@@ -222,10 +222,10 @@ async function executeTool(
     return identity.session;
   }
   if (name === 'session_close') {
-    const identity = resolveSessionIdentity(args, request, state);
+    const identity = resolveSessionIdentity(args, request, state, true);
     return capabilities.execute({ capabilityId: 'session.delete', clientId: identity.clientId, sessionId: identity.sessionId });
   }
-  if (name === 'workspace_select') {
+  if (name === 'workspace_select' || name === 'workspace_select_v27') {
     const identity = resolveSessionIdentity(args, request, state);
     return capabilities.execute({
       capabilityId: 'session.current_project.set', clientId: identity.clientId, sessionId: identity.sessionId,
@@ -425,7 +425,8 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'session_open', description: 'Open a new IRIS runtime session for this MCP client. Call once per logical ChatGPT conversation before session-bound project or execution operations.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
     { name: 'session_get', description: 'Read the owned IRIS runtime session and its current project.', inputSchema: { type: 'object', properties: sessionProperty, additionalProperties: false } },
     { name: 'session_close', description: 'Close the owned IRIS runtime session when the logical conversation no longer needs it.', inputSchema: { type: 'object', properties: sessionProperty, additionalProperties: false } },
-    { name: 'workspace_select', description: 'Select one registered project and optional active workspace as the current scope for this IRIS session only.', inputSchema: { type: 'object', required: ['projectId'], properties: { ...sessionProperty, projectId: { type: 'string', description: 'Registered project ID returned by list_projects.' }, workspaceId: { type: 'string', description: 'Optional active workspace ID returned by the workspace capability.' } }, additionalProperties: false } },
+    { name: 'workspace_select', description: 'Select one registered project as the current workspace for this IRIS session only.', inputSchema: { type: 'object', required: ['projectId'], properties: { ...sessionProperty, projectId: { type: 'string', description: 'Registered project ID returned by list_projects.' } }, additionalProperties: false } },
+    { name: 'workspace_select_v27', description: 'Select one registered project and optional active workspace as the current scope for this IRIS session only.', inputSchema: { type: 'object', required: ['projectId'], properties: { ...sessionProperty, projectId: { type: 'string', description: 'Registered project ID returned by list_projects.' }, workspaceId: { type: 'string', description: 'Optional active workspace ID returned by the workspace capability.' } }, additionalProperties: false } },
     { name: 'mission_list_waiting_supervisor', description: 'List broker-bound missions durably waiting for supervisor review. This is read-only supervisor transport and grants no execution permission.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
     { name: 'mission_get', description: 'Read one durable mission with tasks, governed actions, evidence, supervisor-gate representation, timeline, and broker checkpoint state when available.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
     { name: 'mission_events', description: 'Read a bounded merged mission timeline containing governed mission events, supervisor checkpoints, and accepted directives.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
@@ -459,6 +460,7 @@ function resolveSessionIdentity(
   args: Record<string, unknown>,
   request: Request,
   state: RuntimeState | undefined,
+  allowInvalidBinding = false,
 ): { clientId: string; sessionId: string; session: ReturnType<RuntimeState['getSessionForClient']> } {
   const clientId = requiredHeader(request, CLIENT_ID_HEADER);
   const argumentSessionId = optionalString(args, 'sessionId');
@@ -471,7 +473,7 @@ function resolveSessionIdentity(
     throw new RuntimeError('INVALID_REQUEST', 'IRIS session is required; call session_open first and pass its sessionId.');
   }
   if (state === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session validation is unavailable');
-  return { clientId, sessionId, session: state.getSessionForClient(sessionId, clientId) };
+  return { clientId, sessionId, session: allowInvalidBinding ? state.getSessionForDetach(sessionId, clientId) : state.getSessionForClient(sessionId, clientId) };
 }
 
 function requireBrokerContext(state: RuntimeState | undefined, broker: MissionBrokerService | undefined): { state: RuntimeState; broker: MissionBrokerService } {
