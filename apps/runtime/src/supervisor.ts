@@ -917,13 +917,9 @@ export class Supervisor {
     const adminChildWorkingDirectory = state.admin?.workingDirectory ?? null;
     const adminSourceCoherent = await adminProcessMatchesControlSource(state.admin, this.sourceRoot);
     const workloadConnector = registry?.connectors.find((connector) => connector.connectorId === 'iris-full') ?? null;
-    const workloadTunnel = state.workloadDesiredState === 'OFF'
-      ? { state: 'OFF', code: 'WORKLOAD_OFF', detail: 'Workload is OFF; the persistent Supervisor gateway remains available' }
-      : state.tunnels.full !== null && workloadConnector !== null && state.tunnels.full.tunnelId === workloadConnector.tunnelId
-        ? { state: 'READY', code: 'READY', detail: 'Supervisor-owned workload tunnel identity is bound' }
-        : { state: 'UNKNOWN', code: 'TUNNEL_IDENTITY_UNVERIFIED', detail: 'Workload tunnel ownership is not verified' };
+    const workloadTunnel = await this.probeTunnel(state.tunnels.full, workloadConnector);
     const readiness = state.stackDesiredState === 'UP' && (observed.state === 'running' || (observed.state === 'stopped' && state.workloadDesiredState === 'OFF'))
-      && state.admin !== null && (registry?.connectors.length === 1 || state.adminTunnel !== null) && adminSourceCoherent ? 'READY' : 'DEGRADED';
+      && state.admin !== null && (registry?.connectors.length === 1 || state.adminTunnel !== null) && adminSourceCoherent && workloadTunnel.state === 'READY' ? 'READY' : 'DEGRADED';
     return {
       supervisorControlOwner: 'OUTER_SUPERVISOR_DAEMON',
       supervisorProcessId: process.pid,

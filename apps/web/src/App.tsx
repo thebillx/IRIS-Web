@@ -426,8 +426,8 @@ export function App(): ReactElement {
   const detachSession = async () => {
     const target = selectedSession;
     if (target === null) return;
-    if (target.executionState === 'WORKING' || target.executionState === 'UNCERTAIN') {
-      throw new Error('This session has an active or uncertain execution; verify it before detaching.');
+    if (target.executionState === 'WORKING') {
+      throw new Error('This session has an active execution; verify it before detaching.');
     }
     const response = await authorizedFetch(ownerAccessToken, `/sessions/${encodeURIComponent(target.id)}`, {
       method: 'DELETE', headers: { 'x-iris-client-id': target.clientId },
@@ -596,7 +596,7 @@ export function RuntimePage(props: {
           {props.selectedSession === null
             ? <div className="empty-state prominent"><p>Create a session or resume one from the list.</p><button onClick={props.onCreateSession}>Create session</button></div>
             : <>
-              <div className="session-summary"><div><span>Role</span><strong>{props.selectedSession.agentRole}</strong></div><div><span>Agent</span><strong>{humanAgentName(props.selectedSession.agentId)}</strong></div><div><span>Started</span><strong><time dateTime={props.selectedSession.createdAt}>{formatSessionTime(props.selectedSession.createdAt)}</time></strong></div><button type="button" onClick={props.onDetachSession} disabled={props.onDetachSession === undefined || props.selectedSession.executionState === 'WORKING' || props.selectedSession.executionState === 'UNCERTAIN'}>Detach session</button></div>
+              <div className="session-summary"><div><span>Role</span><strong>{props.selectedSession.agentRole}</strong></div><div><span>Agent</span><strong>{humanAgentName(props.selectedSession.agentId)}</strong></div><div><span>Started</span><strong><time dateTime={props.selectedSession.createdAt}>{formatSessionTime(props.selectedSession.createdAt)}</time></strong></div><button type="button" onClick={props.onDetachSession} disabled={props.onDetachSession === undefined || props.selectedSession.executionState === 'WORKING'}>Detach session</button></div>
               <label>Active project<select value={props.selectedSession.currentProjectId ?? ''} onChange={(event) => props.onSelectProject(event.target.value)}><option value="">No active project</option>{props.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
               {props.health?.agentExecutorType === 'local-development-executor' && !props.health.productionModelConnected
                 ? <p className="executor-note">Development executor active · no production model connected.</p>
@@ -640,11 +640,11 @@ export function RuntimePage(props: {
           <div className="section-title-row"><div><p className="section-label">Supervisor control</p><h2 id="supervisor-control-heading">Machine and workload</h2></div><span className={`session-state ${props.supervisorStatus?.state === 'READY' ? 'is-ready' : ''}`}>{props.supervisorStatus?.state ?? 'BLOCKED'}</span></div>
           <dl>
             <dt>Machine identity</dt><dd>{props.supervisorStatus?.machineId ?? props.health?.machineId ?? 'Unverified'}</dd>
-            <dt>Gateway</dt><dd>{props.supervisorStatus?.state === undefined ? 'Unavailable' : 'Authenticated owner bridge'}</dd>
+            <dt>Gateway</dt><dd>{props.supervisorStatus === null || props.supervisorStatus === undefined || props.supervisorStatus.code === 'SUPERVISOR_BRIDGE_UNAVAILABLE' ? 'Unavailable' : 'Authenticated owner bridge'}</dd>
             <dt>Workload</dt><dd>{props.supervisorStatus?.workloadState ?? props.supervisorStatus?.detail ?? 'Unknown'}</dd>
             <dt>Tunnel</dt><dd>{props.supervisorStatus?.tunnel?.state ?? 'Unknown'}</dd>
             <dt>Keep-awake</dt><dd>BLOCKED · no ownership-safe provider contract</dd>
-            <dt>Jobs affected by OFF</dt><dd>{props.supervisorStatus?.affectedJobs ?? 'Verified by Supervisor after operation'}</dd>
+            <dt>Jobs affected by OFF</dt><dd>{props.supervisorStatus?.affectedJobs === null || props.supervisorStatus?.affectedJobs === undefined ? 'Not reported by Supervisor' : props.supervisorStatus.affectedJobs}</dd>
           </dl>
           <div className="composer-actions">
             <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('workload_on')}>Workload ON</button>
