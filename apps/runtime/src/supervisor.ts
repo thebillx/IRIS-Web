@@ -831,6 +831,7 @@ export class Supervisor {
     process.once('SIGTERM', stop);
     try {
       if ((await this.readState()).workloadDesiredState === 'ON') await this.up();
+      else await this.withOperationLock('control-plane-off-recovery', () => this.recoverControlPlaneOffUnlocked());
       const state = await this.readState();
       if (state.recovery.windowStartedAt !== null && recoveryWindowExpired(state.recovery)) {
         await this.writeState({ ...state, recovery: emptyRecovery() });
@@ -853,6 +854,42 @@ export class Supervisor {
       await this.withOperationLock('automatic-recovery', () => this.monitorOnceUnlocked());
     } catch (error) {
       if (runtimeErrorCode(error) === 'SUPERVISOR_BUSY') return;
+      throw error;
+    }
+  }
+
+  private async recoverControlPlaneOffUnlocked(): Promise<SupervisorStackStatus> {
+    const credentials = await inspectCredentialStatus(this.dataRoot);
+    if (!credentials.controlPlaneApiKeyPresent) {
+      throw new RuntimeError(credentials.legacy.detected ? 'MIGRATION_REQUIRED' : 'CREDENTIAL_MISSING', 'A persistent control-plane credential is required before recovering the control plane');
+    }
+    const registry = await readConnectorRegistry(this.dataRoot);
+    if (registry === null) throw new RuntimeError('MIGRATION_REQUIRED', 'Connector registry is not initialized');
+    let state = await this.readState();
+    if (state.workloadDesiredState !== 'OFF') return this.upUnlocked();
+    const observed = await runtimeStatus(this.dataRoot);
+    if (state.runtime !== null || observed.state === 'running' || observed.state === 'indeterminate') {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Cannot recover an OFF control plane while workload runtime authority is active or ambiguous');
+    }
+    if (observed.state === 'stale') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Cannot recover an OFF control plane while workload runtime authority is stale');
+    const started: Array<'runtime' | 'web' | 'admin' | 'full' | 'pro' | 'admin-tunnel'> = [];
+    try {
+      state = await this.ensureAdmin(state, started);
+      if (state.adminTunnel !== null && registry.admin !== null) {
+        state = await this.ensureAdminTunnel(state, registry, registry.admin.managedProfilePath, started);
+      }
+      for (const profile of ['full', 'pro'] as const) {
+        const current = state.tunnels[profile];
+        if (current === null) continue;
+        const binding = registry.connectors.find((candidate) => candidate.connectorId === (profile === 'full' ? 'iris-full' : 'iris-pro'));
+        if (binding === undefined || !existsSync(binding.managedProfilePath)) continue;
+        state = await this.ensureTunnel(state, profile, registry, binding.managedProfilePath, current.instanceId ?? '', started, false);
+      }
+      state = { ...state, runtime: null, workloadDesiredState: 'OFF' };
+      await this.writeState(state);
+      return this.statusFrom(state, registry, credentials);
+    } catch (error) {
+      await this.rollbackStarted(started).catch(() => undefined);
       throw error;
     }
   }
@@ -1220,9 +1257,12 @@ export class Supervisor {
   }
 
   private async monitorOnceUnlocked(): Promise<void> {
-    const current = await this.status();
     const state = await this.readState();
-    if (state.workloadDesiredState === 'OFF') return;
+    if (state.workloadDesiredState === 'OFF') {
+      await this.recoverControlPlaneOffUnlocked();
+      return;
+    }
+    const current = await this.status();
     const controlledTransition = current.localRuntime.state === 'DEGRADED'
       && current.localRuntime.code === 'CATALOG_IDENTITY_UNVERIFIED';
     if (current.runtime.state === 'READY'

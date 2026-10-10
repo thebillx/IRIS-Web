@@ -25,7 +25,7 @@ import { FoundationStateStore } from './persistence.js';
 import { MissionLedgerStore, missionArchiveEligible } from './mission-store.js';
 import { inspectRegistrationRoot } from './project-path.js';
 import type { ProductionSafetyController } from './production-safety.js';
-import { primaryWorkspaceId } from './resource-registry.js';
+import { primaryWorkspaceId, VNextResourceRegistry } from './resource-registry.js';
 
 const MAX_INSTRUCTION_CHARS = 8_000;
 const MAX_INTERACTION_EVENTS = 200;
@@ -54,7 +54,7 @@ interface SessionDocument {
   readonly sessions: readonly PersistedSession[];
 }
 
-interface SessionBinding {
+export interface SessionBinding {
   readonly projectId: string | null;
   readonly workspaceId: string | null;
 }
@@ -670,7 +670,16 @@ export class RuntimeState {
   public createSessionDurable(clientIdInput?: string, agentIdInput?: string, agentRoleInput: AgentRole = 'other'): Promise<RuntimeSessionSnapshot> {
     return this.serializeMachineMutation(async () => {
       const session = this.createSessionInMemory(clientIdInput, agentIdInput, agentRoleInput);
-      this.persistSessions();
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.delete(session.id);
+        this.submissionBindings.delete(session.id);
+        this.sessionBindings.delete(session.id);
+        this.invalidSessionBindings.delete(session.id);
+        if (![...this.sessions.values()].some((candidate) => candidate.clientId === session.clientId)) this.clients.delete(session.clientId);
+        throw error;
+      }
       return session;
     });
   }
@@ -709,12 +718,108 @@ export class RuntimeState {
 
   public async revalidateSessionBindings(): Promise<void> {
     const projects = await this.listProjects();
+    const resources = new VNextResourceRegistry(this, this.dataRoot);
     for (const session of this.sessions.values()) {
       const binding = this.sessionBindings.get(session.id);
-      if (binding?.projectId !== null && binding !== undefined && !projects.some((project) => project.id === binding.projectId)) {
+      if (binding === undefined || binding.projectId === null) {
+        this.invalidSessionBindings.delete(session.id);
+        continue;
+      }
+      if (!projects.some((project) => project.id === binding.projectId)) {
+        this.invalidSessionBindings.add(session.id);
+        continue;
+      }
+      try {
+        const workspace = await resources.getActiveWorkspace(binding.projectId, binding.workspaceId ?? '');
+        if (workspace.projectId !== binding.projectId || workspace.workspaceId !== binding.workspaceId) {
+          this.invalidSessionBindings.add(session.id);
+          continue;
+        }
+        this.invalidSessionBindings.delete(session.id);
+      } catch {
         this.invalidSessionBindings.add(session.id);
       }
     }
+  }
+
+  public getSessionWorkspaceBinding(sessionId: string, clientIdInput: string): SessionBinding {
+    const session = this.getSessionForClient(sessionId, clientIdInput);
+    return { ...(this.sessionBindings.get(session.id) ?? { projectId: session.currentProjectId, workspaceId: null }) };
+  }
+
+  public async assertSessionWorkspace(
+    sessionId: string,
+    clientIdInput: string,
+    projectId: string,
+    workspaceId: string,
+  ): Promise<void> {
+    const session = this.getSessionForClient(sessionId, clientIdInput);
+    const binding = this.sessionBindings.get(session.id);
+    if (session.currentProjectId !== projectId || binding?.projectId !== projectId || binding.workspaceId !== workspaceId) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Session is not authorized for the requested workspace');
+    }
+    try {
+      const workspace = await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(projectId, workspaceId);
+      if (workspace.projectId !== projectId || workspace.workspaceId !== workspaceId) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'Session workspace binding changed before use');
+      }
+    } catch (error) {
+      this.invalidSessionBindings.add(session.id);
+      if (error instanceof RuntimeError && error.code === 'AUTHORITY_CHANGED') throw error;
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Session workspace binding is no longer authorized', { cause: error });
+    }
+  }
+
+  public async ensureSessionWorkspace(
+    sessionId: string,
+    clientIdInput: string,
+    projectId: string,
+    workspaceId: string,
+  ): Promise<void> {
+    const session = this.getSessionForClient(sessionId, clientIdInput);
+    if (session.currentProjectId !== projectId) throw new RuntimeError('CAPABILITY_DENIED', 'Session project does not match the requested workspace');
+    let workspace;
+    try {
+      workspace = await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(projectId, workspaceId);
+    } catch (error) {
+      if (error instanceof RuntimeError && error.code === 'WORKSPACE_NOT_FOUND') throw error;
+      this.invalidSessionBindings.add(session.id);
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Session workspace binding is no longer authorized', { cause: error });
+    }
+    if (workspace.projectId !== projectId || workspace.workspaceId !== workspaceId) {
+      this.invalidSessionBindings.add(session.id);
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Session workspace binding changed before use');
+    }
+    const binding = this.sessionBindings.get(session.id);
+    if (binding?.projectId === projectId && binding.workspaceId === workspaceId) return;
+    await this.bindSessionWorkspace(session.id, clientIdInput, projectId, workspaceId);
+  }
+
+  public async bindSessionWorkspace(
+    sessionId: string,
+    clientIdInput: string,
+    projectId: string,
+    workspaceId: string,
+  ): Promise<RuntimeSessionSnapshot> {
+    return this.serializeMachineMutation(async () => {
+      const session = this.getSessionForClient(sessionId, clientIdInput);
+      if (session.currentProjectId !== projectId) throw new RuntimeError('CAPABILITY_DENIED', 'Workspace binding does not match the selected session project');
+      const workspace = await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(projectId, workspaceId);
+      const previous = this.sessionBindings.get(sessionId);
+      const previousInvalid = this.invalidSessionBindings.has(sessionId);
+      this.sessionBindings.set(sessionId, { projectId, workspaceId: workspace.workspaceId });
+      this.invalidSessionBindings.delete(sessionId);
+      try {
+        this.persistSessions();
+      } catch (error) {
+        if (previous === undefined) this.sessionBindings.delete(sessionId);
+        else this.sessionBindings.set(sessionId, previous);
+        if (previousInvalid) this.invalidSessionBindings.add(sessionId);
+        else this.invalidSessionBindings.delete(sessionId);
+        throw error;
+      }
+      return session;
+    });
   }
 
   public deleteSession(sessionId: string, clientIdInput: string): void {
@@ -725,8 +830,23 @@ export class RuntimeState {
 
   public deleteSessionDurable(sessionId: string, clientIdInput: string): Promise<void> {
     return this.serializeMachineMutation(async () => {
+      const session = this.getSessionForClient(sessionId, clientIdInput);
+      const binding = this.sessionBindings.get(sessionId);
+      const submissions = this.submissionBindings.get(sessionId);
+      const invalid = this.invalidSessionBindings.has(sessionId);
+      const client = this.clients.get(session.clientId);
       this.deleteSessionInMemory(sessionId, clientIdInput);
-      this.persistSessions();
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.set(sessionId, session);
+        if (submissions !== undefined) this.submissionBindings.set(sessionId, submissions);
+        if (binding !== undefined) this.sessionBindings.set(sessionId, binding);
+        if (invalid) this.invalidSessionBindings.add(sessionId);
+        if (client !== undefined) this.clients.set(session.clientId, client);
+        else this.clients.delete(session.clientId);
+        throw error;
+      }
     });
   }
 
@@ -833,7 +953,10 @@ export class RuntimeState {
     instruction: string,
   ): { readonly duplicate: RuntimeSessionSnapshot | null; readonly executionId?: string; readonly working?: RuntimeSessionSnapshot } {
     const session = this.getSessionForClient(sessionId, clientId);
-    const bindings = this.submissionBindings.get(sessionId) ?? new Map<string, string>();
+    const previousBindings = this.submissionBindings.get(sessionId);
+    const previousClient = this.clients.get(clientId);
+    const previousActiveSubmission = this.activeSubmissions.get(sessionId);
+    const bindings = new Map(this.submissionBindings.get(sessionId) ?? new Map<string, string>());
     const boundInstruction = bindings.get(submissionId);
     if (boundInstruction !== undefined) {
       if (boundInstruction !== instruction) {
@@ -861,7 +984,18 @@ export class RuntimeState {
     this.submissionBindings.set(sessionId, bindings);
     this.activeSubmissions.set(sessionId, submissionId);
     this.touchClient(clientId);
-    this.persistSessions();
+    try {
+      this.persistSessions();
+    } catch (error) {
+      this.sessions.set(sessionId, session);
+      if (previousBindings === undefined) this.submissionBindings.delete(sessionId);
+      else this.submissionBindings.set(sessionId, previousBindings);
+      if (previousActiveSubmission === undefined) this.activeSubmissions.delete(sessionId);
+      else this.activeSubmissions.set(sessionId, previousActiveSubmission);
+      if (previousClient === undefined) this.clients.delete(clientId);
+      else this.clients.set(clientId, previousClient);
+      throw error;
+    }
     return { duplicate: null, executionId, working };
   }
 
@@ -924,13 +1058,27 @@ export class RuntimeState {
       }
       const session = this.getSessionForClient(sessionId, clientIdInput);
       const updated: RuntimeSessionSnapshot = { ...session, currentProjectId: projectId };
+      const previousBinding = this.sessionBindings.get(sessionId);
+      const previousInvalid = this.invalidSessionBindings.has(sessionId);
+      const previousClient = this.clients.get(session.clientId);
       this.sessions.set(sessionId, updated);
       this.sessionBindings.set(sessionId, {
         projectId,
         workspaceId: projectId === null ? null : primaryWorkspaceId(projectId),
       });
       this.touchClient(session.clientId);
-      this.persistSessions();
+      try {
+        this.persistSessions();
+      } catch (error) {
+        this.sessions.set(sessionId, session);
+        if (previousBinding === undefined) this.sessionBindings.delete(sessionId);
+        else this.sessionBindings.set(sessionId, previousBinding);
+        if (previousInvalid) this.invalidSessionBindings.add(sessionId);
+        else this.invalidSessionBindings.delete(sessionId);
+        if (previousClient === undefined) this.clients.delete(session.clientId);
+        else this.clients.set(session.clientId, previousClient);
+        throw error;
+      }
       return updated;
     });
   }
@@ -1043,7 +1191,7 @@ export class RuntimeState {
         projectId: session.currentProjectId,
         workspaceId: session.currentProjectId === null ? null : primaryWorkspaceId(session.currentProjectId),
       };
-      if (binding.projectId !== session.currentProjectId || binding.workspaceId !== (session.currentProjectId === null ? null : primaryWorkspaceId(session.currentProjectId))) {
+      if (binding.projectId !== session.currentProjectId || (binding.projectId === null ? binding.workspaceId !== null : binding.workspaceId === null)) {
         throw new RuntimeError('AUTHORITY_CHANGED', 'Persisted session project/workspace binding is inconsistent');
       }
       this.sessions.set(session.id, session);

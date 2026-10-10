@@ -82,7 +82,7 @@ describe('IRIS vNext Phase 2 workspace, filesystem, and artifact foundation', ()
     await expect(fixture.service.execute({
       capabilityId: 'fs.stat', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
       projectId: fixture.projectA.id, workspaceId: scratch.workspaceId, path: 'inside.md', expectedEffects: ['READ'],
-    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    })).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
   });
 
   it('AC-BBL-001 + AC-RDJ-003 recursively inventories a synthetic Obsidian vault with bounded pagination and never follows symlink escape', async () => {

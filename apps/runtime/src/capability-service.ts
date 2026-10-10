@@ -941,6 +941,9 @@ export class CapabilityService {
     const session = this.state.getSessionForClient(operation.sessionId, operation.clientId);
     if (session.currentProjectId === null) throw new RuntimeError('CAPABILITY_DENIED', 'Session has no current project');
     if ('projectId' in operation && operation.projectId !== undefined && operation.projectId !== session.currentProjectId) throw new RuntimeError('CAPABILITY_DENIED', 'Operation project no longer matches the live session project');
+    if ('workspaceId' in operation && typeof operation.workspaceId === 'string' && typeof operation.projectId === 'string') {
+      await this.state.ensureSessionWorkspace(operation.sessionId, operation.clientId, operation.projectId, operation.workspaceId);
+    }
     const project = (await this.state.listProjects()).find((entry) => entry.id === session.currentProjectId);
     if (project === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Live session project is no longer registered');
     return project;

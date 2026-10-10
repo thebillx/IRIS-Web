@@ -1,13 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RuntimeError, type MissionSnapshot } from '@iris/domain';
 import type { AgentExecutor } from './agent-executor.js';
 import { MissionLedgerStore, missionArchiveEligible } from './mission-store.js';
 import { FoundationStateStore } from './persistence.js';
 import { RuntimeState } from './state.js';
+import { primaryWorkspaceId, VNextResourceRegistry } from './resource-registry.js';
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
@@ -63,6 +64,50 @@ describe('runtime machine, client, and session state', () => {
       .toThrowError(expect.objectContaining({ code: 'AUTHORITY_CHANGED' }));
     const resumed = new RuntimeState(new FoundationStateStore(dataRoot), undefined, undefined, undefined, authority);
     expect(resumed.getSessionForClient(session.id, session.clientId).id).toBe(session.id);
+  });
+
+  it('persists the actual workspace binding and invalidates resume after workspace revocation', async () => {
+    const dataRoot = await realpath(await temp('iris-session-workspace-binding-'));
+    const projectRoot = await realpath(await temp('iris-session-workspace-project-'));
+    const first = new RuntimeState(new FoundationStateStore(dataRoot));
+    const project = await first.registerProject('Workspace binding project', projectRoot);
+    const workspace = await new VNextResourceRegistry(first, dataRoot).createScratch(project.id);
+    const session = first.createSession('workspace-client');
+    await first.setSessionCurrentProject(session.id, session.clientId, project.id);
+    await first.bindSessionWorkspace(session.id, session.clientId, project.id, workspace.workspaceId);
+    await expect(first.assertSessionWorkspace(session.id, session.clientId, project.id, workspace.workspaceId)).resolves.toBeUndefined();
+    await expect(first.assertSessionWorkspace(session.id, session.clientId, project.id, primaryWorkspaceId(project.id)))
+      .rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+
+    const replacement = new RuntimeState(new FoundationStateStore(dataRoot));
+    expect(replacement.getSessionWorkspaceBinding(session.id, session.clientId)).toEqual({ projectId: project.id, workspaceId: workspace.workspaceId });
+    await replacement.revalidateSessionBindings();
+    expect(replacement.getSessionForClient(session.id, session.clientId).id).toBe(session.id);
+
+    await new VNextResourceRegistry(replacement, dataRoot).revokeScratch(project.id, workspace.workspaceId);
+    await replacement.revalidateSessionBindings();
+    expect(() => replacement.getSessionForClient(session.id, session.clientId)).toThrowError(expect.objectContaining({ code: 'AUTHORITY_CHANGED' }));
+  });
+
+  it('rolls back fenced session admission when publication fails so the same submission can retry', async () => {
+    const dataRoot = await temp('iris-session-publication-rollback-');
+    let executions = 0;
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async ({ instruction }) => { executions += 1; return { text: `result:${instruction}` }; },
+    };
+    const state = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const session = state.createSession('publication-client');
+    const publication = vi.spyOn(state as unknown as { persistSessions: () => void }, 'persistSessions')
+      .mockImplementationOnce(() => { throw new RuntimeError('PERSISTENCE_FAILURE', 'injected session publication failure'); });
+
+    await expect(state.submitInstruction(session.id, session.clientId, 'retry-after-publication', 'retry this work'))
+      .rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    publication.mockRestore();
+
+    const retried = await state.submitInstruction(session.id, session.clientId, 'retry-after-publication', 'retry this work');
+    expect(executions).toBe(1);
+    expect(retried.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
   });
 
   it('supports concurrent agent roles on one daemon without sharing session identity', async () => {

@@ -356,6 +356,16 @@ describe('IRIS supervisor', () => {
       expect(stopped.tunnels.full.pid).toBe(before.tunnels.full.pid);
       const repeatedOff = await supervisor.workloadOff();
       expect(repeatedOff.runtime).toMatchObject({ state: 'DEGRADED', code: 'WORKLOAD_OFF' });
+      const deadTunnel = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      const deadTunnelPid = deadTunnel.tunnels.full.pid;
+      if (deadTunnelPid === null) throw new Error('missing unified workload tunnel');
+      process.kill(deadTunnelPid, 'SIGTERM');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const recoveredOff = await (supervisor as unknown as { recoverControlPlaneOffUnlocked(): Promise<unknown> }).recoverControlPlaneOffUnlocked();
+      expect(recoveredOff).toMatchObject({ runtime: { state: 'DEGRADED', code: 'WORKLOAD_OFF' } });
+      const recoveredState = JSON.parse(await readFile(filename, 'utf8')) as typeof before;
+      expect(recoveredState.runtime).toBeNull();
+      expect(recoveredState.tunnels.full.pid).not.toBe(deadTunnelPid);
       const [on, concurrentOn] = await Promise.all([supervisor.workloadOn(), supervisor.workloadOn()]);
       expect(on.runtime.state).toBe('READY');
       expect(concurrentOn.runtime.state).toBe('READY');
