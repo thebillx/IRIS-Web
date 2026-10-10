@@ -1,14 +1,21 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { RuntimeError, type RuntimeIdentity } from '@iris/domain';
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
+import { observeProcessStart } from './macos-safety.js';
 
 const SAFETY_FILE = 'production-safety.json';
 const SAFETY_LOCK = 'production-safety.lock';
 const MANIFEST_FILE = 'manifest.json';
 const CHECKPOINT_FILE = 'checkpoint.json';
-const REQUIRED_WRITERS = ['runtime-state', 'mission-state', 'mission-broker', 'durable-jobs', 'supervisor', 'external-runners'] as const;
+let processStartMarker: string | undefined;
+const REQUIRED_WRITERS = [
+  'runtime-state', 'mission-state', 'mission-broker', 'durable-jobs',
+  'mission-lifecycle', 'multi-worker', 'security-audit', 'resource-registry',
+  'permission-store', 'permission-audit', 'activation', 'supervisor', 'external-runners',
+] as const;
 const WRITER_STATES = ['IDLE', 'ACTIVE', 'UNKNOWN'] as const;
 const FENCE_STATES = ['ACTIVE', 'QUIESCING', 'QUIESCED', 'BLOCKED', 'RECOVERY_REQUIRED'] as const;
 
@@ -26,12 +33,39 @@ interface WriterRecord {
   readonly state: SafetyWriterState;
   readonly inFlight: number;
   readonly ownerInstanceId: string | null;
+  readonly leaseIds: readonly string[];
 }
 
-interface EvidenceRecord {
+interface BackupEvidence {
+  readonly backupId: string;
+  readonly destination: string;
+  readonly manifestDigest: string;
+  readonly sourceIdentity: SafetyIdentity;
+  readonly fenceEpoch: number;
+  readonly checkpointDigest: string | null;
+  readonly verifiedAt: string;
+}
+
+interface RestoreEvidence {
+  readonly backupId: string;
+  readonly destination: string;
+  readonly checkpointTarget: string | null;
+  readonly manifestDigest: string;
+  readonly sourceIdentity: SafetyIdentity;
+  readonly fenceEpoch: number;
+  readonly checkpointDigest: string | null;
+  readonly verifiedAt: string;
+}
+
+interface SafetyReservation {
   readonly id: string;
-  readonly at: string;
-  readonly detail: string;
+  readonly operation: 'BACKUP' | 'RESTORE';
+  readonly ownerInstanceId: string;
+  readonly fenceEpoch: number;
+  readonly destination: string;
+  readonly checkpointTarget: string | null;
+  readonly startedAt: string;
+  readonly status: 'ACTIVE' | 'FAILED';
 }
 
 interface SafetyDocument {
@@ -41,8 +75,10 @@ interface SafetyDocument {
   readonly identity: SafetyIdentity;
   readonly writers: Readonly<Record<string, WriterRecord>>;
   readonly blockedReason: string | null;
-  readonly backup: EvidenceRecord | null;
-  readonly restore: EvidenceRecord | null;
+  readonly fenceEpoch: number;
+  readonly backup: BackupEvidence | null;
+  readonly restore: RestoreEvidence | null;
+  readonly reservation: SafetyReservation | null;
   readonly updatedAt: string;
 }
 
@@ -51,6 +87,10 @@ export type SafetySnapshot = SafetyDocument;
 export interface WriterObservation {
   readonly state: SafetyWriterState;
   readonly inFlight?: number;
+  readonly verified?: boolean;
+  readonly runtimeId?: string;
+  readonly instanceId?: string;
+  readonly fenceEpoch?: number;
 }
 
 export interface ProductionSafetyOpenOptions {
@@ -68,6 +108,10 @@ export interface ReadinessReport {
   readonly status: 'READY_FOR_OWNER_WINDOW' | 'BLOCKED';
   readonly reasons: readonly string[];
   readonly fence: SafetySnapshot;
+}
+
+export interface ReadOnlySafetyControllerOptions {
+  readonly dataRoot: string;
 }
 
 export interface BackupManifest {
@@ -116,106 +160,128 @@ export class ProductionSafetyController {
       instanceId: options.identity.instanceId,
       dataRoot,
     };
-    const filename = path.join(dataRoot, SAFETY_FILE);
-    let document: SafetyDocument | null = null;
-    const inspected = await inspectPrivateRegularFile(filename, 'Production safety state');
-    if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
-    if (inspected.state === 'ok') document = parseDocument(inspected.content);
-    if (document === null) {
-      document = emptyDocument(identity);
-      await writeDocument(filename, document);
-    } else if (document.identity.runtimeId === identity.runtimeId && document.identity.instanceId !== identity.instanceId) {
-      const nextState: ProductionFenceState = document.state === 'ACTIVE' ? 'ACTIVE' : 'RECOVERY_REQUIRED';
-      document = { ...document, state: nextState, identity, blockedReason: nextState === 'ACTIVE' ? null : 'Runtime instance changed; owner recovery is required', generation: document.generation + 1, updatedAt: new Date().toISOString() };
-      await writeDocument(filename, document);
-    }
+    const document = await withLock(dataRoot, async () => {
+      const filename = path.join(dataRoot, SAFETY_FILE);
+      const inspected = await inspectPrivateRegularFile(filename, 'Production safety state');
+      if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
+      if (inspected.state === 'missing') {
+        const initial = emptyDocument(identity);
+        await writeDocument(filename, initial);
+        return initial;
+      }
+      const current = parseDocument(inspected.content);
+      if (current.identity.runtimeId !== identity.runtimeId || current.identity.instanceId === identity.instanceId) return current;
+      const recoverable = current.state === 'ACTIVE' && current.reservation === null;
+      const next = {
+        ...current,
+        state: recoverable ? 'ACTIVE' as const : 'RECOVERY_REQUIRED' as const,
+        identity,
+        blockedReason: recoverable ? null : 'Runtime instance changed; owner recovery is required',
+        backup: null,
+        restore: null,
+        reservation: current.reservation === null ? null : { ...current.reservation, status: 'FAILED' as const },
+      };
+      const published = bump(next);
+      await writeDocument(filename, published);
+      return published;
+    }, identity);
     return new ProductionSafetyController(dataRoot, identity, options.ownerAccessSecret, document);
+  }
+
+  public static async openReadOnly(options: ReadOnlySafetyControllerOptions): Promise<ProductionSafetyController | null> {
+    const dataRoot = path.resolve(options.dataRoot);
+    const problem = await privateDirectoryProblem(dataRoot, 'Runtime data root');
+    if (problem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', problem);
+    const inspected = await inspectPrivateRegularFile(path.join(dataRoot, SAFETY_FILE), 'Production safety state');
+    if (inspected.state === 'missing') return null;
+    if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
+    const document = parseDocument(inspected.content);
+    return new ProductionSafetyController(dataRoot, document.identity, '', document);
   }
 
   public snapshot(): SafetySnapshot { return structuredClone(this.document); }
 
   public async inspect(): Promise<SafetySnapshot> {
-    await this.refresh();
-    return this.snapshot();
+    return parseDocument(await readPrivateFile(path.join(this.dataRoot, SAFETY_FILE), 'Production safety state'));
   }
 
   public registerWriter(name: string, state: SafetyWriterState = 'IDLE'): Promise<void> {
     if (!name || !WRITER_STATES.includes(state)) throw new RuntimeError('INVALID_REQUEST', 'Writer registration is invalid');
-    return this.enqueue(async () => {
-      const current = await this.refresh();
-      if (current.writers[name] !== undefined && current.writers[name]!.inFlight > 0) return;
-      const writers = { ...current.writers, [name]: { state, inFlight: 0, ownerInstanceId: this.identity.instanceId } };
-      await this.persist({ ...current, writers });
+    return this.transaction(async (current) => {
+      this.assertIdentity(current);
+      if (current.writers[name] !== undefined && current.writers[name]!.inFlight > 0) return { value: undefined, document: current };
+      const writers = {
+        ...current.writers,
+        [name]: { state, inFlight: 0, ownerInstanceId: state === 'UNKNOWN' ? null : this.identity.instanceId, leaseIds: [] },
+      };
+      return { value: undefined, document: { ...current, writers } };
     });
   }
 
   public beginMutation(writer: string): Promise<MutationLease> {
-    return this.enqueue(async () => {
-      const current = await this.refresh();
+    return this.transaction(async (current) => {
       this.assertIdentity(current);
       if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Production writer fence is ${current.state}`);
       const record = current.writers[writer];
       if (record === undefined || record.state === 'UNKNOWN') throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} is not verified for mutation`);
-      const writers = { ...current.writers, [writer]: { ...record, state: 'ACTIVE' as const, inFlight: record.inFlight + 1, ownerInstanceId: this.identity.instanceId } };
-      await this.persist({ ...current, writers });
+      const leaseId = randomUUID();
+      const writers = { ...current.writers, [writer]: { ...record, state: 'ACTIVE' as const, inFlight: record.inFlight + 1, ownerInstanceId: this.identity.instanceId, leaseIds: [...record.leaseIds, leaseId] } };
       let released = false;
       return {
-        writer,
-        release: async () => {
+        value: {
+          writer,
+          release: async () => {
           if (released) return;
           released = true;
-          await this.enqueue(async () => {
-            const latest = await this.refresh();
+          await this.transaction(async (latest) => {
             const active = latest.writers[writer];
-            if (active === undefined || active.inFlight < 1) throw new RuntimeError('PERSISTENCE_FAILURE', `Writer ${writer} lease accounting is inconsistent`);
+            if (active === undefined || !active.leaseIds.includes(leaseId) || active.inFlight < 1) throw new RuntimeError('PERSISTENCE_FAILURE', `Writer ${writer} lease accounting is inconsistent`);
             const nextCount = active.inFlight - 1;
-            await this.persist({ ...latest, writers: { ...latest.writers, [writer]: { ...active, state: nextCount === 0 ? 'IDLE' : 'ACTIVE', inFlight: nextCount } } });
+            const leaseIds = active.leaseIds.filter((id) => id !== leaseId);
+            return { value: undefined, document: { ...latest, writers: { ...latest.writers, [writer]: { ...active, state: nextCount === 0 ? 'IDLE' : 'ACTIVE', inFlight: nextCount, leaseIds } } } };
           });
+          },
         },
+        document: { ...current, writers },
       };
     });
   }
 
   public async quiesce(ownerAccessToken: string, observations: Readonly<Record<string, WriterObservation>> = {}): Promise<SafetySnapshot> {
-    return this.enqueue(async () => {
-      let current = await this.refresh();
+    return this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      if (current.state === 'QUIESCED') return current;
+      if (current.state === 'QUIESCED') return { value: current, document: current };
       if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
-      current = applyObservations(current, observations);
-      await this.persist({ ...current, state: 'QUIESCING', blockedReason: null });
-      const reasons = quiescenceReasons(current, observations);
+      const observed = applyObservations(current, observations, this.identity);
+      const reasons = quiescenceReasons(observed, observations);
       const state: ProductionFenceState = reasons.length === 0 ? 'QUIESCED' : 'BLOCKED';
-      const next = { ...current, state, blockedReason: reasons.length === 0 ? null : reasons.join('; ') };
-      await this.persist(next);
-      return next;
+      const next = { ...observed, state, blockedReason: reasons.length === 0 ? null : reasons.join('; '), fenceEpoch: reasons.length === 0 ? observed.fenceEpoch + 1 : observed.fenceEpoch };
+      return { value: next, document: next };
     });
   }
 
   public async recover(ownerAccessToken: string, observations: Readonly<Record<string, WriterObservation>>): Promise<SafetySnapshot> {
-    return this.enqueue(async () => {
-      let current = await this.refresh();
+    return this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
       if (!['BLOCKED', 'RECOVERY_REQUIRED'].includes(current.state)) throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
-      current = applyObservations(current, observations);
-      const reasons = quiescenceReasons(current, observations);
+      if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation outcome must be verified before recovery');
+      const observed = applyObservations(current, observations, this.identity);
+      const reasons = quiescenceReasons(observed, observations);
       if (reasons.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Recovery is not verified: ${reasons.join('; ')}`);
-      const next = { ...current, state: 'ACTIVE' as const, blockedReason: null };
-      await this.persist(next);
-      return next;
+      const next = { ...observed, state: 'ACTIVE' as const, blockedReason: null, backup: null, restore: null, reservation: null };
+      return { value: next, document: next };
     });
   }
 
   public async unfence(ownerAccessToken: string): Promise<SafetySnapshot> {
-    return this.enqueue(async () => {
-      const current = await this.refresh();
+    return this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
       if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Only a verified QUIESCED fence can be released');
+      if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A backup or restore reservation is active');
       const reasons = quiescenceReasons(current, {});
       if (reasons.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Cannot release fence: ${reasons.join('; ')}`);
-      const next = { ...current, state: 'ACTIVE' as const };
-      await this.persist(next);
-      return next;
+      const next = { ...current, state: 'ACTIVE' as const, backup: null, restore: null };
+      return { value: next, document: next };
     });
   }
 
@@ -223,49 +289,113 @@ export class ProductionSafetyController {
     const fence = await this.inspect();
     const reasons: string[] = [];
     if (fence.state !== 'QUIESCED') reasons.push(`fence state is ${fence.state}`);
+    if (fence.reservation !== null) reasons.push(`reservation ${fence.reservation.id} is ${fence.reservation.status.toLowerCase()}`);
     if (fence.backup === null) reasons.push('a verified backup is not recorded');
     if (fence.restore === null) reasons.push('a disposable restore drill is not recorded');
-    if (fence.backup !== null && !fence.backup.detail.includes('checkpoint=VERIFIED')) reasons.push('backup does not include verified task checkpoint evidence');
-    if (fence.restore !== null && !fence.restore.detail.includes('checkpoint=VERIFIED')) reasons.push('restore drill does not include verified task checkpoint evidence');
+    if (fence.backup !== null) {
+      if (fence.backup.fenceEpoch !== fence.fenceEpoch) reasons.push('backup evidence is from an earlier fence epoch');
+      try {
+        const manifest = await verifyRuntimeBackup(fence.backup.destination);
+        if (manifestDigest(manifest) !== fence.backup.manifestDigest || manifest.backupId !== fence.backup.backupId) reasons.push('backup evidence does not match its verified artifact');
+        if (manifest.checkpoint === null || fence.backup.checkpointDigest !== manifest.checkpoint.sha256) reasons.push('backup does not include verified task checkpoint evidence');
+      } catch { reasons.push('recorded backup is no longer verifiable'); }
+    }
+    if (fence.restore !== null) {
+      if (fence.restore.fenceEpoch !== fence.fenceEpoch) reasons.push('restore evidence is from an earlier fence epoch');
+      try {
+        const manifest = await verifyRuntimeBackup(fence.restore.destination);
+        if (manifestDigest(manifest) !== fence.restore.manifestDigest || manifest.backupId !== fence.restore.backupId) reasons.push('restore evidence does not match its verified artifact');
+        if (manifest.checkpoint === null || fence.restore.checkpointDigest !== manifest.checkpoint.sha256) reasons.push('restore drill does not include verified task checkpoint evidence');
+        if (fence.restore.checkpointTarget === null || await hashFile(fence.restore.checkpointTarget) !== fence.restore.checkpointDigest) reasons.push('restored task checkpoint is unavailable or changed');
+      } catch { reasons.push('restored runtime is no longer verifiable'); }
+    }
     return { status: reasons.length === 0 ? 'READY_FOR_OWNER_WINDOW' : 'BLOCKED', reasons, fence };
   }
 
   public async requireQuiesced(ownerAccessToken: string): Promise<SafetySnapshot> {
-    return this.enqueue(async () => {
-      const current = await this.refresh();
+    return this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
       if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'A verified QUIESCED fence is required');
+      if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A safety reservation is already active');
       if (quiescenceReasons(current, {}).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'Writer inventory is not idle and verified');
-      return current;
+      return { value: current, document: current };
     });
   }
 
-  public async recordBackupEvidence(ownerAccessToken: string, detail: string): Promise<void> {
-    await this.enqueue(async () => {
-      const current = await this.refresh();
+  public async reserveBackup(ownerAccessToken: string, destination: string): Promise<{ readonly id: string; readonly fence: SafetySnapshot }> {
+    return this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      if (current.state !== 'QUIESCED' || quiescenceReasons(current, {}).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'A verified QUIESCED fence is required');
-      await this.persist({ ...current, backup: { id: randomUUID(), at: new Date().toISOString(), detail } });
+      this.assertQuiescedForReservation(current);
+      const reservation: SafetyReservation = { id: randomUUID(), operation: 'BACKUP', ownerInstanceId: this.identity.instanceId, fenceEpoch: current.fenceEpoch, destination: path.resolve(destination), checkpointTarget: null, startedAt: new Date().toISOString(), status: 'ACTIVE' };
+      const next = { ...current, reservation };
+      return { value: { id: reservation.id, fence: next }, document: next };
     });
   }
 
-  public async recordRestoreEvidence(ownerAccessToken: string, detail: string): Promise<void> {
-    await this.enqueue(async () => {
-      const current = await this.refresh();
+  public async completeBackup(ownerAccessToken: string, reservationId: string, evidence: BackupEvidence): Promise<void> {
+    await this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      if (current.state !== 'QUIESCED' || quiescenceReasons(current, {}).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'A verified QUIESCED fence is required');
-      await this.persist({ ...current, restore: { id: randomUUID(), at: new Date().toISOString(), detail } });
+      this.assertReservation(current, reservationId, 'BACKUP');
+      if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Backup completion requires a QUIESCED fence');
+      const next = { ...current, backup: evidence, reservation: null };
+      return { value: undefined, document: next };
     });
   }
 
-  private async refresh(): Promise<SafetyDocument> {
-    try { this.document = parseDocument(await readFile(path.join(this.dataRoot, SAFETY_FILE), 'utf8')); }
-    catch (error: unknown) { throw error instanceof RuntimeError ? error : new RuntimeError('PERSISTENCE_FAILURE', 'Production safety state is unreadable', { cause: error }); }
-    return this.document;
+  public async reserveRestore(ownerAccessToken: string, destination: string, checkpointTarget: string | null): Promise<{ readonly id: string; readonly fence: SafetySnapshot }> {
+    return this.transaction(async (current) => {
+      this.authorize(current, ownerAccessToken);
+      this.assertQuiescedForReservation(current);
+      const reservation: SafetyReservation = { id: randomUUID(), operation: 'RESTORE', ownerInstanceId: this.identity.instanceId, fenceEpoch: current.fenceEpoch, destination: path.resolve(destination), checkpointTarget: checkpointTarget === null ? null : path.resolve(checkpointTarget), startedAt: new Date().toISOString(), status: 'ACTIVE' };
+      const next = { ...current, reservation };
+      return { value: { id: reservation.id, fence: next }, document: next };
+    });
+  }
+
+  public async completeRestore(ownerAccessToken: string, reservationId: string, evidence: RestoreEvidence): Promise<void> {
+    await this.transaction(async (current) => {
+      this.authorize(current, ownerAccessToken);
+      this.assertReservation(current, reservationId, 'RESTORE');
+      if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Restore completion requires a QUIESCED fence');
+      const next = { ...current, restore: evidence, reservation: null };
+      return { value: undefined, document: next };
+    });
+  }
+
+  public async failReservation(ownerAccessToken: string, reservationId: string, reason: string): Promise<void> {
+    await this.transaction(async (current) => {
+      this.authorize(current, ownerAccessToken);
+      if (current.reservation?.id !== reservationId || current.reservation.ownerInstanceId !== this.identity.instanceId) return { value: undefined, document: current };
+      const next = { ...current, state: 'BLOCKED' as const, blockedReason: `Safety reservation ${reservationId} failed: ${reason}`, reservation: { ...current.reservation, status: 'FAILED' as const } };
+      return { value: undefined, document: next };
+    });
+  }
+
+  private assertQuiescedForReservation(current: SafetyDocument): void {
+    if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'A verified QUIESCED fence is required');
+    if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A safety reservation is already active');
+    if (quiescenceReasons(current, {}).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'Writer inventory is not idle and verified');
+  }
+
+  private assertReservation(current: SafetyDocument, reservationId: string, operation: SafetyReservation['operation']): void {
+    if (current.reservation === null || current.reservation.id !== reservationId || current.reservation.operation !== operation || current.reservation.ownerInstanceId !== this.identity.instanceId || current.reservation.status !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation is not owned by this runtime instance');
+  }
+
+  private async transaction<T>(operation: (current: SafetyDocument) => Promise<{ readonly value: T; readonly document: SafetyDocument }> | { readonly value: T; readonly document: SafetyDocument }): Promise<T> {
+    return this.enqueue(async () => withLock(this.dataRoot, async () => {
+      const current = await readDocument(this.dataRoot);
+      this.document = current;
+      const result = await operation(current);
+      const next = result.document === current ? current : bump(result.document);
+      if (next !== current) await writeDocument(path.join(this.dataRoot, SAFETY_FILE), next);
+      this.document = next;
+      return result.value;
+    }, this.identity));
   }
 
   private authorize(document: SafetyDocument, token: string): void {
     this.assertIdentity(document);
+    if (this.ownerAccessSecret.length < 1) throw new RuntimeError('CONTROL_DENIED', 'Owner access token is unavailable');
     const expected = Buffer.from(this.ownerAccessSecret);
     const provided = Buffer.from(token);
     if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) throw new RuntimeError('CONTROL_DENIED', 'Owner authorization is invalid');
@@ -277,11 +407,6 @@ export class ProductionSafetyController {
     }
   }
 
-  private async persist(document: SafetyDocument): Promise<void> {
-    this.document = { ...document, generation: document.generation + 1, updatedAt: new Date().toISOString() };
-    await withLock(this.dataRoot, async () => writeDocument(path.join(this.dataRoot, SAFETY_FILE), this.document));
-  }
-
   private async enqueue<T>(operation: () => Promise<T>): Promise<T> {
     let result!: T;
     const queued = this.operationTail.then(async () => { result = await operation(); }, async () => { result = await operation(); });
@@ -290,15 +415,15 @@ export class ProductionSafetyController {
     return result;
   }
 }
-
 export async function createRuntimeBackup(input: CreateBackupInput): Promise<BackupManifest> {
-  const fence = await input.controller.requireQuiesced(input.ownerAccessToken);
-  const source = fence.identity.dataRoot;
   const destination = path.resolve(input.destination);
-  await assertDestinationAvailable(source, destination);
+  const reservation = await input.controller.reserveBackup(input.ownerAccessToken, destination);
+  const fence = reservation.fence;
+  const source = fence.identity.dataRoot;
   const staging = path.join(path.dirname(destination), `.${path.basename(destination)}.${randomUUID()}.staging`);
-  await mkdir(staging, { mode: 0o700 });
   try {
+    await assertDestinationAvailable(source, destination);
+    await mkdir(staging, { mode: 0o700 });
     const files = await copyTree(source, staging);
     if (input.checkpointFile !== undefined && isWithin(source, path.resolve(input.checkpointFile))) throw new RuntimeError('PRECONDITION_FAILED', 'Checkpoint source must be outside the runtime data root');
     const checkpoint = input.checkpointFile === undefined ? null : await copyCheckpoint(input.checkpointFile, staging);
@@ -308,10 +433,19 @@ export async function createRuntimeBackup(input: CreateBackupInput): Promise<Bac
     await verifyRuntimeBackup(staging);
     await rename(staging, destination);
     await verifyRuntimeBackup(destination);
-    await input.controller.recordBackupEvidence(input.ownerAccessToken, `${manifest.backupId}:${manifest.files.length} files;checkpoint=${manifest.checkpoint === null ? 'UNVERIFIED' : 'VERIFIED'}`);
+    await input.controller.completeBackup(input.ownerAccessToken, reservation.id, {
+      backupId: manifest.backupId,
+      destination,
+      manifestDigest: manifestDigest(manifest),
+      sourceIdentity: manifest.sourceIdentity,
+      fenceEpoch: fence.fenceEpoch,
+      checkpointDigest: manifest.checkpoint?.sha256 ?? null,
+      verifiedAt: new Date().toISOString(),
+    });
     return manifest;
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    await input.controller.failReservation(input.ownerAccessToken, reservation.id, error instanceof Error ? error.message : 'backup outcome is unknown').catch(() => undefined);
     throw error;
   }
 }
@@ -341,16 +475,18 @@ export async function verifyRuntimeBackup(destinationInput: string): Promise<Bac
 
 export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<BackupManifest> {
   if (input.disposable !== true) throw new RuntimeError('PRECONDITION_FAILED', 'Restore requires disposable: true');
-  const fence = await input.controller.requireQuiesced(input.ownerAccessToken);
   const backupRoot = path.resolve(input.backupRoot);
   const destination = path.resolve(input.destination);
-  const manifest = await verifyRuntimeBackup(backupRoot);
-  if (manifest.sourceIdentity.dataRoot !== fence.identity.dataRoot || manifest.sourceIdentity.runtimeId !== fence.identity.runtimeId) throw new RuntimeError('AUTHORITY_CHANGED', 'Backup identity does not match the fenced runtime');
-  await assertDestinationAvailable(backupRoot, destination);
+  const checkpointTarget = input.checkpointFile === undefined ? null : path.resolve(input.checkpointFile);
+  const reservation = await input.controller.reserveRestore(input.ownerAccessToken, destination, checkpointTarget);
+  const fence = reservation.fence;
   const staging = path.join(path.dirname(destination), `.${path.basename(destination)}.${randomUUID()}.staging`);
-  await mkdir(staging, { mode: 0o700 });
   let checkpointStaging: string | undefined;
   try {
+    const manifest = await verifyRuntimeBackup(backupRoot);
+    if (manifest.sourceIdentity.dataRoot !== fence.identity.dataRoot || manifest.sourceIdentity.runtimeId !== fence.identity.runtimeId || manifest.sourceIdentity.instanceId !== fence.identity.instanceId) throw new RuntimeError('AUTHORITY_CHANGED', 'Backup identity does not match the fenced runtime instance');
+    await assertDestinationAvailable(backupRoot, destination);
+    await mkdir(staging, { mode: 0o700 });
     for (const file of manifest.files) {
       const source = safeJoin(backupRoot, file.path);
       const target = safeJoin(staging, file.path);
@@ -372,33 +508,56 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
       await rename(staging, destination);
       await rename(checkpointStaging, checkpointTarget);
       await verifyRuntimeBackup(destination);
-      await input.controller.recordRestoreEvidence(input.ownerAccessToken, `${manifest.backupId}:${destination};checkpoint=VERIFIED`);
+      await verifyCheckpointTarget(checkpointTarget!, manifest.checkpoint.sha256);
+      await input.controller.completeRestore(input.ownerAccessToken, reservation.id, {
+        backupId: manifest.backupId,
+        destination,
+        checkpointTarget,
+        manifestDigest: manifestDigest(manifest),
+        sourceIdentity: manifest.sourceIdentity,
+        fenceEpoch: fence.fenceEpoch,
+        checkpointDigest: manifest.checkpoint.sha256,
+        verifiedAt: new Date().toISOString(),
+      });
       return manifest;
     }
     await writePrivateJson(path.join(staging, MANIFEST_FILE), manifest);
     await verifyRuntimeBackup(staging);
     await rename(staging, destination);
     await verifyRuntimeBackup(destination);
-    await input.controller.recordRestoreEvidence(input.ownerAccessToken, `${manifest.backupId}:${destination};checkpoint=UNVERIFIED`);
+    await input.controller.completeRestore(input.ownerAccessToken, reservation.id, {
+      backupId: manifest.backupId,
+      destination,
+      checkpointTarget: null,
+      manifestDigest: manifestDigest(manifest),
+      sourceIdentity: manifest.sourceIdentity,
+      fenceEpoch: fence.fenceEpoch,
+      checkpointDigest: null,
+      verifiedAt: new Date().toISOString(),
+    });
     return manifest;
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => undefined);
     if (checkpointStaging !== undefined) await rm(checkpointStaging, { force: true }).catch(() => undefined);
+    await input.controller.failReservation(input.ownerAccessToken, reservation.id, error instanceof Error ? error.message : 'restore outcome is unknown').catch(() => undefined);
     throw error;
   }
 }
 
 function emptyDocument(identity: SafetyIdentity): SafetyDocument {
   const writers: Record<string, WriterRecord> = {};
-  for (const writer of REQUIRED_WRITERS) writers[writer] = { state: 'UNKNOWN', inFlight: 0, ownerInstanceId: null };
-  return { schemaVersion: 1, generation: 0, state: 'ACTIVE', identity, writers, blockedReason: null, backup: null, restore: null, updatedAt: new Date().toISOString() };
+  for (const writer of REQUIRED_WRITERS) writers[writer] = { state: 'UNKNOWN', inFlight: 0, ownerInstanceId: null, leaseIds: [] };
+  return { schemaVersion: 1, generation: 0, state: 'ACTIVE', identity, writers, blockedReason: null, fenceEpoch: 0, backup: null, restore: null, reservation: null, updatedAt: new Date().toISOString() };
 }
 
-function applyObservations(document: SafetyDocument, observations: Readonly<Record<string, WriterObservation>>): SafetyDocument {
+function applyObservations(document: SafetyDocument, observations: Readonly<Record<string, WriterObservation>>, identity: SafetyIdentity): SafetyDocument {
   const writers = { ...document.writers };
   for (const [name, observation] of Object.entries(observations)) {
     if (!WRITER_STATES.includes(observation.state) || !Number.isSafeInteger(observation.inFlight ?? 0) || (observation.inFlight ?? 0) < 0) throw new RuntimeError('INVALID_REQUEST', `Writer observation for ${name} is invalid`);
-    if (writers[name] !== undefined) writers[name] = { ...writers[name], state: observation.state, inFlight: observation.inFlight ?? writers[name]!.inFlight };
+    if (observation.verified !== true || observation.runtimeId !== identity.runtimeId || observation.instanceId !== identity.instanceId || observation.fenceEpoch !== document.fenceEpoch) {
+      throw new RuntimeError('PRECONDITION_FAILED', `Writer observation for ${name} is not independently verified for this runtime epoch`);
+    }
+    if (writers[name] !== undefined) writers[name] = { ...writers[name], state: observation.state, inFlight: observation.inFlight ?? writers[name]!.inFlight, ownerInstanceId: identity.instanceId };
   }
   return { ...document, writers };
 }
@@ -444,6 +603,11 @@ async function copyCheckpoint(sourceInput: string, destination: string): Promise
   await writeFile(target, content, { mode: metadata.mode, flag: 'wx' });
   await chmod(target, metadata.mode);
   return { size: content.length, sha256: createHash('sha256').update(content).digest('hex'), mode: metadata.mode };
+}
+
+async function verifyCheckpointTarget(filename: string, expectedDigest: string): Promise<void> {
+  await safeFileMetadata(filename, 'Restored checkpoint');
+  if (await hashFile(filename) !== expectedDigest) throw new RuntimeError('PERSISTENCE_FAILURE', 'Restored checkpoint integrity check failed');
 }
 
 async function listFiles(root: string, prefix = ''): Promise<string[]> {
@@ -504,18 +668,104 @@ async function readPrivateFile(filename: string, label: string): Promise<string>
   if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || (metadata.mode & 0o077) !== 0) throw new RuntimeError('PERSISTENCE_FAILURE', `${label} is not private`);
   return readFile(filename, 'utf8');
 }
-async function withLock<T>(dataRoot: string, operation: () => Promise<T>): Promise<T> {
+
+async function readDocument(dataRoot: string): Promise<SafetyDocument> {
+  try { return parseDocument(await readPrivateFile(path.join(dataRoot, SAFETY_FILE), 'Production safety state')); }
+  catch (error: unknown) { throw error instanceof RuntimeError ? error : new RuntimeError('PERSISTENCE_FAILURE', 'Production safety state is unreadable', { cause: error }); }
+}
+
+function bump(document: SafetyDocument): SafetyDocument {
+  return { ...document, generation: document.generation + 1, updatedAt: new Date().toISOString() };
+}
+
+interface OwnedLock {
+  readonly filename: string;
+  readonly handle: FileHandle;
+  readonly device: number;
+  readonly inode: number;
+}
+
+async function withLock<T>(dataRoot: string, operation: () => Promise<T>, identity?: SafetyIdentity): Promise<T> {
   const filename = path.join(dataRoot, SAFETY_LOCK);
-  let handle;
-  try { handle = await open(filename, 'wx', 0o600); return await operation(); }
-  catch (error) { throw error instanceof RuntimeError ? error : new RuntimeError('SUPERVISOR_BUSY', 'Production safety state is busy', { cause: error }); }
-  finally { await handle?.close().catch(() => undefined); await rm(filename, { force: true }).catch(() => undefined); }
+  let lock: OwnedLock | undefined;
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(filename, 'wx', 0o600);
+    const marker = verifiedProcessStartMarker();
+    await handle.writeFile(`${JSON.stringify({ schemaVersion: 1, pid: process.pid, processStartMarker: marker, lockId: randomUUID(), runtimeId: identity?.runtimeId ?? null, instanceId: identity?.instanceId ?? null, dataRoot: identity?.dataRoot ?? null, createdAt: new Date().toISOString() })}\n`, 'utf8');
+    await handle.sync();
+    const file = await handle.stat();
+    const visible = await lstat(filename);
+    if (file.dev !== visible.dev || file.ino !== visible.ino || visible.nlink !== 1 || (visible.mode & 0o077) !== 0) {
+      await handle.close().catch(() => undefined);
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Production safety lock identity changed during acquisition');
+    }
+    lock = { filename, handle, device: Number(file.dev), inode: Number(file.ino) };
+    return await operation();
+  }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') throw new RuntimeError('SUPERVISOR_BUSY', 'Production safety state is busy');
+    if (handle !== undefined) {
+      const owned = await handle.stat().then(async (file) => {
+        const visible = await lstat(filename).catch(() => null);
+        return visible !== null && file.dev === visible.dev && file.ino === visible.ino;
+      }).catch(() => false);
+      await handle.close().catch(() => undefined);
+      if (owned) await rm(filename, { force: true }).catch(() => undefined);
+    }
+    throw error instanceof RuntimeError ? error : new RuntimeError('PERSISTENCE_FAILURE', 'Production safety lock could not be acquired', { cause: error });
+  }
+  finally {
+    if (lock !== undefined) await releaseLock(lock);
+  }
+}
+
+function verifiedProcessStartMarker(): string {
+  if (processStartMarker !== undefined) return processStartMarker;
+  const observed = observeProcessStart(process.pid);
+  if (observed.state !== 'live') throw new RuntimeError('SUPERVISOR_BUSY', 'Production safety process identity is indeterminate');
+  processStartMarker = observed.marker;
+  return processStartMarker;
+}
+
+async function releaseLock(lock: OwnedLock): Promise<void> {
+  await lock.handle.close().catch(() => undefined);
+  try {
+    const visible = await lstat(lock.filename);
+    if (Number(visible.dev) !== lock.device || Number(visible.ino) !== lock.inode || visible.nlink !== 1) throw new RuntimeError('PERSISTENCE_FAILURE', 'Production safety lock ownership changed before release');
+    await rm(lock.filename);
+  } catch (error: unknown) {
+    if (isNotFound(error)) return;
+    if (error instanceof RuntimeError) throw error;
+    throw new RuntimeError('PERSISTENCE_FAILURE', 'Production safety lock could not be released', { cause: error });
+  }
 }
 function parseDocument(content: string): SafetyDocument {
   try {
-    const value = JSON.parse(content) as SafetyDocument;
-    if (value.schemaVersion !== 1 || !FENCE_STATES.includes(value.state) || !value.identity || typeof value.identity.runtimeId !== 'string' || typeof value.identity.instanceId !== 'string' || !path.isAbsolute(value.identity.dataRoot) || !Number.isSafeInteger(value.generation) || typeof value.writers !== 'object') throw new Error('schema');
-    return value;
+    const value = JSON.parse(content) as Partial<SafetyDocument> & { writers?: Record<string, Partial<WriterRecord>> };
+    if (value.schemaVersion !== 1 || !FENCE_STATES.includes(value.state as ProductionFenceState) || !value.identity || typeof value.identity.runtimeId !== 'string' || typeof value.identity.instanceId !== 'string' || !path.isAbsolute(value.identity.dataRoot) || !Number.isSafeInteger(value.generation) || !value.writers || typeof value.writers !== 'object') throw new Error('schema');
+    const generation = value.generation as number;
+    const fenceEpoch = Number.isSafeInteger(value.fenceEpoch) ? value.fenceEpoch as number : 0;
+    const writers: Record<string, WriterRecord> = {};
+    for (const [name, record] of Object.entries(value.writers)) {
+      if (!record || !WRITER_STATES.includes(record.state as SafetyWriterState) || !Number.isSafeInteger(record.inFlight) || record.inFlight < 0) throw new Error('writer schema');
+      const leaseIds = record.leaseIds ?? [];
+      if (!Array.isArray(leaseIds) || leaseIds.some((id) => typeof id !== 'string') || leaseIds.length !== record.inFlight) throw new Error('lease schema');
+      writers[name] = { state: record.state as SafetyWriterState, inFlight: record.inFlight, ownerInstanceId: typeof record.ownerInstanceId === 'string' ? record.ownerInstanceId : null, leaseIds };
+    }
+    return {
+      schemaVersion: 1,
+      generation,
+      state: value.state as ProductionFenceState,
+      identity: value.identity,
+      writers,
+      blockedReason: typeof value.blockedReason === 'string' ? value.blockedReason : null,
+      fenceEpoch,
+      backup: value.backup ?? null,
+      restore: value.restore ?? null,
+      reservation: value.reservation ?? null,
+      updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date(0).toISOString(),
+    };
   } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Production safety state is invalid', { cause: error }); }
 }
 function parseManifest(content: string): BackupManifest {
@@ -528,3 +778,4 @@ function parseManifest(content: string): BackupManifest {
 function isWithin(root: string, candidate: string): boolean { const relative = path.relative(root, candidate); return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`)); }
 function isNotFound(error: unknown): boolean { return typeof error === 'object' && error !== null && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT'; }
 async function hashFile(filename: string): Promise<string> { return createHash('sha256').update(await readFile(filename)).digest('hex'); }
+function manifestDigest(manifest: BackupManifest): string { return createHash('sha256').update(JSON.stringify(manifest)).digest('hex'); }

@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readEndpoint, readOwnerAccessSecret } from './persistence.js';
-import { createRuntimeBackup, ProductionSafetyController, restoreRuntimeBackup, verifyRuntimeBackup, type SafetyIdentity, type WriterObservation } from './production-safety.js';
+import { createRuntimeBackup, ProductionSafetyController, restoreRuntimeBackup, verifyRuntimeBackup, type SafetyIdentity } from './production-safety.js';
 
 const TOKEN_ENV = 'IRIS_OWNER_ACCESS_TOKEN';
 
@@ -11,24 +11,33 @@ async function main(argv: readonly string[]): Promise<void> {
   const args = parseArgs(argv.slice(1));
   const dataRoot = args.get('data-root');
   if (dataRoot === undefined || !path.isAbsolute(dataRoot)) throw new Error('--data-root must be an absolute path');
+  if (args.has('writer')) throw new Error('--writer assertions are not authoritative and are no longer accepted');
+  if (command === 'inspect' || command === 'readiness') {
+    const controller = await ProductionSafetyController.openReadOnly({ dataRoot });
+    const result = controller === null
+      ? command === 'inspect'
+        ? { status: 'NOT_INITIALIZED', fence: null }
+        : { status: 'BLOCKED', reasons: ['production safety state is not initialized'], fence: null }
+      : command === 'inspect' ? await controller.inspect() : await controller.readiness();
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  if (command === 'verify') {
+    const backup = args.get('backup');
+    if (backup === undefined) throw new Error('--backup is required for verify');
+    process.stdout.write(`${JSON.stringify(await verifyRuntimeBackup(backup), null, 2)}\n`);
+    return;
+  }
   const identity = await loadIdentity(dataRoot);
   const ownerAccessSecret = await readOwnerAccessSecret(dataRoot);
   if (ownerAccessSecret === null) throw new Error('Owner access credential is unavailable');
   const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret });
   const token = process.env[TOKEN_ENV];
-  const observations = parseObservations(args);
   let result: unknown;
-  if (command === 'inspect') result = await controller.inspect();
-  else if (command === 'readiness') result = await controller.readiness();
-  else if (command === 'verify') {
-    const backup = args.get('backup');
-    if (backup === undefined) throw new Error('--backup is required for verify');
-    result = await verifyRuntimeBackup(backup);
-  }
-  else {
+  {
     if (token === undefined || token.length === 0) throw new Error(`${TOKEN_ENV} is required`);
-    if (command === 'quiesce') result = await controller.quiesce(token, observations);
-    else if (command === 'recover') result = await controller.recover(token, observations);
+    if (command === 'quiesce') result = await controller.quiesce(token);
+    else if (command === 'recover') result = await controller.recover(token, {});
     else if (command === 'unfence') result = await controller.unfence(token);
     else if (command === 'backup') {
       const destination = args.get('destination');
@@ -61,20 +70,6 @@ function parseArgs(argv: readonly string[]): Map<string, string> {
     }
   }
   return result;
-}
-
-function parseObservations(args: Map<string, string>): Readonly<Record<string, WriterObservation>> {
-  const raw = args.get('writer');
-  if (raw === undefined) return {};
-  const observations: Record<string, WriterObservation> = {};
-  for (const item of raw.split(',')) {
-    const equal = item.indexOf('=');
-    if (equal < 1) throw new Error('--writer must be name=IDLE or name=UNKNOWN; separate writers with commas');
-    const state = item.slice(equal + 1) as WriterObservation['state'];
-    if (!['IDLE', 'ACTIVE', 'UNKNOWN'].includes(state)) throw new Error('--writer state is invalid');
-    observations[item.slice(0, equal)] = { state };
-  }
-  return observations;
 }
 
 async function loadIdentity(dataRoot: string): Promise<SafetyIdentity> {

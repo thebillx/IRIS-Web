@@ -62,6 +62,9 @@ jobs:
             pnpm --filter @iris/runtime exec vitest run src/unified-iris.test.ts src/connector-registry.test.ts src/server.test.ts src/permissions.test.ts src/mcp-catalog.test.ts
           fi
 
+      - name: Run production safety suite
+        run: pnpm --filter @iris/runtime exec vitest run src/production-safety.test.ts
+
       - name: Run affected lint and diff checks
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}

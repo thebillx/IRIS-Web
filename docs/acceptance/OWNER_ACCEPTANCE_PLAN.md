@@ -174,7 +174,7 @@ quiescence procedure.
 |---|---|---|---|---|
 | Before window | Owner names the Mac, candidate checkout/HEAD, maintenance period, backup destination, tunnel identity, live source/data roots, ports, LaunchAgent and active jobs/sessions | Any identity, backup, provider or active-work ambiguity | Leave live IRIS untouched; retain redacted inventory and ask the owner | Owner authorizes downtime and the exact candidate |
 | Reconfirm baseline | Read-only identity and process/port/LaunchAgent records match the recorded baseline | Source, runtime, machine, port or LaunchAgent identity differs unexpectedly | Stop before mutation; record the difference | Owner reviews the discrepancy |
-| Quiesce and fence | `pnpm --filter @iris/runtime safety quiesce --data-root "$IRIS_RUNTIME_DATA_ROOT" --writer supervisor=IDLE,external-runners=IDLE` returns `QUIESCED` after `inspect` shows the required writers idle | Any `BLOCKED`, unknown writer, unexplained `RUNNING` work, or active session | Keep the live stack running; use `recover` only after independently observing every writer idle | Owner supplies the token and approves the observation |
+| Quiesce and fence | `pnpm --filter @iris/runtime safety quiesce --data-root "$IRIS_RUNTIME_DATA_ROOT"` returns `QUIESCED` only when every inventoried writer has an instance-bound, independently verifiable idle record | Any `BLOCKED`, unknown writer, unexplained `RUNNING` work, or active session | Keep the live stack running; do not substitute CLI labels for writer evidence | Owner supplies the token and approves the controlled window |
 | Backup and verify | `safety backup ... --checkpoint-file "$IRIS_CHECKPOINT_FILE"` returns a manifest and `safety verify ...` passes; then run disposable `restore ... --checkpoint-file "$IRIS_RESTORE_CHECKPOINT_FILE" --disposable true` | No consistency guarantee, incomplete manifest, failed restore drill, missing checkpoint evidence, or secret exposure | Do not start the candidate; preserve live state | Owner approves the backup evidence |
 | Candidate preflight/start | Fresh wrapper preflight passes; all required ports are free; provider ownership and local process ownership are proven | Any occupied port, global LaunchAgent collision, stale tunnel, or wrapper block | Do not adopt or kill the owner; preserve the candidate root and diagnostics | Separate approval is required for real startup |
 | Validate | Owner UI selects the intended connector; one read-only `/mcp` identity/status call returns the expected machine/runtime/tunnel; wrong credential is rejected | Connector ambiguity, identity mismatch, mutation, or unknown result | Stop only the owned candidate through its supported lifecycle; inspect before retrying | Owner observes and records the result |
@@ -188,9 +188,9 @@ operation, mark it **BLOCKED** rather than substituting a guessed command.
 After the owner window, release the candidate fence only with the owner-local
 command `pnpm --filter @iris/runtime safety unfence --data-root
 "$IRIS_RUNTIME_DATA_ROOT"`. If a fence is `BLOCKED` or
-`RECOVERY_REQUIRED`, use `safety recover` with fresh `supervisor=IDLE` and
-`external-runners=IDLE` observations; never force the state or edit the safety
-file.
+`RECOVERY_REQUIRED`, use `safety recover` only after fresh, instance-bound
+writer evidence is available; never supply unverified CLI labels, force the
+state, or edit the safety file.
 
 ## LaunchAgent and two-machine isolation
 

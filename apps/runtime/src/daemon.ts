@@ -84,7 +84,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   };
   const authority = await acquireRuntimeAuthority(dataRoot, identity);
   const safety = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret });
-  for (const [writer, state] of [['runtime-state', 'IDLE'], ['mission-state', 'IDLE'], ['mission-broker', 'IDLE'], ['durable-jobs', 'IDLE'], ['supervisor', 'UNKNOWN'], ['external-runners', 'UNKNOWN']] as const) {
+  for (const [writer, state] of [
+    ['runtime-state', 'IDLE'], ['mission-state', 'IDLE'], ['mission-broker', 'IDLE'], ['durable-jobs', 'IDLE'],
+    ['mission-lifecycle', 'UNKNOWN'], ['multi-worker', 'UNKNOWN'], ['security-audit', 'UNKNOWN'],
+    ['resource-registry', 'UNKNOWN'], ['permission-store', 'UNKNOWN'], ['permission-audit', 'UNKNOWN'],
+    ['activation', 'UNKNOWN'], ['supervisor', 'UNKNOWN'], ['external-runners', 'UNKNOWN'],
+  ] as const) {
     await safety.registerWriter(writer, state);
   }
   let server: RuntimeServerHandle | undefined;

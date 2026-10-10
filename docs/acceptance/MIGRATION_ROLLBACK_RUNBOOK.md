@@ -16,8 +16,10 @@ The unified setup command is a fresh-install command. It refuses an existing reg
 4. Record project and workspace identifiers, connector labels, tunnel IDs, runtime identity, checkpoint location, and the list of IRIS-owned paths. Do not copy secret contents into the evidence.
 5. With the intended daemon observable, set the owner token only in `IRIS_OWNER_ACCESS_TOKEN` and inspect the persisted writer inventory:
    `pnpm --filter @iris/runtime safety inspect --data-root "$IRIS_RUNTIME_DATA_ROOT"`.
-6. Quiesce through the owner-local fence, explicitly reporting only independently observed external runners:
-   `pnpm --filter @iris/runtime safety quiesce --data-root "$IRIS_RUNTIME_DATA_ROOT" --writer supervisor=IDLE,external-runners=IDLE`.
+6. Quiesce through the owner-local fence:
+   `pnpm --filter @iris/runtime safety quiesce --data-root "$IRIS_RUNTIME_DATA_ROOT"`.
+   CLI writer labels are not accepted as evidence; unknown or detached writers
+   keep the result `BLOCKED`.
    A `BLOCKED` result is a hard stop. Do not substitute PID removal, recursive copying, or LaunchAgent removal.
 7. Set `IRIS_CHECKPOINT_FILE` to the owner-controlled canonical checkpoint file (outside the runtime data root), then create and verify a new private destination outside the data root:
    `pnpm --filter @iris/runtime safety backup --data-root "$IRIS_RUNTIME_DATA_ROOT" --destination "$IRIS_BACKUP_ROOT" --checkpoint-file "$IRIS_CHECKPOINT_FILE"`,
@@ -28,7 +30,8 @@ The unified setup command is a fresh-install command. It refuses an existing reg
    Readiness remains blocked until both backup and restore evidence are recorded.
 9. After the owner window, inspect `safety readiness`; release a verified fence
    with `safety unfence`, or recover a blocked fence only after fresh idle
-   observations using `safety recover --writer supervisor=IDLE,external-runners=IDLE`.
+   instance-bound observations using `safety recover`; do not pass writer labels
+   or edit the persisted safety document.
 
 ## Explicit migration
 
