@@ -45,7 +45,7 @@ export const PHASE8_V230_CATALOG_FIXTURE = {
     'mission_evidence',
     'catalog_identity',
   ],
-  legacyCompatibilityHash: '1770afee25ea16845137464de238c36c51465ada722ad7206cee38f14b5e0f54',
+  legacyCompatibilityHash: '5c1b9fe718251239b4677b39ac740b35f01bf5c4a65a728a5954427dca213433',
   proToolNames: ['list_projects', 'project_info', 'git_status', 'file_read', 'search'],
   proCompatibilityHash: 'ae0be3214fdf8b60275027394a7bd43d5b5121a69f31bebc3011b01789ce15e1',
 } as const;

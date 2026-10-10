@@ -93,6 +93,8 @@ describe('runtime machine, client, and session state', () => {
     await new VNextResourceRegistry(replacement, dataRoot).revokeScratch(project.id, workspace.workspaceId);
     await replacement.revalidateSessionBindings();
     expect(() => replacement.getSessionForClient(session.id, session.clientId)).toThrowError(expect.objectContaining({ code: 'AUTHORITY_CHANGED' }));
+    await expect(replacement.deleteSessionDurable(session.id, session.clientId)).resolves.toBeUndefined();
+    expect(() => replacement.getSessionForDetach(session.id, session.clientId)).toThrowError(expect.objectContaining({ code: 'SESSION_NOT_FOUND' }));
   });
 
   it('rolls back fenced session admission when publication fails so the same submission can retry', async () => {
@@ -141,6 +143,9 @@ describe('runtime machine, client, and session state', () => {
     const duplicate = await state.submitInstruction(session.id, session.clientId, 'completion-uncertain', 'complete once');
     expect(executions).toBe(1);
     expect(duplicate.executionState).toBe('UNCERTAIN');
+    await expect(state.submitInstruction(session.id, session.clientId, 'new-after-uncertain', 'do not replay'))
+      .rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    expect(state.getSessionForClient(session.id, session.clientId).executionState).toBe('UNCERTAIN');
   });
 
   it('supports concurrent agent roles on one daemon without sharing session identity', async () => {

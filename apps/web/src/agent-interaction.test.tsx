@@ -200,6 +200,27 @@ describe('agent interaction conversation execution', () => {
     expect(document.querySelector('[role="alert"]')?.textContent).toContain('Runtime unavailable');
     expect(document.querySelector('textarea[aria-label="Session instruction"]')).toBeNull();
   });
+
+  it('renders uncertain execution as non-ready and blocks new submission', async () => {
+    window.sessionStorage.setItem('iris.web.selectedSessionId', 'session-a');
+    const uncertain = { ...sessionSnapshot('session-a', projectA.id), executionState: 'UNCERTAIN' as const };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === '/sessions') return jsonResponse({ sessions: [uncertain] });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+
+    await mountApp();
+    await settleApp();
+    expect(document.body.textContent).toContain('Outcome uncertain');
+    expect(document.body.textContent).toContain('verify durable state before continuing');
+    expect((document.querySelector('textarea[aria-label="Session instruction"]') as HTMLTextAreaElement).disabled).toBe(true);
+    expect(buttonStartingWith('Send').disabled).toBe(true);
+  });
 });
 
 function sessionSnapshot(id: string, currentProjectId: string | null): Session {

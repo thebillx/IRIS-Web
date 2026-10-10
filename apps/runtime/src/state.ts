@@ -716,6 +716,15 @@ export class RuntimeState {
     return session;
   }
 
+  public getSessionForDetach(sessionId: string, clientIdInput: string): RuntimeSessionSnapshot {
+    const clientId = normalizeClientId(clientIdInput);
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) throw new RuntimeError('SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
+    if (session.clientId !== clientId) throw new RuntimeError('CONTROL_DENIED', 'Session does not belong to this client');
+    this.touchClient(clientId);
+    return session;
+  }
+
   public async revalidateSessionBindings(): Promise<void> {
     const projects = await this.listProjects();
     const resources = new VNextResourceRegistry(this, this.dataRoot);
@@ -841,7 +850,7 @@ export class RuntimeState {
 
   public deleteSessionDurable(sessionId: string, clientIdInput: string): Promise<void> {
     return this.serializeMachineMutation(async () => {
-      const session = this.getSessionForClient(sessionId, clientIdInput);
+      const session = this.getSessionForDetach(sessionId, clientIdInput);
       const binding = this.sessionBindings.get(sessionId);
       const submissions = this.submissionBindings.get(sessionId);
       const invalid = this.invalidSessionBindings.has(sessionId);
@@ -862,7 +871,7 @@ export class RuntimeState {
   }
 
   private deleteSessionInMemory(sessionId: string, clientIdInput: string): void {
-    const session = this.getSessionForClient(sessionId, clientIdInput);
+    const session = this.getSessionForDetach(sessionId, clientIdInput);
     if (this.activeSubmissions.has(sessionId)) {
       throw new RuntimeError('SESSION_BUSY', 'Cannot delete a session while its instruction is executing');
     }
@@ -988,6 +997,9 @@ export class RuntimeState {
         throw new RuntimeError('INVALID_REQUEST', 'submissionId is already bound to a different instruction');
       }
       return { duplicate: session as RuntimeSessionSnapshot };
+    }
+    if (session.executionState === 'UNCERTAIN') {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Session execution outcome is uncertain; verify durable state before submitting new work');
     }
     if (this.activeSubmissions.has(sessionId)) {
       throw new RuntimeError('SESSION_BUSY', 'This session is already executing an instruction');

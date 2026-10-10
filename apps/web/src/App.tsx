@@ -18,7 +18,7 @@ type Health = {
 };
 
 type Project = { id: string; name: string; rootPath: string };
-type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED';
+type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED' | 'UNCERTAIN';
 type SessionInteraction = {
   id: string;
   timestamp: string;
@@ -487,6 +487,8 @@ export function RuntimePage(props: {
     ? 'Disconnected'
     : props.pendingApprovalCount > 0
       ? 'Approval required'
+      : props.selectedSession?.executionState === 'UNCERTAIN'
+        ? 'Outcome uncertain'
       : props.selectedSession?.executionState === 'WORKING'
         ? 'Working'
         : props.selectedSession?.executionState === 'FAILED' ? 'Failed' : 'Ready';
@@ -551,10 +553,10 @@ export function RuntimePage(props: {
                   maxLength={8000}
                   rows={3}
                   placeholder={props.health === null ? 'Runtime unavailable' : 'Tell IRIS what to do…'}
-                  disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting}
+                  disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.selectedSession.executionState === 'UNCERTAIN' || props.isSubmitting}
                   onChange={(event) => props.setInstruction(event.target.value)}
                 />
-                <div className="composer-actions"><span>{props.selectedSession.executionState === 'WORKING' ? 'Runtime is working on this session.' : 'Enter sends only when you choose Send.'}</span><button type="submit" disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting || props.instruction.trim().length === 0}>{props.isSubmitting ? 'Sending…' : 'Send'}</button></div>
+                <div className="composer-actions"><span>{props.selectedSession.executionState === 'WORKING' ? 'Runtime is working on this session.' : props.selectedSession.executionState === 'UNCERTAIN' ? 'Execution outcome is uncertain; verify durable state before continuing.' : 'Enter sends only when you choose Send.'}</span><button type="submit" disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.selectedSession.executionState === 'UNCERTAIN' || props.isSubmitting || props.instruction.trim().length === 0}>{props.isSubmitting ? 'Sending…' : 'Send'}</button></div>
               </form>
               <details className="session-runtime-activity"><summary>Runtime activity</summary>{props.sessionActivity.length === 0 ? <p>No recorded runtime activity in this session yet.</p> : <ul>{props.sessionActivity.map((event) => <li key={event.id}><strong>{humanCapability(event.capabilityId)}</strong><span>{event.result.toLowerCase()}</span></li>)}</ul>}</details>
             </>}
