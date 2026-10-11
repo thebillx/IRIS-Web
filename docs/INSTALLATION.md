@@ -75,17 +75,26 @@ LaunchAgent install/uninstall. It never falls back to
 cleanup and credential-migration commands are allowlisted; nested root flags,
 unknown options, connector initialization or rebinding, credential rotation and
 other lifecycle mutations are rejected before child execution. Remote startup
-remains blocked while tunnel ownership is unverified; a separate owner-
-authorized implementation must first provide authoritative non-production
-tunnel evidence. An unreadable protected registry is an evidence failure, not
-an unclaimed tunnel.
+uses a two-phase ownership check. Before `up` or `restart`, the owner supplies
+a private `schemaVersion: 2`, `phase: "PREPARED"` authorization file binding
+the non-production tunnel ID, registry machine UUID, candidate source, managed
+profile and acceptance credential path. The wrapper does not require a provider
+PID at this stage: the Supervisor is the sole provider owner. After the child
+reports success, the wrapper verifies the persisted Supervisor PID, executable,
+process-start marker, profile/tunnel/runtime identity, isolated listeners,
+provider readiness and authenticated local `/mcp` discovery before returning
+success. Missing static evidence, stale state, unknown startup outcomes or
+mismatched process identity remain blocked; an external provider is never
+adopted. An unreadable protected registry is an evidence failure, not an
+unclaimed tunnel.
 
 Provider ownership evidence is a separate read-only step. For the exact
 non-production tunnel, an owner may run
 `tunnel-client admin tunnels get <tunnel-id> --json` with an approved runtime
 or admin key reference. Keep only redacted metadata. This lookup does not prove
 local process ownership and does not authorize `up`; the acceptance wrapper
-continues to block remote startup while ownership is `UNVERIFIED`.
+still requires the bound static authorization and post-start Supervisor
+verification.
 
 ## C. Existing installation migration
 

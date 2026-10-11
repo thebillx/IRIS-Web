@@ -134,49 +134,44 @@ be outside every protected production path. The wrapper never prints its
 contents. Setup is local and may create the registry, but it does not prove
 remote tunnel ownership.
 
-Starting or restarting a remote tunnel is blocked while ownership is
-`UNVERIFIED`. The supported positive path requires a private JSON evidence file
-whose `schemaVersion` is `1`, `environment` is `non-production`, and whose
-provider, machine, source checkout, tunnel ID, executable path, PID, process-start marker and binding
-profile are recorded. The wrapper checks the current-user process identity with
-`ps`, verifies that the live command exposes the evidenced tunnel binding, and
-matches the process-start marker from `ps -p <pid> -o lstart=` to prevent PID reuse,
-requires the acceptance root's `connector-registry.json` to contain the exact tunnel
-binding, and requires `IRIS_ACCEPTANCE_TUNNEL_EVIDENCE` to point to that file. Provider
-metadata alone is insufficient. Do not invent evidence, reuse production
-profiles, kill or adopt an occupied process, or add a `--force` switch.
-
-The owner procedure is to obtain the provider's read-only non-production
-record, start the separately provisioned local provider process, capture its
-PID, executable path and managed profile path, and write a mode-`0600` evidence
-file with this shape (all values are owner-supplied). The `machineId` must be
-the canonical UUID stored on the single `iris-full` workload connector in the
-acceptance registry; `binding.profilePath` must exactly identify that connector's
-canonical `managedProfilePath` (normally `<acceptance-root>/tunnel-profiles/iris-full.yaml`);
-a hostname, admin-only binding or unrelated process is rejected:
+Starting or restarting a remote tunnel first requires a **static** startup
+authorization. This removes the circular dependency in which the wrapper
+required a provider PID before the Supervisor was allowed to create its
+provider. The private JSON file uses `schemaVersion: 2`, `phase: "PREPARED"`,
+the non-production provider/tunnel, the exact candidate source, the canonical
+registry machine UUID, the acceptance control-plane credential path and the
+canonical managed profile binding. It contains no secret and no provider PID:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "phase": "PREPARED",
   "environment": "non-production",
-  "provider": "<documented-provider>",
+  "provider": "tunnel-client",
   "machineId": "<canonical-registry-machine-uuid>",
   "sourceRoot": "<candidate-checkout>",
   "tunnelId": "<non-production-tunnel-id>",
-  "pid": 12345,
-  "executablePath": "/absolute/path/to/provider",
-  "processStartMarker": "<exact ps lstart output>",
+  "credentialPath": "<acceptance-root>/credentials/control-plane-api-key",
   "binding": { "connectorId": "iris-full", "machineId": "<canonical-registry-machine-uuid>", "tunnelId": "<non-production-tunnel-id>", "profilePath": "/absolute/path/to/profile" }
 }
 ```
 
+Create this file only after the separately provisioned profile, credential and
+single unified `iris-full` registry binding exist. The wrapper checks private
+ownership, exact source/root/registry/profile/credential paths, the tunnel ID in
+the managed profile, protected tunnel claims and all configured ports. Provider
+metadata alone is insufficient. Do not invent evidence, reuse production
+profiles, kill or adopt an occupied process, or add a `--force` switch.
+
 Export `IRIS_ACCEPTANCE_TUNNEL_EVIDENCE` to that file before invoking
 `iris_acceptance up --tunnel-id <non-production-tunnel-id>` or
 `iris_acceptance restart --tunnel-id <non-production-tunnel-id>`. The wrapper independently
-checks file mode/owner, current-user PID, executable identity, the canonical managed
-profile path and the provider command's profile/tunnel binding, and requires the exact
-single unified `iris-full` connector binding plus its canonical machine UUID. Any missing, stale or contradictory field
-remains **BLOCKED**.
+allows the Supervisor to spawn the provider as the sole owner. After the child
+returns success, it verifies the persisted Supervisor record, PID, executable,
+process-start marker, profile/tunnel/runtime identity, actual isolated listeners,
+provider readiness and an authenticated local `/mcp` discovery call. Any missing,
+stale or contradictory field remains **BLOCKED** or **UNKNOWN_OUTCOME**; inspect
+Supervisor state before retrying. No external provider process may be adopted.
 Use `iris_acceptance down` only for the acceptance root whose identity was
 verified by the wrapper.
 
@@ -223,10 +218,11 @@ quiescence procedure.
 | Validate | Owner UI selects the intended connector; one read-only `/mcp` identity/status call returns the expected machine/runtime/tunnel; wrong credential is rejected | Connector ambiguity, identity mismatch, mutation, or unknown result | Stop only the owned candidate through its supported lifecycle; inspect before retrying | Owner observes and records the result |
 | Restore live IRIS | Original source/data/LaunchAgent identities, catalog and durable state are verified after supported restart | Any failed or ambiguous restoration | Stop; do not replay mutations or restore state blindly | Owner confirms the maintenance window is closed |
 
-The current wrapper intentionally blocks real remote startup while tunnel
-ownership is `UNVERIFIED`; no bypass is permitted. Source rollback and data
-restoration remain separate operations. If any step lacks the stated supported
-operation, mark it **BLOCKED** rather than substituting a guessed command.
+The wrapper intentionally blocks real remote startup while static tunnel
+authorization is missing or post-start ownership cannot be verified; no bypass
+is permitted. Source rollback and data restoration remain separate operations.
+If any step lacks the stated supported operation, mark it **BLOCKED** rather
+than substituting a guessed command.
 
 After the owner window, release the candidate fence only with the owner-local
 command `pnpm --filter @iris/runtime safety unfence --data-root
