@@ -996,9 +996,12 @@ export class Supervisor {
 
   private async authorizeUnifiedGatewayRequest(headers: SupervisorNativeRequestHeaders): Promise<void> {
     const registry = await readConnectorRegistry(this.dataRoot);
-    if (registry === null || registry.connectors.length !== 1) {
+    if (registry === null) {
       throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Unified Supervisor gateway binding is unavailable');
     }
+    // Dedicated FULL/PRO deployments keep their existing native control contract.
+    if (registry.connectors.length !== 1) return;
+    if (headers['x-iris-connector-profile'] === 'ADMIN' && registry.admin !== null) return;
     const binding = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
     if (binding === undefined || binding.mode !== 'FULL') {
       throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Unified Supervisor gateway binding is unavailable');
