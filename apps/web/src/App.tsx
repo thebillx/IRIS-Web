@@ -28,8 +28,11 @@ type SupervisorStatus = {
   machineId?: string;
   tunnel?: { state?: string; code?: string; detail?: string };
 };
-type DurableJob = { jobId: string; requestId: string; projectId: string; workspaceId: string; state: string; startedAt: string; finishedAt: string | null; cancelRequested?: boolean };
-type JobLog = { text: string; cursor: string; eof: boolean };
+type DurableJob = { jobId: string; requestId: string; projectId: string; workspaceId: string; state: string; startedAt: string; finishedAt: string | null; exitCode?: number | null; signal?: string | null; cancelRequested?: boolean };
+type JobLog = { stream: 'stdout' | 'stderr'; text: string; cursor: string; eof: boolean; bytes: number };
+type JobResult = { jobId: string; state: string; exitCode: number | null; signal: string | null; startedAt: string; finishedAt: string | null; logArtifactIds: string[]; artifactIds: string[] };
+type JobLogs = Record<string, Partial<Record<'stdout' | 'stderr', JobLog>>>;
+type JobViewState = 'IDLE' | 'LOADING' | 'READY' | 'EMPTY' | 'ERROR' | 'UNAVAILABLE';
 
 type Project = { id: string; name: string; rootPath: string };
 type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED' | 'UNCERTAIN';
@@ -166,7 +169,13 @@ export function App(): ReactElement {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [jobs, setJobs] = useState<DurableJob[]>([]);
-  const [jobLogs, setJobLogs] = useState<Record<string, JobLog>>({});
+  const [jobLogs, setJobLogs] = useState<JobLogs>({});
+  const [jobResults, setJobResults] = useState<Record<string, JobResult>>({});
+  const [jobViewState, setJobViewState] = useState<JobViewState>('IDLE');
+  const [jobError, setJobError] = useState('');
+  const jobGeneration = useRef(0);
+  const jobAbort = useRef<AbortController | null>(null);
+  const jobContext = useRef<{ sessionId: string; clientId: string; projectId: string } | null>(null);
 
   const refreshSupervisor = useCallback(async () => {
     if (ownerAccessToken.length === 0) { setSupervisorStatus(null); return; }
@@ -235,30 +244,91 @@ export function App(): ReactElement {
   }, [refresh]);
 
   const selectedSession = sessions.find((candidate) => candidate.id === selectedSessionId) ?? null;
+  const jobSessionId = selectedSession?.id ?? null;
+  const jobClientId = selectedSession?.clientId ?? null;
+  const jobProjectId = selectedSession?.currentProjectId ?? null;
+  jobContext.current = jobSessionId !== null && jobClientId !== null && jobProjectId !== null
+    ? { sessionId: jobSessionId, clientId: jobClientId, projectId: jobProjectId }
+    : null;
   const refreshJobs = useCallback(async () => {
-    const projectId = selectedSession?.currentProjectId;
-    if (ownerAccessToken.length === 0 || selectedSession === null || projectId === null || projectId === undefined) { setJobs([]); return; }
-    const response = await authorizedFetch(ownerAccessToken, `/jobs?projectId=${encodeURIComponent(projectId)}`, { headers: { 'x-iris-client-id': selectedSession.clientId, 'x-iris-session-id': selectedSession.id } });
-    if (!response.ok) throw new Error('Durable job status is unavailable');
-    setJobs((await response.json() as { jobs: DurableJob[] }).jobs);
-  }, [ownerAccessToken, selectedSession]);
+    const context = jobSessionId !== null && jobClientId !== null && jobProjectId !== null
+      ? { sessionId: jobSessionId, clientId: jobClientId, projectId: jobProjectId }
+      : null;
+    const generation = jobGeneration.current + 1;
+    jobGeneration.current = generation;
+    jobAbort.current?.abort();
+    if (context === null || ownerAccessToken.length === 0) {
+      setJobs([]); setJobLogs({}); setJobResults({}); setJobError(''); setJobViewState('IDLE');
+      return;
+    }
+    const controller = new AbortController();
+    jobAbort.current = controller;
+    setJobViewState('LOADING');
+    setJobError('');
+    try {
+      const response = await authorizedFetch(ownerAccessToken, `/jobs?projectId=${encodeURIComponent(context.projectId)}`, {
+        signal: controller.signal,
+        headers: { 'x-iris-client-id': context.clientId, 'x-iris-session-id': context.sessionId },
+      });
+      const body = response.ok ? await response.json() as { jobs?: DurableJob[] } : null;
+      if (generation !== jobGeneration.current || controller.signal.aborted) return;
+      if (!response.ok || !Array.isArray(body?.jobs)) {
+        setJobs([]); setJobLogs({}); setJobResults({});
+        setJobViewState(response.status === 401 || response.status === 403 ? 'UNAVAILABLE' : 'ERROR');
+        setJobError(response.ok ? 'Runtime returned an invalid durable job response' : `Durable jobs unavailable (${response.status})`);
+        return;
+      }
+      const scopedJobs = body.jobs.filter((job) => job.projectId === context.projectId);
+      setJobs(scopedJobs); setJobLogs({}); setJobResults({}); setJobError('');
+      setJobViewState(scopedJobs.length === 0 ? 'EMPTY' : 'READY');
+    } catch (cause) {
+      if (controller.signal.aborted || generation !== jobGeneration.current) return;
+      setJobs([]); setJobLogs({}); setJobResults({});
+      setJobViewState('ERROR');
+      setJobError(cause instanceof Error ? cause.message : 'Durable job status is unavailable');
+    }
+  }, [jobClientId, jobProjectId, jobSessionId, ownerAccessToken]);
 
-  useEffect(() => { void refreshJobs().catch(() => setJobs([])); }, [refreshJobs]);
+  useEffect(() => {
+    void refreshJobs();
+    const timer = window.setInterval(() => void refreshJobs(), 3_000);
+    return () => { window.clearInterval(timer); jobAbort.current?.abort(); };
+  }, [refreshJobs]);
 
   const cancelJob = useCallback(async (job: DurableJob) => {
-    if (selectedSession === null) return;
-    const response = await authorizedFetch(ownerAccessToken, `/jobs/${encodeURIComponent(job.jobId)}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-iris-client-id': selectedSession.clientId, 'x-iris-session-id': selectedSession.id }, body: JSON.stringify({ projectId: job.projectId }) });
+    const context = jobContext.current;
+    if (context === null || context.projectId !== job.projectId) return;
+    const response = await authorizedFetch(ownerAccessToken, `/jobs/${encodeURIComponent(job.jobId)}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-iris-client-id': context.clientId, 'x-iris-session-id': context.sessionId }, body: JSON.stringify({ projectId: job.projectId }) });
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
     if (!response.ok) throw new Error(await responseMessage(response, 'Job cancellation was not verified'));
     await refreshJobs();
-  }, [ownerAccessToken, refreshJobs, selectedSession]);
+  }, [ownerAccessToken, refreshJobs]);
 
-  const readJobLogs = useCallback(async (job: DurableJob) => {
-    if (selectedSession === null) return;
-    const response = await authorizedFetch(ownerAccessToken, `/jobs/${encodeURIComponent(job.jobId)}/logs?projectId=${encodeURIComponent(job.projectId)}&stream=stdout`, { headers: { 'x-iris-client-id': selectedSession.clientId, 'x-iris-session-id': selectedSession.id } });
+  const readJobLogs = useCallback(async (job: DurableJob, stream: 'stdout' | 'stderr', cursor?: string) => {
+    const context = jobContext.current;
+    if (context === null || context.projectId !== job.projectId) return;
+    const query = `/jobs/${encodeURIComponent(job.jobId)}/logs?projectId=${encodeURIComponent(job.projectId)}&stream=${stream}${cursor === undefined ? '' : `&cursor=${encodeURIComponent(cursor)}`}`;
+    const response = await authorizedFetch(ownerAccessToken, query, { headers: { 'x-iris-client-id': context.clientId, 'x-iris-session-id': context.sessionId } });
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
     if (!response.ok) throw new Error(await responseMessage(response, 'Job output is unavailable'));
     const log = await response.json() as JobLog;
-    setJobLogs((current) => ({ ...current, [job.jobId]: log }));
-  }, [ownerAccessToken, selectedSession]);
+    setJobLogs((current) => {
+      const previous = current[job.jobId]?.[stream];
+      const append = cursor !== undefined && previous?.cursor === cursor;
+      return { ...current, [job.jobId]: { ...current[job.jobId], [stream]: { ...log, text: append ? `${previous.text}${log.text}` : log.text } } };
+    });
+  }, [ownerAccessToken]);
+
+  const readJobResult = useCallback(async (job: DurableJob) => {
+    const context = jobContext.current;
+    if (context === null || context.projectId !== job.projectId) return;
+    const response = await authorizedFetch(ownerAccessToken, `/jobs/${encodeURIComponent(job.jobId)}?projectId=${encodeURIComponent(job.projectId)}&view=result`, { headers: { 'x-iris-client-id': context.clientId, 'x-iris-session-id': context.sessionId } });
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
+    if (!response.ok) throw new Error(await responseMessage(response, 'Job result is unavailable'));
+    const result = await response.json() as JobResult;
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
+    setJobResults((current) => ({ ...current, [job.jobId]: result }));
+  }, [ownerAccessToken]);
   const visibleApprovals = (permissions?.pendingApprovals ?? []).filter((approval) =>
     approvalBelongsToSessionContext(approval, clientId, selectedSessionId),
   );
@@ -537,8 +607,12 @@ export function App(): ReactElement {
         onSupervisorOperation={(operation) => run(() => supervisorOperation(operation))}
         jobs={jobs}
         jobLogs={jobLogs}
+        jobResults={jobResults}
+        jobViewState={jobViewState}
+        jobError={jobError}
         onCancelJob={(job) => run(() => cancelJob(job))}
-        onReadJobLogs={(job) => run(() => readJobLogs(job))}
+        onReadJobLogs={(job, stream, cursor) => run(() => readJobLogs(job, stream, cursor))}
+        onReadJobResult={(job) => run(() => readJobResult(job))}
         onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
         onRequestMissionLifecycleAction={(mission, action) => run(() => requestMissionLifecycleAction(mission, action))}
       />}
@@ -580,9 +654,13 @@ export function RuntimePage(props: {
   onSelectProject(projectId: string): void;
   onSupervisorOperation?(operation: 'workload_on' | 'workload_off' | 'workload_restart' | 'supervisor_doctor'): void;
   jobs?: DurableJob[];
-  jobLogs?: Record<string, JobLog>;
+  jobLogs?: JobLogs;
+  jobResults?: Record<string, JobResult>;
+  jobViewState?: JobViewState;
+  jobError?: string;
   onCancelJob?(job: DurableJob): void;
-  onReadJobLogs?(job: DurableJob): void;
+  onReadJobLogs?(job: DurableJob, stream: 'stdout' | 'stderr', cursor?: string): void;
+  onReadJobResult?(job: DurableJob): void;
   onRequestMissionOrchestrator(mission: Mission, targetMode: OrchestratorMode): void;
   onRequestMissionLifecycleAction?(mission: Mission, action: MissionLifecycleAction): void;
 }): ReactElement {
@@ -693,9 +771,25 @@ export function RuntimePage(props: {
 
         <section className="jobs-card" aria-labelledby="jobs-heading">
           <div className="section-title-row"><div><p className="section-label">Durable jobs</p><h2 id="jobs-heading">Authoritative job status</h2></div><span>{props.jobs?.length ?? 0}</span></div>
-          {(props.jobs ?? []).length === 0
-            ? <p className="muted">No durable jobs reported for this project.</p>
-            : <ul className="project-list">{(props.jobs ?? []).map((job) => <li key={job.jobId}><div><strong>{job.state}{job.cancelRequested ? ' · CANCEL_PENDING' : ''}</strong><code>{job.jobId} · project {job.projectId} · workspace {job.workspaceId}</code>{props.jobLogs?.[job.jobId] ? <pre>{props.jobLogs[job.jobId]!.text}</pre> : null}</div><div><button onClick={() => props.onReadJobLogs?.(job)}>Output</button><button disabled={job.state !== 'RUNNING' && job.state !== 'QUEUED'} onClick={() => props.onCancelJob?.(job)}>Cancel job</button></div></li>)}</ul>}
+          {props.jobViewState === 'LOADING' ? <p className="muted" role="status">Loading durable jobs…</p>
+            : props.jobViewState === 'ERROR' ? <p className="error" role="alert">Job status error: {props.jobError || 'Durable job status is unavailable'}</p>
+              : props.jobViewState === 'UNAVAILABLE' ? <p className="muted" role="status">Durable jobs unavailable: {props.jobError || 'Owner access was not verified'}</p>
+                : props.jobViewState === 'IDLE' ? <p className="muted">Select a project session to view durable jobs.</p>
+                  : props.jobViewState === 'EMPTY' || (props.jobViewState === undefined && (props.jobs ?? []).length === 0) ? <p className="muted">No durable jobs reported for this project.</p>
+                    : <ul className="project-list">{(props.jobs ?? []).map((job) => {
+                      const result = props.jobResults?.[job.jobId];
+                      const logs = props.jobLogs?.[job.jobId] ?? {};
+                      const stdout = logs.stdout;
+                      const stderr = logs.stderr;
+                      const terminal = !['RUNNING', 'QUEUED'].includes(job.state);
+                      const stateLabel = job.state === 'LOST' || job.state === 'INTERRUPTED' || job.state === 'UNCERTAIN' ? `${job.state} · VERIFY OUTCOME` : job.state;
+                      return <li key={job.jobId}><div><strong>{stateLabel}{job.cancelRequested ? ' · CANCEL_PENDING' : ''}</strong><code>{job.jobId} · project {job.projectId} · workspace {job.workspaceId}</code>
+                        {job.finishedAt ? <small>Finished {job.finishedAt}{job.exitCode === null || job.exitCode === undefined ? '' : ` · exit ${job.exitCode}`}{job.signal ? ` · signal ${job.signal}` : ''}</small> : null}
+                        {result ? <small>Result verified: {result.state}{result.finishedAt ? ` · ${result.finishedAt}` : ''}</small> : null}
+                        {stdout ? <><strong>stdout</strong><pre>{stdout.text || '(empty)'}</pre>{stdout.eof ? null : <button onClick={() => props.onReadJobLogs?.(job, 'stdout', stdout.cursor)}>More stdout</button>}</> : null}
+                        {stderr ? <><strong>stderr</strong><pre>{stderr.text || '(empty)'}</pre>{stderr.eof ? null : <button onClick={() => props.onReadJobLogs?.(job, 'stderr', stderr.cursor)}>More stderr</button>}</> : null}
+                      </div><div><button onClick={() => props.onReadJobLogs?.(job, 'stdout')}>stdout</button><button onClick={() => props.onReadJobLogs?.(job, 'stderr')}>stderr</button>{terminal ? <button onClick={() => props.onReadJobResult?.(job)}>Result</button> : null}<button disabled={job.state !== 'RUNNING' && job.state !== 'QUEUED'} onClick={() => props.onCancelJob?.(job)}>Cancel job</button></div></li>;
+                    })}</ul>}
         </section>
 
         {props.health && <details className="runtime-details"><summary>Runtime details</summary><dl>

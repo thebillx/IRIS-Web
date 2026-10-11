@@ -847,7 +847,7 @@ async function readLogTail(filename: string, maxBytes: number): Promise<{ readon
   }
 }
 
-function statusView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, requestId: job.requestId, projectId: job.projectId, workspaceId: job.workspaceId, state: job.state, startedAt: job.startedAt, finishedAt: job.finishedAt, pid: job.pid, processStartMarker: job.processStartMarker, processGroupId: job.processGroupId, runnerIdentity: job.runnerIdentity, effectiveEffects: job.effectiveEffects }; }
+function statusView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, requestId: job.requestId, projectId: job.projectId, workspaceId: job.workspaceId, state: job.state, startedAt: job.startedAt, finishedAt: job.finishedAt, exitCode: job.exitCode, signal: job.signal, pid: job.pid, processStartMarker: job.processStartMarker, processGroupId: job.processGroupId, runnerIdentity: job.runnerIdentity, effectiveEffects: job.effectiveEffects }; }
 function resultView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, state: job.state, exitCode: job.exitCode, signal: job.signal, startedAt: job.startedAt, finishedAt: job.finishedAt, logArtifactIds: job.logArtifactIds, artifactIds: job.artifactIds }; }
 function isTerminal(state: DurableJobState): boolean { return state === 'SUCCEEDED' || state === 'FAILED' || state === 'CANCELLED' || state === 'LOST' || state === 'INTERRUPTED'; }
 function persistedIdentityMatchesClaim(job: DurableJobRecord, claim: RunnerClaim): boolean {

@@ -81,9 +81,12 @@ function renderWorkspace(selectedSession: Session | null, sessions: Session[] = 
     onSelectProject: () => undefined,
     onRequestMissionOrchestrator: () => undefined,
     jobs,
-    jobLogs: { 'job-1': { text: 'hello from job\n', cursor: 'stdout:5', eof: true } },
+    jobViewState: jobs.length === 0 ? 'EMPTY' : 'READY',
+    jobLogs: { 'job-1': { stdout: { stream: 'stdout', text: 'hello from job\n', cursor: 'stdout:5', eof: true, bytes: 15 } } },
+    jobResults: {},
     onCancelJob: () => undefined,
     onReadJobLogs: () => undefined,
+    onReadJobResult: () => undefined,
   }));
 }
 
@@ -122,6 +125,86 @@ describe('daily workspace session experience', () => {
     expect(markup).toContain('workspace-a');
     expect(markup).toContain('hello from job');
     expect(markup).toContain('Cancel job');
+  });
+
+  it('keeps job-list responses bound to the selected session and project', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    let resolveProjectA: ((response: Response) => void) | undefined;
+    const projectAResponse = new Promise<Response>((resolve) => { resolveProjectA = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA, projectB], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA, sessionB] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/jobs?projectId=${projectA.id}`) return projectAResponse;
+      if (url === `/jobs?projectId=${projectB.id}`) return jsonResponse({ jobs: [{ jobId: 'job-b', requestId: 'request-b', projectId: projectB.id, workspaceId: 'workspace-b', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null }] });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    await clickButtonStartingWith('Session 2');
+    await settleApp();
+    expect(document.body.textContent).toContain('job-b');
+    resolveProjectA?.(jsonResponse({ jobs: [{ jobId: 'job-a', requestId: 'request-a', projectId: projectA.id, workspaceId: 'workspace-a', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null }] }));
+    await settleApp();
+    expect(document.body.textContent).toContain('job-b');
+    expect(document.body.textContent).not.toContain('job-a');
+  });
+
+  it('reports failed job refreshes as errors instead of an empty project', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/jobs?projectId=${projectA.id}`) return new Response(null, { status: 503 });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    expect(document.body.textContent).toContain('Job status error: Durable jobs unavailable (503)');
+    expect(document.body.textContent).not.toContain('No durable jobs reported for this project.');
+  });
+
+  it('reads authoritative stdout, stderr and terminal result for the captured job', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    const job = { jobId: 'job-1', requestId: 'request-1', projectId: projectA.id, workspaceId: 'workspace-a', state: 'SUCCEEDED', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: '2026-09-05T06:01:00.000Z', exitCode: 0, signal: null };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/jobs?projectId=${projectA.id}`) return jsonResponse({ jobs: [job] });
+      if (url === `/jobs/${job.jobId}/logs?projectId=${projectA.id}&stream=stdout`) return jsonResponse({ jobId: job.jobId, state: job.state, stream: 'stdout', text: 'stdout line', cursor: 'stdout:11', eof: true, bytes: 11 });
+      if (url === `/jobs/${job.jobId}/logs?projectId=${projectA.id}&stream=stderr`) return jsonResponse({ jobId: job.jobId, state: job.state, stream: 'stderr', text: 'stderr line', cursor: 'stderr:11', eof: true, bytes: 11 });
+      if (url === `/jobs/${job.jobId}?projectId=${projectA.id}&view=result`) return jsonResponse({ jobId: job.jobId, state: job.state, exitCode: 0, signal: null, startedAt: job.startedAt, finishedAt: job.finishedAt, logArtifactIds: [], artifactIds: [] });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    expect(document.body.textContent).toContain('exit 0');
+    await clickButton('stdout');
+    await settleApp();
+    expect(document.body.textContent).toContain('stdout line');
+    await clickButton('stderr');
+    await settleApp();
+    expect(document.body.textContent).toContain('stderr line');
+    await clickButton('Result');
+    await settleApp();
+    expect(document.body.textContent).toContain('Result verified: SUCCEEDED');
   });
 
   it('restores a selected session across refresh only while that authoritative session still exists', () => {
