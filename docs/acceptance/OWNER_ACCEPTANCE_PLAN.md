@@ -64,7 +64,7 @@ it does, stop rather than remove or overwrite it.
 ```sh
 export IRIS_ACCEPTANCE_ROOT="$HOME/Library/Application Support/IRIS-acceptance-<unique>"
 export IRIS_ACCEPTANCE_EXPECTED_BRANCH="codex/one-iris-completion"
-export IRIS_ACCEPTANCE_EXPECTED_HEAD="23c15c14a7751e6435123eefe91806987ae6f151"
+export IRIS_ACCEPTANCE_EXPECTED_HEAD="cac2f7d9531f7ce27574eff75cba86ceb973e5f5"
 export IRIS_LIVE_DATA_ROOT="$HOME/Library/Application Support/IRIS"
 export IRIS_LIVE_SOURCE_ROOT="/Users/RARW/iris"
 export IRIS_ACCEPTANCE_PORTS='runtime=46110,supervisorAdmin=46111,supervisorControl=46112,supervisorTunnelHealth=46113,fullTunnelHealth=46114,proTunnelHealth=46115,web=46116'
