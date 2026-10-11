@@ -416,6 +416,7 @@ describe('acceptance isolation preflight', () => {
       managedProfilePath: path.join(fixture.root, 'tunnel-profiles', 'iris-admin.yaml'), machineId: '11111111-1111-4111-8111-111111111111', leaseGeneration: 1,
     };
     await writeFile(registryFile, JSON.stringify(registry));
+    await writeFile(fixture.profilePath, (await readFile(fixture.profilePath, 'utf8')).replace(`127.0.0.1:${TEST_PORTS.supervisorControl}/mcp`, `127.0.0.1:${TEST_PORTS.runtime}/mcp`));
     const stateFile = path.join(fixture.root, 'supervisor', 'state.json');
     const state = JSON.parse(await readFile(stateFile, 'utf8').catch(() => '{}'));
     state.schemaVersion = 3; state.supervisorId = 'fixture-supervisor'; state.updatedAt = new Date().toISOString(); state.workloadSourceRoot = sourceRoot; state.workloadDesiredState = 'ON'; state.stackDesiredState = 'UP';
