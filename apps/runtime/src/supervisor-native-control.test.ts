@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { RuntimeError } from '@iris/domain';
 import { catalogToolNames } from './mcp-catalog.js';
 import { loadOrCreateTunnelServiceSecret } from './credentials.js';
 import { MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
@@ -29,6 +30,47 @@ describe('outer supervisor native control', () => {
       harness.runtimeAvailable = false;
       expect(await rpcTool(harness, 'runtime_status', {})).toMatchObject({ result: { isError: true, structuredContent: { code: 'RUNTIME_NOT_RUNNING' } } });
       expect(structured(await rpcTool(harness, 'workload_off', {}))).toMatchObject({ workloadState: 'OFF' });
+    } finally {
+      await harness.server.close();
+    }
+  });
+
+  it('rejects stale unified gateway identity before dispatching a tool', async () => {
+    const harness = await startHarness(true, true);
+    try {
+      const stale = await postRpc(harness, {
+        jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'supervisor_status', arguments: {} },
+      }, {
+        'Mcp-Name': 'supervisor_status',
+        'x-iris-connector-profile': 'FULL',
+        'x-iris-deployment-epoch': '1',
+        'x-iris-runtime-id': 'stale-runtime',
+      });
+      expect(stale.status).toBe(409);
+      await expect(stale.json()).resolves.toMatchObject({ error: { code: 'CONNECTOR_MANIFEST_STALE' } });
+
+      const staleRuntime = await postRpc(harness, {
+        jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'supervisor_status', arguments: {} },
+      }, {
+        'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
+        'Mcp-Name': 'supervisor_status',
+        'x-iris-connector-profile': 'FULL',
+        'x-iris-deployment-epoch': '2',
+        'x-iris-runtime-id': 'stale-runtime',
+      });
+      expect(staleRuntime.status).toBe(409);
+      await expect(staleRuntime.json()).resolves.toMatchObject({ error: { code: 'RUNTIME_IDENTITY_MISMATCH' } });
+
+      const valid = await postRpc(harness, {
+        jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'supervisor_status', arguments: {} },
+      }, {
+        'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
+        'Mcp-Name': 'supervisor_status',
+        'x-iris-connector-profile': 'FULL',
+        'x-iris-deployment-epoch': '2',
+        'x-iris-runtime-id': 'runtime-a',
+      });
+      expect(valid.status).toBe(200);
     } finally {
       await harness.server.close();
     }
@@ -193,7 +235,7 @@ describe('outer supervisor native control', () => {
   });
 });
 
-async function startHarness(unified = false) {
+async function startHarness(unified = false, identityGuard = false) {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-native-supervisor-control-'));
   roots.push(dataRoot);
   const secret = await loadOrCreateTunnelServiceSecret(dataRoot);
@@ -219,6 +261,13 @@ async function startHarness(unified = false) {
         ? { content: [{ type: 'text', text: JSON.stringify({ status: 'ready', name }) }], structuredContent: { status: 'ready', name }, isError: false }
         : { content: [{ type: 'text', text: JSON.stringify({ code: 'RUNTIME_NOT_RUNNING', message: 'Runtime tools are unavailable while workload is OFF' }) }], structuredContent: { code: 'RUNTIME_NOT_RUNNING' }, isError: true },
       sourceIdentity: async () => ({ state: 'VERIFIED', commitSha: 'a'.repeat(40) }),
+      ...(identityGuard ? {
+        authorizeMcpRequest: async (headers: Readonly<Record<string, string | string[] | undefined>>) => {
+          if (headers['x-iris-connector-profile'] !== 'FULL') throw new Error('profile mismatch');
+          if (headers['x-iris-deployment-epoch'] !== '2') throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'stale epoch');
+          if (headers['x-iris-runtime-id'] !== harness.workloadRuntimeId) throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'stale runtime');
+        },
+      } : {}),
     } : {}),
   };
   const server = await startSupervisorNativeControlServer(dataRoot, await freePort(), operations);

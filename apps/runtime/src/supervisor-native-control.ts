@@ -49,7 +49,11 @@ export interface SupervisorNativeOperations {
   runtimeToolDefinitions?: readonly Record<string, unknown>[];
   runtimeToolCall?: (name: string, args: Record<string, unknown>) => Promise<SupervisorNativeToolCallResult>;
   sourceIdentity?: () => Promise<unknown>;
+  /** Validate the connector identity before dispatching any authenticated MCP request. */
+  authorizeMcpRequest?: (headers: SupervisorNativeRequestHeaders) => Promise<void>;
 }
+
+export type SupervisorNativeRequestHeaders = Readonly<Record<string, string | string[] | undefined>>;
 
 export interface SupervisorNativeToolCallResult {
   readonly content: readonly Record<string, unknown>[];
@@ -109,6 +113,20 @@ async function handleRequest(
   if (request.method !== 'POST' || request.url !== '/mcp') {
     writeJson(response, 404, { error: 'not_found' });
     return;
+  }
+  if (operations.authorizeMcpRequest !== undefined) {
+    try {
+      await operations.authorizeMcpRequest(request.headers);
+    } catch (error: unknown) {
+      const runtimeError = error instanceof RuntimeError
+        ? error
+        : new RuntimeError('CONTROL_DENIED', 'Supervisor MCP request identity could not be verified', { cause: error });
+      const status = runtimeError.code === 'CONTROL_DENIED' ? 403
+        : runtimeError.code === 'CONNECTOR_BINDING_MISMATCH' || runtimeError.code === 'CONNECTOR_MANIFEST_STALE' || runtimeError.code === 'RUNTIME_IDENTITY_MISMATCH' ? 409
+          : 500;
+      writeJson(response, status, { error: { code: runtimeError.code, message: runtimeError.message } });
+      return;
+    }
   }
   const rpc = await readJsonRpc(request);
   if (rpc === null) {

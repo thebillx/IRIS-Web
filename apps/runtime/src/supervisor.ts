@@ -20,7 +20,7 @@ import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
-import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput } from './supervisor-native-control.js';
+import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput, type SupervisorNativeRequestHeaders } from './supervisor-native-control.js';
 import type { SupervisorNativeToolCallResult } from './supervisor-native-control.js';
 import { readRuntimeSourceIdentity } from './source-identity.js';
 import { parseIrisPortSet, type IrisPortSet, validateIrisPortSet } from './port-config.js';
@@ -834,6 +834,7 @@ export class Supervisor {
       runtimeToolDefinitions: fullMcpToolDefinitionsV21(),
       runtimeToolCall: (name, args) => this.runtimeToolCall(name, args),
       sourceIdentity: () => this.supervisorSourceIdentity(),
+      authorizeMcpRequest: (headers) => this.authorizeUnifiedGatewayRequest(headers),
     });
     this.nativeControlActive = true;
     let stopping = false;
@@ -991,6 +992,27 @@ export class Supervisor {
         deploymentEpoch: binding.deploymentEpoch,
       },
     };
+  }
+
+  private async authorizeUnifiedGatewayRequest(headers: SupervisorNativeRequestHeaders): Promise<void> {
+    const registry = await readConnectorRegistry(this.dataRoot);
+    if (registry === null || registry.connectors.length !== 1) {
+      throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Unified Supervisor gateway binding is unavailable');
+    }
+    const binding = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
+    if (binding === undefined || binding.mode !== 'FULL') {
+      throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Unified Supervisor gateway binding is unavailable');
+    }
+    if (headers['x-iris-connector-profile'] !== 'FULL') {
+      throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Tunnel connector profile does not match the unified Supervisor gateway');
+    }
+    const epoch = headers['x-iris-deployment-epoch'];
+    if (typeof epoch !== 'string' || Number(epoch) !== registry.deploymentEpoch) {
+      throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'Tunnel connector deployment epoch is stale or missing');
+    }
+    if (binding.runtimeId === null || headers['x-iris-runtime-id'] !== binding.runtimeId) {
+      throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Tunnel connector runtime identity is stale or missing');
+    }
   }
 
   private async runtimeToolCall(name: string, args: Record<string, unknown>): Promise<SupervisorNativeToolCallResult> {
