@@ -48,7 +48,7 @@ means the supported operation cannot safely proceed under current authority.
 | A08 functional UI | DISPOSABLE_ONLY | Web 34 tests/build pass; owner-authenticated Supervisor status/doctor/workload controls, truthful bridge/tunnel/affected-job reporting, OFF-state gateway visibility, session detach and durable job list/status/log/cancel controls are exposed through the local bridge, while keep-awake and intended-host interaction remain unverified |
 | A09 clean setup/reinstall | DISPOSABLE_ONLY | Disposable setup wrapper passes; clean-machine reinstall is unverified |
 | A10 login persistence | UNVERIFIED | LaunchAgent rendering is tested; no login/reboot run was authorized |
-| A11 migration/safety | DISPOSABLE_ONLY | Disposable fence/backup/restore passes; live migration and rollback are blocked |
+| A11 migration/safety | BLOCKED | Disposable fence/backup/restore passes, but live migration and rollback remain blocked until trusted production writer ownership, held-fence evidence, an approved maintenance window and rollback observations exist |
 | A12 RARW/bill isolation | UNVERIFIED | No two-Mac acceptance was authorized or run |
 | A13 regression/review | DISPOSABLE_ONLY | Tested source revision `181a9c34c7d7ad5d56fa971a773d6975d9e7b243` passes focused runtime port/unified/lifecycle/server tests (25), acceptance wrapper (27), runtime typecheck/build, Web typecheck/build, changed-file lint and diff checks; exact-head CI `38122944860` passed for this source revision (focused runtime, production safety, typecheck/build and diff/lint job). Later publication commits are documentation-only. |
 
