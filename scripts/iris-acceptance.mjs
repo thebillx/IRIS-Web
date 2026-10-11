@@ -290,12 +290,17 @@ export async function verifyAcceptanceTunnelAuthorization(options) {
 export async function verifyAcceptanceTunnelStartup(options) {
   const authorization = await verifyAcceptanceTunnelAuthorization(options);
   const workloadBinding = await readAcceptanceWorkloadBinding(options.dataRoot);
+  const topology = await readAcceptanceStartupTopology(options.dataRoot);
   const statePath = path.join(await canonicalPath(options.dataRoot), 'supervisor', 'state.json');
   const stateContent = await readFile(statePath, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
   if (stateContent === null) throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Supervisor state is missing after startup; provider ownership is not proven');
   let state;
   try { state = JSON.parse(stateContent); } catch { throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Supervisor state is invalid after startup; preserve evidence and do not retry'); }
   const record = state?.tunnels?.full;
+  if ((topology.admin !== null) !== (state.adminTunnel !== null)
+    || (topology.pro !== null) !== (state.tunnels?.pro !== null)) {
+    throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Acceptance registry and Supervisor state disagree about owned tunnel components');
+  }
   if (!isRecord(record)
     || state.workloadSourceRoot !== path.resolve(options.sourceRoot)
     || state.stackDesiredState !== 'UP' || state.workloadDesiredState !== 'ON'
@@ -326,10 +331,35 @@ export async function verifyAcceptanceTunnelStartup(options) {
     || !processInfo.command.includes(workloadBinding.managedProfilePath)) {
     throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_MISMATCH', 'Supervisor provider process identity does not match the persisted acceptance binding');
   }
+  if (topology.pro !== null) {
+    await verifyOptionalOwnedTunnel({
+      record: state.tunnels.pro,
+      binding: topology.pro,
+      component: 'tunnel-pro',
+      sourceRoot: options.sourceRoot,
+      provider: authorization.provider,
+      isAlive,
+      inspectProcess,
+      runtimeId: record.runtimeId,
+      instanceId: record.instanceId,
+    });
+  }
+  if (topology.admin !== null) {
+    await verifyOptionalOwnedTunnel({
+      record: state.adminTunnel,
+      binding: topology.admin,
+      component: 'tunnel-admin',
+      sourceRoot: options.sourceRoot,
+      provider: authorization.provider,
+      isAlive,
+      inspectProcess,
+    });
+  }
   await verifyGeneratedPortBindings(options.dataRoot, options.ports);
   const probe = options.probePort ?? probePort;
-  const listenerKeys = ['runtime', 'supervisorAdmin', 'supervisorControl', 'supervisorTunnelHealth', 'fullTunnelHealth', 'web'];
-  if (workloadBinding.connectorId === 'iris-full' && state.tunnels?.pro !== null) listenerKeys.push('proTunnelHealth');
+  const listenerKeys = ['runtime', 'supervisorAdmin', 'supervisorControl', 'fullTunnelHealth', 'web'];
+  if (topology.pro !== null) listenerKeys.push('proTunnelHealth');
+  if (topology.admin !== null) listenerKeys.push('supervisorTunnelHealth');
   const listeners = await Promise.all(listenerKeys.map((key) => probe(options.ports[key], '127.0.0.1')));
   if (listeners.some((ready) => !ready)) throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'One or more isolated acceptance listeners is not bound after startup');
   const providerReady = options.probeProviderReady ?? probeProviderReady;
@@ -341,6 +371,33 @@ export async function verifyAcceptanceTunnelStartup(options) {
     throw new AcceptanceError('ACCEPTANCE_ENDPOINT_UNVERIFIED', 'The authenticated acceptance endpoint did not prove the bound runtime identity');
   }
   return { state: 'READY', pid: record.pid, processStartMarker: processInfo.processStartMarker, executable: record.executable, tunnelId: workloadBinding.tunnelId, managedProfilePath: workloadBinding.managedProfilePath };
+}
+
+async function verifyOptionalOwnedTunnel(options) {
+  const { record, binding, component, sourceRoot, provider, isAlive, inspectProcess, runtimeId, instanceId } = options;
+  if (!isRecord(record)
+    || record.component !== component
+    || !Number.isSafeInteger(record.pid) || record.pid <= 0
+    || typeof record.executable !== 'string' || !path.isAbsolute(record.executable)
+    || path.basename(record.executable) !== provider
+    || record.profilePath !== binding.managedProfilePath
+    || record.tunnelId !== binding.tunnelId
+    || record.workingDirectory !== path.resolve(sourceRoot)
+    || !Number.isSafeInteger(record.processStartTimeMs) || record.processStartTimeMs <= 0
+    || (runtimeId !== undefined && record.runtimeId !== runtimeId)
+    || (instanceId !== undefined && record.instanceId !== instanceId)) {
+    throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', `Supervisor did not persist a complete acceptance-owned ${component} identity`);
+  }
+  if (!await isAlive(record.pid)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_UNAVAILABLE', `Supervisor-owned ${component} is not alive after startup`);
+  const processInfo = await inspectProcess(record.pid);
+  if (processInfo === null
+    || processInfo.uid !== (typeof process.getuid === 'function' ? process.getuid() : processInfo.uid)
+    || path.resolve(processInfo.executable) !== path.resolve(record.executable)
+    || typeof processInfo.processStartMarker !== 'string' || processInfo.processStartMarker.length === 0
+    || (Number.isFinite(processInfo.processStartTimeMs) && Math.abs(processInfo.processStartTimeMs - record.processStartTimeMs) > 5_000)
+    || !processInfo.command.includes(binding.managedProfilePath)) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_MISMATCH', `${component} process identity does not match the persisted acceptance binding`);
+  }
 }
 
 export async function verifyAcceptanceTunnelEvidence(options) {
@@ -420,8 +477,11 @@ async function readAcceptanceWorkloadBinding(dataRoot) {
   try { parsedRegistry = JSON.parse(registryContent); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Acceptance connector registry is invalid'); }
   const registry = parsedRegistry?.registry ?? parsedRegistry;
   const connectors = Array.isArray(registry?.connectors) ? registry.connectors : null;
-  if (connectors === null || connectors.length !== 1) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance requires exactly one unified workload connector');
-  const workload = connectors[0];
+  if (connectors === null || connectors.length < 1 || connectors.length > 2) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance requires a FULL workload connector with at most one PRO connector');
+  const workload = connectors.find((connector) => connector?.connectorId === 'iris-full');
+  if (workload === undefined || (connectors.length === 2 && !connectors.some((connector) => connector?.connectorId === 'iris-pro'))) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance registry does not contain a canonical FULL workload connector');
+  }
   let managedProfilePath = null;
   if (isRecord(workload) && typeof workload.managedProfilePath === 'string' && path.isAbsolute(workload.managedProfilePath)) {
     try { managedProfilePath = await canonicalPath(workload.managedProfilePath); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance connector profile path is not canonicalizable'); }
@@ -441,6 +501,48 @@ async function readAcceptanceWorkloadBinding(dataRoot) {
     runtimeId: workload.runtimeId,
     deploymentEpoch: registry.deploymentEpoch,
   };
+}
+
+async function readAcceptanceStartupTopology(dataRoot) {
+  const canonicalDataRoot = await canonicalPath(dataRoot);
+  const registryContent = await readFile(path.join(canonicalDataRoot, 'connector-registry.json'), 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
+  if (registryContent === null) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance connector registry is required for startup verification');
+  let parsedRegistry;
+  try { parsedRegistry = JSON.parse(registryContent); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_EVIDENCE_INVALID', 'Acceptance connector registry is invalid'); }
+  const registry = parsedRegistry?.registry ?? parsedRegistry;
+  const connectors = Array.isArray(registry?.connectors) ? registry.connectors : null;
+  const full = connectors?.find((connector) => connector?.connectorId === 'iris-full') ?? null;
+  const pro = connectors?.find((connector) => connector?.connectorId === 'iris-pro') ?? null;
+  const admin = registry?.admin ?? null;
+  if (connectors === null || full === null || connectors.length < 1 || connectors.length > 2
+    || (connectors.length === 1 && pro !== null)
+    || (connectors.length === 2 && pro === null)
+    || (connectors.length === 1 && admin !== null)) {
+    throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Acceptance registry contains a contradictory workload or ADMIN tunnel topology');
+  }
+  if (pro !== null) {
+    const proProfile = typeof pro.managedProfilePath === 'string' ? await canonicalPath(pro.managedProfilePath).catch(() => null) : null;
+    if (pro.label !== 'IRIS PRO' || pro.mode !== 'PRO' || pro.runtime !== 'iris-local-runtime' || pro.mcpProfile !== 'READ_ONLY' || pro.mcpPath !== '/mcp-pro'
+      || !/^tunnel_[a-f0-9]{32}$/.test(pro.tunnelId) || !Number.isSafeInteger(pro.healthPort) || pro.healthPort <= 0 || pro.healthPort > 65_535
+      || proProfile !== path.join(canonicalDataRoot, 'tunnel-profiles', 'iris-pro.yaml')) {
+      throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Acceptance PRO connector profile binding is invalid');
+    }
+  }
+  if (admin !== null) {
+    const adminProfile = typeof admin === 'object' && !Array.isArray(admin) && typeof admin.managedProfilePath === 'string'
+      ? await canonicalPath(admin.managedProfilePath).catch(() => null)
+      : null;
+    if (typeof admin !== 'object' || Array.isArray(admin)
+      || admin.connectorId !== 'iris-admin'
+      || admin.label !== 'IRIS ADMIN'
+      || admin.mode !== 'ADMIN'
+      || typeof admin.tunnelId !== 'string'
+      || !/^tunnel_[a-f0-9]{32}$/.test(admin.tunnelId)
+      || adminProfile !== path.join(canonicalDataRoot, 'tunnel-profiles', 'iris-admin.yaml')) {
+      throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Acceptance ADMIN connector profile binding is invalid');
+    }
+  }
+  return { full, pro, admin };
 }
 
 export function buildChildEnvironment(dataRoot, environment = process.env, ports = null) {

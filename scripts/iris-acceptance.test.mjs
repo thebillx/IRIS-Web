@@ -321,6 +321,7 @@ describe('acceptance isolation preflight', () => {
       tunnels: { full: { component: 'tunnel-full', pid: 4242, startedAt: new Date().toISOString(), executable: '/usr/local/bin/tunnel-client', profilePath: canonicalProfilePath, tunnelId: fixture.tunnelId, marker: 'tunnel-client', runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', deploymentEpoch: 1, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot }, pro: null },
       recovery: { attempts: 0, terminal: false, lastFailureCode: null, nextAttemptAt: null, windowStartedAt: null },
     }), { mode: 0o600 });
+    const probed = [];
     const result = await verifyAcceptanceTunnelStartup({
       filename: fixture.evidence,
       tunnelId: fixture.tunnelId,
@@ -332,12 +333,79 @@ describe('acceptance isolation preflight', () => {
         uid: process.getuid(), executable: '/usr/local/bin/tunnel-client', command: `tunnel-client --profile ${canonicalProfilePath}`,
         processStartMarker: 'Sun Nov 12 22:13:20 2023', processStartTimeMs: 1_700_000_000_000,
       } : null,
-      probePort: async () => true,
+      probePort: async (port) => { probed.push(port); return true; },
       probeProviderReady: async () => true,
       probeAuthenticatedEndpoint: async () => true,
     });
     assert.equal(result.state, 'READY');
     assert.equal(result.pid, 4242);
+    assert.equal(probed.includes(TEST_PORTS.supervisorTunnelHealth), false);
+    assert.deepEqual(probed.sort((a, b) => a - b), [TEST_PORTS.runtime, TEST_PORTS.supervisorAdmin, TEST_PORTS.supervisorControl, TEST_PORTS.fullTunnelHealth, TEST_PORTS.web].sort((a, b) => a - b));
+  });
+
+  it('requires every listener owned by the verified unified topology', async () => {
+    const fixture = await startupFixture();
+    const listenerKeys = ['runtime', 'supervisorAdmin', 'supervisorControl', 'fullTunnelHealth', 'web'];
+    for (const key of listenerKeys) {
+      await assert.rejects(verifyAcceptanceTunnelStartup({
+        filename: fixture.evidence, tunnelId: fixture.tunnelId, dataRoot: fixture.root, sourceRoot, ports: TEST_PORTS,
+        isPidAlive: async (pid) => pid === 4242,
+        inspectProcess: async () => ({ uid: process.getuid(), executable: '/usr/local/bin/tunnel-client', command: `tunnel-client --profile ${fixture.profilePath}`, processStartMarker: 'Sun Nov 12 22:13:20 2023', processStartTimeMs: 1_700_000_000_000 }),
+        probePort: async (port) => port !== TEST_PORTS[key], probeProviderReady: async () => true, probeAuthenticatedEndpoint: async () => true,
+      }), (error) => error.code === 'ACCEPTANCE_STARTUP_UNVERIFIED');
+    }
+  });
+
+  it('blocks contradictory unified registry and Supervisor state', async () => {
+    const fixture = await startupFixture();
+    const registryFile = path.join(fixture.root, 'connector-registry.json');
+    const registry = JSON.parse(await readFile(registryFile, 'utf8'));
+    registry.admin = {
+      connectorId: 'iris-admin', label: 'IRIS ADMIN', mode: 'ADMIN', tunnelId: 'tunnel_abcdefabcdefabcdefabcdefabcdefab',
+      managedProfilePath: path.join(fixture.root, 'tunnel-profiles', 'iris-admin.yaml'), machineId: '11111111-1111-4111-8111-111111111111', leaseGeneration: 1,
+    };
+    await writeFile(registryFile, JSON.stringify(registry));
+    await assert.rejects(verifyAcceptanceTunnelStartup({
+      filename: fixture.evidence, tunnelId: fixture.tunnelId, dataRoot: fixture.root, sourceRoot, ports: TEST_PORTS,
+      isPidAlive: async () => true, inspectProcess: async () => ({ uid: process.getuid(), executable: '/usr/local/bin/tunnel-client', command: `tunnel-client --profile ${fixture.profilePath}`, processStartMarker: 'Sun Nov 12 22:13:20 2023', processStartTimeMs: 1_700_000_000_000 }),
+      probePort: async () => true, probeProviderReady: async () => true, probeAuthenticatedEndpoint: async () => true,
+    }), (error) => error.code === 'ACCEPTANCE_STARTUP_UNVERIFIED');
+  });
+
+  it('requires PRO and ADMIN health only for owned legacy topology', async () => {
+    const fixture = await startupFixture();
+    const registryFile = path.join(fixture.root, 'connector-registry.json');
+    const registry = JSON.parse(await readFile(registryFile, 'utf8'));
+    registry.connectors.push({
+      connectorId: 'iris-pro', label: 'IRIS PRO', mode: 'PRO', tunnelId: 'tunnel_abcdefabcdefabcdefabcdefabcdefab',
+      runtime: 'iris-local-runtime', mcpProfile: 'READ_ONLY', mcpPath: '/mcp-pro', healthPort: TEST_PORTS.proTunnelHealth,
+      managedProfilePath: path.join(fixture.root, 'tunnel-profiles', 'iris-pro.yaml'), machineId: '11111111-1111-4111-8111-111111111111', runtimeId: 'runtime-fixture', deploymentEpoch: 1, leaseGeneration: 1,
+    });
+    registry.admin = {
+      connectorId: 'iris-admin', label: 'IRIS ADMIN', mode: 'ADMIN', tunnelId: 'tunnel_fedcbafedcbafedcbafedcbafedcbafe',
+      managedProfilePath: path.join(fixture.root, 'tunnel-profiles', 'iris-admin.yaml'), machineId: '11111111-1111-4111-8111-111111111111', leaseGeneration: 1,
+    };
+    await writeFile(registryFile, JSON.stringify(registry));
+    const stateFile = path.join(fixture.root, 'supervisor', 'state.json');
+    const state = JSON.parse(await readFile(stateFile, 'utf8').catch(() => '{}'));
+    state.schemaVersion = 3; state.supervisorId = 'fixture-supervisor'; state.updatedAt = new Date().toISOString(); state.workloadSourceRoot = sourceRoot; state.workloadDesiredState = 'ON'; state.stackDesiredState = 'UP';
+    state.runtime = { component: 'runtime', pid: 4100, executable: '/usr/local/bin/node', profilePath: null, tunnelId: null, runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot };
+    state.admin = null; state.web = null; state.adminTunnel = { component: 'tunnel-admin', pid: 4343, executable: '/usr/local/bin/tunnel-client', profilePath: path.join(fixture.root, 'tunnel-profiles', 'iris-admin.yaml'), tunnelId: registry.admin.tunnelId, runtimeId: null, instanceId: null, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot };
+    state.tunnels = { full: { component: 'tunnel-full', pid: 4242, executable: '/usr/local/bin/tunnel-client', profilePath: await realpath(fixture.profilePath), tunnelId: fixture.tunnelId, runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', deploymentEpoch: 1, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot }, pro: { component: 'tunnel-pro', pid: 4344, executable: '/usr/local/bin/tunnel-client', profilePath: path.join(fixture.root, 'tunnel-profiles', 'iris-pro.yaml'), tunnelId: registry.connectors[1].tunnelId, runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', deploymentEpoch: 1, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot } };
+    state.recovery = { attempts: 0, terminal: false, lastFailureCode: null, nextAttemptAt: null, windowStartedAt: null };
+    await mkdir(path.join(fixture.root, 'supervisor'), { recursive: true });
+    await writeFile(stateFile, JSON.stringify(state));
+    const probed = [];
+    const canonicalFullProfile = await realpath(fixture.profilePath);
+    const result = await verifyAcceptanceTunnelStartup({
+      filename: fixture.evidence, tunnelId: fixture.tunnelId, dataRoot: fixture.root, sourceRoot, ports: TEST_PORTS,
+      isPidAlive: async (pid) => [4242, 4343, 4344].includes(pid),
+      inspectProcess: async (pid) => ({ uid: process.getuid(), executable: '/usr/local/bin/tunnel-client', command: `tunnel-client --profile ${pid === 4242 ? canonicalFullProfile : pid === 4343 ? registry.admin.managedProfilePath : registry.connectors[1].managedProfilePath}`, processStartMarker: 'Sun Nov 12 22:13:20 2023', processStartTimeMs: 1_700_000_000_000 }),
+      probePort: async (port) => { probed.push(port); return true; }, probeProviderReady: async () => true, probeAuthenticatedEndpoint: async () => true,
+    });
+    assert.equal(result.state, 'READY');
+    assert.equal(probed.includes(TEST_PORTS.supervisorTunnelHealth), true);
+    assert.equal(probed.includes(TEST_PORTS.proTunnelHealth), true);
   });
 
   it('keeps startup blocked when the persisted provider identity or readiness is uncertain', async () => {
