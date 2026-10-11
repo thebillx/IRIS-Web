@@ -292,3 +292,21 @@ the documented provider/permission evidence for Option B, or keep R06/A07
 blocked. Any physical lid-close, battery/charger, restart and continued
 connectivity test must name the target Mac, candidate SHA, expected impact,
 rollback and evidence to capture before execution.
+
+## Candidate acceptance handoff
+
+This handoff is for candidate `bbec92dbfb00c7e11ad642238e661152fda9f6cd`.
+It is owner-controlled and records procedures only; no live action was run.
+The owner must replace the target, hostname, data root and tunnel fields with
+the exact redacted values before authorizing a step.
+
+| Group | Target and identity | Preconditions | Action and expected result | Evidence and rollback | Authorization |
+|---|---|---|---|---|---|
+| A01–A06, A08, A09, A13 | RARW Mac: owner-confirmed hostname/hardware; source `/Users/RARW/iris-one-iris-completion` at `bbec92d`; owner-named disposable data root and non-production connector/tunnel ID | `iris_acceptance preflight`, `status` and `doctor` pass; source SHA, process owner, ports and tunnel identity match; no protected-root overlap | Read-only identity/MCP check, workload `OFF → status/doctor → ON`, session/project/job/Web checks, then supported `down`; expected same machine identity, no duplicate workload, captured job/log/result state and truthful polling | Redacted status, Project/Workspace IDs, source SHA, tunnel suffix, process/port checks and Web screenshots/logs; abort and use supported `down`/inspect before retry | Owner authorizes each disposable run; no credential or registry edits |
+| A10 | Same owner-confirmed Mac and source SHA; isolated acceptance root and LaunchAgent label | A09 clean setup evidence exists; no live `com.iris.supervisor` conflict; login/reboot window scheduled | Install or render only the separately authorized acceptance LaunchAgent, log out/in or reboot, and verify identity persistence; expected one owned Supervisor and unchanged protected installation | LaunchAgent status, machine/runtime IDs, process start markers and rollback via supported acceptance teardown | Explicit owner approval for login/reboot and LaunchAgent mutation |
+| A12 | Bill Mac, separately named by owner, with a distinct source/data root, credential profile and tunnel ID | RARW evidence is complete; no copied registry/data/credentials; both tunnel identities independently verified | Repeat read-only identity and authenticated MCP checks on bill Mac; expected routing stays machine-local and cross-machine project/job access is denied | Redacted per-machine identities, tunnel suffixes, project/workspace IDs and denied cross-machine check; teardown each candidate independently | Both owners authorize the two-Mac window |
+| A11 | Owner-named production Mac, live data root and maintenance window; candidate SHA `bbec92d` | Trusted production writer inventory, held fence and rollback destination are independently verified | **Do not run yet.** Only after evidence is accepted may the owner execute the documented quiesce/backup/restore/recovery sequence | Preserve live state on any unknown result; no manual safety-file edits or migration retry | Separate written production maintenance authorization |
+
+A07 remains blocked by the R06 provider decision. Every row requires the exact
+tunnel identity, source SHA and redacted evidence in the acceptance record; an
+unknown or conflicting result is a stop-and-verify outcome, never a pass.
