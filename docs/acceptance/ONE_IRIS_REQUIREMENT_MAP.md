@@ -50,7 +50,7 @@ means the supported operation cannot safely proceed under current authority.
 | A10 login persistence | UNVERIFIED | LaunchAgent rendering is tested; no login/reboot run was authorized |
 | A11 migration/safety | DISPOSABLE_ONLY | Disposable fence/backup/restore passes; live migration and rollback are blocked |
 | A12 RARW/bill isolation | UNVERIFIED | No two-Mac acceptance was authorized or run |
-| A13 regression/review | DISPOSABLE_ONLY | Candidate `cac2f7d9531f7ce27574eff75cba86ceb973e5f5` passes focused runtime port/unified/lifecycle/server tests (25), acceptance wrapper (27), runtime typecheck/build, Web typecheck/build, changed-file lint and diff checks; exact-head CI `38122303225` passed for this SHA (focused runtime, production safety, typecheck/build and diff/lint job) |
+| A13 regression/review | DISPOSABLE_ONLY | Candidate `45eb807dd0a4260a50146254367d85b1acbb7871` passes focused runtime port/unified/lifecycle/server tests (25), acceptance wrapper (27), runtime typecheck/build, Web typecheck/build, changed-file lint and diff checks; exact-head CI `38122783611` and `38122792021` passed for this SHA (focused runtime, production safety, typecheck/build and diff/lint job) |
 
 No row above is a production acceptance claim. `NOT_RUN`, `UNVERIFIED` and
 `BLOCKED` remain non-passing under the merge gate. The original Enhance01
