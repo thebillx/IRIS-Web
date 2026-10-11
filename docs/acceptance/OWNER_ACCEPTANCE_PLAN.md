@@ -271,11 +271,21 @@ identifier. Ending such a session could terminate a user-owned session, so the
 candidate does not call it. No Power Protect helper, sudoers change, TCC bypass
 or privileged power setting is authorized.
 
+The feasibility boundary is explicit: an idle-awake assertion while the lid is
+open is a different capability from closed-lid operation. Closed-lid AC use
+depends on supported clamshell hardware, power and display conditions and must
+be demonstrated on the target Mac; a process-owned idle assertion alone is not
+evidence that lid-close sleep is prevented. Closed-lid battery behavior is
+hardware/OS dependent and is not claimed without a documented provider contract
+and physical evidence. Restart/login persistence requires the Supervisor-owned
+provider process to reacquire only its own resource and report an unavailable or
+ambiguous state after failure.
+
 | Option | Feasibility | Permissions and limits | Rollback | Recommendation |
 |---|---|---|---|---|
-| A. Supervisor-owned native macOS power assertion | A documented non-privileged process-owned assertion can keep the machine awake while the Supervisor process is alive | Requires a small macOS-native provider contract and owner verification; it does not guarantee closed-lid wake or bypass Apple Silicon/OS display-sleep limits | Disable the assertion and remove only the Supervisor-owned process lease | Preferred for ordinary idle-sleep prevention if the owner accepts the closed-lid limitation |
-| B. Amphetamine with an ownership-scoped lease API | Not feasible with the inspected 5.3.2 dictionary; becomes feasible only if the owner supplies a documented lease/resource ID and permission path | Must preserve user sessions and report denied Automation permission or unsupported closed-display behavior | Release only the returned IRIS lease ID | Do not approve the current global start/end interface |
-| C. Remain blocked | Safe and immediately available | No keep-awake claim or enable control; physical closed-lid evidence remains unperformed | None | Required until A is approved or B supplies an ownership-safe interface |
+| A. Supervisor-owned native macOS power assertion | A documented non-privileged process-owned assertion can keep the machine awake while the Supervisor process is alive with the lid open | Requires a small macOS-native provider contract and owner verification; it does not guarantee closed-lid wake, battery behavior or bypass Apple Silicon/OS display-sleep limits | Disable the assertion and remove only the Supervisor-owned process lease | Candidate for an explicitly bounded open-lid idle contract; it does not complete the original closed-lid requirement |
+| B. Amphetamine with an ownership-scoped lease API | Not feasible with the inspected 5.3.2 dictionary; becomes feasible only if the owner supplies a documented lease/resource ID and permission path | Must preserve user sessions and report denied Automation permission, restart reconciliation and unsupported closed-display behavior | Release only the returned IRIS lease ID | Do not approve the current global start/end interface |
+| C. Remain blocked | Safe and immediately available | No keep-awake claim or enable control; physical closed-lid, battery and connectivity evidence remain unperformed | None | Recommended until A is explicitly narrowed or B supplies an ownership-safe interface |
 
 Owner decision required: approve Option A's ordinary idle-sleep contract, provide
 the documented provider/permission evidence for Option B, or keep R06/A07
