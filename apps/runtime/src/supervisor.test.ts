@@ -335,8 +335,9 @@ describe('IRIS supervisor', () => {
       expect(first.connectors.map((binding) => binding.label)).toEqual(['IRIS']);
       expect(first.controlPlane.state).toBe('READY');
       const fullProfile = await readFile(path.join(dataRoot, 'tunnel-profiles', 'iris-full.yaml'), 'utf8');
-      expect(fullProfile).toContain('channel: admin');
+      expect(fullProfile).toContain('channel: main');
       expect(fullProfile).toContain(`http://127.0.0.1:${controlPort}/mcp`);
+      expect(fullProfile).not.toContain('channel: admin');
       const secret = await readTunnelServiceSecret(dataRoot);
       if (secret === null) throw new Error('missing unified native control test secret');
       const filename = path.join(dataRoot, 'supervisor/state.json');

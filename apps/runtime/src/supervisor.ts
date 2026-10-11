@@ -11,9 +11,9 @@ import { assertActivationSourceIdentity, assertActivationWorkloadReady, type Act
 import { bindAdminTunnelIdentity, bindConnectorRuntime, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry, replaceConnectorCatalogManifest, seedFromLegacyProfiles, type AdminConnectorBinding, type ConnectorBinding, type ConnectorCatalogManifest, type ConnectorRegistryDocument } from './connector-registry.js';
 import { credentialPaths, inspectCredentialStatus, loadOrCreateTunnelServiceSecret, readTunnelServiceSecret, rotateTunnelServiceSecret, type CredentialStatus } from './credentials.js';
 import { ensureRuntimeDataRoot, resolveRuntimeDataRoot, resolveSourceRoot } from './data-root.js';
-import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, isSupportedCatalogVersion, type McpCatalogIdentity } from './mcp-catalog.js';
+import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, isSupportedCatalogVersion, MCP_CATALOG_VERSION, type McpCatalogIdentity } from './mcp-catalog.js';
 import { observeProcessStart } from './macos-safety.js';
-import { proMcpToolDefinitions } from './mcp.js';
+import { MCP_PROTOCOL_VERSION, proMcpToolDefinitions } from './mcp.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
 import { loadOrCreateRuntimeId, readEndpoint, readOwnerAccessSecret, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
 import { privateDirectoryProblem } from './private-fs.js';
@@ -21,6 +21,8 @@ import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } 
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput } from './supervisor-native-control.js';
+import type { SupervisorNativeToolCallResult } from './supervisor-native-control.js';
+import { readRuntimeSourceIdentity } from './source-identity.js';
 import { parseIrisPortSet, type IrisPortSet, validateIrisPortSet } from './port-config.js';
 
 const execFileAsync = promisify(execFile);
@@ -829,6 +831,9 @@ export class Supervisor {
       adminRecycle: (input) => this.adminRecycle(input),
       adminTunnelRecycle: (input) => this.adminTunnelRecycle(input),
       adminToolCall: (name, args) => this.adminToolCall(name, args),
+      runtimeToolDefinitions: fullMcpToolDefinitionsV21(),
+      runtimeToolCall: (name, args) => this.runtimeToolCall(name, args),
+      sourceIdentity: () => this.supervisorSourceIdentity(),
     });
     this.nativeControlActive = true;
     let stopping = false;
@@ -955,6 +960,75 @@ export class Supervisor {
       adminTunnelIdentity: ownedProcessIdentity(state.adminTunnel),
       workloadProfileDigest: state.tunnels.full?.profileDigest ?? null,
       adminProfileDigest: state.adminTunnel?.profileDigest ?? null,
+    };
+  }
+
+  private async supervisorSourceIdentity(): Promise<Record<string, unknown>> {
+    const [source, registry, state, observed] = await Promise.all([
+      readRuntimeSourceIdentity(this.sourceRoot),
+      readConnectorRegistry(this.dataRoot),
+      this.readState(),
+      runtimeStatus(this.dataRoot),
+    ]);
+    const binding = registry?.connectors.find((connector) => connector.connectorId === 'iris-full') ?? null;
+    const runtimeId = binding?.runtimeId ?? observed.endpoint?.runtimeId ?? state.runtime?.runtimeId ?? null;
+    const instanceId = observed.endpoint?.instanceId ?? state.runtime?.instanceId ?? state.tunnels.full?.instanceId ?? null;
+    return {
+      ...source,
+      machineId: binding?.machineId ?? registry?.admin?.machineId ?? null,
+      runtimeId,
+      instanceId,
+      deploymentEpoch: registry?.deploymentEpoch ?? null,
+      catalogVersion: MCP_CATALOG_VERSION,
+      catalogHash: binding?.catalogHash ?? null,
+      tunnelId: binding?.tunnelId ?? null,
+      tunnelBinding: binding === null ? null : {
+        connectorId: binding.connectorId,
+        mode: binding.mode,
+        tunnelId: binding.tunnelId,
+        profilePath: binding.managedProfilePath,
+        healthPort: binding.healthPort,
+        deploymentEpoch: binding.deploymentEpoch,
+      },
+    };
+  }
+
+  private async runtimeToolCall(name: string, args: Record<string, unknown>): Promise<SupervisorNativeToolCallResult> {
+    const observed = await runtimeStatus(this.dataRoot);
+    if (observed.state !== 'running' || observed.endpoint === null) {
+      throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Runtime tools are unavailable while workload is OFF');
+    }
+    const registry = await readConnectorRegistry(this.dataRoot);
+    const binding = registry?.connectors.find((connector) => connector.connectorId === 'iris-full');
+    const serviceSecret = await readTunnelServiceSecret(this.dataRoot);
+    if (registry === null || binding === undefined || serviceSecret === null) {
+      throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Unified runtime binding is unavailable');
+    }
+    const response = await fetch(`${observed.endpoint.apiUrl}${binding.mcpPath}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${serviceSecret}`,
+        'content-type': 'application/json',
+        'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
+        'x-iris-connector-profile': binding.mode,
+        'x-iris-deployment-epoch': String(registry.deploymentEpoch),
+        'x-iris-runtime-id': binding.runtimeId ?? '',
+        'x-iris-client-id': 'chatgpt',
+        'Mcp-Name': name,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+      signal: AbortSignal.timeout(5_000),
+    });
+    const payload = await response.json() as unknown;
+    if (!response.ok || !isRecord(payload) || !isRecord(payload.result)) {
+      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', `Unified runtime tool ${name} did not return a valid response`);
+    }
+    const result = payload.result;
+    if (!Array.isArray(result.content)) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', `Unified runtime tool ${name} returned an invalid result`);
+    return {
+      content: result.content as readonly Record<string, unknown>[],
+      ...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
+      ...(typeof result.isError === 'boolean' ? { isError: result.isError } : {}),
     };
   }
 
@@ -1862,7 +1936,7 @@ function managedProfile(
   logDirectory: string,
   epoch: number,
   runtimeApiUrl: string,
-  adminMcpUrl: string | null,
+  unifiedControlMcpUrl: string | null,
 ): string {
   const controlRef = `file:${controlPlaneKey}`;
   const serviceRef = `file:${tunnelServiceAuthorization}`;
@@ -1890,8 +1964,7 @@ function managedProfile(
     'mcp:',
     '  server_urls:',
     '    - channel: main',
-    `      url: ${yamlString(new URL(binding.mcpPath, `${runtimeApiUrl}/`).toString())}`,
-    ...(adminMcpUrl === null ? [] : ['    - channel: admin', `      url: ${yamlString(adminMcpUrl)}`]),
+    `      url: ${yamlString(unifiedControlMcpUrl ?? new URL(binding.mcpPath, `${runtimeApiUrl}/`).toString())}`,
     '  extra_headers:',
     headers,
     '  discovery_extra_headers:',

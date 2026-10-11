@@ -45,6 +45,16 @@ export interface SupervisorNativeOperations {
   adminRecycle(input: AdminRecycleInput): Promise<unknown>;
   adminTunnelRecycle(input: AdminTunnelRecycleInput): Promise<unknown>;
   adminToolCall(name: string, args: Record<string, unknown>): Promise<SupervisorAdminToolCallResult>;
+  /** Runtime tools are proxied only through the Supervisor-owned unified gateway. */
+  runtimeToolDefinitions?: readonly Record<string, unknown>[];
+  runtimeToolCall?: (name: string, args: Record<string, unknown>) => Promise<SupervisorNativeToolCallResult>;
+  sourceIdentity?: () => Promise<unknown>;
+}
+
+export interface SupervisorNativeToolCallResult {
+  readonly content: readonly Record<string, unknown>[];
+  readonly structuredContent?: unknown;
+  readonly isError?: boolean;
 }
 
 export interface SupervisorNativeControlHandle {
@@ -153,7 +163,7 @@ async function handleRequest(
     return;
   }
   if (rpc.method === 'tools/list') {
-    writeJsonRpcResult(response, rpc.id ?? null, { tools: nativeToolDefinitions() });
+    writeJsonRpcResult(response, rpc.id ?? null, { tools: unifiedToolDefinitions(operations) });
     return;
   }
   if (rpc.method !== 'tools/call') {
@@ -198,6 +208,15 @@ async function handleRequest(
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.workloadRestart()));
       return;
     }
+    if (name === 'source_identity') {
+      requireNoArguments(args);
+      if (operations.sourceIdentity === undefined) {
+        writeJsonRpcResult(response, rpc.id ?? null, toolResult({ state: 'SOURCE_IDENTITY_UNVERIFIED' }));
+        return;
+      }
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.sourceIdentity()));
+      return;
+    }
     if (name === 'admin_status') {
       requireNoArguments(args);
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.adminStatus()));
@@ -225,6 +244,11 @@ async function handleRequest(
       });
       return;
     }
+    if (operations.runtimeToolCall !== undefined
+      && (operations.runtimeToolDefinitions ?? []).some((definition) => definition.name === name)) {
+      writeJsonRpcResult(response, rpc.id ?? null, await operations.runtimeToolCall(name, args));
+      return;
+    }
   } catch (error) {
     writeJsonRpcResult(response, rpc.id ?? null, toolErrorResult(error));
     return;
@@ -232,7 +256,7 @@ async function handleRequest(
   writeJsonRpcError(response, rpc.id ?? null, -32601, 'Unknown supervisor tool');
 }
 
-export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
+export function nativeToolDefinitions(includeSourceIdentity = false): readonly Record<string, unknown>[] {
   const noArgs = { type: 'object', properties: {}, additionalProperties: false };
   const activation = adminToolDefinitions().filter((tool) => typeof tool.name === 'string' && ACTIVATION_NAMES.has(tool.name));
   return [
@@ -266,6 +290,12 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
       inputSchema: noArgs,
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
+    ...(includeSourceIdentity ? [{
+      name: 'source_identity',
+      description: 'Read authenticated machine, deployment, tunnel, and source-tree identity from the Supervisor-owned candidate.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: true },
+    }] : []),
     {
       name: 'admin_status',
       description: 'Read the supervisor-owned admin child identity and bounded activation capability visibility without mutation.',
@@ -308,6 +338,20 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
     },
     ...activation,
   ];
+}
+
+function unifiedToolDefinitions(operations: SupervisorNativeOperations): readonly Record<string, unknown>[] {
+  const definitions = [
+    ...nativeToolDefinitions(operations.sourceIdentity !== undefined),
+    ...(operations.runtimeToolDefinitions ?? []),
+  ];
+  const seen = new Set<string>();
+  return definitions.filter((definition) => {
+    const name = typeof definition.name === 'string' ? definition.name : null;
+    if (name === null || seen.has(name)) return false;
+    seen.add(name);
+    return true;
+  });
 }
 
 function adminRecycleArguments(args: Record<string, unknown>): AdminRecycleInput {

@@ -18,6 +18,20 @@ const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 describe('outer supervisor native control', () => {
+  it('publishes one gateway catalog and routes runtime tools without losing supervisor authority', async () => {
+    const harness = await startHarness(true);
+    try {
+      const listed = await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      expect(toolNames(listed)).toContain('source_identity');
+      expect(toolNames(listed)).toContain('runtime_status');
+      expect(structured(await rpcTool(harness, 'source_identity', {}))).toMatchObject({ state: 'VERIFIED', commitSha: 'a'.repeat(40) });
+      expect(structured(await rpcTool(harness, 'runtime_status', {}))).toMatchObject({ status: 'ready' });
+      expect(structured(await rpcTool(harness, 'workload_off', {}))).toMatchObject({ workloadState: 'OFF' });
+    } finally {
+      await harness.server.close();
+    }
+  });
+
   it('implements the authenticated tunnel-client initialize handshake without widening native tools', async () => {
     const harness = await startHarness();
     const initialize = {
@@ -177,7 +191,7 @@ describe('outer supervisor native control', () => {
   });
 });
 
-async function startHarness() {
+async function startHarness(unified = false) {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-native-supervisor-control-'));
   roots.push(dataRoot);
   const secret = await loadOrCreateTunnelServiceSecret(dataRoot);
@@ -197,6 +211,11 @@ async function startHarness() {
     },
     adminTunnelRecycle: async (input: AdminTunnelRecycleInput) => ({ ...input, readiness: 'READY' }),
     adminToolCall: async (name): Promise<SupervisorAdminToolCallResult> => ({ structuredContent: { proxied: name }, isError: false }),
+    ...(unified ? {
+      runtimeToolDefinitions: [{ name: 'runtime_status', inputSchema: { type: 'object' } }],
+      runtimeToolCall: async (name: string) => ({ content: [{ type: 'text', text: JSON.stringify({ status: 'ready', name }) }], structuredContent: { status: 'ready', name }, isError: false }),
+      sourceIdentity: async () => ({ state: 'VERIFIED', commitSha: 'a'.repeat(40) }),
+    } : {}),
   };
   const server = await startSupervisorNativeControlServer(dataRoot, await freePort(), operations);
   return { ...harness, dataRoot, secret, recycleInputs, server, get workloadRuntimeId() { return harness.workloadRuntimeId; }, set workloadRuntimeId(value: string) { harness.workloadRuntimeId = value; } };
