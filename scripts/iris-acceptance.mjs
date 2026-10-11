@@ -265,7 +265,7 @@ export async function verifyAcceptanceTunnelAuthorization(options) {
     || evidence.schemaVersion !== 2
     || evidence.phase !== 'PREPARED'
     || evidence.environment !== 'non-production'
-    || typeof evidence.provider !== 'string' || evidence.provider.length === 0 || evidence.provider.length > 200
+    || evidence.provider !== 'tunnel-client'
     || typeof evidence.machineId !== 'string' || evidence.machineId !== workloadBinding.machineId
     || typeof evidence.sourceRoot !== 'string' || path.resolve(evidence.sourceRoot) !== path.resolve(options.sourceRoot)
     || evidence.tunnelId !== expectedTunnelId
@@ -288,7 +288,7 @@ export async function verifyAcceptanceTunnelAuthorization(options) {
 }
 
 export async function verifyAcceptanceTunnelStartup(options) {
-  await verifyAcceptanceTunnelAuthorization(options);
+  const authorization = await verifyAcceptanceTunnelAuthorization(options);
   const workloadBinding = await readAcceptanceWorkloadBinding(options.dataRoot);
   const statePath = path.join(await canonicalPath(options.dataRoot), 'supervisor', 'state.json');
   const stateContent = await readFile(statePath, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
@@ -302,6 +302,7 @@ export async function verifyAcceptanceTunnelStartup(options) {
     || record.component !== 'tunnel-full'
     || !Number.isSafeInteger(record.pid) || record.pid <= 0
     || typeof record.executable !== 'string' || !path.isAbsolute(record.executable)
+    || path.basename(record.executable) !== authorization.provider
     || typeof record.profilePath !== 'string'
     || path.resolve(record.profilePath) !== workloadBinding.managedProfilePath
     || record.tunnelId !== workloadBinding.tunnelId

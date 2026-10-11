@@ -219,7 +219,7 @@ describe('acceptance isolation preflight', () => {
       schemaVersion: 2,
       phase: 'PREPARED',
       environment: 'non-production',
-      provider: 'fixture-provider',
+      provider: 'tunnel-client',
       machineId,
       sourceRoot,
       tunnelId,
@@ -249,7 +249,7 @@ describe('acceptance isolation preflight', () => {
     await writeFile(path.join(root, 'credentials', 'control-plane-api-key'), 'fixture-key\n', { mode: 0o600 });
     await writeFile(path.join(root, 'connector-registry.json'), JSON.stringify({ connectors: [{ connectorId: 'iris-full', label: 'IRIS', mode: 'FULL', runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', healthPort: TEST_PORTS.fullTunnelHealth, managedProfilePath: profilePath, tunnelId, machineId }], admin: null }), { mode: 0o600 });
     const baseEvidence = {
-      schemaVersion: 2, phase: 'PREPARED', environment: 'non-production', provider: 'fixture-provider', machineId, sourceRoot,
+      schemaVersion: 2, phase: 'PREPARED', environment: 'non-production', provider: 'tunnel-client', machineId, sourceRoot,
       tunnelId, credentialPath: path.join(await realpath(root), 'credentials', 'control-plane-api-key'),
       binding: { connectorId: 'iris-full', machineId, tunnelId, profilePath },
     };
@@ -276,7 +276,7 @@ describe('acceptance isolation preflight', () => {
     await writeFile(evidence, `${JSON.stringify({
       schemaVersion: 1,
       environment: 'non-production',
-      provider: 'fixture-provider',
+      provider: 'tunnel-client',
       machineId,
       sourceRoot,
       tunnelId,
@@ -318,7 +318,7 @@ describe('acceptance isolation preflight', () => {
       web: null,
       admin: null,
       adminTunnel: null,
-      tunnels: { full: { component: 'tunnel-full', pid: 4242, startedAt: new Date().toISOString(), executable: '/usr/local/bin/fixture-provider', profilePath: canonicalProfilePath, tunnelId: fixture.tunnelId, marker: 'tunnel-client', runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', deploymentEpoch: 1, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot }, pro: null },
+      tunnels: { full: { component: 'tunnel-full', pid: 4242, startedAt: new Date().toISOString(), executable: '/usr/local/bin/tunnel-client', profilePath: canonicalProfilePath, tunnelId: fixture.tunnelId, marker: 'tunnel-client', runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', deploymentEpoch: 1, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot }, pro: null },
       recovery: { attempts: 0, terminal: false, lastFailureCode: null, nextAttemptAt: null, windowStartedAt: null },
     }), { mode: 0o600 });
     const result = await verifyAcceptanceTunnelStartup({
@@ -329,7 +329,7 @@ describe('acceptance isolation preflight', () => {
       ports: TEST_PORTS,
       isPidAlive: async (pid) => pid === 4242,
       inspectProcess: async (pid) => pid === 4242 ? {
-        uid: process.getuid(), executable: '/usr/local/bin/fixture-provider', command: `fixture-provider --profile ${canonicalProfilePath}`,
+        uid: process.getuid(), executable: '/usr/local/bin/tunnel-client', command: `tunnel-client --profile ${canonicalProfilePath}`,
         processStartMarker: 'Sun Nov 12 22:13:20 2023', processStartTimeMs: 1_700_000_000_000,
       } : null,
       probePort: async () => true,
@@ -349,7 +349,7 @@ describe('acceptance isolation preflight', () => {
       workloadDesiredState: 'ON', stackDesiredState: 'UP',
       runtime: { component: 'runtime', pid: 4100, startedAt: new Date().toISOString(), executable: '/usr/local/bin/node', profilePath: null, tunnelId: null, marker: sourceRoot, runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot },
       web: null, admin: null, adminTunnel: null,
-      tunnels: { full: { component: 'tunnel-full', pid: 4242, startedAt: new Date().toISOString(), executable: '/usr/local/bin/other-provider', profilePath: canonicalProfilePath, tunnelId: fixture.tunnelId, marker: 'tunnel-client', runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', deploymentEpoch: 1, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot }, pro: null },
+      tunnels: { full: { component: 'tunnel-full', pid: 4242, startedAt: new Date().toISOString(), executable: '/usr/local/bin/tunnel-client', profilePath: canonicalProfilePath, tunnelId: fixture.tunnelId, marker: 'tunnel-client', runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', deploymentEpoch: 1, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot }, pro: null },
       recovery: { attempts: 0, terminal: false, lastFailureCode: null, nextAttemptAt: null, windowStartedAt: null },
     }), { mode: 0o600 });
     await assert.rejects(verifyAcceptanceTunnelStartup({
@@ -468,7 +468,7 @@ async function startupFixture() {
     connectors: [{ connectorId: 'iris-full', label: 'IRIS', mode: 'FULL', runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', healthPort: TEST_PORTS.fullTunnelHealth, managedProfilePath: profilePath, tunnelId, machineId, runtimeId: 'runtime-fixture', deploymentEpoch: 1, leaseGeneration: 1 }], admin: null,
   }), { mode: 0o600 });
   await writeFile(evidence, `${JSON.stringify({
-    schemaVersion: 2, phase: 'PREPARED', environment: 'non-production', provider: 'fixture-provider', machineId, sourceRoot, tunnelId,
+    schemaVersion: 2, phase: 'PREPARED', environment: 'non-production', provider: 'tunnel-client', machineId, sourceRoot, tunnelId,
     credentialPath: path.join(await realpath(root), 'credentials', 'control-plane-api-key'),
     binding: { connectorId: 'iris-full', machineId, tunnelId, profilePath },
   })}\n`, { mode: 0o600 });
