@@ -69,6 +69,10 @@ describe('runtime lifecycle integration', () => {
     expect(developmentEnvironment.IRIS_AGENT_EXECUTOR).toBe('development');
     expect(developmentEnvironment.OPENAI_API_KEY).toBeUndefined();
     expect(developmentEnvironment.IRIS_OPENAI_MODEL).toBeUndefined();
+
+    const acceptanceEnvironment = runtimeChildEnvironment('/private/tmp/iris-acceptance-test', 46110, { PATH: node24Path() }, undefined, true);
+    expect(acceptanceEnvironment.IRIS_RUNTIME_PORT).toBe('46110');
+    expect(acceptanceEnvironment.IRIS_RUNTIME_PORT_STRICT).toBe('1');
   });
 
   it('rejects a stale expected activation source identity before spawning a runtime', async () => {

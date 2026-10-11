@@ -21,6 +21,7 @@ import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } 
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput } from './supervisor-native-control.js';
+import { parseIrisPortSet, type IrisPortSet, validateIrisPortSet } from './port-config.js';
 
 const execFileAsync = promisify(execFile);
 const SUPERVISOR_DIRECTORY = 'supervisor';
@@ -31,10 +32,6 @@ const MAX_RECOVERY_ATTEMPTS = 3;
 const RECOVERY_WINDOW_MS = 60_000;
 const RECOVERY_BACKOFF_MS = [1_000, 2_000, 4_000] as const;
 const CONTROLLED_ACTIVATION_SHUTDOWN_DEADLINE_MS = 60_000;
-const DEFAULT_WEB_PORT = 5_173;
-const DEFAULT_ADMIN_PORT = 43_111;
-const DEFAULT_SUPERVISOR_CONTROL_PORT = 43_112;
-const DEFAULT_ADMIN_TUNNEL_HEALTH_PORT = 43_113;
 const DEFAULT_TUNNEL_CLIENT = 'tunnel-client';
 const OPERATION_LOCK_FILE = 'operation.lock';
 
@@ -120,10 +117,13 @@ export interface SupervisorOptions {
   readonly dataRoot?: string;
   readonly sourceRoot?: string;
   readonly tunnelClientPath?: string;
+  readonly runtimePort?: number;
   readonly webPort?: number;
   readonly adminPort?: number;
   readonly supervisorControlPort?: number;
   readonly adminTunnelHealthPort?: number;
+  readonly fullTunnelHealthPort?: number;
+  readonly proTunnelHealthPort?: number;
   readonly protectedReferenceRoot?: string;
 }
 
@@ -191,14 +191,23 @@ export async function createSupervisor(options: SupervisorOptions = {}): Promise
     : await resolveRuntimeDataRoot({ ...process.env, IRIS_RUNTIME_DATA_ROOT: options.dataRoot });
   const sourceRoot = options.sourceRoot === undefined ? await resolveSourceRoot() : path.resolve(options.sourceRoot);
   const protectedReferenceRoot = options.protectedReferenceRoot ?? process.env.IRIS_PROTECTED_REFERENCE_ROOT?.trim();
+  const configuredPorts = parseIrisPortSet(process.env.IRIS_ACCEPTANCE_PORTS);
+  const ports: IrisPortSet = {
+    runtime: options.runtimePort ?? configuredPorts.runtime,
+    supervisorAdmin: options.adminPort ?? configuredPorts.supervisorAdmin,
+    supervisorControl: options.supervisorControlPort ?? configuredPorts.supervisorControl,
+    supervisorTunnelHealth: options.adminTunnelHealthPort ?? configuredPorts.supervisorTunnelHealth,
+    fullTunnelHealth: options.fullTunnelHealthPort ?? configuredPorts.fullTunnelHealth,
+    proTunnelHealth: options.proTunnelHealthPort ?? configuredPorts.proTunnelHealth,
+    web: options.webPort ?? configuredPorts.web,
+  };
+  validateIrisPortSet(ports);
   return new Supervisor(
     dataRoot,
     sourceRoot,
     options.tunnelClientPath ?? DEFAULT_TUNNEL_CLIENT,
-    options.webPort ?? DEFAULT_WEB_PORT,
-    options.adminPort ?? DEFAULT_ADMIN_PORT,
-    options.supervisorControlPort ?? DEFAULT_SUPERVISOR_CONTROL_PORT,
-    options.adminTunnelHealthPort ?? DEFAULT_ADMIN_TUNNEL_HEALTH_PORT,
+    ports,
+    (process.env.IRIS_ACCEPTANCE_PORTS?.trim().length ?? 0) > 0,
     protectedReferenceRoot,
   );
 }
@@ -210,25 +219,18 @@ export class Supervisor {
     public readonly dataRoot: string,
     private readonly sourceRoot: string,
     private readonly tunnelClientPath: string,
-    private readonly webPort: number,
-    private readonly adminPort: number,
-    private readonly supervisorControlPort: number,
-    private readonly adminTunnelHealthPort: number,
+    private readonly ports: IrisPortSet,
+    private readonly acceptanceScopedPorts: boolean,
     private readonly protectedReferenceRoot?: string,
   ) {
-    for (const [label, port] of [
-      ['Supervisor admin', adminPort],
-      ['Supervisor native control', supervisorControlPort],
-      ['Supervisor admin tunnel health', adminTunnelHealthPort],
-    ] as const) {
-      if (!Number.isSafeInteger(port) || port <= 0 || port > 65_535) {
-        throw new RuntimeError('INVALID_REQUEST', `${label} port must be a valid TCP port`);
-      }
-    }
-    if (new Set([adminPort, supervisorControlPort, adminTunnelHealthPort]).size !== 3) {
-      throw new RuntimeError('INVALID_REQUEST', 'Supervisor admin, native control, and admin tunnel health ports must be distinct');
-    }
+    validateIrisPortSet(ports);
   }
+
+  private get runtimePort(): number { return this.ports.runtime; }
+  private get webPort(): number { return this.ports.web; }
+  private get adminPort(): number { return this.ports.supervisorAdmin; }
+  private get supervisorControlPort(): number { return this.ports.supervisorControl; }
+  private get adminTunnelHealthPort(): number { return this.ports.supervisorTunnelHealth; }
 
   public async up(): Promise<SupervisorStackStatus> {
     await this.prepareDirectories();
@@ -327,6 +329,7 @@ export class Supervisor {
     await loadOrCreateTunnelServiceSecret(this.dataRoot);
     const runtimeId = await loadOrCreateRuntimeId(this.dataRoot);
     const boundRegistry = await bindConnectorRuntime(this.dataRoot, runtimeId);
+    this.assertConfiguredConnectorPorts(boundRegistry);
     const registryChanged = registryResult.changed || boundRegistry.deploymentEpoch !== registryResult.registry.deploymentEpoch;
     let state = await this.readState();
     const started: Array<'runtime' | 'web' | 'admin' | 'full' | 'pro' | 'admin-tunnel'> = [];
@@ -372,6 +375,8 @@ export class Supervisor {
         const startedRuntime = await startRuntime({
           dataRoot: this.dataRoot,
           sourceRoot: state.workloadSourceRoot,
+          preferredPort: this.runtimePort,
+          strictPort: this.acceptanceScopedPorts,
           ...(this.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: this.protectedReferenceRoot }),
           ...(expectedSourceIdentity === undefined ? {} : { expectedSourceIdentity }),
         });
@@ -1414,8 +1419,24 @@ export class Supervisor {
     await this.prepareDirectories();
     return this.withOperationLock('initialize-unified', async () => {
       if (await readConnectorRegistry(this.dataRoot) !== null) throw new RuntimeError('PRECONDITION_FAILED', 'Connector setup already exists; explicit migration is required');
-      return initializeConnectorRegistry(this.dataRoot, { unified: true, fullTunnelId: tunnelId });
+      return initializeConnectorRegistry(this.dataRoot, {
+        unified: true,
+        fullTunnelId: tunnelId,
+        fullHealthPort: this.ports.fullTunnelHealth,
+      });
     });
+  }
+
+  private assertConfiguredConnectorPorts(registry: ConnectorRegistryDocument): void {
+    if (!this.acceptanceScopedPorts) return;
+    const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
+    const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
+    if (full?.healthPort !== this.ports.fullTunnelHealth) {
+      throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'FULL tunnel health port does not match the acceptance port set');
+    }
+    if (pro !== undefined && pro.healthPort !== this.ports.proTunnelHealth) {
+      throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'PRO tunnel health port does not match the acceptance port set');
+    }
   }
 
   private async ensureRegistry(): Promise<{ readonly registry: ConnectorRegistryDocument; readonly changed: boolean }> {

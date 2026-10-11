@@ -5,16 +5,61 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { buildChildEnvironment, inspectAcceptanceEnvironment, parseAcceptanceArgs } from './iris-acceptance.mjs';
+import { buildChildEnvironment, inspectAcceptanceEnvironment, parseAcceptanceArgs, verifyGeneratedPortBindings } from './iris-acceptance.mjs';
 
 const roots = [];
 const sourceRoot = path.resolve(import.meta.dirname, '..');
+const TEST_PORTS = {
+  runtime: 46_110,
+  supervisorAdmin: 46_111,
+  supervisorControl: 46_112,
+  supervisorTunnelHealth: 46_113,
+  fullTunnelHealth: 46_114,
+  proTunnelHealth: 46_115,
+  web: 46_116,
+};
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe('acceptance isolation preflight', () => {
+  it('accepts one complete isolated port set and rejects partial or protected sets', async () => {
+    const spec = Object.entries(TEST_PORTS).map(([name, port]) => `${name}=${port}`).join(',');
+    assert.deepEqual(parseAcceptanceArgs(['--runtime-data-root', '/tmp/root', '--protected-root', '/tmp/live', '--ports', spec, '--', 'status']).ports, TEST_PORTS);
+    assert.throws(() => parseAcceptanceArgs(['--runtime-data-root', '/tmp/root', '--protected-root', '/tmp/live', '--ports', 'runtime=46110', '--', 'status']), (error) => error.code === 'ACCEPTANCE_PORTS_INVALID');
+    await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions('/tmp/root', ['status']), ports: { ...TEST_PORTS, web: 5173 } }), (error) => error.code === 'ACCEPTANCE_PORT_PROTECTED');
+  });
+
+  it('requires explicit ports for every acceptance command', async () => {
+    const root = await fixtureRoot();
+    const options = baseOptions(root, ['status']);
+    delete options.ports;
+    await assert.rejects(inspectAcceptanceEnvironment(options), (error) => error.code === 'ACCEPTANCE_PORTS_REQUIRED');
+    const preflight = baseOptions(root, ['preflight']);
+    delete preflight.ports;
+    await assert.rejects(inspectAcceptanceEnvironment(preflight), (error) => error.code === 'ACCEPTANCE_PORTS_REQUIRED');
+  });
+
+  it('propagates isolated ports to acceptance child processes', () => {
+    const child = buildChildEnvironment('/private/tmp/acceptance', {}, TEST_PORTS);
+    assert.equal(child.IRIS_RUNTIME_PORT, String(TEST_PORTS.runtime));
+    assert.equal(child.IRIS_SUPERVISOR_ADMIN_PORT, String(TEST_PORTS.supervisorAdmin));
+    assert.equal(child.IRIS_SUPERVISOR_CONTROL_PORT, String(TEST_PORTS.supervisorControl));
+    assert.equal(child.IRIS_WEB_PORT, String(TEST_PORTS.web));
+  });
+
+  it('rejects generated registry and profile port mismatches', async () => {
+    const root = await fixtureRoot();
+    await mkdir(path.join(root, 'tunnel-profiles'), { mode: 0o700 });
+    await writeFile(path.join(root, 'connector-registry.json'), JSON.stringify({ connectors: [{ connectorId: 'iris-full', healthPort: 43113 }], admin: null }));
+    await assert.rejects(verifyGeneratedPortBindings(root, TEST_PORTS), (error) => error.code === 'ACCEPTANCE_PORT_BINDING_MISMATCH');
+    const profileRoot = await fixtureRoot();
+    await mkdir(path.join(profileRoot, 'tunnel-profiles'), { mode: 0o700 });
+    await writeFile(path.join(profileRoot, 'tunnel-profiles', 'iris-full.yaml'), 'listen_addr: 127.0.0.1:46114\nurl: http://127.0.0.1:43110/mcp\n');
+    await assert.rejects(verifyGeneratedPortBindings(profileRoot, TEST_PORTS), (error) => error.code === 'ACCEPTANCE_PORT_BINDING_MISMATCH');
+  });
+
   it('requires an explicit root and never resolves the default root', () => {
     assert.throws(() => parseAcceptanceArgs(['--protected-root', '/tmp/live', '--', 'status']), (error) => error.code === 'ACCEPTANCE_USAGE');
   });
@@ -137,8 +182,10 @@ describe('acceptance isolation preflight', () => {
 
   it('rejects a controlled port conflict without adopting the process', async () => {
     const root = await fixtureRoot();
+    await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, ['preflight']), probePort: async (port) => port === TEST_PORTS.runtime }), (error) => error.code === 'ACCEPTANCE_PORT_CONFLICT');
+    assert.deepEqual(await readdir(root), []);
     await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
-    await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, ['up']), probePort: async (port) => port === 43110 }), (error) => error.code === 'ACCEPTANCE_PORT_CONFLICT');
+    await assert.rejects(inspectAcceptanceEnvironment({ ...baseOptions(root, ['up']), probePort: async (port) => port === TEST_PORTS.runtime }), (error) => error.code === 'ACCEPTANCE_PORT_CONFLICT');
   });
 
   it('blocks LaunchAgent install and uninstall for parallel acceptance', async () => {
@@ -350,6 +397,7 @@ function baseOptions(root, command) {
     runtimeDataRoot: root,
     protectedRoots: ['/tmp/iris-live-fixture'],
     sourceRoot,
+    ports: TEST_PORTS,
     command,
     environment: { IRIS_ACCEPTANCE_ROOT: root },
   };
@@ -358,6 +406,7 @@ function baseOptions(root, command) {
 function runWrapper(root, protectedRoots, command) {
   const argumentsList = [path.join(sourceRoot, 'scripts', 'iris-acceptance.mjs'), '--runtime-data-root', root];
   for (const protectedRoot of protectedRoots) argumentsList.push('--protected-root', protectedRoot);
+  argumentsList.push('--ports', Object.entries(TEST_PORTS).map(([name, port]) => `${name}=${port}`).join(','));
   argumentsList.push('--', ...command);
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, argumentsList, {

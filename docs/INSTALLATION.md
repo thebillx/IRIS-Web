@@ -43,6 +43,7 @@ acceptance-only wrapper. Do not scope only `setup`; credential migration,
 export IRIS_ACCEPTANCE_ROOT="$HOME/Library/Application Support/IRIS-acceptance-<unique>"
 export IRIS_LIVE_DATA_ROOT="$HOME/Library/Application Support/IRIS"
 export IRIS_LIVE_SOURCE_ROOT="/Users/RARW/iris"
+export IRIS_ACCEPTANCE_PORTS='runtime=46110,supervisorAdmin=46111,supervisorControl=46112,supervisorTunnelHealth=46113,fullTunnelHealth=46114,proTunnelHealth=46115,web=46116'
 mkdir -m 700 "$IRIS_ACCEPTANCE_ROOT"   # stop first if it already exists
 
 iris_acceptance() {
@@ -50,6 +51,7 @@ iris_acceptance() {
     --runtime-data-root "$IRIS_ACCEPTANCE_ROOT" \
     --protected-root "$IRIS_LIVE_DATA_ROOT" \
     --protected-root "$IRIS_LIVE_SOURCE_ROOT" \
+    --ports "$IRIS_ACCEPTANCE_PORTS" \
     -- "$@"
 }
 
@@ -60,7 +62,11 @@ iris_acceptance status
 iris_acceptance doctor
 ```
 
-The wrapper refuses a missing root export, root switch, source/data overlap,
+The wrapper requires one complete, unique, owner-verified acceptance port set
+for runtime, Supervisor admin/control and health, FULL/PRO health, and Web.
+Replace the example values with free ports from the acceptance Mac; production
+defaults (`43110`, `43111`, `43112`, `43113`, `8080`, `8081`, `5173`) are
+rejected. The wrapper refuses a missing root export, root switch, source/data overlap,
 reused state, physical root replacement, symlink or unsafe mode, protected-root
 collision, ambiguous process state, occupied runtime/web ports, protected
 tunnel claim, production profile, and the global `com.iris.supervisor`

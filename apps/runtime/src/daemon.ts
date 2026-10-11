@@ -231,6 +231,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         },
       },
       options.preferredPort ?? readPreferredPort(),
+      process.env.IRIS_RUNTIME_PORT_STRICT !== '1',
     );
     await writeRuntimeControl(dataRoot, { schemaVersion: 1, runtimeId, instanceId: identity.instanceId, secret: controlSecret });
     await writeEndpoint(dataRoot, {

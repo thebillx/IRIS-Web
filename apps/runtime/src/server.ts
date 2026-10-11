@@ -60,12 +60,12 @@ export function requireLoopbackAddress(address: string): typeof LOOPBACK_ADDRESS
   return LOOPBACK_ADDRESS;
 }
 
-export async function startRuntimeServer(context: RuntimeServerContext, preferredPort: number): Promise<RuntimeServerHandle> {
+export async function startRuntimeServer(context: RuntimeServerContext, preferredPort: number, allowPortFallback = true): Promise<RuntimeServerHandle> {
   requirePort(preferredPort);
   const server = createServer((request, response) => {
     void routeRequest(request, response, context).catch((error: unknown) => writeError(response, error));
   });
-  const port = await listenWithFallback(server, preferredPort);
+  const port = await listenWithFallback(server, preferredPort, allowPortFallback);
   const apiUrl = `http://${LOOPBACK_ADDRESS}:${port}`;
   return {
     server,
@@ -79,11 +79,11 @@ export async function startRuntimeServer(context: RuntimeServerContext, preferre
   };
 }
 
-async function listenWithFallback(server: Server, preferredPort: number): Promise<number> {
+async function listenWithFallback(server: Server, preferredPort: number, allowPortFallback: boolean): Promise<number> {
   try {
     return await listen(server, preferredPort);
   } catch (error: unknown) {
-    if (preferredPort !== 0 && isAddressInUse(error)) return listen(server, 0);
+    if (allowPortFallback && preferredPort !== 0 && isAddressInUse(error)) return listen(server, 0);
     throw new RuntimeError('PORT_UNAVAILABLE', 'IRIS runtime could not bind its loopback listener', { cause: error });
   }
 }

@@ -6,7 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { pathToFileURL } from 'node:url';
+import { URL, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -14,13 +14,16 @@ const REPO_ROOT = path.resolve(import.meta.dirname, '..');
 const IDENTITY_FILE = '.iris-acceptance-identity.json';
 const DEFAULT_DATA_ROOT = path.join(os.homedir(), 'Library', 'Application Support', 'IRIS');
 const DEFAULT_CREDENTIAL_ROOT = path.join(os.homedir(), '.config', 'tunnel-client');
-const PORTS = [
-  ['runtime', 43_110],
-  ['supervisor-admin', 43_111],
-  ['supervisor-control', 43_112],
-  ['supervisor-tunnel-health', 43_113],
-  ['web', 5_173],
-];
+const PORT_KEYS = ['runtime', 'supervisorAdmin', 'supervisorControl', 'supervisorTunnelHealth', 'fullTunnelHealth', 'proTunnelHealth', 'web'];
+const DEFAULT_PORTS = Object.freeze({
+  runtime: 43_110,
+  supervisorAdmin: 43_111,
+  supervisorControl: 43_112,
+  supervisorTunnelHealth: 43_113,
+  fullTunnelHealth: 8_080,
+  proTunnelHealth: 8_081,
+  web: 5_173,
+});
 
 export class AcceptanceError extends Error {
   constructor(code, message) {
@@ -31,6 +34,7 @@ export class AcceptanceError extends Error {
 
 export function parseAcceptanceArgs(argumentsList) {
   let runtimeDataRoot;
+  let ports;
   const protectedRoots = [];
   let separator = -1;
   for (let index = 0; index < argumentsList.length; index += 1) {
@@ -42,6 +46,7 @@ export function parseAcceptanceArgs(argumentsList) {
     const value = argumentsList[index + 1]?.trim();
     if (value === undefined || value.length === 0) throw new AcceptanceError('ACCEPTANCE_USAGE', 'Every acceptance command requires --runtime-data-root, --protected-root and -- <iris command>');
     if (name === '--runtime-data-root' && runtimeDataRoot === undefined) runtimeDataRoot = value;
+    else if (name === '--ports' && ports === undefined) ports = parsePortSpec(value);
     else if (name === '--protected-root') protectedRoots.push(value);
     else throw new AcceptanceError('ACCEPTANCE_USAGE', 'Every acceptance command requires --runtime-data-root, --protected-root and -- <iris command>');
     index += 1;
@@ -49,7 +54,7 @@ export function parseAcceptanceArgs(argumentsList) {
   if (separator < 0 || runtimeDataRoot === undefined || protectedRoots.length === 0 || argumentsList.slice(separator + 1).length === 0) {
     throw new AcceptanceError('ACCEPTANCE_USAGE', 'Every acceptance command requires --runtime-data-root, --protected-root and -- <iris command>');
   }
-  return { runtimeDataRoot, protectedRoots, command: argumentsList.slice(separator + 1) };
+  return { runtimeDataRoot, protectedRoots, ports: ports ?? null, command: argumentsList.slice(separator + 1) };
 }
 
 export function validateAcceptanceCommand(command) {
@@ -121,7 +126,10 @@ export function validateAcceptanceCommand(command) {
 export async function inspectAcceptanceEnvironment(options) {
   const environment = options.environment ?? process.env;
   const command = options.command ?? [];
+  const ports = options.ports ?? parsePortEnvironment(environment.IRIS_ACCEPTANCE_PORTS);
   validateAcceptanceCommand(command);
+  if (requiresPortSet(command) && ports === null) throw new AcceptanceError('ACCEPTANCE_PORTS_REQUIRED', 'Acceptance commands require the complete isolated port set; pass --ports before --');
+  if (ports !== null) assertSideBySidePorts(ports);
   const dataRoot = await existingPrivateDirectory(options.runtimeDataRoot, 'ACCEPTANCE_ROOT_INVALID');
   const sourceRoot = await existingDirectory(options.sourceRoot ?? REPO_ROOT, 'ACCEPTANCE_SOURCE_INVALID');
   const sessionRoot = environment.IRIS_ACCEPTANCE_ROOT?.trim();
@@ -147,6 +155,10 @@ export async function inspectAcceptanceEnvironment(options) {
   const expectedBranch = environment.IRIS_ACCEPTANCE_EXPECTED_BRANCH?.trim();
   if (expectedHead !== undefined && expectedHead.length > 0 && git.head !== expectedHead) throw new AcceptanceError('ACCEPTANCE_SOURCE_HEAD_MISMATCH', `Acceptance checkout HEAD is ${git.head}, expected ${expectedHead}`);
   if (expectedBranch !== undefined && expectedBranch.length > 0 && git.branch !== expectedBranch) throw new AcceptanceError('ACCEPTANCE_SOURCE_BRANCH_MISMATCH', `Acceptance checkout branch is ${git.branch}, expected ${expectedBranch}`);
+  if (needsFreePorts(command)) {
+    const conflicts = await findPortConflicts(ports, options.probePort);
+    if (conflicts.length > 0) throw new AcceptanceError('ACCEPTANCE_PORT_CONFLICT', `Acceptance ports are occupied: ${conflicts.map((entry) => `${entry.name}:${entry.port}`).join(', ')}`);
+  }
   await bindIdentity(dataRoot, sourceRoot, git, rootIdentity, command[0] === 'preflight');
 
   const processState = await inspectProcessState(dataRoot, sourceRoot, options.isPidAlive);
@@ -154,11 +166,6 @@ export async function inspectAcceptanceEnvironment(options) {
   if (['install', 'uninstall'].includes(command[1] ?? '') && commandName === 'launchd') {
     throw new AcceptanceError('ACCEPTANCE_LAUNCHD_BLOCKED', 'LaunchAgent install/uninstall is blocked during parallel acceptance; inspect artifacts only in a separately authorized window');
   }
-  if (needsFreePorts(command)) {
-    const conflicts = await findPortConflicts(options.probePort);
-    if (conflicts.length > 0) throw new AcceptanceError('ACCEPTANCE_PORT_CONFLICT', `Acceptance ports are occupied: ${conflicts.map((entry) => `${entry.name}:${entry.port}`).join(', ')}`);
-  }
-
   const requestedTunnelId = commandValue(command, '--tunnel-id');
   const tunnelClaims = requestedTunnelId === null ? [] : await findTunnelClaims(protectedRoots, requestedTunnelId, options.readTextFile);
   if (tunnelClaims.length > 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_CONFLICT', `Acceptance tunnel identity is already claimed by protected installation ${tunnelClaims[0]}`);
@@ -189,7 +196,7 @@ export async function inspectAcceptanceEnvironment(options) {
     protectedRoots,
     processState,
     tunnelIdentity,
-    ports: PORTS.map(([name, port]) => ({ name, port })),
+    ports,
   };
 }
 
@@ -201,15 +208,24 @@ async function main() {
       process.stdout.write(`${JSON.stringify({ status: 'PASS', ...report }, null, 2)}\n`);
       return;
     }
-    const childEnvironment = buildChildEnvironment(report.dataRoot, process.env);
+    const childEnvironment = buildChildEnvironment(report.dataRoot, process.env, report.ports);
     const child = spawn(process.execPath, [path.join(REPO_ROOT, 'scripts', 'iris.mjs'), ...stripAcceptanceArguments(parsed.command)], {
       cwd: REPO_ROOT,
       env: childEnvironment,
       stdio: 'inherit',
     });
-    child.once('exit', (code, signal) => {
+    child.once('exit', async (code, signal) => {
       if (signal !== null) process.kill(process.pid, signal);
-      else process.exitCode = code ?? 1;
+      else {
+        try {
+          if (code === 0 && report.ports !== null) await verifyGeneratedPortBindings(report.dataRoot, report.ports);
+          process.exitCode = code ?? 1;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Generated acceptance port bindings are invalid';
+          process.stderr.write(`IRIS_ACCEPTANCE_BLOCKED code=ACCEPTANCE_PORT_BINDING_MISMATCH message=${message}\n`);
+          process.exitCode = 1;
+        }
+      }
     });
   } catch (error) {
     const code = error instanceof AcceptanceError ? error.code : 'ACCEPTANCE_PREFLIGHT_FAILED';
@@ -292,10 +308,103 @@ async function readAcceptanceWorkloadBinding(dataRoot) {
   return { connectorId: workload.connectorId, tunnelId: workload.tunnelId, machineId: workload.machineId, managedProfilePath };
 }
 
-export function buildChildEnvironment(dataRoot, environment = process.env) {
+export function buildChildEnvironment(dataRoot, environment = process.env, ports = null) {
   const childEnvironment = { ...environment };
   delete childEnvironment.IRIS_PROTECTED_REFERENCE_ROOT;
-  return { ...childEnvironment, IRIS_RUNTIME_DATA_ROOT: dataRoot, IRIS_ACCEPTANCE_ROOT: dataRoot };
+  return {
+    ...childEnvironment,
+    IRIS_RUNTIME_DATA_ROOT: dataRoot,
+    IRIS_ACCEPTANCE_ROOT: dataRoot,
+    ...(ports === null ? {} : portEnvironment(ports)),
+  };
+}
+
+function parsePortEnvironment(raw) {
+  if (raw === undefined || raw.trim().length === 0) return null;
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { throw new AcceptanceError('ACCEPTANCE_PORTS_INVALID', 'IRIS_ACCEPTANCE_PORTS must be valid JSON'); }
+  return validatePortSet(parsed);
+}
+
+function parsePortSpec(value) {
+  const parsed = {};
+  for (const entry of value.split(',')) {
+    const [name, rawPort, ...extra] = entry.split('=');
+    if (extra.length > 0 || !PORT_KEYS.includes(name) || rawPort === undefined || rawPort.length === 0 || Object.prototype.hasOwnProperty.call(parsed, name)) {
+      throw new AcceptanceError('ACCEPTANCE_PORTS_INVALID', 'Use --ports key=port,... with the complete isolated port set');
+    }
+    parsed[name] = Number(rawPort);
+  }
+  return validatePortSet(parsed);
+}
+
+function validatePortSet(value) {
+  if (!isRecord(value) || Object.keys(value).length !== PORT_KEYS.length || PORT_KEYS.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
+    throw new AcceptanceError('ACCEPTANCE_PORTS_INVALID', 'The isolated port set must contain runtime, supervisorAdmin, supervisorControl, supervisorTunnelHealth, fullTunnelHealth, proTunnelHealth and web');
+  }
+  const ports = Object.fromEntries(PORT_KEYS.map((key) => [key, value[key]]));
+  if (Object.values(ports).some((port) => !Number.isSafeInteger(port) || port <= 0 || port > 65_535)) {
+    throw new AcceptanceError('ACCEPTANCE_PORTS_INVALID', 'Every isolated port must be an integer from 1 through 65535');
+  }
+  if (new Set(Object.values(ports)).size !== PORT_KEYS.length) throw new AcceptanceError('ACCEPTANCE_PORTS_INVALID', 'Isolated ports must be unique');
+  return ports;
+}
+
+function assertSideBySidePorts(ports) {
+  const protectedPort = Object.entries(DEFAULT_PORTS).find(([, value]) => Object.values(ports).includes(value));
+  if (protectedPort !== undefined) throw new AcceptanceError('ACCEPTANCE_PORT_PROTECTED', `Isolated port ${protectedPort[1]} reuses the protected production ${protectedPort[0]} port`);
+}
+
+function portEnvironment(ports) {
+  return {
+    IRIS_ACCEPTANCE_PORTS: JSON.stringify(ports),
+    IRIS_RUNTIME_PORT: String(ports.runtime),
+    IRIS_SUPERVISOR_ADMIN_PORT: String(ports.supervisorAdmin),
+    IRIS_SUPERVISOR_CONTROL_PORT: String(ports.supervisorControl),
+    IRIS_SUPERVISOR_TUNNEL_HEALTH_PORT: String(ports.supervisorTunnelHealth),
+    IRIS_FULL_TUNNEL_HEALTH_PORT: String(ports.fullTunnelHealth),
+    IRIS_PRO_TUNNEL_HEALTH_PORT: String(ports.proTunnelHealth),
+    IRIS_WEB_PORT: String(ports.web),
+  };
+}
+
+export async function verifyGeneratedPortBindings(dataRoot, ports) {
+  const registry = await readJsonIfPresent(path.join(dataRoot, 'connector-registry.json'));
+  if (registry !== null) {
+    const connectors = registry?.connectors;
+    if (!Array.isArray(connectors)) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', 'Acceptance connector registry is invalid');
+    for (const connector of connectors) {
+      const expected = connector.connectorId === 'iris-full' ? ports.fullTunnelHealth : connector.connectorId === 'iris-pro' ? ports.proTunnelHealth : null;
+      if (expected !== null && connector.healthPort !== expected) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${connector.connectorId} health port does not match the isolated port set`);
+    }
+  }
+  const endpoint = await readJsonIfPresent(path.join(dataRoot, 'endpoint.json'));
+  if (endpoint !== null && new URL(endpoint.apiUrl).port !== String(ports.runtime)) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', 'Runtime endpoint does not match the isolated runtime port');
+  const profiles = [
+    ['iris-full.yaml', ports.fullTunnelHealth, '/mcp'],
+    ['iris-pro.yaml', ports.proTunnelHealth, '/mcp-pro'],
+    ['iris-admin.yaml', ports.supervisorTunnelHealth, '/mcp'],
+  ];
+  for (const [filename, healthPort, mcpPath] of profiles) {
+    const content = await readTextIfPresent(path.join(dataRoot, 'tunnel-profiles', filename));
+    if (content === null) continue;
+    if (!content.includes(`127.0.0.1:${healthPort}`)) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${filename} health binding does not match the isolated port set`);
+    if (!content.includes(`127.0.0.1:${ports.runtime}${mcpPath}`) && filename !== 'iris-admin.yaml') {
+      throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${filename} runtime URL does not match the isolated runtime port`);
+    }
+    if (filename === 'iris-admin.yaml' && !content.includes(`127.0.0.1:${ports.supervisorControl}${mcpPath}`)) {
+      throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', 'Admin profile does not match the isolated Supervisor control port');
+    }
+  }
+}
+
+async function readJsonIfPresent(filename) {
+  const content = await readTextIfPresent(filename);
+  return content === null ? null : JSON.parse(content);
+}
+
+async function readTextIfPresent(filename) {
+  return readFile(filename, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) await main();
@@ -368,18 +477,22 @@ async function findTunnelClaims(protectedRoots, tunnelId, readTextFile = readFil
   return claims;
 }
 
-async function findPortConflicts(probe = probePort) {
+async function findPortConflicts(ports, probe = probePort) {
   const conflicts = [];
-  for (const [name, port] of PORTS) if (await probe(port, '127.0.0.1')) conflicts.push({ name, port });
+  for (const [name, port] of Object.entries(ports)) if (await probe(port, '127.0.0.1')) conflicts.push({ name, port });
   return conflicts;
 }
 
+function requiresPortSet(command) {
+  return command.length > 0;
+}
+
 function needsFreePorts(command) {
-  return command[0] === 'up' || command[0] === 'restart' || command[0] === 'supervisor' || (command[0] === 'setup' && command.includes('--start'));
+  return command[0] === 'preflight' || command[0] === 'up' || command[0] === 'restart' || command[0] === 'supervisor' || (command[0] === 'setup' && command.includes('--start'));
 }
 
 function startsRemoteTunnel(command) {
-  return needsFreePorts(command) || (command[0] === 'connectors' && command[1] === 'admin-bind');
+  return (needsFreePorts(command) && command[0] !== 'preflight') || (command[0] === 'connectors' && command[1] === 'admin-bind');
 }
 
 function commandValue(command, flag) {

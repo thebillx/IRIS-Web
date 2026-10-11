@@ -16,6 +16,12 @@ LaunchAgent collision.
 - Identify every protected live source/data root on that Mac and pass each one
   to `--protected-root`. The wrapper also protects the default IRIS data root,
   the default tunnel profile directory and the candidate source checkout.
+- Choose one complete, unique acceptance port set for `runtime`,
+  `supervisorAdmin`, `supervisorControl`, `supervisorTunnelHealth`,
+  `fullTunnelHealth`, `proTunnelHealth` and `web`. Verify every port is free
+  on the target Mac and does not equal a protected production default
+  (`43110`, `43111`, `43112`, `43113`, `8080`, `8081` or `5173`). The wrapper
+  rejects partial sets, duplicates, occupied ports and protected-port reuse.
 - Provision a separate non-production tunnel profile and tunnel ID. Never copy
   a production credential or reuse a production tunnel identity.
 - Obtain owner-approved, read-only provider evidence for that exact tunnel with
@@ -57,10 +63,11 @@ it does, stop rather than remove or overwrite it.
 
 ```sh
 export IRIS_ACCEPTANCE_ROOT="$HOME/Library/Application Support/IRIS-acceptance-<unique>"
-export IRIS_ACCEPTANCE_EXPECTED_BRANCH="codex/unified-iris-task-continuity"
+export IRIS_ACCEPTANCE_EXPECTED_BRANCH="codex/one-iris-completion"
 export IRIS_ACCEPTANCE_EXPECTED_HEAD="<expected-candidate-head>"
 export IRIS_LIVE_DATA_ROOT="$HOME/Library/Application Support/IRIS"
 export IRIS_LIVE_SOURCE_ROOT="/Users/RARW/iris"
+export IRIS_ACCEPTANCE_PORTS='runtime=46110,supervisorAdmin=46111,supervisorControl=46112,supervisorTunnelHealth=46113,fullTunnelHealth=46114,proTunnelHealth=46115,web=46116'
 
 if [ -e "$IRIS_ACCEPTANCE_ROOT" ]; then
   echo "Acceptance root already exists; preserve it and stop" >&2
@@ -73,6 +80,7 @@ iris_acceptance() {
     --runtime-data-root "$IRIS_ACCEPTANCE_ROOT" \
     --protected-root "$IRIS_LIVE_DATA_ROOT" \
     --protected-root "$IRIS_LIVE_SOURCE_ROOT" \
+    --ports "$IRIS_ACCEPTANCE_PORTS" \
     -- "$@"
 }
 
@@ -80,9 +88,9 @@ iris_acceptance preflight
 ```
 
 The wrapper checks the physical source/data paths, owner and mode, Git branch
-and HEAD, protected-root collisions, existing process state, runtime ports
-`43110–43113` and web port `5173`, tunnel claims visible in protected local
-registries, and the global LaunchAgent risk. Its visible
+and HEAD, protected-root collisions, existing process state, every port in
+`IRIS_ACCEPTANCE_PORTS`, tunnel claims visible in protected local registries,
+and the global LaunchAgent risk. Its visible
 `.iris-acceptance-identity.json` guard binds the canonical root path, device,
 inode, owner and private mode as well as the checkout, branch and HEAD. A
 later command with a changed root, checkout, branch or HEAD fails closed.

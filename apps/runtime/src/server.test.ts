@@ -37,6 +37,31 @@ describe('runtime listener safety', () => {
     expect(() => requireLoopbackAddress('localhost')).toThrow();
   });
 
+  it('fails closed on an occupied explicit port when fallback is disabled', async () => {
+    const context: RuntimeServerContext = {
+      identity,
+      state: {} as RuntimeState,
+      capabilities: {} as CapabilityService,
+      missionBroker: {} as MissionBrokerService,
+      health: () => ({
+        status: 'ready', version: '0.0.0', platform: 'darwin', runtimeId: identity.runtimeId, instanceId: identity.instanceId,
+        pid: identity.pid, uptimeMs: 1, authority: 'owned', connectedClients: 0, connectedSessions: 0,
+        agentExecutorType: 'local-development-executor', productionModelConnected: false, apiUrl: '', mcpUrl: '',
+      }),
+      doctor: async () => ({ status: 'pass', checks: [] }),
+      isShuttingDown: () => false,
+      controlSecret: 'test-control-secret-that-is-not-public',
+      ownerAccessSecret: 'test-owner-access-secret-that-is-not-public',
+      requestShutdown: () => undefined,
+    };
+    const holder = await startRuntimeServer(context, 0);
+    try {
+      await expect(startRuntimeServer(context, holder.port, false)).rejects.toMatchObject({ code: 'PORT_UNAVAILABLE' });
+    } finally {
+      await holder.close();
+    }
+  });
+
   it('serves health from a loopback listener and rejects a non-loopback browser origin', async () => {
     handle = await startRuntimeServer({
       identity,
