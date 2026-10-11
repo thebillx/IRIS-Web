@@ -170,11 +170,12 @@ export async function inspectAcceptanceEnvironment(options) {
   const tunnelClaims = requestedTunnelId === null ? [] : await findTunnelClaims(protectedRoots, requestedTunnelId, options.readTextFile);
   if (tunnelClaims.length > 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_CONFLICT', `Acceptance tunnel identity is already claimed by protected installation ${tunnelClaims[0]}`);
   let tunnelIdentity = tunnelClaims.length > 0 ? 'CONFLICT' : 'UNVERIFIED';
+  let startupState = null;
   if (startsRemoteTunnel(command)) {
     if (requestedTunnelId === null) throw new AcceptanceError('ACCEPTANCE_TUNNEL_ID_REQUIRED', 'Remote acceptance startup requires the exact non-production workload tunnel id');
     const evidencePath = environment.IRIS_ACCEPTANCE_TUNNEL_EVIDENCE?.trim();
-    if (evidencePath === undefined || evidencePath.length === 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_UNVERIFIED', 'Acceptance tunnel ownership is UNVERIFIED; provide authoritative non-production tunnel ownership evidence');
-    await verifyAcceptanceTunnelEvidence({
+    if (evidencePath === undefined || evidencePath.length === 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_UNVERIFIED', 'Acceptance tunnel authorization is UNVERIFIED; provide the bound non-production startup authorization');
+    const authorization = await verifyAcceptanceTunnelAuthorization({
       filename: evidencePath,
       tunnelId: requestedTunnelId,
       dataRoot,
@@ -183,8 +184,10 @@ export async function inspectAcceptanceEnvironment(options) {
       isPidAlive: options.isPidAlive,
       inspectProcess: options.inspectProcess,
       readTextFile: options.readTextFile,
+      ports,
     });
-    tunnelIdentity = 'VERIFIED';
+    tunnelIdentity = 'AUTHORIZED';
+    startupState = authorization.state;
   }
 
   if (commandName === 'credentials' && command[1] === 'migrate') await validateCredentialProfile(command[2], protectedRoots);
@@ -196,6 +199,7 @@ export async function inspectAcceptanceEnvironment(options) {
     protectedRoots,
     processState,
     tunnelIdentity,
+    startupState,
     ports,
   };
 }
@@ -215,16 +219,30 @@ async function main() {
       stdio: 'inherit',
     });
     child.once('exit', async (code, signal) => {
-      if (signal !== null) process.kill(process.pid, signal);
-      else {
-        try {
-          if (code === 0 && report.ports !== null) await verifyGeneratedPortBindings(report.dataRoot, report.ports);
-          process.exitCode = code ?? 1;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'Generated acceptance port bindings are invalid';
-          process.stderr.write(`IRIS_ACCEPTANCE_BLOCKED code=ACCEPTANCE_PORT_BINDING_MISMATCH message=${message}\n`);
+      try {
+        if (signal !== null) {
+          process.stderr.write(`IRIS_ACCEPTANCE_BLOCKED code=ACCEPTANCE_STARTUP_UNKNOWN_OUTCOME message=Acceptance child exited from ${signal}; inspect Supervisor state before retrying\n`);
           process.exitCode = 1;
+          return;
         }
+        if (code === 0 && report.ports !== null) {
+          await verifyGeneratedPortBindings(report.dataRoot, report.ports);
+          if (startsRemoteTunnel(parsed.command)) {
+            await verifyAcceptanceTunnelStartup({
+              filename: process.env.IRIS_ACCEPTANCE_TUNNEL_EVIDENCE,
+              tunnelId: commandValue(parsed.command, '--tunnel-id'),
+              dataRoot: report.dataRoot,
+              sourceRoot: report.sourceRoot,
+              ports: report.ports,
+            });
+          }
+        }
+        process.exitCode = code ?? 1;
+      } catch (error) {
+        const acceptanceCode = error instanceof AcceptanceError ? error.code : 'ACCEPTANCE_STARTUP_UNVERIFIED';
+        const message = error instanceof Error ? error.message : 'Acceptance startup verification failed';
+        process.stderr.write(`IRIS_ACCEPTANCE_BLOCKED code=${acceptanceCode} message=${message}\n`);
+        process.exitCode = 1;
       }
     });
   } catch (error) {
@@ -233,6 +251,95 @@ async function main() {
     process.stderr.write(`IRIS_ACCEPTANCE_BLOCKED code=${code} message=${message}\n`);
     process.exitCode = 1;
   }
+}
+
+export async function verifyAcceptanceTunnelAuthorization(options) {
+  const evidence = await readAcceptanceTunnelEvidence(options.filename, options.readTextFile);
+  const workloadBinding = await readAcceptanceWorkloadBinding(options.dataRoot);
+  const canonicalDataRoot = await canonicalPath(options.dataRoot);
+  const expectedCredentialPath = path.resolve(canonicalDataRoot, 'credentials', 'control-plane-api-key');
+  const evidenceProfilePath = await canonicalEvidenceProfile(evidence);
+  const expectedTunnelId = options.tunnelId;
+  if (typeof expectedTunnelId !== 'string' || expectedTunnelId.length === 0) throw new AcceptanceError('ACCEPTANCE_TUNNEL_ID_REQUIRED', 'Tunnel authorization must name the exact workload tunnel');
+  if (!isRecord(evidence)
+    || evidence.schemaVersion !== 2
+    || evidence.phase !== 'PREPARED'
+    || evidence.environment !== 'non-production'
+    || typeof evidence.provider !== 'string' || evidence.provider.length === 0 || evidence.provider.length > 200
+    || typeof evidence.machineId !== 'string' || evidence.machineId !== workloadBinding.machineId
+    || typeof evidence.sourceRoot !== 'string' || path.resolve(evidence.sourceRoot) !== path.resolve(options.sourceRoot)
+    || evidence.tunnelId !== expectedTunnelId
+    || evidence.credentialPath !== expectedCredentialPath
+    || !isRecord(evidence.binding)
+    || evidence.binding.connectorId !== workloadBinding.connectorId
+    || evidence.binding.machineId !== workloadBinding.machineId
+    || evidence.binding.tunnelId !== workloadBinding.tunnelId
+    || evidenceProfilePath !== workloadBinding.managedProfilePath) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID', 'Startup authorization does not bind the expected non-production machine, source, credential, registry connector or managed profile');
+  }
+  await verifyPrivateFile(expectedCredentialPath, 'ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID', 'Acceptance control-plane credential must be a private owner file');
+  await verifyPrivateFile(workloadBinding.managedProfilePath, 'ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID', 'Acceptance tunnel profile must be a private owner file');
+  const profileContent = await readFile(workloadBinding.managedProfilePath, 'utf8').catch(() => null);
+  if (profileContent === null || !profileContent.includes(`tunnel_id: "${workloadBinding.tunnelId}"`)) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID', 'Acceptance managed profile does not bind the authorized tunnel');
+  }
+  if (options.ports !== undefined && options.ports !== null) await verifyGeneratedPortBindings(canonicalDataRoot, options.ports);
+  return { state: 'PREPARED', provider: evidence.provider, machineId: evidence.machineId, tunnelId: evidence.tunnelId, managedProfilePath: workloadBinding.managedProfilePath };
+}
+
+export async function verifyAcceptanceTunnelStartup(options) {
+  await verifyAcceptanceTunnelAuthorization(options);
+  const workloadBinding = await readAcceptanceWorkloadBinding(options.dataRoot);
+  const statePath = path.join(await canonicalPath(options.dataRoot), 'supervisor', 'state.json');
+  const stateContent = await readFile(statePath, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
+  if (stateContent === null) throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Supervisor state is missing after startup; provider ownership is not proven');
+  let state;
+  try { state = JSON.parse(stateContent); } catch { throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Supervisor state is invalid after startup; preserve evidence and do not retry'); }
+  const record = state?.tunnels?.full;
+  if (!isRecord(record)
+    || state.workloadSourceRoot !== path.resolve(options.sourceRoot)
+    || state.stackDesiredState !== 'UP' || state.workloadDesiredState !== 'ON'
+    || record.component !== 'tunnel-full'
+    || !Number.isSafeInteger(record.pid) || record.pid <= 0
+    || typeof record.executable !== 'string' || !path.isAbsolute(record.executable)
+    || typeof record.profilePath !== 'string'
+    || path.resolve(record.profilePath) !== workloadBinding.managedProfilePath
+    || record.tunnelId !== workloadBinding.tunnelId
+    || typeof record.runtimeId !== 'string' || typeof record.instanceId !== 'string'
+    || record.runtimeId !== workloadBinding.runtimeId
+    || state.runtime?.runtimeId !== record.runtimeId || state.runtime?.instanceId !== record.instanceId
+    || record.deploymentEpoch !== workloadBinding.deploymentEpoch
+    || record.workingDirectory !== path.resolve(options.sourceRoot)
+    || !Number.isSafeInteger(record.processStartTimeMs) || record.processStartTimeMs <= 0) {
+    throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Supervisor did not persist a complete acceptance-owned provider identity');
+  }
+  const isAlive = options.isPidAlive ?? pidExists;
+  if (!await isAlive(record.pid)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_UNAVAILABLE', 'Supervisor-owned acceptance provider is not alive after startup');
+  const inspectProcess = options.inspectProcess ?? inspectProcessIdentity;
+  const processInfo = await inspectProcess(record.pid);
+  if (processInfo === null
+    || processInfo.uid !== (typeof process.getuid === 'function' ? process.getuid() : processInfo.uid)
+    || path.resolve(processInfo.executable) !== path.resolve(record.executable)
+    || typeof processInfo.processStartMarker !== 'string' || processInfo.processStartMarker.length === 0
+    || (Number.isFinite(processInfo.processStartTimeMs) && Math.abs(processInfo.processStartTimeMs - record.processStartTimeMs) > 5_000)
+    || !processInfo.command.includes(workloadBinding.managedProfilePath)) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_PROCESS_MISMATCH', 'Supervisor provider process identity does not match the persisted acceptance binding');
+  }
+  await verifyGeneratedPortBindings(options.dataRoot, options.ports);
+  const probe = options.probePort ?? probePort;
+  const listenerKeys = ['runtime', 'supervisorAdmin', 'supervisorControl', 'supervisorTunnelHealth', 'fullTunnelHealth', 'web'];
+  if (workloadBinding.connectorId === 'iris-full' && state.tunnels?.pro !== null) listenerKeys.push('proTunnelHealth');
+  const listeners = await Promise.all(listenerKeys.map((key) => probe(options.ports[key], '127.0.0.1')));
+  if (listeners.some((ready) => !ready)) throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'One or more isolated acceptance listeners is not bound after startup');
+  const providerReady = options.probeProviderReady ?? probeProviderReady;
+  if (!await providerReady(record.executable, options.ports.fullTunnelHealth)) {
+    throw new AcceptanceError('ACCEPTANCE_PROVIDER_NOT_READY', 'Supervisor-owned provider did not prove readiness for the bound acceptance tunnel');
+  }
+  const authenticatedEndpointReady = options.probeAuthenticatedEndpoint ?? probeAuthenticatedEndpoint;
+  if (!await authenticatedEndpointReady(options.dataRoot, workloadBinding)) {
+    throw new AcceptanceError('ACCEPTANCE_ENDPOINT_UNVERIFIED', 'The authenticated acceptance endpoint did not prove the bound runtime identity');
+  }
+  return { state: 'READY', pid: record.pid, processStartMarker: processInfo.processStartMarker, executable: record.executable, tunnelId: workloadBinding.tunnelId, managedProfilePath: workloadBinding.managedProfilePath };
 }
 
 export async function verifyAcceptanceTunnelEvidence(options) {
@@ -284,8 +391,28 @@ export async function verifyAcceptanceTunnelEvidence(options) {
   return { provider: evidence.provider, machineId: evidence.machineId, tunnelId: evidence.tunnelId, managedProfilePath: workloadBinding?.managedProfilePath ?? evidenceProfilePath, pid: evidence.pid };
 }
 
+async function readAcceptanceTunnelEvidence(filename, readTextFile = readFile) {
+  if (typeof filename !== 'string' || !path.isAbsolute(filename)) throw new AcceptanceError('ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID', 'Tunnel authorization must be an absolute private file');
+  await verifyPrivateFile(filename, 'ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID', 'Tunnel authorization must be a private physical file');
+  try { return JSON.parse(await readTextFile(filename, 'utf8')); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID', 'Tunnel authorization is not valid JSON'); }
+}
+
+async function canonicalEvidenceProfile(evidence) {
+  if (!isRecord(evidence?.binding) || typeof evidence.binding.profilePath !== 'string' || !path.isAbsolute(evidence.binding.profilePath)) {
+    throw new AcceptanceError('ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID', 'Tunnel authorization must bind an absolute managed profile path');
+  }
+  try { return await canonicalPath(evidence.binding.profilePath); } catch { throw new AcceptanceError('ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID', 'Tunnel authorization profile path is not canonicalizable'); }
+}
+
+async function verifyPrivateFile(filename, code, message) {
+  const metadata = await lstat(filename).catch(() => null);
+  if (metadata === null || !metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || (metadata.mode & 0o077) !== 0
+    || (typeof process.getuid === 'function' && metadata.uid !== process.getuid())) throw new AcceptanceError(code, message);
+}
+
 async function readAcceptanceWorkloadBinding(dataRoot) {
-  const registryPath = path.join(dataRoot, 'connector-registry.json');
+  const canonicalDataRoot = await canonicalPath(dataRoot);
+  const registryPath = path.join(canonicalDataRoot, 'connector-registry.json');
   const registryContent = await readFile(registryPath, 'utf8').catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
   if (registryContent === null) throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance connector registry is required for remote startup');
   let parsedRegistry;
@@ -301,11 +428,18 @@ async function readAcceptanceWorkloadBinding(dataRoot) {
   if (!isRecord(workload) || workload.connectorId !== 'iris-full' || workload.label !== 'IRIS' || workload.mode !== 'FULL'
     || workload.runtime !== 'iris-local-runtime' || workload.mcpProfile !== 'FULL' || workload.mcpPath !== '/mcp'
     || !Number.isSafeInteger(workload.healthPort) || workload.healthPort <= 0 || workload.healthPort > 65_535
-    || managedProfilePath !== path.resolve(dataRoot, 'tunnel-profiles', 'iris-full.yaml')
+    || managedProfilePath !== path.resolve(canonicalDataRoot, 'tunnel-profiles', 'iris-full.yaml')
     || !/^tunnel_[a-f0-9]{32}$/.test(workload.tunnelId) || !isUuid(workload.machineId)) {
     throw new AcceptanceError('ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED', 'Acceptance registry does not contain a canonical unified workload connector');
   }
-  return { connectorId: workload.connectorId, tunnelId: workload.tunnelId, machineId: workload.machineId, managedProfilePath };
+  return {
+    connectorId: workload.connectorId,
+    tunnelId: workload.tunnelId,
+    machineId: workload.machineId,
+    managedProfilePath,
+    runtimeId: workload.runtimeId,
+    deploymentEpoch: registry.deploymentEpoch,
+  };
 }
 
 export function buildChildEnvironment(dataRoot, environment = process.env, ports = null) {
@@ -577,8 +711,46 @@ async function inspectProcessIdentity(pid) {
     if (!Number.isSafeInteger(uid) || executable.length === 0 || command.length === 0) return null;
     const processStartMarker = await execFileAsync('ps', ['-p', String(pid), '-o', 'lstart=']).then((result) => result.stdout.trim());
     if (processStartMarker.length === 0) return null;
-    return { uid, executable, command, processStartMarker };
+    const processStartTimeMs = Date.parse(processStartMarker);
+    return { uid, executable, command, processStartMarker, processStartTimeMs: Number.isFinite(processStartTimeMs) ? processStartTimeMs : null };
   } catch { return null; }
+}
+
+async function probeProviderReady(executable, healthPort) {
+  try {
+    const result = await execFileAsync(executable, ['health', '--json', '--port', String(healthPort)], { encoding: 'utf8', timeout: 2_000 });
+    const parsed = JSON.parse(result.stdout);
+    return isRecord(parsed) && parsed.result === 'ok' && isRecord(parsed.healthz) && parsed.healthz.ok === true && isRecord(parsed.readyz) && parsed.readyz.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+async function probeAuthenticatedEndpoint(dataRoot, binding) {
+  const endpoint = await readJsonIfPresent(path.join(await canonicalPath(dataRoot), 'endpoint.json'));
+  const authorization = await readFile(path.join(await canonicalPath(dataRoot), 'credentials', 'tunnel-service-authorization'), 'utf8').catch(() => null);
+  if (!isRecord(endpoint) || typeof endpoint.apiUrl !== 'string' || typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) return false;
+  try {
+    const response = await globalThis.fetch(`${endpoint.apiUrl}${binding.connectorId === 'iris-full' ? '/mcp' : '/mcp-pro'}`, {
+      method: 'POST',
+      headers: {
+        authorization: authorization.trim(),
+        'content-type': 'application/json',
+        'x-iris-connector-profile': binding.connectorId === 'iris-full' ? 'FULL' : 'PRO',
+        'x-iris-deployment-epoch': String(binding.deploymentEpoch),
+        'x-iris-runtime-id': binding.runtimeId ?? '',
+        'x-iris-client-id': binding.connectorId === 'iris-full' ? 'iris-supervisor-full' : 'iris-supervisor-pro',
+        'MCP-Protocol-Version': '2026-07-28',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'server/discover' }),
+      signal: globalThis.AbortSignal.timeout(2_000),
+    });
+    if (!response.ok) return false;
+    const payload = await response.json();
+    return payload?.result?.protocolVersion === '2026-07-28' || payload?.result?.supportedVersions?.includes('2026-07-28');
+  } catch {
+    return false;
+  }
 }
 
 async function probePort(port, host) {

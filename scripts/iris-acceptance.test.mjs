@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { buildChildEnvironment, inspectAcceptanceEnvironment, parseAcceptanceArgs, verifyGeneratedPortBindings } from './iris-acceptance.mjs';
+import { buildChildEnvironment, inspectAcceptanceEnvironment, parseAcceptanceArgs, verifyAcceptanceTunnelStartup, verifyGeneratedPortBindings } from './iris-acceptance.mjs';
 
 const roots = [];
 const sourceRoot = path.resolve(import.meta.dirname, '..');
@@ -204,49 +204,53 @@ describe('acceptance isolation preflight', () => {
     assert.equal(report.dataRoot, await realpath(root));
   });
 
-  it('allows remote startup only with independently checked non-production tunnel evidence', async () => {
+  it('authorizes remote startup before the Supervisor has a provider PID', async () => {
     const root = await fixtureRoot();
     const evidence = path.join(root, 'tunnel-evidence.json');
     const profilePath = path.join(root, 'tunnel-profiles', 'iris-full.yaml');
-    const canonicalProfilePath = path.join(await realpath(root), 'tunnel-profiles', 'iris-full.yaml');
     const tunnelId = 'tunnel_0123456789abcdef0123456789abcdef';
     const machineId = '11111111-1111-4111-8111-111111111111';
     await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
+    await mkdir(path.join(root, 'tunnel-profiles'), { mode: 0o700 });
+    await mkdir(path.join(root, 'credentials'), { mode: 0o700 });
+    await writeFile(profilePath, `control_plane:\n  tunnel_id: "${tunnelId}"\nhealth:\n  listen_addr: 127.0.0.1:${TEST_PORTS.fullTunnelHealth}\nmcp:\n  server_urls:\n    - url: http://127.0.0.1:${TEST_PORTS.runtime}/mcp\n`, { mode: 0o600 });
+    await writeFile(path.join(root, 'credentials', 'control-plane-api-key'), 'fixture-key\n', { mode: 0o600 });
     await writeFile(evidence, `${JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
+      phase: 'PREPARED',
       environment: 'non-production',
       provider: 'fixture-provider',
       machineId,
       sourceRoot,
       tunnelId,
-      pid: 4242,
-      executablePath: '/usr/local/bin/fixture-provider',
-      processStartMarker: 'Sun Oct 11 01:00:00 2026',
+      credentialPath: path.join(await realpath(root), 'credentials', 'control-plane-api-key'),
       binding: { connectorId: 'iris-full', machineId, tunnelId, profilePath },
     })}\n`, { mode: 0o600 });
-    await writeFile(path.join(root, 'connector-registry.json'), JSON.stringify({ connectors: [{ connectorId: 'iris-full', label: 'IRIS', mode: 'FULL', runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', healthPort: 43113, managedProfilePath: profilePath, tunnelId, machineId }], admin: null }), { mode: 0o600 });
+    await writeFile(path.join(root, 'connector-registry.json'), JSON.stringify({ connectors: [{ connectorId: 'iris-full', label: 'IRIS', mode: 'FULL', runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', healthPort: TEST_PORTS.fullTunnelHealth, managedProfilePath: profilePath, tunnelId, machineId }], admin: null }), { mode: 0o600 });
     const report = await inspectAcceptanceEnvironment({
       ...baseOptions(root, ['up', '--tunnel-id', tunnelId]),
       environment: { IRIS_ACCEPTANCE_ROOT: root, IRIS_ACCEPTANCE_TUNNEL_EVIDENCE: evidence },
       machineName: 'fixture-machine',
-      isPidAlive: async (pid) => pid === 4242,
-      inspectProcess: async (pid) => pid === 4242 ? { uid: process.getuid(), executable: '/usr/local/bin/fixture-provider', command: `fixture-provider --profile ${canonicalProfilePath}`, processStartMarker: 'Sun Oct 11 01:00:00 2026' } : null,
       probePort: async () => false,
     });
-    assert.equal(report.tunnelIdentity, 'VERIFIED');
+    assert.equal(report.tunnelIdentity, 'AUTHORIZED');
   });
 
-  it('rejects evidence that chooses an unrelated process or profile path', async () => {
+  it('rejects startup authorization that chooses an unrelated profile path', async () => {
     const root = await fixtureRoot();
     const evidence = path.join(root, 'tunnel-evidence.json');
     const profilePath = path.join(root, 'tunnel-profiles', 'iris-full.yaml');
     const tunnelId = 'tunnel_0123456789abcdef0123456789abcdef';
     const machineId = '11111111-1111-4111-8111-111111111111';
     await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
-    await writeFile(path.join(root, 'connector-registry.json'), JSON.stringify({ connectors: [{ connectorId: 'iris-full', label: 'IRIS', mode: 'FULL', runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', healthPort: 43113, managedProfilePath: profilePath, tunnelId, machineId }], admin: null }), { mode: 0o600 });
+    await mkdir(path.join(root, 'tunnel-profiles'), { mode: 0o700 });
+    await mkdir(path.join(root, 'credentials'), { mode: 0o700 });
+    await writeFile(profilePath, `control_plane:\n  tunnel_id: "${tunnelId}"\nhealth:\n  listen_addr: 127.0.0.1:${TEST_PORTS.fullTunnelHealth}\nmcp:\n  server_urls:\n    - url: http://127.0.0.1:${TEST_PORTS.runtime}/mcp\n`, { mode: 0o600 });
+    await writeFile(path.join(root, 'credentials', 'control-plane-api-key'), 'fixture-key\n', { mode: 0o600 });
+    await writeFile(path.join(root, 'connector-registry.json'), JSON.stringify({ connectors: [{ connectorId: 'iris-full', label: 'IRIS', mode: 'FULL', runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', healthPort: TEST_PORTS.fullTunnelHealth, managedProfilePath: profilePath, tunnelId, machineId }], admin: null }), { mode: 0o600 });
     const baseEvidence = {
-      schemaVersion: 1, environment: 'non-production', provider: 'fixture-provider', machineId, sourceRoot,
-      tunnelId, pid: 4242, executablePath: '/usr/local/bin/fixture-provider', processStartMarker: 'Sun Oct 11 01:00:00 2026',
+      schemaVersion: 2, phase: 'PREPARED', environment: 'non-production', provider: 'fixture-provider', machineId, sourceRoot,
+      tunnelId, credentialPath: path.join(await realpath(root), 'credentials', 'control-plane-api-key'),
       binding: { connectorId: 'iris-full', machineId, tunnelId, profilePath },
     };
     await writeFile(evidence, `${JSON.stringify({ ...baseEvidence, binding: { ...baseEvidence.binding, profilePath: '/usr/bin/node' } })}\n`, { mode: 0o600 });
@@ -254,13 +258,12 @@ describe('acceptance isolation preflight', () => {
       ...baseOptions(root, ['up', '--tunnel-id', tunnelId]),
       environment: { IRIS_ACCEPTANCE_ROOT: root, IRIS_ACCEPTANCE_TUNNEL_EVIDENCE: evidence },
       machineName: 'fixture-machine',
-      isPidAlive: async (pid) => pid === 4242,
-      inspectProcess: async () => ({ uid: process.getuid(), executable: '/usr/local/bin/fixture-provider', command: 'node unrelated-worker.js', processStartMarker: 'Sun Oct 11 01:00:00 2026' }),
       probePort: async () => false,
     };
-    await assert.rejects(inspectAcceptanceEnvironment(options), (error) => error.code === 'ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED');
+    await assert.rejects(inspectAcceptanceEnvironment(options), (error) => error.code === 'ACCEPTANCE_TUNNEL_AUTHORIZATION_INVALID');
     await writeFile(evidence, `${JSON.stringify(baseEvidence)}\n`, { mode: 0o600 });
-    await assert.rejects(inspectAcceptanceEnvironment(options), (error) => error.code === 'ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED');
+    const report = await inspectAcceptanceEnvironment(options);
+    assert.equal(report.tunnelIdentity, 'AUTHORIZED');
   });
 
   it('rejects remote startup evidence when the acceptance registry is missing', async () => {
@@ -299,6 +302,62 @@ describe('acceptance isolation preflight', () => {
       inspectProcess: async (pid) => pid === 4242 ? { uid: process.getuid(), executable: '/usr/local/bin/fixture-provider', command: 'fixture-provider --profile /tmp/fixture-profile.yaml', processStartMarker: 'Sun Oct 11 01:00:00 2026' } : null,
       probePort: async () => false,
     }), (error) => error.code === 'ACCEPTANCE_TUNNEL_BINDING_UNVERIFIED');
+  });
+
+  it('accepts only a Supervisor-persisted provider after startup verification', async () => {
+    const fixture = await startupFixture();
+    const canonicalProfilePath = await realpath(fixture.profilePath);
+    await writeFile(path.join(fixture.root, 'supervisor', 'state.json'), JSON.stringify({
+      schemaVersion: 3,
+      supervisorId: 'fixture-supervisor',
+      updatedAt: new Date().toISOString(),
+      workloadSourceRoot: sourceRoot,
+      workloadDesiredState: 'ON',
+      stackDesiredState: 'UP',
+      runtime: { component: 'runtime', pid: 4100, startedAt: new Date().toISOString(), executable: '/usr/local/bin/node', profilePath: null, tunnelId: null, marker: sourceRoot, runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot },
+      web: null,
+      admin: null,
+      adminTunnel: null,
+      tunnels: { full: { component: 'tunnel-full', pid: 4242, startedAt: new Date().toISOString(), executable: '/usr/local/bin/fixture-provider', profilePath: canonicalProfilePath, tunnelId: fixture.tunnelId, marker: 'tunnel-client', runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', deploymentEpoch: 1, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot }, pro: null },
+      recovery: { attempts: 0, terminal: false, lastFailureCode: null, nextAttemptAt: null, windowStartedAt: null },
+    }), { mode: 0o600 });
+    const result = await verifyAcceptanceTunnelStartup({
+      filename: fixture.evidence,
+      tunnelId: fixture.tunnelId,
+      dataRoot: fixture.root,
+      sourceRoot,
+      ports: TEST_PORTS,
+      isPidAlive: async (pid) => pid === 4242,
+      inspectProcess: async (pid) => pid === 4242 ? {
+        uid: process.getuid(), executable: '/usr/local/bin/fixture-provider', command: `fixture-provider --profile ${canonicalProfilePath}`,
+        processStartMarker: 'Sun Nov 12 22:13:20 2023', processStartTimeMs: 1_700_000_000_000,
+      } : null,
+      probePort: async () => true,
+      probeProviderReady: async () => true,
+      probeAuthenticatedEndpoint: async () => true,
+    });
+    assert.equal(result.state, 'READY');
+    assert.equal(result.pid, 4242);
+  });
+
+  it('keeps startup blocked when the persisted provider identity or readiness is uncertain', async () => {
+    const fixture = await startupFixture();
+    const canonicalProfilePath = await realpath(fixture.profilePath);
+    await writeFile(path.join(fixture.root, 'supervisor', 'state.json'), JSON.stringify({
+      schemaVersion: 3,
+      supervisorId: 'fixture-supervisor', updatedAt: new Date().toISOString(), workloadSourceRoot: sourceRoot,
+      workloadDesiredState: 'ON', stackDesiredState: 'UP',
+      runtime: { component: 'runtime', pid: 4100, startedAt: new Date().toISOString(), executable: '/usr/local/bin/node', profilePath: null, tunnelId: null, marker: sourceRoot, runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot },
+      web: null, admin: null, adminTunnel: null,
+      tunnels: { full: { component: 'tunnel-full', pid: 4242, startedAt: new Date().toISOString(), executable: '/usr/local/bin/other-provider', profilePath: canonicalProfilePath, tunnelId: fixture.tunnelId, marker: 'tunnel-client', runtimeId: 'runtime-fixture', instanceId: 'instance-fixture', deploymentEpoch: 1, processStartTimeMs: 1_700_000_000_000, workingDirectory: sourceRoot }, pro: null },
+      recovery: { attempts: 0, terminal: false, lastFailureCode: null, nextAttemptAt: null, windowStartedAt: null },
+    }), { mode: 0o600 });
+    await assert.rejects(verifyAcceptanceTunnelStartup({
+      filename: fixture.evidence, tunnelId: fixture.tunnelId, dataRoot: fixture.root, sourceRoot, ports: TEST_PORTS,
+      isPidAlive: async () => true,
+      inspectProcess: async () => ({ uid: process.getuid(), executable: '/usr/local/bin/fixture-provider', command: `fixture-provider --profile ${canonicalProfilePath}`, processStartMarker: 'Sun Nov 12 22:13:20 2023', processStartTimeMs: 1_700_000_000_000 }),
+      probePort: async () => true, probeProviderReady: async () => false, probeAuthenticatedEndpoint: async () => true,
+    }), (error) => error.code === 'ACCEPTANCE_TUNNEL_PROCESS_MISMATCH');
   });
 
   it('rejects connector mutation and unsupported commands before child execution', async () => {
@@ -390,6 +449,30 @@ async function fixtureRoot() {
   roots.push(root);
   await chmod(root, 0o700);
   return root;
+}
+
+async function startupFixture() {
+  const root = await fixtureRoot();
+  const tunnelId = 'tunnel_0123456789abcdef0123456789abcdef';
+  const machineId = '11111111-1111-4111-8111-111111111111';
+  const profilePath = path.join(root, 'tunnel-profiles', 'iris-full.yaml');
+  const evidence = path.join(root, 'tunnel-evidence.json');
+  await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
+  await mkdir(path.join(root, 'tunnel-profiles'), { mode: 0o700 });
+  await mkdir(path.join(root, 'credentials'), { mode: 0o700 });
+  await mkdir(path.join(root, 'supervisor'), { mode: 0o700 });
+  await writeFile(profilePath, `control_plane:\n  tunnel_id: "${tunnelId}"\nhealth:\n  listen_addr: 127.0.0.1:${TEST_PORTS.fullTunnelHealth}\nmcp:\n  server_urls:\n    - url: http://127.0.0.1:${TEST_PORTS.runtime}/mcp\n`, { mode: 0o600 });
+  await writeFile(path.join(root, 'credentials', 'control-plane-api-key'), 'fixture-key\n', { mode: 0o600 });
+  await writeFile(path.join(root, 'connector-registry.json'), JSON.stringify({
+    schemaVersion: 3, deploymentEpoch: 1, updatedAt: new Date().toISOString(),
+    connectors: [{ connectorId: 'iris-full', label: 'IRIS', mode: 'FULL', runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', healthPort: TEST_PORTS.fullTunnelHealth, managedProfilePath: profilePath, tunnelId, machineId, runtimeId: 'runtime-fixture', deploymentEpoch: 1, leaseGeneration: 1 }], admin: null,
+  }), { mode: 0o600 });
+  await writeFile(evidence, `${JSON.stringify({
+    schemaVersion: 2, phase: 'PREPARED', environment: 'non-production', provider: 'fixture-provider', machineId, sourceRoot, tunnelId,
+    credentialPath: path.join(await realpath(root), 'credentials', 'control-plane-api-key'),
+    binding: { connectorId: 'iris-full', machineId, tunnelId, profilePath },
+  })}\n`, { mode: 0o600 });
+  return { root, tunnelId, profilePath, evidence };
 }
 
 function baseOptions(root, command) {
