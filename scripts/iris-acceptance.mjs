@@ -626,6 +626,7 @@ export async function verifyGeneratedPortBindings(dataRoot, ports) {
   for (const [filename, healthPort, expectedMcpUrl] of profiles) {
     const content = await readTextIfPresent(path.join(dataRoot, 'tunnel-profiles', filename));
     if (content === null) continue;
+    if (connectors === undefined) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', 'Acceptance connector registry is required to resolve profile topology');
     const parsed = parseManagedProfileBindings(content);
     if (parsed.healthListenAddr !== `127.0.0.1:${healthPort}`) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${filename} health binding does not match the isolated port set`);
     if (parsed.mainMcpUrl !== expectedMcpUrl) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${filename} MCP main channel does not match the expected isolated route`);
