@@ -175,6 +175,7 @@ export function App(): ReactElement {
   const [jobError, setJobError] = useState('');
   const jobGeneration = useRef(0);
   const jobAbort = useRef<AbortController | null>(null);
+  const jobCacheContext = useRef<string | null>(null);
   const jobContext = useRef<{ sessionId: string; clientId: string; projectId: string } | null>(null);
 
   const refreshSupervisor = useCallback(async () => {
@@ -247,6 +248,9 @@ export function App(): ReactElement {
   const jobSessionId = selectedSession?.id ?? null;
   const jobClientId = selectedSession?.clientId ?? null;
   const jobProjectId = selectedSession?.currentProjectId ?? null;
+  const jobContextKey = jobSessionId !== null && jobClientId !== null && jobProjectId !== null
+    ? `${jobSessionId}\u0000${jobClientId}\u0000${jobProjectId}`
+    : null;
   jobContext.current = jobSessionId !== null && jobClientId !== null && jobProjectId !== null
     ? { sessionId: jobSessionId, clientId: jobClientId, projectId: jobProjectId }
     : null;
@@ -279,7 +283,11 @@ export function App(): ReactElement {
         return;
       }
       const scopedJobs = body.jobs.filter((job) => job.projectId === context.projectId);
-      setJobs(scopedJobs); setJobLogs({}); setJobResults({}); setJobError('');
+      const jobIds = new Set(scopedJobs.map((job) => job.jobId));
+      setJobs(scopedJobs);
+      setJobLogs((current) => Object.fromEntries(Object.entries(current).filter(([jobId]) => jobIds.has(jobId))));
+      setJobResults((current) => Object.fromEntries(Object.entries(current).filter(([jobId]) => jobIds.has(jobId))));
+      setJobError('');
       setJobViewState(scopedJobs.length === 0 ? 'EMPTY' : 'READY');
     } catch (cause) {
       if (controller.signal.aborted || generation !== jobGeneration.current) return;
@@ -288,6 +296,16 @@ export function App(): ReactElement {
       setJobError(cause instanceof Error ? cause.message : 'Durable job status is unavailable');
     }
   }, [jobClientId, jobProjectId, jobSessionId, ownerAccessToken]);
+
+  useEffect(() => {
+    if (jobCacheContext.current === jobContextKey) return;
+    jobCacheContext.current = jobContextKey;
+    setJobs([]);
+    setJobLogs({});
+    setJobResults({});
+    setJobError('');
+    setJobViewState(jobContextKey === null ? 'IDLE' : 'LOADING');
+  }, [jobContextKey]);
 
   useEffect(() => {
     void refreshJobs();
