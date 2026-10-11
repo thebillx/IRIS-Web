@@ -301,6 +301,7 @@ export function App(): ReactElement {
     const response = await authorizedFetch(ownerAccessToken, `/jobs/${encodeURIComponent(job.jobId)}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-iris-client-id': context.clientId, 'x-iris-session-id': context.sessionId }, body: JSON.stringify({ projectId: job.projectId }) });
     if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
     if (!response.ok) throw new Error(await responseMessage(response, 'Job cancellation was not verified'));
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
     await refreshJobs();
   }, [ownerAccessToken, refreshJobs]);
 
@@ -312,6 +313,7 @@ export function App(): ReactElement {
     if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
     if (!response.ok) throw new Error(await responseMessage(response, 'Job output is unavailable'));
     const log = await response.json() as JobLog;
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
     setJobLogs((current) => {
       const previous = current[job.jobId]?.[stream];
       const append = cursor !== undefined && previous?.cursor === cursor;
