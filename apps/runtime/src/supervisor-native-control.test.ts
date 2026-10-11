@@ -26,6 +26,8 @@ describe('outer supervisor native control', () => {
       expect(toolNames(listed)).toContain('runtime_status');
       expect(structured(await rpcTool(harness, 'source_identity', {}))).toMatchObject({ state: 'VERIFIED', commitSha: 'a'.repeat(40) });
       expect(structured(await rpcTool(harness, 'runtime_status', {}))).toMatchObject({ status: 'ready' });
+      harness.runtimeAvailable = false;
+      expect(await rpcTool(harness, 'runtime_status', {})).toMatchObject({ result: { isError: true, structuredContent: { code: 'RUNTIME_NOT_RUNNING' } } });
       expect(structured(await rpcTool(harness, 'workload_off', {}))).toMatchObject({ workloadState: 'OFF' });
     } finally {
       await harness.server.close();
@@ -196,7 +198,7 @@ async function startHarness(unified = false) {
   roots.push(dataRoot);
   const secret = await loadOrCreateTunnelServiceSecret(dataRoot);
   const recycleInputs: AdminRecycleInput[] = [];
-  const harness = { workloadRuntimeId: 'runtime-a' };
+  const harness = { workloadRuntimeId: 'runtime-a', runtimeAvailable: true };
   const operations: SupervisorNativeOperations = {
     supervisorStatus: async () => ({ supervisor: 'outer', workloadRuntimeId: harness.workloadRuntimeId }),
     supervisorDoctor: async () => ({ code: 'NONE' }),
@@ -213,12 +215,24 @@ async function startHarness(unified = false) {
     adminToolCall: async (name): Promise<SupervisorAdminToolCallResult> => ({ structuredContent: { proxied: name }, isError: false }),
     ...(unified ? {
       runtimeToolDefinitions: [{ name: 'runtime_status', inputSchema: { type: 'object' } }],
-      runtimeToolCall: async (name: string) => ({ content: [{ type: 'text', text: JSON.stringify({ status: 'ready', name }) }], structuredContent: { status: 'ready', name }, isError: false }),
+      runtimeToolCall: async (name: string) => harness.runtimeAvailable
+        ? { content: [{ type: 'text', text: JSON.stringify({ status: 'ready', name }) }], structuredContent: { status: 'ready', name }, isError: false }
+        : { content: [{ type: 'text', text: JSON.stringify({ code: 'RUNTIME_NOT_RUNNING', message: 'Runtime tools are unavailable while workload is OFF' }) }], structuredContent: { code: 'RUNTIME_NOT_RUNNING' }, isError: true },
       sourceIdentity: async () => ({ state: 'VERIFIED', commitSha: 'a'.repeat(40) }),
     } : {}),
   };
   const server = await startSupervisorNativeControlServer(dataRoot, await freePort(), operations);
-  return { ...harness, dataRoot, secret, recycleInputs, server, get workloadRuntimeId() { return harness.workloadRuntimeId; }, set workloadRuntimeId(value: string) { harness.workloadRuntimeId = value; } };
+  return {
+    ...harness,
+    dataRoot,
+    secret,
+    recycleInputs,
+    server,
+    get workloadRuntimeId() { return harness.workloadRuntimeId; },
+    set workloadRuntimeId(value: string) { harness.workloadRuntimeId = value; },
+    get runtimeAvailable() { return harness.runtimeAvailable; },
+    set runtimeAvailable(value: boolean) { harness.runtimeAvailable = value; },
+  };
 }
 
 async function rpcTool(harness: Awaited<ReturnType<typeof startHarness>>, name: string, args: object): Promise<Record<string, unknown>> {
