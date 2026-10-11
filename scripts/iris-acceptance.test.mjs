@@ -60,6 +60,36 @@ describe('acceptance isolation preflight', () => {
     await assert.rejects(verifyGeneratedPortBindings(profileRoot, TEST_PORTS), (error) => error.code === 'ACCEPTANCE_PORT_BINDING_MISMATCH');
   });
 
+  it('validates unified and dedicated MCP routes from the exact main channel', async () => {
+    const unifiedRoot = await fixtureRoot();
+    await mkdir(path.join(unifiedRoot, 'tunnel-profiles'), { mode: 0o700 });
+    await writeFile(path.join(unifiedRoot, 'connector-registry.json'), JSON.stringify({ connectors: [{ connectorId: 'iris-full', healthPort: TEST_PORTS.fullTunnelHealth }], admin: null }));
+    const unifiedProfile = (url) => `health:\n  listen_addr: "127.0.0.1:${TEST_PORTS.fullTunnelHealth}"\nmcp:\n  server_urls:\n    - channel: main\n      url: "${url}"\n`;
+    await writeFile(path.join(unifiedRoot, 'tunnel-profiles', 'iris-full.yaml'), unifiedProfile(`http://127.0.0.1:${TEST_PORTS.supervisorControl}/mcp`));
+    await verifyGeneratedPortBindings(unifiedRoot, TEST_PORTS);
+    await writeFile(path.join(unifiedRoot, 'tunnel-profiles', 'iris-full.yaml'), unifiedProfile(`http://127.0.0.1:${TEST_PORTS.runtime}/mcp`));
+    await assert.rejects(verifyGeneratedPortBindings(unifiedRoot, TEST_PORTS), (error) => error.code === 'ACCEPTANCE_PORT_BINDING_MISMATCH');
+    await writeFile(path.join(unifiedRoot, 'tunnel-profiles', 'iris-full.yaml'), unifiedProfile(`http://127.0.0.1:${TEST_PORTS.supervisorControl + 1}/mcp`));
+    await assert.rejects(verifyGeneratedPortBindings(unifiedRoot, TEST_PORTS), (error) => error.code === 'ACCEPTANCE_PORT_BINDING_MISMATCH');
+    await writeFile(path.join(unifiedRoot, 'tunnel-profiles', 'iris-full.yaml'), unifiedProfile(`http://127.0.0.1:${TEST_PORTS.supervisorControl}/mcp`).replace(String(TEST_PORTS.fullTunnelHealth), String(TEST_PORTS.fullTunnelHealth + 1)));
+    await assert.rejects(verifyGeneratedPortBindings(unifiedRoot, TEST_PORTS), (error) => error.code === 'ACCEPTANCE_PORT_BINDING_MISMATCH');
+
+    const dedicatedRoot = await fixtureRoot();
+    await mkdir(path.join(dedicatedRoot, 'tunnel-profiles'), { mode: 0o700 });
+    await writeFile(path.join(dedicatedRoot, 'connector-registry.json'), JSON.stringify({ connectors: [
+      { connectorId: 'iris-full', healthPort: TEST_PORTS.fullTunnelHealth },
+      { connectorId: 'iris-pro', healthPort: TEST_PORTS.proTunnelHealth },
+    ], admin: { connectorId: 'iris-admin' } }));
+    await writeFile(path.join(dedicatedRoot, 'tunnel-profiles', 'iris-full.yaml'), unifiedProfile(`http://127.0.0.1:${TEST_PORTS.runtime}/mcp`));
+    await writeFile(path.join(dedicatedRoot, 'tunnel-profiles', 'iris-pro.yaml'), `health:\n  listen_addr: "127.0.0.1:${TEST_PORTS.proTunnelHealth}"\nmcp:\n  server_urls:\n    - channel: main\n      url: "http://127.0.0.1:${TEST_PORTS.runtime}/mcp-pro"\n`);
+    await writeFile(path.join(dedicatedRoot, 'tunnel-profiles', 'iris-admin.yaml'), `health:\n  listen_addr: "127.0.0.1:${TEST_PORTS.supervisorTunnelHealth}"\nmcp:\n  server_urls:\n    - channel: main\n      url: "http://127.0.0.1:${TEST_PORTS.supervisorControl}/mcp"\n`);
+    await verifyGeneratedPortBindings(dedicatedRoot, TEST_PORTS);
+    await writeFile(path.join(dedicatedRoot, 'tunnel-profiles', 'iris-full.yaml'), `${unifiedProfile(`http://127.0.0.1:${TEST_PORTS.supervisorControl + 1}/mcp`)}\n# unrelated text http://127.0.0.1:${TEST_PORTS.runtime}/mcp\n`);
+    await assert.rejects(verifyGeneratedPortBindings(dedicatedRoot, TEST_PORTS), (error) => error.code === 'ACCEPTANCE_PORT_BINDING_MISMATCH');
+    await writeFile(path.join(dedicatedRoot, 'tunnel-profiles', 'iris-full.yaml'), `health:\n  listen_addr: "127.0.0.1:${TEST_PORTS.fullTunnelHealth}"\nmcp:\n  server_urls:\n    - channel: main\n      url: "http://127.0.0.1:${TEST_PORTS.runtime}/mcp"\n    - channel: main\n      url: "http://127.0.0.1:${TEST_PORTS.runtime}/mcp"\n`);
+    await assert.rejects(verifyGeneratedPortBindings(dedicatedRoot, TEST_PORTS), (error) => error.code === 'ACCEPTANCE_PORT_BINDING_MISMATCH');
+  });
+
   it('requires an explicit root and never resolves the default root', () => {
     assert.throws(() => parseAcceptanceArgs(['--protected-root', '/tmp/live', '--', 'status']), (error) => error.code === 'ACCEPTANCE_USAGE');
   });
@@ -213,7 +243,7 @@ describe('acceptance isolation preflight', () => {
     await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
     await mkdir(path.join(root, 'tunnel-profiles'), { mode: 0o700 });
     await mkdir(path.join(root, 'credentials'), { mode: 0o700 });
-    await writeFile(profilePath, `control_plane:\n  tunnel_id: "${tunnelId}"\nhealth:\n  listen_addr: 127.0.0.1:${TEST_PORTS.fullTunnelHealth}\nmcp:\n  server_urls:\n    - url: http://127.0.0.1:${TEST_PORTS.runtime}/mcp\n`, { mode: 0o600 });
+    await writeFile(profilePath, `control_plane:\n  tunnel_id: "${tunnelId}"\nhealth:\n  listen_addr: 127.0.0.1:${TEST_PORTS.fullTunnelHealth}\nmcp:\n  server_urls:\n    - url: http://127.0.0.1:${TEST_PORTS.supervisorControl}/mcp\n`, { mode: 0o600 });
     await writeFile(path.join(root, 'credentials', 'control-plane-api-key'), 'fixture-key\n', { mode: 0o600 });
     await writeFile(evidence, `${JSON.stringify({
       schemaVersion: 2,
@@ -245,7 +275,7 @@ describe('acceptance isolation preflight', () => {
     await inspectAcceptanceEnvironment(baseOptions(root, ['preflight']));
     await mkdir(path.join(root, 'tunnel-profiles'), { mode: 0o700 });
     await mkdir(path.join(root, 'credentials'), { mode: 0o700 });
-    await writeFile(profilePath, `control_plane:\n  tunnel_id: "${tunnelId}"\nhealth:\n  listen_addr: 127.0.0.1:${TEST_PORTS.fullTunnelHealth}\nmcp:\n  server_urls:\n    - url: http://127.0.0.1:${TEST_PORTS.runtime}/mcp\n`, { mode: 0o600 });
+    await writeFile(profilePath, `control_plane:\n  tunnel_id: "${tunnelId}"\nhealth:\n  listen_addr: 127.0.0.1:${TEST_PORTS.fullTunnelHealth}\nmcp:\n  server_urls:\n    - url: http://127.0.0.1:${TEST_PORTS.supervisorControl}/mcp\n`, { mode: 0o600 });
     await writeFile(path.join(root, 'credentials', 'control-plane-api-key'), 'fixture-key\n', { mode: 0o600 });
     await writeFile(path.join(root, 'connector-registry.json'), JSON.stringify({ connectors: [{ connectorId: 'iris-full', label: 'IRIS', mode: 'FULL', runtime: 'iris-local-runtime', mcpProfile: 'FULL', mcpPath: '/mcp', healthPort: TEST_PORTS.fullTunnelHealth, managedProfilePath: profilePath, tunnelId, machineId }], admin: null }), { mode: 0o600 });
     const baseEvidence = {
@@ -529,7 +559,7 @@ async function startupFixture() {
   await mkdir(path.join(root, 'tunnel-profiles'), { mode: 0o700 });
   await mkdir(path.join(root, 'credentials'), { mode: 0o700 });
   await mkdir(path.join(root, 'supervisor'), { mode: 0o700 });
-  await writeFile(profilePath, `control_plane:\n  tunnel_id: "${tunnelId}"\nhealth:\n  listen_addr: 127.0.0.1:${TEST_PORTS.fullTunnelHealth}\nmcp:\n  server_urls:\n    - url: http://127.0.0.1:${TEST_PORTS.runtime}/mcp\n`, { mode: 0o600 });
+  await writeFile(profilePath, `control_plane:\n  tunnel_id: "${tunnelId}"\nhealth:\n  listen_addr: 127.0.0.1:${TEST_PORTS.fullTunnelHealth}\nmcp:\n  server_urls:\n    - url: http://127.0.0.1:${TEST_PORTS.supervisorControl}/mcp\n`, { mode: 0o600 });
   await writeFile(path.join(root, 'credentials', 'control-plane-api-key'), 'fixture-key\n', { mode: 0o600 });
   await writeFile(path.join(root, 'connector-registry.json'), JSON.stringify({
     schemaVersion: 3, deploymentEpoch: 1, updatedAt: new Date().toISOString(),

@@ -607,32 +607,96 @@ function portEnvironment(ports) {
 
 export async function verifyGeneratedPortBindings(dataRoot, ports) {
   const registry = await readJsonIfPresent(path.join(dataRoot, 'connector-registry.json'));
+  const registryDocument = registry?.registry ?? registry;
+  const connectors = registryDocument?.connectors;
+  if (registry !== null && !Array.isArray(connectors)) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', 'Acceptance connector registry is invalid');
   if (registry !== null) {
-    const connectors = registry?.connectors;
-    if (!Array.isArray(connectors)) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', 'Acceptance connector registry is invalid');
     for (const connector of connectors) {
-      const expected = connector.connectorId === 'iris-full' ? ports.fullTunnelHealth : connector.connectorId === 'iris-pro' ? ports.proTunnelHealth : null;
-      if (expected !== null && connector.healthPort !== expected) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${connector.connectorId} health port does not match the isolated port set`);
+      const expected = connector?.connectorId === 'iris-full' ? ports.fullTunnelHealth : connector?.connectorId === 'iris-pro' ? ports.proTunnelHealth : null;
+      if (expected !== null && connector?.healthPort !== expected) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${connector?.connectorId ?? 'unknown'} health port does not match the isolated port set`);
     }
   }
   const endpoint = await readJsonIfPresent(path.join(dataRoot, 'endpoint.json'));
   if (endpoint !== null && new URL(endpoint.apiUrl).port !== String(ports.runtime)) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', 'Runtime endpoint does not match the isolated runtime port');
   const profiles = [
-    ['iris-full.yaml', ports.fullTunnelHealth, '/mcp'],
-    ['iris-pro.yaml', ports.proTunnelHealth, '/mcp-pro'],
-    ['iris-admin.yaml', ports.supervisorTunnelHealth, '/mcp'],
+    ['iris-full.yaml', ports.fullTunnelHealth, connectors?.some((connector) => connector?.connectorId === 'iris-pro') === true ? `http://127.0.0.1:${ports.runtime}/mcp` : `http://127.0.0.1:${ports.supervisorControl}/mcp`],
+    ['iris-pro.yaml', ports.proTunnelHealth, `http://127.0.0.1:${ports.runtime}/mcp-pro`],
+    ['iris-admin.yaml', ports.supervisorTunnelHealth, `http://127.0.0.1:${ports.supervisorControl}/mcp`],
   ];
-  for (const [filename, healthPort, mcpPath] of profiles) {
+  for (const [filename, healthPort, expectedMcpUrl] of profiles) {
     const content = await readTextIfPresent(path.join(dataRoot, 'tunnel-profiles', filename));
     if (content === null) continue;
-    if (!content.includes(`127.0.0.1:${healthPort}`)) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${filename} health binding does not match the isolated port set`);
-    if (!content.includes(`127.0.0.1:${ports.runtime}${mcpPath}`) && filename !== 'iris-admin.yaml') {
-      throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${filename} runtime URL does not match the isolated runtime port`);
+    const parsed = parseManagedProfileBindings(content);
+    if (parsed.healthListenAddr !== `127.0.0.1:${healthPort}`) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${filename} health binding does not match the isolated port set`);
+    if (parsed.mainMcpUrl !== expectedMcpUrl) throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', `${filename} MCP main channel does not match the expected isolated route`);
+  }
+}
+
+function parseManagedProfileBindings(content) {
+  const lines = content.split(/\r?\n/);
+  let section = null;
+  let inServerUrls = false;
+  let currentEntry = null;
+  const entries = [];
+  let healthListenAddr = null;
+  const finishEntry = () => {
+    if (currentEntry !== null) entries.push(currentEntry);
+    currentEntry = null;
+  };
+  for (const line of lines) {
+    const indentation = line.match(/^\s*/u)?.[0].length ?? 0;
+    const trimmed = line.trim();
+    if (indentation === 0 && trimmed.endsWith(':')) {
+      finishEntry();
+      section = trimmed.slice(0, -1);
+      inServerUrls = false;
+      continue;
     }
-    if (filename === 'iris-admin.yaml' && !content.includes(`127.0.0.1:${ports.supervisorControl}${mcpPath}`)) {
-      throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', 'Admin profile does not match the isolated Supervisor control port');
+    if (section === 'health' && /^listen_addr:\s*/u.test(trimmed)) {
+      healthListenAddr = yamlScalar(trimmed.slice('listen_addr:'.length));
+      continue;
+    }
+    if (section === 'mcp' && /^server_urls:\s*$/u.test(trimmed)) {
+      finishEntry();
+      inServerUrls = true;
+      continue;
+    }
+    if (!inServerUrls) continue;
+    if (indentation <= 2 && trimmed.length > 0 && !trimmed.startsWith('-')) {
+      finishEntry();
+      inServerUrls = false;
+      continue;
+    }
+    if (/^-\s*/u.test(trimmed)) {
+      finishEntry();
+      currentEntry = { channel: null, url: null };
+      const inline = trimmed.slice(1).trim();
+      const separator = inline.indexOf(':');
+      if (separator >= 0) {
+        const key = inline.slice(0, separator).trim();
+        if (key === 'channel' || key === 'url') currentEntry[key] = yamlScalar(inline.slice(separator + 1));
+      }
+      continue;
+    }
+    if (currentEntry !== null) {
+      const match = /^(channel|url):\s*(.*)$/u.exec(trimmed);
+      if (match !== null) currentEntry[match[1]] = yamlScalar(match[2]);
     }
   }
+  finishEntry();
+  const mainEntries = entries.filter((entry) => entry.channel === 'main' || entry.channel === null);
+  if (mainEntries.length !== 1 || typeof mainEntries[0].url !== 'string' || mainEntries[0].url.length === 0) {
+    throw new AcceptanceError('ACCEPTANCE_PORT_BINDING_MISMATCH', 'Profile must contain exactly one MCP main channel destination');
+  }
+  return { healthListenAddr, mainMcpUrl: mainEntries[0].url };
+}
+
+function yamlScalar(value) {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
 }
 
 async function readJsonIfPresent(filename) {
