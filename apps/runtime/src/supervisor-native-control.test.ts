@@ -19,6 +19,22 @@ const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 describe('outer supervisor native control', () => {
+  it('serves the trusted source and connector identity to the local Web bridge', async () => {
+    const harness = await startHarness(true);
+    try {
+      const response = await fetch(new URL('/identity', harness.server.healthUrl), {
+        headers: { authorization: `Bearer ${harness.secret}` },
+      });
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        state: 'VERIFIED',
+        tunnelBinding: { mode: 'FULL' },
+      });
+    } finally {
+      await harness.server.close();
+    }
+  });
+
   it('publishes one gateway catalog and routes runtime tools without losing supervisor authority', async () => {
     const harness = await startHarness(true);
     try {
@@ -260,7 +276,7 @@ async function startHarness(unified = false, identityGuard = false) {
       runtimeToolCall: async (name: string) => harness.runtimeAvailable
         ? { content: [{ type: 'text', text: JSON.stringify({ status: 'ready', name }) }], structuredContent: { status: 'ready', name }, isError: false }
         : { content: [{ type: 'text', text: JSON.stringify({ code: 'RUNTIME_NOT_RUNNING', message: 'Runtime tools are unavailable while workload is OFF' }) }], structuredContent: { code: 'RUNTIME_NOT_RUNNING' }, isError: true },
-      sourceIdentity: async () => ({ state: 'VERIFIED', commitSha: 'a'.repeat(40) }),
+      sourceIdentity: async () => ({ state: 'VERIFIED', commitSha: 'a'.repeat(40), runtimeId: 'runtime-a', deploymentEpoch: 2, tunnelBinding: { mode: 'FULL' } }),
       ...(identityGuard ? {
         authorizeMcpRequest: async (headers: Readonly<Record<string, string | string[] | undefined>>) => {
           if (headers['x-iris-connector-profile'] !== 'FULL') throw new Error('profile mismatch');

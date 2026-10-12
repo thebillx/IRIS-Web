@@ -110,6 +110,14 @@ async function handleRequest(
     writeJson(response, 200, { ok: true, owner: OWNER, pid: process.pid });
     return;
   }
+  if (request.method === 'GET' && request.url === '/identity') {
+    if (operations.sourceIdentity === undefined) {
+      writeJson(response, 503, { error: 'identity_unavailable' });
+      return;
+    }
+    writeJson(response, 200, await operations.sourceIdentity());
+    return;
+  }
   if (request.method !== 'POST' || request.url !== '/mcp') {
     writeJson(response, 404, { error: 'not_found' });
     return;

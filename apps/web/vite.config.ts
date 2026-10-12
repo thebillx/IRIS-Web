@@ -5,6 +5,12 @@ import react from '@vitejs/plugin-react';
 const runtimeUrl = process.env.IRIS_RUNTIME_URL ?? 'http://127.0.0.1:43110';
 const SUPERVISOR_WEB_TOOLS = new Set(['supervisor_status', 'supervisor_doctor', 'workload_on', 'workload_off', 'workload_restart']);
 
+export interface SupervisorBridgeIdentity {
+  readonly connectorProfile: 'FULL' | 'PRO';
+  readonly deploymentEpoch: number;
+  readonly runtimeId: string;
+}
+
 export function validateSupervisorWebRequest(body: unknown, headers: { readonly method: string | undefined; readonly name: string | undefined }): string | null {
   if (!isRecord(body) || body.method !== 'tools/call') return 'Supervisor bridge accepts only tools/call requests';
   const params = isRecord(body.params) ? body.params : null;
@@ -20,10 +26,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function supervisorBridge() {
-  const controlUrl = process.env.IRIS_SUPERVISOR_CONTROL_URL;
-  const ownerSecret = process.env.IRIS_OWNER_ACCESS_SECRET;
-  const supervisorSecret = process.env.IRIS_SUPERVISOR_CONTROL_SECRET;
+export function parseSupervisorBridgeIdentity(value: unknown): SupervisorBridgeIdentity | null {
+  if (!isRecord(value) || value.state !== 'VERIFIED') return null;
+  const binding = isRecord(value.tunnelBinding) ? value.tunnelBinding : null;
+  const connectorProfile = binding?.mode === 'FULL' || binding?.mode === 'PRO' ? binding.mode : null;
+  const deploymentEpoch = value.deploymentEpoch;
+  const runtimeId = value.runtimeId;
+  if (connectorProfile === null || typeof deploymentEpoch !== 'number' || !Number.isSafeInteger(deploymentEpoch) || deploymentEpoch <= 0 || typeof runtimeId !== 'string' || runtimeId.length === 0) return null;
+  return { connectorProfile, deploymentEpoch, runtimeId };
+}
+
+export async function readSupervisorBridgeIdentity(controlUrl: string, supervisorSecret: string): Promise<SupervisorBridgeIdentity> {
+  const response = await fetch(new URL('/identity', controlUrl), {
+    headers: { authorization: `Bearer ${supervisorSecret}` },
+    signal: AbortSignal.timeout(2_000),
+  });
+  if (!response.ok) throw new Error(`Supervisor identity returned HTTP ${response.status}`);
+  const identity = parseSupervisorBridgeIdentity(await response.json() as unknown);
+  if (identity === null) throw new Error('Supervisor identity is missing or stale');
+  return identity;
+}
+
+export function createSupervisorBridge(environment: NodeJS.ProcessEnv = process.env) {
+  const controlUrl = environment.IRIS_SUPERVISOR_CONTROL_URL;
+  const ownerSecret = environment.IRIS_OWNER_ACCESS_SECRET;
+  const supervisorSecret = environment.IRIS_SUPERVISOR_CONTROL_SECRET;
   return {
     name: 'iris-supervisor-owner-bridge',
     configureServer(server: { middlewares: { use: (path: string, handler: (request: import('node:http').IncomingMessage, response: import('node:http').ServerResponse, next: () => void) => void) => void } }) {
@@ -52,6 +79,7 @@ function supervisorBridge() {
           else chunks.push(chunk);
         });
         request.on('end', () => {
+          void (async () => {
           if (tooLarge) {
             response.writeHead(413, { 'content-type': 'application/json', 'cache-control': 'no-store' });
             response.end(JSON.stringify({ error: { code: 'REQUEST_TOO_LARGE', message: 'Supervisor control request exceeds the 64 KiB limit' } }));
@@ -75,6 +103,16 @@ function supervisorBridge() {
               return;
             }
           }
+          let identity: SupervisorBridgeIdentity | null = null;
+          if (targetPath === '/mcp') {
+            try {
+              identity = await readSupervisorBridgeIdentity(controlUrl, supervisorSecret);
+            } catch {
+              response.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+              response.end(JSON.stringify({ error: { code: 'SUPERVISOR_IDENTITY_UNAVAILABLE', message: 'Supervisor connector identity is unavailable' } }));
+              return;
+            }
+          }
           const target = new URL(targetPath, controlUrl);
           const proxy = http.request(target, {
             method: request.method,
@@ -84,6 +122,11 @@ function supervisorBridge() {
               ...(request.headers['mcp-protocol-version'] === undefined ? {} : { 'mcp-protocol-version': request.headers['mcp-protocol-version'] }),
               ...(request.headers['mcp-method'] === undefined ? {} : { 'mcp-method': request.headers['mcp-method'] }),
               ...(request.headers['mcp-name'] === undefined ? {} : { 'mcp-name': request.headers['mcp-name'] }),
+              ...(identity === null ? {} : {
+                'x-iris-connector-profile': identity.connectorProfile,
+                'x-iris-deployment-epoch': String(identity.deploymentEpoch),
+                'x-iris-runtime-id': identity.runtimeId,
+              }),
               'content-length': String(Buffer.concat(chunks).byteLength),
             },
           }, (upstream) => {
@@ -97,6 +140,12 @@ function supervisorBridge() {
             } else response.end();
           });
           proxy.end(body);
+          })().catch(() => {
+            if (!response.headersSent) {
+              response.writeHead(502, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+              response.end(JSON.stringify({ error: { code: 'SUPERVISOR_UNAVAILABLE', message: 'Supervisor control did not respond' } }));
+            } else response.end();
+          });
         });
       });
     },
@@ -104,7 +153,7 @@ function supervisorBridge() {
 }
 
 export default defineConfig({
-  plugins: [react(), supervisorBridge()],
+  plugins: [react(), createSupervisorBridge()],
   server: {
     host: '127.0.0.1',
     proxy: {
