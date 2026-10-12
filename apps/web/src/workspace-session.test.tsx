@@ -56,9 +56,9 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB], missions: Parameters<typeof RuntimePage>[0]['missions'] = [], jobs: Parameters<typeof RuntimePage>[0]['jobs'] = []): string {
+function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB], missions: Parameters<typeof RuntimePage>[0]['missions'] = [], jobs: Parameters<typeof RuntimePage>[0]['jobs'] = [], healthOverride: Parameters<typeof RuntimePage>[0]['health'] = health, jobViewState: Parameters<typeof RuntimePage>[0]['jobViewState'] = jobs.length === 0 ? 'EMPTY' : 'READY'): string {
   return renderToStaticMarkup(createElement(RuntimePage, {
-    health,
+    health: healthOverride,
     projects: [projectA, projectB],
     defaultProject: projectA,
     activeProject: selectedSession?.currentProjectId === projectA.id ? projectA : selectedSession?.currentProjectId === projectB.id ? projectB : null,
@@ -81,7 +81,7 @@ function renderWorkspace(selectedSession: Session | null, sessions: Session[] = 
     onSelectProject: () => undefined,
     onRequestMissionOrchestrator: () => undefined,
     jobs,
-    jobViewState: jobs.length === 0 ? 'EMPTY' : 'READY',
+    jobViewState,
     jobLogs: { 'job-1': { stdout: { stream: 'stdout', text: 'hello from job\n', cursor: 'stdout:5', eof: true, bytes: 15 } } },
     jobResults: {},
     onCancelJob: () => undefined,
@@ -125,6 +125,28 @@ describe('daily workspace session experience', () => {
     expect(markup).toContain('workspace-a');
     expect(markup).toContain('hello from job');
     expect(markup).toContain('Cancel job');
+  });
+
+  it('counts only queued and running jobs in the active jobs summary', () => {
+    const markup = renderWorkspace(sessionA, [sessionA], [], [
+      { jobId: 'queued', requestId: 'request-queued', projectId: projectA.id, workspaceId: 'workspace-a', state: 'QUEUED', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null },
+      { jobId: 'running', requestId: 'request-running', projectId: projectA.id, workspaceId: 'workspace-a', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null },
+      { jobId: 'done', requestId: 'request-done', projectId: projectA.id, workspaceId: 'workspace-a', state: 'SUCCEEDED', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: '2026-09-05T06:01:00.000Z' },
+    ]);
+    expect(markup).toContain('ops-card--jobs"><span class="ops-card-label">Active jobs</span><strong>2</strong>');
+  });
+
+  it('does not report zero active jobs while job status is loading or unavailable', () => {
+    const loading = renderWorkspace(sessionA, [sessionA], [], [], health, 'LOADING');
+    const unavailable = renderWorkspace(sessionA, [sessionA], [], [], health, 'UNAVAILABLE');
+    expect(loading).toContain('Active jobs</span><strong>…</strong>');
+    expect(unavailable).toContain('Active jobs</span><strong>—</strong>');
+  });
+
+  it('does not report Runtime OFF when health is unavailable', () => {
+    const markup = renderWorkspace(sessionA, [sessionA], [], [], null);
+    expect(markup).toContain('ops-card--runtime"><span class="ops-card-label">Runtime</span><strong>UNKNOWN</strong>');
+    expect(markup).not.toContain('ops-card--runtime"><span class="ops-card-label">Runtime</span><strong>OFF</strong>');
   });
 
   it('keeps job-list responses bound to the selected session and project', async () => {

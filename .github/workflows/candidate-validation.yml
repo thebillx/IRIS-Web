@@ -41,6 +41,16 @@ jobs:
           pnpm --filter @iris/runtime typecheck
           pnpm --filter @iris/web typecheck
 
+      - name: Run Web tests and build
+        run: |
+          pnpm --filter @iris/web test
+          pnpm --filter @iris/web build
+
+      - name: Run focused Supervisor tests and runtime build
+        run: |
+          pnpm --filter @iris/runtime exec vitest run src/supervisor.test.ts -t 'prepares the canonical unified profile|keeps dedicated FULL and PRO profiles'
+          pnpm --filter @iris/runtime build
+
       - name: Run setup and continuity tests
         run: |
           if [ -f apps/runtime/src/control-setup.test.ts ]; then

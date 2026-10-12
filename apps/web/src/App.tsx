@@ -705,14 +705,19 @@ export function RuntimePage(props: {
       : props.selectedSession?.executionState === 'WORKING'
         ? 'Working'
         : props.selectedSession?.executionState === 'FAILED' ? 'Failed' : 'Ready';
+  const activeJobSummary = props.jobViewState === 'LOADING'
+    ? '…'
+    : props.jobViewState === 'ERROR' || props.jobViewState === 'UNAVAILABLE' || props.jobViewState === 'IDLE'
+      ? '—'
+      : String((props.jobs ?? []).filter((job) => job.state === 'QUEUED' || job.state === 'RUNNING').length);
 
   return <>
     <div className="page-heading"><div><p className="eyebrow">Daily workspace</p><h1>IRIS</h1><p>One local daemon, your projects, and resumable browser sessions.</p></div><span className="page-context">Owner workspace<br /><strong>Local-first operations</strong></span></div>
     <div className="ops-summary" aria-label="Operational summary">
-      <article className="ops-card ops-card--runtime"><span className="ops-card-label">Runtime</span><strong>{props.health?.status ?? 'OFF'}</strong><span className="ops-card-detail">{props.health?.runtimeId ?? 'No runtime identity'}</span></article>
+      <article className="ops-card ops-card--runtime"><span className="ops-card-label">Runtime</span><strong>{props.health?.status ?? 'UNKNOWN'}</strong><span className="ops-card-detail">{props.health?.runtimeId ?? 'No runtime identity'}</span></article>
       <article className="ops-card ops-card--gateway"><span className="ops-card-label">Supervisor gateway</span><strong>{props.supervisorStatus?.state ?? 'UNKNOWN'}</strong><span className="ops-card-detail">{props.supervisorStatus?.readiness ?? 'Control path not verified'}</span></article>
       <article className="ops-card ops-card--tunnel"><span className="ops-card-label">Tunnel</span><strong>{props.supervisorStatus?.tunnel?.state ?? 'UNKNOWN'}</strong><span className="ops-card-detail">{props.supervisorStatus?.tunnel?.detail ?? 'Provider state not reported'}</span></article>
-      <article className="ops-card ops-card--jobs"><span className="ops-card-label">Active jobs</span><strong>{props.jobs?.length ?? 0}</strong><span className="ops-card-detail">Captured to this project</span></article>
+      <article className="ops-card ops-card--jobs"><span className="ops-card-label">Active jobs</span><strong>{activeJobSummary}</strong><span className="ops-card-detail">{props.jobViewState === 'LOADING' ? 'Checking project scope' : props.jobViewState === 'ERROR' || props.jobViewState === 'UNAVAILABLE' ? 'Status unavailable' : 'Captured to this project'}</span></article>
     </div>
     <div className="workspace-grid">
       <aside className="workspace-rail">
