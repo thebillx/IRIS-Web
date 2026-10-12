@@ -237,6 +237,7 @@ export class Supervisor {
   public async up(): Promise<SupervisorStackStatus> {
     await this.prepareDirectories();
     return this.withOperationLock('up', async () => {
+      await this.assertStartupTopologySupported();
       const state = await this.readState();
       if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
       return this.upUnlocked();
@@ -248,6 +249,7 @@ export class Supervisor {
     await this.prepareDirectories();
     try {
       return await this.withOperationLock('workload-on', async () => {
+        await this.assertStartupTopologySupported();
         const state = await this.readState();
         if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
         return this.upUnlocked();
@@ -287,6 +289,7 @@ export class Supervisor {
   public async workloadRestart(): Promise<SupervisorStackStatus> {
     await this.prepareDirectories();
     return this.withOperationLock('workload-restart', async () => {
+      await this.assertStartupTopologySupported();
       const state = await this.readState();
       if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
       await this.workloadOffUnlocked();
@@ -323,6 +326,7 @@ export class Supervisor {
   }
 
   private async upUnlocked(expectedSourceIdentity?: ActivationSourceIdentity): Promise<SupervisorStackStatus> {
+    await this.assertStartupTopologySupported();
     const credentials = await inspectCredentialStatus(this.dataRoot);
     if (!credentials.controlPlaneApiKeyPresent) {
       throw new RuntimeError(credentials.legacy.detected ? 'MIGRATION_REQUIRED' : 'CREDENTIAL_MISSING', 'A persistent control-plane credential is required; run explicit credentials migration before iris up');
@@ -458,6 +462,7 @@ export class Supervisor {
   public async restart(): Promise<SupervisorStackStatus> {
     await this.prepareDirectories();
     return this.withOperationLock('restart', async () => {
+      await this.assertStartupTopologySupported();
       const state = await this.readState();
       if (state.workloadDesiredState !== 'ON' || state.stackDesiredState !== 'UP') await this.writeState({ ...state, workloadDesiredState: 'ON', stackDesiredState: 'UP' });
       await this.downUnlocked();
@@ -1550,6 +1555,16 @@ export class Supervisor {
     }
     if (pro !== undefined && pro.healthPort !== this.ports.proTunnelHealth) {
       throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'PRO tunnel health port does not match the acceptance port set');
+    }
+  }
+
+  private async assertStartupTopologySupported(): Promise<void> {
+    const registry = await readConnectorRegistry(this.dataRoot);
+    if (registry?.connectors.length === 1 && !this.nativeControlActive) {
+      throw new RuntimeError(
+        'PRECONDITION_FAILED',
+        'Unified IRIS startup requires the persistent Supervisor Gateway; run "iris supervisor" and use its authenticated control path',
+      );
     }
   }
 

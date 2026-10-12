@@ -57,6 +57,36 @@ describe('IRIS supervisor', () => {
     expect(await readFile(prepared.pro!, 'utf8')).toContain('url: "http://127.0.0.1:43110/mcp-pro"');
   });
 
+  it('rejects standalone unified startup before desired state or processes are created', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-unified-standalone-'));
+    roots.push(dataRoot);
+    const supervisorControlPort = await freePort();
+    const runtimePort = await freePort();
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-standalone-test-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot, runtimePort, supervisorControlPort });
+    await supervisor.initializeUnified('tunnel_0123456789abcdef0123456789abcdef');
+    const prepared = await supervisor.prepareManagedProfiles();
+    const fullProfile = await readFile(prepared.full, 'utf8');
+
+    for (const operation of [
+      () => supervisor.up(),
+      () => supervisor.workloadOn(),
+      () => supervisor.workloadRestart(),
+      () => supervisor.restart(),
+    ]) {
+      await expect(operation()).rejects.toMatchObject({
+        code: 'PRECONDITION_FAILED',
+        message: expect.stringContaining('persistent Supervisor Gateway'),
+      });
+    }
+
+    expect(fullProfile).toContain(`url: "http://127.0.0.1:${supervisorControlPort}/mcp"`);
+    expect(fullProfile).not.toContain(`url: "http://127.0.0.1:${runtimePort}/mcp"`);
+    await expect(readFile(path.join(dataRoot, 'supervisor', 'state.json'), 'utf8')).rejects.toThrow();
+    expect((await runtimeStatus(dataRoot)).state).toBe('stopped');
+  });
+
   it('reports missing migration state without creating files during status', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-status-'));
     roots.push(dataRoot);

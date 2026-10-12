@@ -164,8 +164,10 @@ metadata alone is insufficient. Do not invent evidence, reuse production
 profiles, kill or adopt an occupied process, or add a `--force` switch.
 
 Export `IRIS_ACCEPTANCE_TUNNEL_EVIDENCE` to that file before invoking
-`iris_acceptance up --tunnel-id <non-production-tunnel-id>` or
-`iris_acceptance restart --tunnel-id <non-production-tunnel-id>`. The wrapper independently
+`iris_acceptance supervisor --tunnel-id <non-production-tunnel-id>` for a
+unified registry, or `iris_acceptance up --tunnel-id <non-production-tunnel-id>`
+and `iris_acceptance restart --tunnel-id <non-production-tunnel-id>` for a
+dedicated registry. The wrapper independently
 allows the Supervisor to spawn the provider as the sole owner. After the child
 returns success, it verifies the persisted Supervisor record, PID, executable,
 process-start marker, profile/tunnel/runtime identity, actual isolated listeners,
@@ -174,6 +176,22 @@ stale or contradictory field remains **BLOCKED** or **UNKNOWN_OUTCOME**; inspect
 Supervisor state before retrying. No external provider process may be adopted.
 Use `iris_acceptance down` only for the acceptance root whose identity was
 verified by the wrapper.
+
+For a single unified `iris-full` registry, standalone `up`, `restart`,
+`workload-on`, and `workload-restart` are intentionally unsupported: without the persistent Supervisor
+Gateway they would have no authenticated control route and must fail before
+desired state or child processes are created. Start the persistent control path
+through the wrapper instead:
+
+```sh
+iris_acceptance supervisor --tunnel-id <non-production-tunnel-id>
+```
+
+That daemon owns the authenticated Supervisor Gateway and may start the unified
+workload through it. Use the Gateway's authenticated workload controls for
+`OFF`, `ON`, and restart. Dedicated FULL/PRO registries retain their supported
+standalone `up`/`restart` routes. A failed or unknown startup remains blocked;
+inspect the persisted Supervisor state before retrying.
 
 If a command is blocked, preserve the root and error output. A fresh terminal
 must re-export `IRIS_ACCEPTANCE_ROOT` and rerun `iris_acceptance preflight`; an
