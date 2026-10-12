@@ -74,6 +74,7 @@ test('guided setup initializes one connector and repeats without mutation', asyn
   assert.equal(first.repeated, false);
   assert.deepEqual(first.connector, { label: 'IRIS', mcpPath: '/mcp', tunnelId });
   assert.match(first.machineId, /^[0-9a-f-]{36}$/);
+  assert.match(await readFile(path.join(dataRoot, 'tunnel-profiles', 'iris-full.yaml'), 'utf8'), /127\.0\.0\.1:43112\/mcp/);
   const registryBefore = await readFile(path.join(dataRoot, 'connector-registry.json'), 'utf8');
   const second = JSON.parse((await runSetup(dataRoot, '--tunnel-id', tunnelId)).stdout) as { status: string; repeated: boolean };
   assert.equal(second.status, 'READY_TO_START');

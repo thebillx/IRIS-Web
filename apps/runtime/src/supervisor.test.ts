@@ -22,6 +22,41 @@ const sourceRoot = path.resolve(import.meta.dirname, '../../..');
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 describe('IRIS supervisor', () => {
+  it('prepares the canonical unified profile before runtime startup', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-prestart-profile-'));
+    roots.push(dataRoot);
+    const supervisorControlPort = await freePort();
+    const fullTunnelHealthPort = await freePort();
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-prestart-test-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot, supervisorControlPort, fullTunnelHealthPort });
+    const tunnelId = 'tunnel_0123456789abcdef0123456789abcdef';
+    await supervisor.initializeUnified(tunnelId);
+
+    const prepared = await supervisor.prepareManagedProfiles();
+    const profile = await readFile(prepared.full, 'utf8');
+    expect(profile).toContain(`tunnel_id: "${tunnelId}"`);
+    expect(profile).toContain(`listen_addr: "127.0.0.1:${fullTunnelHealthPort}"`);
+    expect(profile).toContain(`url: "http://127.0.0.1:${supervisorControlPort}/mcp"`);
+    expect((await runtimeStatus(dataRoot)).state).toBe('stopped');
+  });
+
+  it('keeps dedicated FULL and PRO profiles on their runtime routes during preparation', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-prestart-dedicated-'));
+    roots.push(dataRoot);
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-dedicated-prestart-test-12345');
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot });
+    await initializeConnectorRegistry(dataRoot, {
+      fullTunnelId: 'tunnel_0123456789abcdef0123456789abcdef',
+      proTunnelId: 'tunnel_fedcba9876543210fedcba9876543210',
+    });
+
+    const prepared = await supervisor.prepareManagedProfiles();
+    expect(await readFile(prepared.full, 'utf8')).toContain('url: "http://127.0.0.1:43110/mcp"');
+    expect(await readFile(prepared.pro!, 'utf8')).toContain('url: "http://127.0.0.1:43110/mcp-pro"');
+  });
+
   it('reports missing migration state without creating files during status', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-status-'));
     roots.push(dataRoot);

@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { buildChildEnvironment, inspectAcceptanceEnvironment, parseAcceptanceArgs, verifyAcceptanceTunnelStartup, verifyGeneratedPortBindings } from './iris-acceptance.mjs';
+import { buildChildEnvironment, inspectAcceptanceEnvironment, parseAcceptanceArgs, verifyAcceptanceTunnelStartup, verifyGeneratedPortBindings, waitForAcceptanceTunnelStartup } from './iris-acceptance.mjs';
 
 const roots = [];
 const sourceRoot = path.resolve(import.meta.dirname, '..');
@@ -24,6 +24,29 @@ afterEach(async () => {
 });
 
 describe('acceptance isolation preflight', () => {
+  it('waits for persistent Supervisor readiness and does not report after an exit', async () => {
+    let attempts = 0;
+    const result = await waitForAcceptanceTunnelStartup({
+      timeoutMs: 100,
+      retryDelayMs: 1,
+      childExited: () => null,
+      verify: async () => {
+        attempts += 1;
+        if (attempts < 2) throw new Error('not ready yet');
+        return { state: 'READY', pid: 4242 };
+      },
+    });
+    assert.deepEqual(result, { state: 'READY', pid: 4242 });
+    assert.equal(attempts, 2);
+
+    await assert.rejects(waitForAcceptanceTunnelStartup({
+      timeoutMs: 100,
+      retryDelayMs: 1,
+      childExited: () => ({ code: null, signal: 'SIGTERM' }),
+      verify: async () => ({ state: 'READY' }),
+    }), (error) => error.code === 'ACCEPTANCE_STARTUP_UNKNOWN_OUTCOME');
+  });
+
   it('accepts one complete isolated port set and rejects partial or protected sets', async () => {
     const spec = Object.entries(TEST_PORTS).map(([name, port]) => `${name}=${port}`).join(',');
     assert.deepEqual(parseAcceptanceArgs(['--runtime-data-root', '/tmp/root', '--protected-root', '/tmp/live', '--ports', spec, '--', 'status']).ports, TEST_PORTS);

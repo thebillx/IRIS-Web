@@ -1526,6 +1526,21 @@ export class Supervisor {
     });
   }
 
+  /** Prepare private tunnel profiles without starting any workload or control process. */
+  public async prepareManagedProfiles(): Promise<{ readonly full: string; readonly pro: string | null; readonly admin: string | null }> {
+    await this.prepareDirectories();
+    return this.withOperationLock('prepare-managed-profiles', async () => {
+      const credentials = await inspectCredentialStatus(this.dataRoot);
+      if (!credentials.controlPlaneApiKeyPresent || !credentials.tunnelServicePresent) {
+        throw new RuntimeError('CREDENTIAL_MISSING', 'Persistent credentials are required before managed profile preparation');
+      }
+      const registry = await readConnectorRegistry(this.dataRoot);
+      if (registry === null) throw new RuntimeError('MIGRATION_REQUIRED', 'IRIS connector registry is not initialized');
+      this.assertConfiguredConnectorPorts(registry);
+      return this.writeManagedProfiles(registry, `http://127.0.0.1:${this.runtimePort}`, true);
+    });
+  }
+
   private assertConfiguredConnectorPorts(registry: ConnectorRegistryDocument): void {
     if (!this.acceptanceScopedPorts) return;
     const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
@@ -1846,7 +1861,7 @@ export class Supervisor {
     }
   }
 
-  private async writeManagedProfiles(registry: ConnectorRegistryDocument, runtimeApiUrl: string): Promise<{ readonly full: string; readonly pro: string | null; readonly admin: string | null }> {
+  private async writeManagedProfiles(registry: ConnectorRegistryDocument, runtimeApiUrl: string, preStart = false): Promise<{ readonly full: string; readonly pro: string | null; readonly admin: string | null }> {
     const credentials = credentialPaths(this.dataRoot);
     const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
     const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
@@ -1854,7 +1869,7 @@ export class Supervisor {
     const fullPath = full.managedProfilePath;
     const proPath = pro?.managedProfilePath ?? null;
     const adminPath = registry.admin?.managedProfilePath ?? null;
-    const unifiedSupervisorMcpUrl = this.nativeControlActive && registry.connectors.length === 1
+    const unifiedSupervisorMcpUrl = (this.nativeControlActive || preStart) && registry.connectors.length === 1
       ? `http://127.0.0.1:${this.supervisorControlPort}/mcp`
       : null;
     await writePrivateText(fullPath, managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, unifiedSupervisorMcpUrl));

@@ -218,6 +218,25 @@ async function main() {
       env: childEnvironment,
       stdio: 'inherit',
     });
+    let childExit = null;
+    child.once('exit', (code, signal) => { childExit = { code, signal }; });
+    if (parsed.command[0] === 'supervisor') {
+      try {
+        const startup = await waitForAcceptanceTunnelStartup({
+          filename: process.env.IRIS_ACCEPTANCE_TUNNEL_EVIDENCE,
+          tunnelId: commandValue(parsed.command, '--tunnel-id'),
+          dataRoot: report.dataRoot,
+          sourceRoot: report.sourceRoot,
+          ports: report.ports,
+          childExited: () => childExit,
+        });
+        process.stdout.write(`${JSON.stringify({ status: 'READY', ...startup }, null, 2)}\n`);
+      } catch (error) {
+        // Preserve an ambiguous candidate for owner inspection without keeping this wrapper attached to it.
+        child.unref();
+        throw error;
+      }
+    }
     child.once('exit', async (code, signal) => {
       try {
         if (signal !== null) {
@@ -225,7 +244,7 @@ async function main() {
           process.exitCode = 1;
           return;
         }
-        if (code === 0 && report.ports !== null) {
+        if (code === 0 && report.ports !== null && parsed.command[0] !== 'supervisor') {
           await verifyGeneratedPortBindings(report.dataRoot, report.ports);
           if (startsRemoteTunnel(parsed.command)) {
             await verifyAcceptanceTunnelStartup({
@@ -251,6 +270,35 @@ async function main() {
     process.stderr.write(`IRIS_ACCEPTANCE_BLOCKED code=${code} message=${message}\n`);
     process.exitCode = 1;
   }
+}
+
+export async function waitForAcceptanceTunnelStartup(options) {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const retryDelayMs = options.retryDelayMs ?? 100;
+  const verify = options.verify ?? (() => verifyAcceptanceTunnelStartup(options));
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    const exited = options.childExited?.();
+    if (exited !== undefined && exited !== null) {
+      const detail = exited.signal === null ? `exit code ${exited.code ?? 'unknown'}` : `signal ${exited.signal}`;
+      throw new AcceptanceError('ACCEPTANCE_STARTUP_UNKNOWN_OUTCOME', `Persistent Supervisor exited before readiness verification (${detail}); inspect state before retrying`);
+    }
+    try {
+      const result = await verify();
+      const exitedAfter = options.childExited?.();
+      if (exitedAfter !== undefined && exitedAfter !== null) {
+        const detail = exitedAfter.signal === null ? `exit code ${exitedAfter.code ?? 'unknown'}` : `signal ${exitedAfter.signal}`;
+        throw new AcceptanceError('ACCEPTANCE_STARTUP_UNKNOWN_OUTCOME', `Persistent Supervisor exited during readiness verification (${detail}); inspect state before retrying`);
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => globalThis.setTimeout(resolve, retryDelayMs));
+  }
+  if (lastError instanceof AcceptanceError) throw lastError;
+  throw new AcceptanceError('ACCEPTANCE_STARTUP_UNVERIFIED', 'Persistent Supervisor did not reach verified readiness before the startup deadline');
 }
 
 export async function verifyAcceptanceTunnelAuthorization(options) {

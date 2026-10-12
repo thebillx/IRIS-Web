@@ -182,6 +182,7 @@ async function guidedSetup(supervisor: Awaited<ReturnType<typeof createSuperviso
   }
   await loadOrCreateTunnelServiceSecret(dataRoot);
   const configuredCredentials = await inspectCredentialStatus(dataRoot);
+  const preparedProfiles = options.start ? null : await supervisor.prepareManagedProfiles();
   const status = options.start ? await supervisor.up() : await supervisor.status();
   return {
     status: options.start ? (status.state === 'READY' ? 'READY' : 'NEEDS_ATTENTION') : 'READY_TO_START',
@@ -195,6 +196,7 @@ async function guidedSetup(supervisor: Awaited<ReturnType<typeof createSuperviso
       legacyMigrationRequired: configuredCredentials.legacy.migrationRequired,
     },
     local: { stack: status.state, runtime: status.runtime, tunnel: status.tunnel, controlPlane: status.controlPlane },
+    profiles: preparedProfiles === null ? null : { full: preparedProfiles.full, pro: preparedProfiles.pro, admin: preparedProfiles.admin },
     next: options.start ? ['node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'] : ['node scripts/iris.mjs up', 'node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'],
     message: 'Remote tunnel provisioning and ChatGPT connector selection remain owner-verifiable steps; this command does not claim either occurred.',
   };
