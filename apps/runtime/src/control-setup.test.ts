@@ -69,11 +69,12 @@ test('guided setup initializes one connector and repeats without mutation', asyn
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-guided-setup-ready-'));
   roots.push(dataRoot);
   await persistControlPlaneApiKey(dataRoot, 'fixture-control-plane-key-123456');
-  const first = JSON.parse((await runSetup(dataRoot, '--tunnel-id', tunnelId)).stdout) as { status: string; repeated: boolean; connector: { label: string; mcpPath: string }; machineId: string };
+  const first = JSON.parse((await runSetup(dataRoot, '--tunnel-id', tunnelId)).stdout) as { status: string; repeated: boolean; connector: { label: string; mcpPath: string }; machineId: string; next: string[] };
   assert.equal(first.status, 'READY_TO_START');
   assert.equal(first.repeated, false);
   assert.deepEqual(first.connector, { label: 'IRIS', mcpPath: '/mcp', tunnelId });
   assert.match(first.machineId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual(first.next, ['node scripts/iris.mjs supervisor']);
   assert.match(await readFile(path.join(dataRoot, 'tunnel-profiles', 'iris-full.yaml'), 'utf8'), /127\.0\.0\.1:43112\/mcp/);
   const registryBefore = await readFile(path.join(dataRoot, 'connector-registry.json'), 'utf8');
   const second = JSON.parse((await runSetup(dataRoot, '--tunnel-id', tunnelId)).stdout) as { status: string; repeated: boolean };

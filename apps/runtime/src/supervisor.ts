@@ -497,6 +497,7 @@ export class Supervisor {
     let state = await this.readState();
     const admin = await this.probeAdmin(state.admin);
     if (admin.state !== 'READY') throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'Persistent supervisor-admin readiness is required before workload replacement');
+    await this.assertStartupTopologySupported();
     if (expectedSourceIdentity !== undefined) {
       await assertActivationSourceIdentity(sourceRoot, expectedSourceIdentity, 'Candidate source identity does not match the prepared activation before preflight');
     }
@@ -1560,12 +1561,16 @@ export class Supervisor {
 
   private async assertStartupTopologySupported(): Promise<void> {
     const registry = await readConnectorRegistry(this.dataRoot);
-    if (registry?.connectors.length === 1 && !this.nativeControlActive) {
+    if (registry?.connectors.length === 1 && !await this.persistentSupervisorGatewayAvailable()) {
       throw new RuntimeError(
         'PRECONDITION_FAILED',
         'Unified IRIS startup requires the persistent Supervisor Gateway; run "iris supervisor" and use its authenticated control path',
       );
     }
+  }
+
+  private async persistentSupervisorGatewayAvailable(): Promise<boolean> {
+    return this.nativeControlActive || await supervisorNativeEndpointResponds(this.dataRoot, this.supervisorControlPort);
   }
 
   private async ensureRegistry(): Promise<{ readonly registry: ConnectorRegistryDocument; readonly changed: boolean }> {
@@ -1884,7 +1889,7 @@ export class Supervisor {
     const fullPath = full.managedProfilePath;
     const proPath = pro?.managedProfilePath ?? null;
     const adminPath = registry.admin?.managedProfilePath ?? null;
-    const unifiedSupervisorMcpUrl = (this.nativeControlActive || preStart) && registry.connectors.length === 1
+    const unifiedSupervisorMcpUrl = (preStart || registry.connectors.length === 1 && await this.persistentSupervisorGatewayAvailable())
       ? `http://127.0.0.1:${this.supervisorControlPort}/mcp`
       : null;
     await writePrivateText(fullPath, managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, unifiedSupervisorMcpUrl));

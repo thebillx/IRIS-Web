@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -6,7 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { inspectActivationSourceIdentity } from './activation-source-identity.js';
-import { bindConnectorRuntime, initializeConnectorRegistry, readConnectorRegistry, type ConnectorBinding } from './connector-registry.js';
+import { bindConnectorRuntime, initializeConnectorRegistry, readConnectorRegistry, type ConnectorBinding, type ConnectorRegistryDocument } from './connector-registry.js';
 import { credentialPaths, loadOrCreateTunnelServiceSecret, persistControlPlaneApiKey, readTunnelServiceSecret } from './credentials.js';
 import { startDaemon } from './daemon.js';
 import { catalogIdentityAtVersion } from './mcp-catalog.js';
@@ -85,6 +86,34 @@ describe('IRIS supervisor', () => {
     expect(fullProfile).not.toContain(`url: "http://127.0.0.1:${runtimePort}/mcp"`);
     await expect(readFile(path.join(dataRoot, 'supervisor', 'state.json'), 'utf8')).rejects.toThrow();
     expect((await runtimeStatus(dataRoot)).state).toBe('stopped');
+  });
+
+  it('allows a separate activation helper to use an authenticated outer unified Gateway', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-unified-gateway-'));
+    roots.push(dataRoot);
+    const supervisorControlPort = await freePort();
+    await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-gateway-test-12345');
+    const secret = await loadOrCreateTunnelServiceSecret(dataRoot);
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot, supervisorControlPort });
+    await supervisor.initializeUnified('tunnel_0123456789abcdef0123456789abcdef');
+    const gateway = createServer((request, response) => {
+      if (request.url !== '/healthz') { response.writeHead(404).end(); return; }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ ok: true, owner: 'OUTER_SUPERVISOR_DAEMON' }));
+    });
+    await new Promise<void>((resolve) => gateway.listen(supervisorControlPort, '127.0.0.1', resolve));
+    try {
+      const assertTopology = (supervisor as unknown as { assertStartupTopologySupported(): Promise<void> }).assertStartupTopologySupported.bind(supervisor);
+      await expect(assertTopology()).resolves.toBeUndefined();
+      const registry = await readConnectorRegistry(dataRoot);
+      if (registry === null) throw new Error('missing unified registry');
+      const writeProfiles = (supervisor as unknown as { writeManagedProfiles(registry: ConnectorRegistryDocument, runtimeApiUrl: string): Promise<{ full: string }> }).writeManagedProfiles.bind(supervisor);
+      const prepared = await writeProfiles(registry, 'http://127.0.0.1:43110');
+      expect(await readFile(prepared.full, 'utf8')).toContain(`url: "http://127.0.0.1:${supervisorControlPort}/mcp"`);
+      expect(secret).toBeTruthy();
+    } finally {
+      await new Promise<void>((resolve, reject) => gateway.close((error) => error ? reject(error) : resolve()));
+    }
   });
 
   it('reports missing migration state without creating files during status', async () => {

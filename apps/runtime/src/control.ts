@@ -197,7 +197,7 @@ async function guidedSetup(supervisor: Awaited<ReturnType<typeof createSuperviso
     },
     local: { stack: status.state, runtime: status.runtime, tunnel: status.tunnel, controlPlane: status.controlPlane },
     profiles: preparedProfiles === null ? null : { full: preparedProfiles.full, pro: preparedProfiles.pro, admin: preparedProfiles.admin },
-    next: options.start ? ['node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'] : ['node scripts/iris.mjs up', 'node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'],
+    next: options.start ? ['node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'] : ['node scripts/iris.mjs supervisor'],
     message: 'Remote tunnel provisioning and ChatGPT connector selection remain owner-verifiable steps; this command does not claim either occurred.',
   };
 }
@@ -207,7 +207,7 @@ function formatSetupOutput(result: Record<string, unknown>): string {
   const connector = result.connector as { tunnelId?: string } | undefined;
   const next = Array.isArray(result.next) ? result.next.filter((value): value is string => typeof value === 'string') : [];
   const local = result.local as { stack?: string } | undefined;
-  const localRuntime = result.status === 'READY' ? 'Online' : result.status === 'NEEDS_ATTENTION' ? 'Needs Attention' : result.status === 'READY_TO_START' ? 'Offline (run iris up)' : 'Action Required';
+  const localRuntime = result.status === 'READY' ? 'Online' : result.status === 'NEEDS_ATTENTION' ? 'Needs Attention' : result.status === 'READY_TO_START' ? 'Offline (run iris supervisor)' : 'Action Required';
   const credentialStatus = credentials?.controlPlaneApiKeyPresent && credentials.tunnelServicePresent ? 'Ready' : 'Action Required';
   const tunnelStatus = connector?.tunnelId === undefined ? 'Action Required' : 'Configured';
   const nextAction = next.length === 0 ? 'Inspect the setup result and ask the owner for the next authorized action.' : next.join(' → ');
