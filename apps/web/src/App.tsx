@@ -587,58 +587,70 @@ export function App(): ReactElement {
         <span className="brand-mark" aria-hidden="true">I</span>
         <div><strong>IRIS</strong><small>Local Workspace</small></div>
       </div>
-      <nav aria-label="IRIS sections">
-        <button className={view === 'runtime' ? 'is-active' : ''} onClick={() => setView('runtime')}>Workspace</button>
-        <button className={view === 'permissions' ? 'is-active' : ''} onClick={() => setView('permissions')}>Settings · Permissions</button>
-        <button className={view === 'approvals' ? 'is-active' : ''} onClick={() => setView('approvals')}>
-          Approval Center{visibleApprovals.length > 0 ? ` (${visibleApprovals.length})` : ''}
-        </button>
-      </nav>
+      <div className="header-context" aria-label="Machine context">
+        <span>Local control plane</span>
+        <strong>{health?.machineId ? `Machine ${health.machineId.slice(0, 8)}` : 'Identity pending'}</strong>
+      </div>
       <span className={`header-status ${health ? 'is-online' : ''}`}>{productStatus}</span>
     </header>
 
-    <main>
-      {error && <p className="error" role="alert">{error}</p>}
-      {notice && <p className="notice" role="status">{notice}</p>}
-      {view === 'runtime' && <RuntimePage
-        health={health}
-        supervisorStatus={supervisorStatus}
-        projects={projects}
-        defaultProject={defaultProject}
-        activeProject={activeProject}
-        sessions={sessions}
-        missions={missions}
-        selectedSession={selectedSession}
-        sessionActivity={currentSessionActivity}
-        pendingApprovalCount={visibleApprovals.length}
-        instruction={instruction}
-        isSubmitting={selectedSession !== null && submittingSessionIds.has(selectedSession.id)}
-        name={name}
-        rootPath={rootPath}
-        setName={setName}
-        setRootPath={setRootPath}
-        setInstruction={setInstruction}
-        onCreateSession={() => run(createSession)}
-        onSubmitInstruction={() => run(submitInstruction)}
-        onSelectSession={selectSession}
-        onDetachSession={() => run(detachSession)}
-        onRegisterProject={() => run(registerProject)}
-        onSelectProject={(projectId) => run(() => selectProject(projectId))}
-        onSupervisorOperation={(operation) => run(() => supervisorOperation(operation))}
-        jobs={jobs}
-        jobLogs={jobLogs}
-        jobResults={jobResults}
-        jobViewState={jobViewState}
-        jobError={jobError}
-        onCancelJob={(job) => run(() => cancelJob(job))}
-        onReadJobLogs={(job, stream, cursor) => run(() => readJobLogs(job, stream, cursor))}
-        onReadJobResult={(job) => run(() => readJobResult(job))}
-        onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
-        onRequestMissionLifecycleAction={(mission, action) => run(() => requestMissionLifecycleAction(mission, action))}
-      />}
-      {view === 'permissions' && <PermissionsPage permissions={permissions} onRequestMode={(mode) => run(() => requestMode(mode))} />}
-      {view === 'approvals' && <ApprovalCenter approvals={visibleApprovals} selectedSession={selectedSession} onReview={setSelectedApproval} />}
-    </main>
+    <div className="app-shell">
+      <aside className="app-sidebar" aria-label="IRIS navigation">
+        <div className="sidebar-heading"><span className="sidebar-kicker">Control center</span><strong>Operate locally</strong></div>
+        <nav className="sidebar-nav" aria-label="IRIS sections">
+          <button className={view === 'runtime' ? 'is-active' : ''} onClick={() => setView('runtime')}><span className="nav-glyph" aria-hidden="true" />Workspace</button>
+          <button className={view === 'permissions' ? 'is-active' : ''} onClick={() => setView('permissions')}><span className="nav-glyph" aria-hidden="true" />Settings · Permissions</button>
+          <button className={view === 'approvals' ? 'is-active' : ''} onClick={() => setView('approvals')}><span className="nav-glyph" aria-hidden="true" />Approval Center{visibleApprovals.length > 0 ? ` (${visibleApprovals.length})` : ''}</button>
+        </nav>
+        <div className="sidebar-footer">
+          <span className={`identity-dot ${health ? 'is-online' : ''}`} aria-hidden="true" />
+          <div><strong>Local authority</strong><small>{health ? 'Runtime connected' : 'Awaiting runtime'}</small></div>
+        </div>
+      </aside>
+
+      <main>
+        {error && <p className="error" role="alert">{error}</p>}
+        {notice && <p className="notice" role="status">{notice}</p>}
+        {view === 'runtime' && <RuntimePage
+          health={health}
+          supervisorStatus={supervisorStatus}
+          projects={projects}
+          defaultProject={defaultProject}
+          activeProject={activeProject}
+          sessions={sessions}
+          missions={missions}
+          selectedSession={selectedSession}
+          sessionActivity={currentSessionActivity}
+          pendingApprovalCount={visibleApprovals.length}
+          instruction={instruction}
+          isSubmitting={selectedSession !== null && submittingSessionIds.has(selectedSession.id)}
+          name={name}
+          rootPath={rootPath}
+          setName={setName}
+          setRootPath={setRootPath}
+          setInstruction={setInstruction}
+          onCreateSession={() => run(createSession)}
+          onSubmitInstruction={() => run(submitInstruction)}
+          onSelectSession={selectSession}
+          onDetachSession={() => run(detachSession)}
+          onRegisterProject={() => run(registerProject)}
+          onSelectProject={(projectId) => run(() => selectProject(projectId))}
+          onSupervisorOperation={(operation) => run(() => supervisorOperation(operation))}
+          jobs={jobs}
+          jobLogs={jobLogs}
+          jobResults={jobResults}
+          jobViewState={jobViewState}
+          jobError={jobError}
+          onCancelJob={(job) => run(() => cancelJob(job))}
+          onReadJobLogs={(job, stream, cursor) => run(() => readJobLogs(job, stream, cursor))}
+          onReadJobResult={(job) => run(() => readJobResult(job))}
+          onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
+          onRequestMissionLifecycleAction={(mission, action) => run(() => requestMissionLifecycleAction(mission, action))}
+        />}
+        {view === 'permissions' && <PermissionsPage permissions={permissions} onRequestMode={(mode) => run(() => requestMode(mode))} />}
+        {view === 'approvals' && <ApprovalCenter approvals={visibleApprovals} selectedSession={selectedSession} onReview={setSelectedApproval} />}
+      </main>
+    </div>
 
     <ApprovalReview
       approval={selectedApproval}
@@ -695,7 +707,13 @@ export function RuntimePage(props: {
         : props.selectedSession?.executionState === 'FAILED' ? 'Failed' : 'Ready';
 
   return <>
-    <div className="page-heading"><div><p className="eyebrow">Daily workspace</p><h1>IRIS</h1><p>One local daemon, your projects, and resumable browser sessions.</p></div></div>
+    <div className="page-heading"><div><p className="eyebrow">Daily workspace</p><h1>IRIS</h1><p>One local daemon, your projects, and resumable browser sessions.</p></div><span className="page-context">Owner workspace<br /><strong>Local-first operations</strong></span></div>
+    <div className="ops-summary" aria-label="Operational summary">
+      <article className="ops-card ops-card--runtime"><span className="ops-card-label">Runtime</span><strong>{props.health?.status ?? 'OFF'}</strong><span className="ops-card-detail">{props.health?.runtimeId ?? 'No runtime identity'}</span></article>
+      <article className="ops-card ops-card--gateway"><span className="ops-card-label">Supervisor gateway</span><strong>{props.supervisorStatus?.state ?? 'UNKNOWN'}</strong><span className="ops-card-detail">{props.supervisorStatus?.readiness ?? 'Control path not verified'}</span></article>
+      <article className="ops-card ops-card--tunnel"><span className="ops-card-label">Tunnel</span><strong>{props.supervisorStatus?.tunnel?.state ?? 'UNKNOWN'}</strong><span className="ops-card-detail">{props.supervisorStatus?.tunnel?.detail ?? 'Provider state not reported'}</span></article>
+      <article className="ops-card ops-card--jobs"><span className="ops-card-label">Active jobs</span><strong>{props.jobs?.length ?? 0}</strong><span className="ops-card-detail">Captured to this project</span></article>
+    </div>
     <div className="workspace-grid">
       <aside className="workspace-rail">
         <section className="active-project-card" aria-labelledby="active-project-heading">
