@@ -98,6 +98,7 @@ describe('IRIS supervisor', () => {
     await supervisor.initializeUnified('tunnel_0123456789abcdef0123456789abcdef');
     const gateway = createServer((request, response) => {
       if (request.url !== '/healthz') { response.writeHead(404).end(); return; }
+      if (request.headers.authorization !== `Bearer ${secret}`) { response.writeHead(401).end(); return; }
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ ok: true, owner: 'OUTER_SUPERVISOR_DAEMON' }));
     });

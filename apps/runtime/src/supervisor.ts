@@ -1889,7 +1889,8 @@ export class Supervisor {
     const fullPath = full.managedProfilePath;
     const proPath = pro?.managedProfilePath ?? null;
     const adminPath = registry.admin?.managedProfilePath ?? null;
-    const unifiedSupervisorMcpUrl = (preStart || registry.connectors.length === 1 && await this.persistentSupervisorGatewayAvailable())
+    const unifiedSupervisorMcpUrl = registry.connectors.length === 1
+      && (preStart || await this.persistentSupervisorGatewayAvailable())
       ? `http://127.0.0.1:${this.supervisorControlPort}/mcp`
       : null;
     await writePrivateText(fullPath, managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, unifiedSupervisorMcpUrl));
