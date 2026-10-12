@@ -10,13 +10,13 @@ import { buildChildEnvironment, inspectAcceptanceEnvironment, parseAcceptanceArg
 const roots = [];
 const sourceRoot = path.resolve(import.meta.dirname, '..');
 const TEST_PORTS = {
-  runtime: 46_110,
-  supervisorAdmin: 46_111,
-  supervisorControl: 46_112,
-  supervisorTunnelHealth: 46_113,
-  fullTunnelHealth: 46_114,
-  proTunnelHealth: 46_115,
-  web: 46_116,
+  runtime: 48_110,
+  supervisorAdmin: 48_111,
+  supervisorControl: 48_112,
+  supervisorTunnelHealth: 48_113,
+  fullTunnelHealth: 48_114,
+  proTunnelHealth: 48_115,
+  web: 48_116,
 };
 
 afterEach(async () => {
