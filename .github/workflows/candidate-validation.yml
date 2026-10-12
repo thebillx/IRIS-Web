@@ -49,6 +49,7 @@ jobs:
       - name: Run focused Supervisor tests and runtime build
         run: |
           pnpm --filter @iris/runtime exec vitest run src/supervisor.test.ts -t 'rejects standalone unified startup|prepares the canonical unified profile|keeps dedicated FULL and PRO profiles'
+          pnpm --filter @iris/runtime exec vitest run src/supervisor-native-control.test.ts
           pnpm --filter @iris/runtime build
 
       - name: Run setup and continuity tests
