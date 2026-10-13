@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { RuntimeError } from '@iris/domain';
 
@@ -48,6 +49,15 @@ export async function secureProjectFileWrite(projectRoot: string, targetPath: st
   const parsed = await runJsonHelper(['write-file', projectRoot, targetPath], content);
   if (!isRecord(parsed) || !Number.isSafeInteger(parsed.bytes) || (parsed.bytes as number) < 0 || Object.keys(parsed).length !== 1) {
     throw new RuntimeError('CAPABILITY_DENIED', 'macOS safety helper returned an invalid project-write result');
+  }
+  return parsed.bytes as number;
+}
+
+export async function securePrivateJsonWrite(rootHandle: FileHandle, targetName: string, content: string): Promise<number> {
+  const inheritedFd = 3;
+  const parsed = await runJsonHelper(['write-private-json-fd', String(inheritedFd), targetName], content, 'AUTHORITY_INDETERMINATE', rootHandle.fd);
+  if (!isRecord(parsed) || !Number.isSafeInteger(parsed.bytes) || (parsed.bytes as number) < 0 || Object.keys(parsed).length !== 1) {
+    throw new RuntimeError('AUTHORITY_INDETERMINATE', 'macOS safety helper returned an invalid private JSON publication result');
   }
   return parsed.bytes as number;
 }
@@ -104,9 +114,10 @@ async function runJsonHelper(
   args: readonly string[],
   input?: string,
   errorCode: 'CAPABILITY_DENIED' | 'AUTHORITY_INDETERMINATE' = 'CAPABILITY_DENIED',
+  inheritedFd?: number,
 ): Promise<unknown> {
   try {
-    const stdout = await runHelper(args, input);
+    const stdout = await runHelper(args, input, inheritedFd);
     return JSON.parse(stdout) as unknown;
   } catch (error) {
     if (error instanceof RuntimeError) throw error;
@@ -115,12 +126,20 @@ async function runJsonHelper(
   }
 }
 
-function runHelper(args: readonly string[], input?: string): Promise<string> {
+function runHelper(args: readonly string[], input?: string, inheritedFd?: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(PYTHON, ['-I', '-S', HELPER, ...args], {
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: inheritedFd === undefined ? ['pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe', inheritedFd],
       env: { PATH: '/usr/bin:/bin' },
     });
+    const childStdout = child.stdout;
+    const childStderr = child.stderr;
+    const childStdin = child.stdin;
+    if (childStdout === null || childStderr === null || childStdin === null) {
+      child.kill('SIGKILL');
+      reject(new Error('macOS safety helper pipes could not be established'));
+      return;
+    }
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let stdoutBytes = 0;
@@ -137,7 +156,7 @@ function runHelper(args: readonly string[], input?: string): Promise<string> {
       child.kill('SIGKILL');
       finish(new Error('macOS safety helper timed out'));
     }, 5_000);
-    child.stdout.on('data', (chunk: Buffer) => {
+    childStdout.on('data', (chunk: Buffer) => {
       stdoutBytes += chunk.length;
       if (stdoutBytes > MAX_HELPER_OUTPUT_BYTES) {
         child.kill('SIGKILL');
@@ -146,7 +165,7 @@ function runHelper(args: readonly string[], input?: string): Promise<string> {
       }
       stdout.push(chunk);
     });
-    child.stderr.on('data', (chunk: Buffer) => {
+    childStderr.on('data', (chunk: Buffer) => {
       stderrBytes += chunk.length;
       if (stderrBytes <= 64 * 1024) stderr.push(chunk);
     });
@@ -158,8 +177,8 @@ function runHelper(args: readonly string[], input?: string): Promise<string> {
       }
       finish();
     });
-    child.stdin.on('error', (error) => finish(error));
-    child.stdin.end(input ?? '');
+    childStdin.on('error', (error) => finish(error));
+    childStdin.end(input ?? '');
   });
 }
 

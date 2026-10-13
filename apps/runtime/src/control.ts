@@ -2,9 +2,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
-import { readOwnerAccessSecret } from './persistence.js';
 import { inspectCredentialStatus, loadOrCreateTunnelServiceSecret } from './credentials.js';
 import { createSupervisor } from './supervisor.js';
+import { withStrictSupervisorOperationLock } from './supervisor-operation-lock.js';
 import { installLaunchAgent, launchAgentLoaded, launchdPaths, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 
@@ -26,11 +26,7 @@ try {
   } else if (legacyRuntimeControl && command === 'status') {
     process.stdout.write(`${JSON.stringify(await runtimeStatus(dataRoot), null, 2)}\n`);
   } else if (legacyRuntimeControl && command === 'stop') {
-    process.stdout.write(`${JSON.stringify(await stopRuntime(dataRoot), null, 2)}\n`);
-  } else if (legacyRuntimeControl && command === 'owner-token') {
-    const secret = await readOwnerAccessSecret(dataRoot);
-    if (secret === null) throw new Error('IRIS owner access credential is not initialized');
-    process.stdout.write(`${secret}\n`);
+    process.stdout.write(`${JSON.stringify(await withStrictSupervisorOperationLock(dataRoot, 'legacy-stop', () => stopRuntime(dataRoot)), null, 2)}\n`);
   } else {
     const supervisor = await createSupervisor({
       dataRoot,
@@ -84,6 +80,10 @@ try {
       process.stdout.write(`${JSON.stringify(await supervisor.migrateCredentials(profile), null, 2)}\n`);
     } else if (command === 'credentials' && process.argv[3] === 'rotate-tunnel') {
       process.stdout.write(`${JSON.stringify(await supervisor.rotateTunnelCredential(), null, 2)}\n`);
+    } else if (command === 'credentials' && process.argv[3] === 'rotate-owner') {
+      const replacement = process.env.IRIS_OWNER_ACCESS_TOKEN?.trim();
+      if (replacement === undefined) throw new Error('IRIS_OWNER_ACCESS_TOKEN is required for Owner access rotation');
+      process.stdout.write(`${JSON.stringify(await supervisor.rotateOwnerAccessCredential(replacement), null, 2)}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'install') {
       const runtimeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
       const tsxDirectory = path.join(runtimeDirectory, 'node_modules', 'tsx', 'dist');
@@ -98,7 +98,7 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'status') {
       process.stdout.write(`${JSON.stringify({ loaded: await launchAgentLoaded(), paths: launchdPaths(dataRoot) }, null, 2)}\n`);
     } else {
-      process.stderr.write('Usage: iris <setup --tunnel-id <registered-tunnel-id>|up|workload-on|workload-off|workload-restart|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|runtime-reconcile|supervisor|credentials|launchd>\n');
+      process.stderr.write('Usage: iris <setup --tunnel-id <registered-tunnel-id>|up|workload-on|workload-off|workload-restart|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|runtime-reconcile|supervisor|credentials rotate-owner|credentials rotate-tunnel|launchd>\n');
       process.exitCode = 2;
     }
   }

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { describe, expect, it } from 'vitest';
-import config, { createSupervisorBridge, parseSupervisorBridgeIdentity, validateSupervisorWebRequest } from '../vite.config.js';
+import config, { createSupervisorBridge, injectOwnerAccessBootstrap, parseSupervisorBridgeIdentity, validateSupervisorWebRequest } from '../vite.config.js';
 
 describe('Vite runtime proxy', () => {
   it('proxies mission routes to the runtime', () => {
@@ -28,6 +28,14 @@ describe('Vite runtime proxy', () => {
       .toEqual({ connectorProfile: 'FULL', runtimeId: 'runtime-a', deploymentEpoch: 4 });
     expect(parseSupervisorBridgeIdentity({ state: 'SOURCE_IDENTITY_UNVERIFIED', runtimeId: 'runtime-a', deploymentEpoch: 4, tunnelBinding: { mode: 'FULL' } })).toBeNull();
     expect(parseSupervisorBridgeIdentity({ state: 'VERIFIED', runtimeId: 'runtime-a', deploymentEpoch: 4, tunnelBinding: { mode: 'ADMIN' } })).toBeNull();
+  });
+
+  it('hands a replacement owner credential to a fresh browser without URL encoding it', () => {
+    const replacement = 'a'.repeat(48);
+    const html = injectOwnerAccessBootstrap('<html><head></head><body></body></html>', replacement);
+    expect(html).toContain('window.__IRIS_OWNER_ACCESS_TOKEN__');
+    expect(html).toContain(replacement);
+    expect(injectOwnerAccessBootstrap('<html></html>', 'invalid')).toBe('<html></html>');
   });
 
   it('forwards trusted identity headers from the Supervisor and ignores browser overrides', async () => {

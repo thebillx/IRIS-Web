@@ -15,13 +15,16 @@ import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, isSupporte
 import { observeProcessStart } from './macos-safety.js';
 import { MCP_PROTOCOL_VERSION, proMcpToolDefinitions } from './mcp.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
-import { loadOrCreateRuntimeId, readEndpoint, readOwnerAccessSecret, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
-import { privateDirectoryProblem } from './private-fs.js';
+import { loadOrCreateRuntimeId, readEndpoint, readOwnerAccessSecret, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance, rotateOwnerAccessSecret, type OwnerAccessRotationResult } from './persistence.js';
+import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
+import { probeRuntimeAuthority } from './authority.js';
+import { redactOutput } from './output-redaction.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput, type SupervisorNativeRequestHeaders } from './supervisor-native-control.js';
 import type { SupervisorNativeToolCallResult } from './supervisor-native-control.js';
+import { withRuntimeStartupLock, withStrictSupervisorOperationLock } from './supervisor-operation-lock.js';
 import { readRuntimeSourceIdentity } from './source-identity.js';
 import { parseIrisPortSet, type IrisPortSet, validateIrisPortSet } from './port-config.js';
 
@@ -724,6 +727,21 @@ export class Supervisor {
   public async rotateTunnelCredential(): Promise<CredentialStatus> {
     await rotateTunnelServiceSecret(this.dataRoot);
     return inspectCredentialStatus(this.dataRoot);
+  }
+
+  /**
+   * Rotate only the Owner Access Secret while every managed component is
+   * proven stopped. This deliberately uses a strict lock: stale lock files
+   * are not reclaimed during a credential mutation.
+   */
+  public async rotateOwnerAccessCredential(replacement: string): Promise<OwnerAccessRotationResult> {
+    await this.prepareDirectories();
+    return withStrictSupervisorOperationLock(this.dataRoot, 'rotate-owner-access', async () => {
+      return withRuntimeStartupLock(this.dataRoot, 'rotate-owner-access', async () => {
+        await this.assertOwnerAccessRotationSafe();
+        return rotateOwnerAccessSecret(this.dataRoot, replacement);
+      });
+    });
   }
 
   public async adoptRuntime(): Promise<SupervisorStackStatus> {
@@ -1988,6 +2006,47 @@ export class Supervisor {
   private supervisorDirectory(): string { return path.join(this.dataRoot, SUPERVISOR_DIRECTORY); }
   private profileDirectory(): string { return path.join(this.dataRoot, PROFILE_DIRECTORY); }
   private logDirectory(): string { return path.join(this.dataRoot, LOG_DIRECTORY); }
+
+  private async assertOwnerAccessRotationSafe(): Promise<void> {
+    const authority = await probeRuntimeAuthority(this.dataRoot);
+    if (authority.state === 'live') throw new RuntimeError('AUTHORITY_HELD', 'Owner access rotation requires an unowned runtime authority');
+    if (authority.state !== 'unowned') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Owner access rotation requires runtime authority to be proven unowned');
+
+    const observedRuntime = await runtimeStatus(this.dataRoot);
+    if (observedRuntime.state === 'running') throw new RuntimeError('AUTHORITY_HELD', 'Owner access rotation requires the runtime to be stopped');
+    if (observedRuntime.state !== 'stopped') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Owner access rotation requires runtime state to be proven stopped');
+
+    const stateInspection = await inspectPrivateRegularFile(path.join(this.supervisorDirectory(), STATE_FILE), 'Supervisor state');
+    if (stateInspection.state === 'invalid') throw new RuntimeError('AUTHORITY_INDETERMINATE', stateInspection.reason);
+    const state = await this.readState();
+    if (state.workloadDesiredState !== 'OFF' || state.stackDesiredState !== 'DOWN') {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Owner access rotation requires the Supervisor desired state to be OFF/DOWN');
+    }
+
+    const records = [state.runtime, state.web, state.admin, state.adminTunnel, state.tunnels.full, state.tunnels.pro];
+    for (const record of records) {
+      if (record === null) continue;
+      const inspected = await inspectProcess(record);
+      if (inspected === 'running') throw new RuntimeError('AUTHORITY_HELD', 'Owner access rotation requires all Supervisor-managed processes to be stopped');
+      if (inspected === 'stopped') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Stale Supervisor process metadata must be reconciled before Owner access rotation');
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Supervisor process ownership could not be verified for Owner access rotation');
+    }
+
+    const ports = [
+      this.runtimePort,
+      this.adminPort,
+      this.supervisorControlPort,
+      this.adminTunnelHealthPort,
+      this.ports.fullTunnelHealth,
+      this.ports.proTunnelHealth,
+      this.webPort,
+    ];
+    for (const port of new Set(ports)) {
+      const occupancy = await inspectLocalPort(port);
+      if (occupancy === 'occupied') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Port ${port} is occupied during Owner access rotation`);
+      if (occupancy === 'indeterminate') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Port ${port} ownership is indeterminate during Owner access rotation`);
+    }
+  }
 }
 
 function managedProfile(
@@ -2673,9 +2732,7 @@ async function writePrivateText(filename: string, content: string): Promise<void
 function tail(value: string, lines: number): string { return value.split('\n').slice(-lines).join('\n'); }
 
 function redactLogs(value: string): string {
-  return value
-    .replace(/(["']?(?:authorization|api[_-]?key|token|secret)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^,\s}]+)/gi, '$1<REDACTED>')
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <REDACTED>');
+  return redactOutput(value);
 }
 
 function assertRuntimeOwnership(record: OwnedProcess, observed: RuntimeObservedStatus): void {
@@ -2761,6 +2818,24 @@ async function acquireOperationLock(filename: string, operation: string): Promis
     }
   }
   throw new RuntimeError('SUPERVISOR_BUSY', 'Supervisor operation lock changed while stale recovery was in progress');
+}
+
+async function inspectLocalPort(port: number): Promise<'free' | 'occupied' | 'indeterminate'> {
+  const { createConnection } = await import('node:net');
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: '127.0.0.1', port });
+    let settled = false;
+    const finish = (value: 'free' | 'occupied' | 'indeterminate'): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.once('connect', () => finish('occupied'));
+    socket.once('timeout', () => finish('indeterminate'));
+    socket.once('error', (error: NodeJS.ErrnoException) => finish(error.code === 'ECONNREFUSED' ? 'free' : 'indeterminate'));
+    socket.setTimeout(750);
+  });
 }
 
 async function readOperationLockContent(filename: string): Promise<string | null> {

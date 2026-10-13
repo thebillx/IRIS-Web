@@ -20,6 +20,9 @@ let cancelled = false;
 let timedOut = false;
 let resultPublished = false;
 
+const sensitiveKey = '(?:authorization|api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|token|owner[_-]?access[_-]?secret)';
+const sensitivePrefix = new RegExp(`(?:\\\\?["']?${sensitiveKey}\\\\?["']?)\\s*[:=]\\s*`, 'gi');
+
 async function main() {
   const runnerPid = process.pid;
   const runnerStartMarker = processStartMarker(runnerPid);
@@ -316,6 +319,10 @@ function endStream(stream) {
 }
 
 function redactOutput(value, explicitValues) {
+  const quotedValue = `\\?"(?:\\\\.|[^"\\\\])*\\?"|\\?'(?:\\\\.|[^'\\\\])*\\?'`;
+  const unquotedValue = '[^,\\s}\\]]+';
+  const sensitiveAssignment = new RegExp(`((?:\\\\?["']?${sensitiveKey}\\\\?["']?)\\s*[:=]\\s*)(?!(?:Bearer)\\s+)(${quotedValue}|${unquotedValue})`, 'gi');
+  const bearerAssignment = new RegExp(`((?:\\\\?["']?${sensitiveKey}\\\\?["']?)\\s*[:=]\\s*)Bearer\\s+([^\\s\\r\\n,}\\]]+)`, 'gi');
   let output = value;
   for (const secret of explicitValues) {
     if (secret.length === 0) continue;
@@ -324,7 +331,8 @@ function redactOutput(value, explicitValues) {
   return output
     .replace(/(Authorization\s*:\s*Bearer\s+)[^\s\r\n]+/gi, '$1[REDACTED]')
     .replace(/\b(API[_-]?TOKEN|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|PASSWORD|PASSWD|SECRET|API[_-]?KEY|CREDENTIAL)\s*=\s*([^\s\r\n]+)/gi, '$1=[REDACTED]')
-    .replace(/\b(password|token|secret|api[_-]?key)\s*[:=]\s*['"]?([^\s,'"}\]]+)/gi, '$1=[REDACTED]');
+    .replace(bearerAssignment, '$1Bearer [REDACTED]')
+    .replace(sensitiveAssignment, '$1[REDACTED]');
 }
 
 class StreamingRedactor {
@@ -334,14 +342,17 @@ class StreamingRedactor {
   constructor(explicitValues) {
     this.#explicit = explicitValues;
     const longest = explicitValues.reduce((max, value) => Math.max(max, value.length), 0);
-    this.#keep = Math.max(4096, longest + 256);
+    this.#keep = Math.max(4096, longest + 512);
   }
   push(chunk) {
     const combined = this.#tail + chunk;
     if (combined.length <= this.#keep) { this.#tail = combined; return ''; }
     const splitAt = combined.length - this.#keep;
-    const flush = combined.slice(0, splitAt);
-    this.#tail = combined.slice(splitAt);
+    const overlap = Math.max(256, this.#explicit.reduce((max, value) => Math.max(max, value.length), 0));
+    const safeEnd = safeStreamingEnd(combined, Math.max(0, splitAt - overlap));
+    if (safeEnd === 0) { this.#tail = combined; return ''; }
+    const flush = combined.slice(0, safeEnd);
+    this.#tail = combined.slice(safeEnd);
     return redactOutput(flush, this.#explicit);
   }
   finish() {
@@ -349,6 +360,18 @@ class StreamingRedactor {
     this.#tail = '';
     return value;
   }
+}
+
+function safeStreamingEnd(value, proposedEnd) {
+  let safeEnd = proposedEnd;
+  sensitivePrefix.lastIndex = 0;
+  for (const match of value.matchAll(sensitivePrefix)) {
+    const start = match.index ?? 0;
+    if (start >= safeEnd) break;
+    const lineEnd = value.indexOf('\n', start);
+    if (lineEnd < 0 || lineEnd >= safeEnd) safeEnd = start;
+  }
+  return safeEnd;
 }
 
 function isRecord(value) {

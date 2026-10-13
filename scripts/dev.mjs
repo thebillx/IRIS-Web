@@ -11,7 +11,7 @@ let web;
 let webStarting = false;
 let stopping = false;
 let shutdownPromise;
-let ownerUrlPrinted = false;
+let webUrlPrinted = false;
 
 function stopChild(child) {
   if (child === undefined || child.exitCode !== null) return Promise.resolve();
@@ -31,43 +31,27 @@ function shutdown(code = 0) {
   return shutdownPromise;
 }
 
-async function readOwnerToken() {
-  const child = spawn(node.path, node24TsxArgs(path.join(runtimeRoot, 'src', 'control.ts'), ['owner-token']), {
-    cwd: runtimeRoot,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: node24Environment(),
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', (chunk) => { stdout += chunk; });
-  child.stderr.on('data', (chunk) => { stderr += chunk; });
-  const code = await new Promise((resolve) => child.once('exit', resolve));
-  if (code !== 0) throw new Error(`Could not read IRIS owner access credential: ${stderr.trim()}`);
-  const token = stdout.trim();
-  if (!/^[A-Za-z0-9_-]{40,128}$/.test(token)) throw new Error('IRIS owner access credential is invalid');
-  return token;
-}
-
 async function startWeb(runtimeUrl) {
   if (web !== undefined || webStarting || stopping) return;
   webStarting = true;
-  const ownerToken = await readOwnerToken();
   if (stopping) return;
+  const ownerToken = process.env.IRIS_OWNER_ACCESS_TOKEN?.trim();
+  const webEnvironment = node24Environment(process.env, { IRIS_RUNTIME_URL: runtimeUrl });
+  delete webEnvironment.IRIS_OWNER_ACCESS_TOKEN;
+  if (ownerToken !== undefined && /^[A-Za-z0-9_-]{40,128}$/.test(ownerToken)) webEnvironment.IRIS_OWNER_ACCESS_SECRET = ownerToken;
   web = spawn(webExecutable, ['--host', '127.0.0.1'], {
     cwd: path.resolve('apps/web'),
     stdio: ['inherit', 'pipe', 'inherit'],
-    env: node24Environment(process.env, { IRIS_RUNTIME_URL: runtimeUrl }),
+    env: webEnvironment,
   });
   web.stdout.setEncoding('utf8');
   web.stdout.on('data', (chunk) => {
     process.stdout.write(chunk);
-    if (ownerUrlPrinted) return;
+    if (webUrlPrinted) return;
     const match = /(http:\/\/127\.0\.0\.1:\d+\/)/.exec(chunk);
     if (match?.[1] !== undefined) {
-      ownerUrlPrinted = true;
-      process.stdout.write(`IRIS_OWNER_URL=${match[1]}#owner=${encodeURIComponent(ownerToken)}\n`);
+      webUrlPrinted = true;
+      process.stdout.write(`IRIS_WEB_URL=${match[1]}\n`);
     }
   });
   web.once('exit', (code) => {

@@ -148,6 +148,13 @@ type MissionLifecycleAction = 'resume' | 'cancel';
 const WEB_CLIENT_ID_KEY = 'iris.web.clientId';
 const WEB_OWNER_TOKEN_KEY = 'iris.web.ownerToken';
 const WEB_SELECTED_SESSION_KEY = 'iris.web.selectedSessionId';
+const OWNER_ACCESS_TOKEN_PATTERN = /^[A-Za-z0-9_-]{40,128}$/;
+
+declare global {
+  interface Window {
+    __IRIS_OWNER_ACCESS_TOKEN__?: unknown;
+  }
+}
 
 export function App(): ReactElement {
   const [clientId] = useState(webClientId);
@@ -207,7 +214,7 @@ export function App(): ReactElement {
         setSessions([]);
         setMissions([]);
         setPermissions(null);
-        setError('Owner access is locked. Open the IRIS_OWNER_URL printed by pnpm dev.');
+        setError('Owner access is locked. Provide IRIS_OWNER_ACCESS_TOKEN to the local dev process or use the managed Supervisor Web binding.');
         return;
       }
       const [projectsResponse, sessionsResponse, missionsResponse, permissionsResponse] = await Promise.all([
@@ -1042,10 +1049,17 @@ function interactionLabel(kind: SessionInteraction['kind']): string {
 function readOwnerAccessToken(): string {
   const hash = new URLSearchParams(window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash);
   const supplied = hash.get('owner');
-  if (supplied !== null && /^[A-Za-z0-9_-]{40,128}$/.test(supplied)) {
+  if (supplied !== null && OWNER_ACCESS_TOKEN_PATTERN.test(supplied)) {
     window.sessionStorage.setItem(WEB_OWNER_TOKEN_KEY, supplied);
     window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
     return supplied;
+  }
+  const bootstrapped = typeof window.__IRIS_OWNER_ACCESS_TOKEN__ === 'string' && OWNER_ACCESS_TOKEN_PATTERN.test(window.__IRIS_OWNER_ACCESS_TOKEN__)
+    ? window.__IRIS_OWNER_ACCESS_TOKEN__
+    : null;
+  if (bootstrapped !== null) {
+    window.sessionStorage.setItem(WEB_OWNER_TOKEN_KEY, bootstrapped);
+    return bootstrapped;
   }
   return window.sessionStorage.getItem(WEB_OWNER_TOKEN_KEY) ?? '';
 }

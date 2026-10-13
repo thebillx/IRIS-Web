@@ -31,6 +31,7 @@ import { AdoRequirementContextService } from './ado/runtime-context.js';
 import { SecurityAuditStore } from './security-audit/store.js';
 import { SecurityAuditService } from './security-audit/service.js';
 import { ProductionSafetyController } from './production-safety.js';
+import { acquireRuntimeStartupLock } from './supervisor-operation-lock.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -63,26 +64,49 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     : await resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: options.dataRoot });
   await ensureRuntimeDataRoot(dataRoot);
 
-  const machineId = await loadOrCreateMachineId(dataRoot);
-  const runtimeId = await loadOrCreateRuntimeId(dataRoot);
-  const ownerAccessSecret = await loadOrCreateOwnerAccessSecret(dataRoot);
-  const tunnelServiceSecret = await loadOrCreateTunnelServiceSecret(dataRoot);
-  const connectorInspection = await inspectConnectorRegistry(dataRoot);
-  const connectorRegistry = connectorInspection?.registry ?? null;
-  const identityCoherence = assessConnectorRegistryIdentity(
-    connectorRegistry,
-    { machineId, runtimeId },
-    connectorInspection?.staleConnectorIds ?? [],
-  );
-  const identity: RuntimeIdentity = {
-    runtimeId,
-    instanceId: randomUUID(),
-    pid: process.pid,
-    startedAt: new Date().toISOString(),
-    platform: IRIS_PLATFORM,
-    version: IRIS_VERSION,
-  };
-  const authority = await acquireRuntimeAuthority(dataRoot, identity);
+  let machineId: string;
+  let runtimeId: string;
+  let ownerAccessSecret: string;
+  let tunnelServiceSecret: string;
+  let connectorInspection: Awaited<ReturnType<typeof inspectConnectorRegistry>>;
+  let identityCoherence: ReturnType<typeof assessConnectorRegistryIdentity>;
+  let identity: RuntimeIdentity;
+  let authority: Awaited<ReturnType<typeof acquireRuntimeAuthority>> | undefined;
+  const startupLease = await acquireRuntimeStartupLock(dataRoot, 'runtime-startup');
+  try {
+    machineId = await loadOrCreateMachineId(dataRoot);
+    runtimeId = await loadOrCreateRuntimeId(dataRoot);
+    identity = {
+      runtimeId,
+      instanceId: randomUUID(),
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      platform: IRIS_PLATFORM,
+      version: IRIS_VERSION,
+    };
+    authority = await acquireRuntimeAuthority(dataRoot, identity);
+    ownerAccessSecret = await loadOrCreateOwnerAccessSecret(dataRoot);
+    tunnelServiceSecret = await loadOrCreateTunnelServiceSecret(dataRoot);
+    connectorInspection = await inspectConnectorRegistry(dataRoot);
+    const connectorRegistry = connectorInspection?.registry ?? null;
+    identityCoherence = assessConnectorRegistryIdentity(
+      connectorRegistry,
+      { machineId, runtimeId },
+      connectorInspection?.staleConnectorIds ?? [],
+    );
+  } catch (error: unknown) {
+    await startupLease.release().catch(() => undefined);
+    if (authority !== undefined) await authority.release().catch(() => undefined);
+    throw error;
+  }
+  try {
+    await startupLease.release();
+  } catch (error: unknown) {
+    await authority?.release().catch(() => undefined);
+    throw error;
+  }
+  if (authority === undefined) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime startup authority was not established');
+  const runtimeAuthority = authority;
   const safety = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret });
   for (const [writer, state] of [
     ['runtime-state', 'IDLE'], ['mission-state', 'IDLE'], ['mission-broker', 'IDLE'], ['durable-jobs', 'IDLE'],
@@ -102,7 +126,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       if (server !== undefined) await server.close();
       await removeEndpointIfInstance(dataRoot, identity.instanceId);
       await removeRuntimeControlIfInstance(dataRoot, identity.instanceId);
-      await authority.release();
+      await runtimeAuthority.release();
     })();
     return closePromise;
   };
@@ -211,15 +235,15 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         controlSecret,
         ownerAccessSecret,
         tunnelServiceSecret,
-        ...(connectorRegistry === null ? {} : { connectorDeploymentEpoch: connectorRegistry.deploymentEpoch }),
+        ...(connectorInspection?.registry === null || connectorInspection?.registry === undefined ? {} : { connectorDeploymentEpoch: connectorInspection.registry.deploymentEpoch }),
         connectorRuntimeId: runtimeId,
-        singleConnector: connectorRegistry?.connectors.length === 1,
+        singleConnector: connectorInspection?.registry?.connectors.length === 1,
         catalogRuntimeContext: {
           machineId,
           runtimeId,
           instanceId: identity.instanceId,
           runtimeVersion: identity.version,
-          deploymentEpoch: connectorRegistry?.deploymentEpoch ?? null,
+          deploymentEpoch: connectorInspection?.registry?.deploymentEpoch ?? null,
           identityState: identityCoherence.state,
           identityCode: identityCoherence.code,
           tunnelBindings: identityCoherence.tunnelBindings,

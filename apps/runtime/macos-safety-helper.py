@@ -240,6 +240,98 @@ def write_project_file(root, target):
         os.close(root_fd)
 
 
+def write_private_json_fd(root_fd, target, payload):
+    if not target or target in ('.', '..') or os.sep in target or (os.altsep and os.altsep in target):
+        fail('private JSON target must be a direct child name')
+    temp_name = f'.iris-private-json-{os.getpid()}-{secrets.token_hex(16)}'
+    temp_fd = None
+    existing = None
+    try:
+        try:
+            existing = os.stat(target, dir_fd=root_fd, follow_symlinks=False)
+            if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+                fail('private JSON target is not a physical regular file')
+        except FileNotFoundError:
+            existing = None
+
+        temp_fd = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_fd,
+        )
+        written = 0
+        while written < len(payload):
+            count = os.write(temp_fd, payload[written:])
+            if count <= 0:
+                fail('private JSON payload could not be completed')
+            written += count
+        os.fsync(temp_fd)
+        temp_metadata = os.fstat(temp_fd)
+        if not stat.S_ISREG(temp_metadata.st_mode) or temp_metadata.st_nlink != 1:
+            fail('private JSON temporary file lost isolated regular-file identity')
+
+        try:
+            current = os.stat(target, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if existing is None:
+            if current is not None:
+                fail('private JSON target appeared during execution')
+        elif (current is None
+              or not stat.S_ISREG(current.st_mode)
+              or current.st_nlink != 1
+              or current.st_dev != existing.st_dev
+              or current.st_ino != existing.st_ino):
+            fail('private JSON target identity changed during execution')
+
+        os.rename(temp_name, target, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.fsync(root_fd)
+        sys.stdout.write(json.dumps({'bytes': len(payload)}, separators=(',', ':')) + '\n')
+    except OSError as error:
+        fail(f'filesystem operation failed: {error.strerror or error.__class__.__name__}')
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        try:
+            os.unlink(temp_name, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+
+
+def write_private_json(root, target):
+    payload = sys.stdin.buffer.read(MAX_FILE_BYTES + 1)
+    if len(payload) > MAX_FILE_BYTES:
+        fail('private JSON payload exceeds the bounded file size')
+    if not os.path.isabs(root) or os.path.normpath(root) != root:
+        fail('private JSON root must be one normalized absolute path')
+    try:
+        root_metadata = os.lstat(root)
+    except OSError:
+        fail('private JSON root metadata is unavailable')
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        fail('private JSON root is not a physical directory')
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | O_NOFOLLOW_ANY)
+    try:
+        write_private_json_fd(root_fd, target, payload)
+    finally:
+        os.close(root_fd)
+
+
+def write_private_json_from_fd(fd_text, target):
+    payload = sys.stdin.buffer.read(MAX_FILE_BYTES + 1)
+    if len(payload) > MAX_FILE_BYTES:
+        fail('private JSON payload exceeds the bounded file size')
+    try:
+        root_fd = int(fd_text)
+        root_metadata = os.fstat(root_fd)
+    except (ValueError, OSError):
+        fail('private JSON root descriptor is invalid')
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        fail('private JSON root descriptor is not a directory')
+    write_private_json_fd(root_fd, target, payload)
+
+
 def edit_project_file(root, target):
     try:
         request = json.loads(sys.stdin.buffer.read(MAX_FILE_BYTES + 1).decode('utf-8'))
@@ -480,6 +572,16 @@ def main():
         if len(sys.argv) != 4:
             fail('write-file requires project root and target')
         write_project_file(sys.argv[2], sys.argv[3])
+        return
+    if operation == 'write-private-json':
+        if len(sys.argv) != 4:
+            fail('write-private-json requires root and direct child target')
+        write_private_json(sys.argv[2], sys.argv[3])
+        return
+    if operation == 'write-private-json-fd':
+        if len(sys.argv) != 4:
+            fail('write-private-json-fd requires inherited root descriptor and direct child target')
+        write_private_json_from_fd(sys.argv[2], sys.argv[3])
         return
     if operation == 'edit-file':
         if len(sys.argv) != 4:
