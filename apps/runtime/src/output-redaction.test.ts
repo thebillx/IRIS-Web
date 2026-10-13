@@ -37,4 +37,24 @@ describe('secret-safe output redaction', () => {
     expect(output).not.toContain(secret);
     expect(output).toContain('PASSWORD=[REDACTED]');
   });
+
+  it('redacts complete nested arrays and objects without leaking sibling values', () => {
+    const output = redactOutput('{"secret":["alpha","beta"],"safe":"visible"}\n{"secret":{"a":"alpha","b":"beta"},"safe":"visible"}');
+    expect(output).not.toContain('alpha');
+    expect(output).not.toContain('beta');
+    expect(output).toContain('[REDACTED]');
+    expect(output).toContain('"safe":"visible"');
+  });
+
+  it('holds a chunked structured value until the complete value can be redacted', () => {
+    const redactor = new StreamingRedactor();
+    const output = [
+      redactor.push(`${'x'.repeat(4_200)}{"secret":["alpha",`),
+      redactor.push('"beta"],"safe":"visible"}'),
+      redactor.finish(),
+    ].join('');
+    expect(output).not.toContain('alpha');
+    expect(output).not.toContain('beta');
+    expect(output).toContain('"safe":"visible"');
+  });
 });

@@ -4,7 +4,6 @@ import react from '@vitejs/plugin-react';
 
 const runtimeUrl = process.env.IRIS_RUNTIME_URL ?? 'http://127.0.0.1:43110';
 const SUPERVISOR_WEB_TOOLS = new Set(['supervisor_status', 'supervisor_doctor', 'workload_on', 'workload_off', 'workload_restart']);
-const OWNER_ACCESS_TOKEN_PATTERN = /^[A-Za-z0-9_-]{40,128}$/;
 
 export interface SupervisorBridgeIdentity {
   readonly connectorProfile: 'FULL' | 'PRO';
@@ -37,12 +36,6 @@ export function parseSupervisorBridgeIdentity(value: unknown): SupervisorBridgeI
   return { connectorProfile, deploymentEpoch, runtimeId };
 }
 
-export function injectOwnerAccessBootstrap(html: string, token: string | undefined): string {
-  if (token === undefined || !OWNER_ACCESS_TOKEN_PATTERN.test(token)) return html;
-  const bootstrap = `<script>window.__IRIS_OWNER_ACCESS_TOKEN__=${JSON.stringify(token)};</script>`;
-  return html.includes('</head>') ? html.replace('</head>', `${bootstrap}</head>`) : `${bootstrap}${html}`;
-}
-
 export async function readSupervisorBridgeIdentity(controlUrl: string, supervisorSecret: string): Promise<SupervisorBridgeIdentity> {
   const response = await fetch(new URL('/identity', controlUrl), {
     headers: { authorization: `Bearer ${supervisorSecret}` },
@@ -60,9 +53,6 @@ export function createSupervisorBridge(environment: NodeJS.ProcessEnv = process.
   const supervisorSecret = environment.IRIS_SUPERVISOR_CONTROL_SECRET;
   return {
     name: 'iris-supervisor-owner-bridge',
-    transformIndexHtml(html: string) {
-      return injectOwnerAccessBootstrap(html, ownerSecret);
-    },
     configureServer(server: { middlewares: { use: (path: string, handler: (request: import('node:http').IncomingMessage, response: import('node:http').ServerResponse, next: () => void) => void) => void } }) {
       server.middlewares.use('/supervisor-control', (request, response, next) => {
         if (ownerSecret === undefined || supervisorSecret === undefined || controlUrl === undefined) {

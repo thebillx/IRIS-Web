@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import process from 'node:process';
 import { node24Environment, node24TsxArgs, resolveCanonicalNode } from './node24.mjs';
+import { runtimeEnvironment } from './dev-environment.mjs';
 
 const runtimeRoot = path.resolve('apps/runtime');
 const node = resolveCanonicalNode();
@@ -62,7 +63,7 @@ async function startWeb(runtimeUrl) {
 runtime = spawn(node.path, node24TsxArgs(path.join(runtimeRoot, 'src', 'main.ts')), {
   cwd: runtimeRoot,
   stdio: ['inherit', 'pipe', 'inherit'],
-  env: node24Environment(),
+  env: runtimeEnvironment(),
 });
 
 let buffer = '';

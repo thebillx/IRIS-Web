@@ -1,10 +1,7 @@
 const DEFAULT_TAIL = 4096;
 const SENSITIVE_KEY = String.raw`(?:authorization|api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|token|owner[_-]?access[_-]?secret)`;
-const QUOTED_VALUE = String.raw`\\?"(?:\\.|[^"\\])*\\?"|\\?'(?:\\.|[^'\\])*\\?'`;
-const UNQUOTED_VALUE = String.raw`[^,\s}\]]+`;
-const SENSITIVE_ASSIGNMENT = new RegExp(String.raw`((?:\\?["']?${SENSITIVE_KEY}\\?["']?)\s*[:=]\s*)(?!(?:Bearer)\s+)(${QUOTED_VALUE}|${UNQUOTED_VALUE})`, 'gi');
-const BEARER_ASSIGNMENT = new RegExp(String.raw`((?:\\?["']?${SENSITIVE_KEY}\\?["']?)\s*[:=]\s*)Bearer\s+([^\s\r\n,}\]]+)`, 'gi');
 const SENSITIVE_PREFIX = new RegExp(String.raw`(?:\\?["']?${SENSITIVE_KEY}\\?["']?)\s*[:=]\s*`, 'gi');
+const BEARER_ASSIGNMENT = new RegExp(String.raw`((?:\\?["']?${SENSITIVE_KEY}\\?["']?)\s*[:=]\s*)Bearer\s+[^\s\r\n,}\]]+`, 'gi');
 
 export function redactOutput(value: string, explicitValues: readonly string[] = []): string {
   let output = value;
@@ -15,9 +12,76 @@ export function redactOutput(value: string, explicitValues: readonly string[] = 
   output = output
     .replace(/(Authorization\s*:\s*Bearer\s+)[^\s\r\n]+/gi, '$1[REDACTED]')
     .replace(/\b(API[_-]?TOKEN|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|PASSWORD|PASSWD|SECRET|API[_-]?KEY|CREDENTIAL)\s*=\s*([^\s\r\n]+)/gi, '$1=[REDACTED]')
-    .replace(BEARER_ASSIGNMENT, '$1Bearer [REDACTED]')
-    .replace(SENSITIVE_ASSIGNMENT, '$1[REDACTED]');
-  return output;
+    .replace(BEARER_ASSIGNMENT, '$1Bearer [REDACTED]');
+  return redactStructuredAssignments(output);
+}
+
+function redactStructuredAssignments(value: string): string {
+  let output = '';
+  let cursor = 0;
+  SENSITIVE_PREFIX.lastIndex = 0;
+  for (const match of value.matchAll(SENSITIVE_PREFIX)) {
+    const start = match.index ?? 0;
+    if (start < cursor) continue;
+    const valueStart = start + match[0].length;
+    output += value.slice(cursor, valueStart);
+    const bearer = /^Bearer\s+/i.exec(value.slice(valueStart));
+    const valueEnd = bearer === null ? consumeSensitiveValue(value, valueStart) : consumeBearerValue(value, valueStart + bearer[0].length);
+    output += bearer === null ? '[REDACTED]' : 'Bearer [REDACTED]';
+    cursor = valueEnd;
+  }
+  return output + value.slice(cursor);
+}
+
+function consumeBearerValue(value: string, start: number): number {
+  if (value[start] === '[') return consumeBalancedValue(value, start);
+  let end = start;
+  while (end < value.length && !/[\s,}\]]/.test(value[end] ?? '')) end += 1;
+  return end > start ? end : Math.min(value.length, start + 1);
+}
+
+function consumeSensitiveValue(value: string, start: number): number {
+  const first = value[start];
+  if (first === '"' || first === "'") return consumeQuotedValue(value, start, first);
+  if (first === '[' || first === '{') return consumeBalancedValue(value, start);
+  let end = start;
+  while (end < value.length && !/[\s,}\]]/.test(value[end] ?? '')) end += 1;
+  return end > start ? end : Math.min(value.length, start + 1);
+}
+
+function consumeQuotedValue(value: string, start: number, quote: string): number {
+  let escaped = false;
+  for (let index = start + 1; index < value.length; index += 1) {
+    const character = value[index];
+    if (escaped) { escaped = false; continue; }
+    if (character === '\\') { escaped = true; continue; }
+    if (character === quote) return index + 1;
+  }
+  return value.length;
+}
+
+function consumeBalancedValue(value: string, start: number): number {
+  const stack = [value[start] === '[' ? ']' : '}'];
+  let quote: string | undefined;
+  let escaped = false;
+  for (let index = start + 1; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote !== undefined) {
+      if (escaped) { escaped = false; continue; }
+      if (character === '\\') { escaped = true; continue; }
+      if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") { quote = character; continue; }
+    if (character === '[') { stack.push(']'); continue; }
+    if (character === '{') { stack.push('}'); continue; }
+    if (character === ']' || character === '}') {
+      if (stack.at(-1) !== character) return value.length;
+      stack.pop();
+      if (stack.length === 0) return index + 1;
+    }
+  }
+  return value.length;
 }
 
 export class StreamingRedactor {
