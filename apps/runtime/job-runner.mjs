@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { access, lstat, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { safeErrorMessage, StreamingRedactor } from '../../scripts/job-runner-redaction.mjs';
 
 const HELPER = new URL('./macos-safety-helper.py', import.meta.url).pathname;
 const args = process.argv.slice(2);
@@ -188,7 +189,7 @@ async function publishFailure(error) {
       signal: null,
       timedOut,
       cancelled,
-      error: error instanceof Error ? error.message.slice(0, 500) : 'runner failure',
+      error: safeErrorMessage(error, 'runner failure'),
       reviewOutputSha256: null,
       reviewOutputBytes: null,
       finishedAt: new Date().toISOString(),
@@ -313,42 +314,6 @@ function writeWithBackpressure(stream, text, source) {
 
 function endStream(stream) {
   return new Promise((resolve) => stream.end(resolve));
-}
-
-function redactOutput(value, explicitValues) {
-  let output = value;
-  for (const secret of explicitValues) {
-    if (secret.length === 0) continue;
-    output = output.split(secret).join('[REDACTED]');
-  }
-  return output
-    .replace(/(Authorization\s*:\s*Bearer\s+)[^\s\r\n]+/gi, '$1[REDACTED]')
-    .replace(/\b(API[_-]?TOKEN|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|PASSWORD|PASSWD|SECRET|API[_-]?KEY|CREDENTIAL)\s*=\s*([^\s\r\n]+)/gi, '$1=[REDACTED]')
-    .replace(/\b(password|token|secret|api[_-]?key)\s*[:=]\s*['"]?([^\s,'"}\]]+)/gi, '$1=[REDACTED]');
-}
-
-class StreamingRedactor {
-  #tail = '';
-  #keep;
-  #explicit;
-  constructor(explicitValues) {
-    this.#explicit = explicitValues;
-    const longest = explicitValues.reduce((max, value) => Math.max(max, value.length), 0);
-    this.#keep = Math.max(4096, longest + 256);
-  }
-  push(chunk) {
-    const combined = this.#tail + chunk;
-    if (combined.length <= this.#keep) { this.#tail = combined; return ''; }
-    const splitAt = combined.length - this.#keep;
-    const flush = combined.slice(0, splitAt);
-    this.#tail = combined.slice(splitAt);
-    return redactOutput(flush, this.#explicit);
-  }
-  finish() {
-    const value = redactOutput(this.#tail, this.#explicit);
-    this.#tail = '';
-    return value;
-  }
 }
 
 function isRecord(value) {

@@ -58,6 +58,7 @@ const FULL_CATALOG = [
   entry('session_get', 'READ_ONLY', null, '2.0.0'),
   entry('session_close', 'ORCHESTRATION', 'session.delete', '2.0.0'),
   entry('workspace_select', 'ORCHESTRATION', 'session.current_project.set', '2.0.0'),
+  entry('workspace_select_v27', 'ORCHESTRATION', 'session.current_project.set', '2.7.0'),
   entry('mission_list_waiting_supervisor', 'READ_ONLY', null, '2.1.0'),
   entry('mission_get', 'READ_ONLY', 'mission.get', '2.0.0'),
   entry('mission_events', 'READ_ONLY', null, '2.1.0'),

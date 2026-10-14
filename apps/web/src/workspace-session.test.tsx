@@ -56,9 +56,9 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB], missions: Parameters<typeof RuntimePage>[0]['missions'] = []): string {
+function renderWorkspace(selectedSession: Session | null, sessions: Session[] = [sessionA, sessionB], missions: Parameters<typeof RuntimePage>[0]['missions'] = [], jobs: Parameters<typeof RuntimePage>[0]['jobs'] = [], healthOverride: Parameters<typeof RuntimePage>[0]['health'] = health, jobViewState: Parameters<typeof RuntimePage>[0]['jobViewState'] = jobs.length === 0 ? 'EMPTY' : 'READY'): string {
   return renderToStaticMarkup(createElement(RuntimePage, {
-    health,
+    health: healthOverride,
     projects: [projectA, projectB],
     defaultProject: projectA,
     activeProject: selectedSession?.currentProjectId === projectA.id ? projectA : selectedSession?.currentProjectId === projectB.id ? projectB : null,
@@ -80,6 +80,13 @@ function renderWorkspace(selectedSession: Session | null, sessions: Session[] = 
     onRegisterProject: () => undefined,
     onSelectProject: () => undefined,
     onRequestMissionOrchestrator: () => undefined,
+    jobs,
+    jobViewState,
+    jobLogs: { 'job-1': { stdout: { stream: 'stdout', text: 'hello from job\n', cursor: 'stdout:5', eof: true, bytes: 15 } } },
+    jobResults: {},
+    onCancelJob: () => undefined,
+    onReadJobLogs: () => undefined,
+    onReadJobResult: () => undefined,
   }));
 }
 
@@ -100,6 +107,220 @@ describe('daily workspace session experience', () => {
     expect(first).toContain('/Users/bill/iris');
     expect(second).toContain('/Users/bill/sandbox');
     expect(second).toContain('Sandbox');
+  });
+
+  it('renders owner-scoped Supervisor controls and truthful keep-awake blocking', () => {
+    const markup = renderWorkspace(sessionA);
+    expect(markup).toContain('Supervisor control');
+    expect(markup).toContain('Workload ON');
+    expect(markup).toContain('Workload OFF');
+    expect(markup).toContain('Keep-awake</dt><dd>BLOCKED');
+  });
+
+  it('renders captured durable job identity, output and cancellation controls', () => {
+    const markup = renderWorkspace(sessionA, [sessionA], [], [{ jobId: 'job-1', requestId: 'request-1', projectId: projectA.id, workspaceId: 'workspace-a', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null }]);
+    expect(markup).toContain('Durable jobs');
+    expect(markup).toContain('RUNNING');
+    expect(markup).toContain('project-a');
+    expect(markup).toContain('workspace-a');
+    expect(markup).toContain('hello from job');
+    expect(markup).toContain('Cancel job');
+  });
+
+  it('counts only queued and running jobs in the active jobs summary', () => {
+    const markup = renderWorkspace(sessionA, [sessionA], [], [
+      { jobId: 'queued', requestId: 'request-queued', projectId: projectA.id, workspaceId: 'workspace-a', state: 'QUEUED', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null },
+      { jobId: 'running', requestId: 'request-running', projectId: projectA.id, workspaceId: 'workspace-a', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null },
+      { jobId: 'done', requestId: 'request-done', projectId: projectA.id, workspaceId: 'workspace-a', state: 'SUCCEEDED', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: '2026-09-05T06:01:00.000Z' },
+    ]);
+    expect(markup).toContain('ops-card--jobs"><span class="ops-card-label">Active jobs</span><strong>2</strong>');
+  });
+
+  it('does not report zero active jobs while job status is loading or unavailable', () => {
+    const loading = renderWorkspace(sessionA, [sessionA], [], [], health, 'LOADING');
+    const unavailable = renderWorkspace(sessionA, [sessionA], [], [], health, 'UNAVAILABLE');
+    expect(loading).toContain('Active jobs</span><strong>…</strong>');
+    expect(unavailable).toContain('Active jobs</span><strong>—</strong>');
+  });
+
+  it('does not report Runtime OFF when health is unavailable', () => {
+    const markup = renderWorkspace(sessionA, [sessionA], [], [], null);
+    expect(markup).toContain('ops-card--runtime"><span class="ops-card-label">Runtime</span><strong>UNKNOWN</strong>');
+    expect(markup).not.toContain('ops-card--runtime"><span class="ops-card-label">Runtime</span><strong>OFF</strong>');
+  });
+
+  it('keeps job-list responses bound to the selected session and project', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    let resolveProjectA: ((response: Response) => void) | undefined;
+    const projectAResponse = new Promise<Response>((resolve) => { resolveProjectA = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA, projectB], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA, sessionB] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/jobs?projectId=${projectA.id}`) return projectAResponse;
+      if (url === `/jobs?projectId=${projectB.id}`) return jsonResponse({ jobs: [{ jobId: 'job-b', requestId: 'request-b', projectId: projectB.id, workspaceId: 'workspace-b', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null }] });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    await clickButtonStartingWith('Session 2');
+    await settleApp();
+    expect(document.body.textContent).toContain('job-b');
+    resolveProjectA?.(jsonResponse({ jobs: [{ jobId: 'job-a', requestId: 'request-a', projectId: projectA.id, workspaceId: 'workspace-a', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null }] }));
+    await settleApp();
+    expect(document.body.textContent).toContain('job-b');
+    expect(document.body.textContent).not.toContain('job-a');
+  });
+
+  it('reports failed job refreshes as errors instead of an empty project', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/jobs?projectId=${projectA.id}`) return new Response(null, { status: 503 });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    expect(document.body.textContent).toContain('Job status error: Durable jobs unavailable (503)');
+    expect(document.body.textContent).not.toContain('No durable jobs reported for this project.');
+  });
+
+  it('reads authoritative stdout, stderr and terminal result for the captured job', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    const job = { jobId: 'job-1', requestId: 'request-1', projectId: projectA.id, workspaceId: 'workspace-a', state: 'SUCCEEDED', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: '2026-09-05T06:01:00.000Z', exitCode: 0, signal: null };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/jobs?projectId=${projectA.id}`) return jsonResponse({ jobs: [job] });
+      if (url === `/jobs/${job.jobId}/logs?projectId=${projectA.id}&stream=stdout`) return jsonResponse({ jobId: job.jobId, state: job.state, stream: 'stdout', text: 'stdout line', cursor: 'stdout:11', eof: true, bytes: 11 });
+      if (url === `/jobs/${job.jobId}/logs?projectId=${projectA.id}&stream=stderr`) return jsonResponse({ jobId: job.jobId, state: job.state, stream: 'stderr', text: 'stderr line', cursor: 'stderr:11', eof: true, bytes: 11 });
+      if (url === `/jobs/${job.jobId}?projectId=${projectA.id}&view=result`) return jsonResponse({ jobId: job.jobId, state: job.state, exitCode: 0, signal: null, startedAt: job.startedAt, finishedAt: job.finishedAt, logArtifactIds: [], artifactIds: [] });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    expect(document.body.textContent).toContain('exit 0');
+    await clickButton('stdout');
+    await settleApp();
+    expect(document.body.textContent).toContain('stdout line');
+    await clickButton('stderr');
+    await settleApp();
+    expect(document.body.textContent).toContain('stderr line');
+    await clickButton('Result');
+    await settleApp();
+    expect(document.body.textContent).toContain('Result verified: SUCCEEDED');
+  });
+
+  it('preserves logs and terminal results across same-context polling and continues cursor pagination', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    let metadataReads = 0;
+    const job = { jobId: 'job-poll', requestId: 'request-poll', projectId: projectA.id, workspaceId: 'workspace-a', state: 'SUCCEEDED', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: '2026-09-05T06:01:00.000Z', exitCode: 0, signal: null };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA, projectB], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA, sessionB] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/jobs?projectId=${projectA.id}`) { metadataReads += 1; return jsonResponse({ jobs: [job] }); }
+      if (url === `/jobs/${job.jobId}/logs?projectId=${projectA.id}&stream=stdout`) return jsonResponse({ jobId: job.jobId, state: job.state, stream: 'stdout', text: 'first chunk ', cursor: 'stdout:12', eof: false, bytes: 12 });
+      if (url === `/jobs/${job.jobId}/logs?projectId=${projectA.id}&stream=stdout&cursor=stdout%3A12`) return jsonResponse({ jobId: job.jobId, state: job.state, stream: 'stdout', text: 'second chunk', cursor: 'stdout:24', eof: true, bytes: 12 });
+      if (url === `/jobs/${job.jobId}?projectId=${projectA.id}&view=result`) return jsonResponse({ jobId: job.jobId, state: job.state, exitCode: 0, signal: null, startedAt: job.startedAt, finishedAt: job.finishedAt, logArtifactIds: [], artifactIds: [] });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    await clickButton('stdout');
+    await settleApp();
+    await clickButton('Result');
+    await settleApp();
+    expect(document.body.textContent).toContain('first chunk');
+    expect(document.body.textContent).toContain('Result verified: SUCCEEDED');
+    await clickButton('More stdout');
+    await settleApp();
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    await settleApp();
+    expect(metadataReads).toBeGreaterThan(1);
+    expect(document.body.textContent).toContain('first chunk second chunk');
+    expect(document.body.textContent).toContain('Result verified: SUCCEEDED');
+  });
+
+  it('invalidates cached job output when switching project context', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    const jobA = { jobId: 'job-a-cache', requestId: 'request-a-cache', projectId: projectA.id, workspaceId: 'workspace-a', state: 'SUCCEEDED', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: '2026-09-05T06:01:00.000Z', exitCode: 0, signal: null };
+    const jobB = { jobId: 'job-b-cache', requestId: 'request-b-cache', projectId: projectB.id, workspaceId: 'workspace-b', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA, projectB], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA, sessionB] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/jobs?projectId=${projectA.id}`) return jsonResponse({ jobs: [jobA] });
+      if (url === `/jobs?projectId=${projectB.id}`) return jsonResponse({ jobs: [jobB] });
+      if (url === `/jobs/${jobA.jobId}/logs?projectId=${projectA.id}&stream=stdout`) return jsonResponse({ jobId: jobA.jobId, state: jobA.state, stream: 'stdout', text: 'project-a output', cursor: 'stdout:16', eof: true, bytes: 16 });
+      if (url === `/jobs/${jobA.jobId}?projectId=${projectA.id}&view=result`) return jsonResponse({ jobId: jobA.jobId, state: jobA.state, exitCode: 0, signal: null, startedAt: jobA.startedAt, finishedAt: jobA.finishedAt, logArtifactIds: [], artifactIds: [] });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    await clickButton('stdout');
+    await settleApp();
+    await clickButton('Result');
+    await settleApp();
+    expect(document.body.textContent).toContain('project-a output');
+    await clickButtonStartingWith('Session 2');
+    await settleApp();
+    expect(document.body.textContent).toContain('job-b-cache');
+    expect(document.body.textContent).not.toContain('project-a output');
+    expect(document.body.textContent).not.toContain('Result verified: SUCCEEDED');
+  });
+
+  it('keeps a failed polling refresh distinct from an authoritative empty result', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    window.sessionStorage.setItem('iris.web.selectedSessionId', sessionA.id);
+    let metadataReads = 0;
+    const job = { jobId: 'job-failure-poll', requestId: 'request-failure-poll', projectId: projectA.id, workspaceId: 'workspace-a', state: 'RUNNING', startedAt: '2026-09-05T06:00:00.000Z', finishedAt: null };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA] });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === `/jobs?projectId=${projectA.id}`) { metadataReads += 1; return metadataReads === 1 ? jsonResponse({ jobs: [job] }) : new Response(null, { status: 503 }); }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    expect(document.body.textContent).toContain('job-failure-poll');
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    await settleApp();
+    expect(document.body.textContent).toContain('Job status error: Durable jobs unavailable (503)');
+    expect(document.body.textContent).not.toContain('No durable jobs reported for this project.');
   });
 
   it('restores a selected session across refresh only while that authoritative session still exists', () => {
@@ -149,6 +370,11 @@ describe('daily workspace session experience', () => {
         runtimeSessions.push(created);
         return jsonResponse(created, 201);
       }
+      if (url === `/sessions/${sessionA.id}` && method === 'DELETE') {
+        const index = runtimeSessions.findIndex((session) => session.id === sessionA.id);
+        if (index >= 0) runtimeSessions.splice(index, 1);
+        return jsonResponse({ deleted: true });
+      }
       throw new Error(`Unexpected request: ${method} ${url}`);
     }));
 
@@ -174,6 +400,11 @@ describe('daily workspace session experience', () => {
     await clickButtonStartingWith('Session 1');
     expect(window.sessionStorage.getItem('iris.web.selectedSessionId')).toBe(sessionA.id);
     expect(document.body.textContent).toContain('/Users/bill/iris');
+
+    await clickButton('Detach session');
+    await settleApp();
+    expect(runtimeSessions.some((session) => session.id === sessionA.id)).toBe(false);
+    expect(window.sessionStorage.getItem('iris.web.selectedSessionId')).toBe(sessionB.id);
   });
 
   it('mounts App and clears stale selection when a restarted daemon reports no transient sessions while persisted projects remain', async () => {
@@ -196,8 +427,16 @@ describe('daily workspace session experience', () => {
 
     expect(window.sessionStorage.getItem('iris.web.selectedSessionId')).toBeNull();
     expect(document.body.textContent).toContain('No sessions yet.');
+    expect(document.querySelector('.header-status')?.textContent).toBe('Online');
     expect(document.body.textContent).toContain('IRIS');
     expect(document.body.textContent).toContain('/Users/bill/iris');
+  });
+
+  it('shows Offline when the local runtime cannot be reached', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('Runtime unavailable'); }));
+    await mountApp();
+    await settleApp();
+    expect(document.querySelector('.header-status')?.textContent).toBe('Offline');
   });
 
   it('binds approval UI to the selected session and drops the prior session approval when switching context', async () => {
@@ -220,6 +459,7 @@ describe('daily workspace session experience', () => {
 
     await mountApp();
     await settleApp();
+    expect(document.querySelector('.header-status')?.textContent).toBe('Needs Attention');
     await clickButton('Approval Center (1)');
     expect(document.body.textContent).toContain('session · current project · set');
     expect(document.body.textContent).not.toContain('session-b-action');
@@ -357,6 +597,26 @@ describe('daily workspace session experience', () => {
     expect(markup).toContain('No sessions yet.');
     expect(markup).toContain('Nothing selected');
     expect(markup).toContain('Create session');
+  });
+
+  it('keeps persistent Supervisor status visible when the workload health endpoint is unavailable', async () => {
+    window.sessionStorage.setItem('iris.web.clientId', 'web-client');
+    window.sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/health') return new Response(null, { status: 503 });
+      if (url === '/supervisor-control/healthz') return jsonResponse({ ok: true });
+      if (url === '/supervisor-control/mcp') return jsonResponse({ result: { structuredContent: {
+        state: 'DEGRADED', workloadState: 'OFF', machineId: 'machine-a', tunnel: { state: 'OFF' },
+        detail: 'Workload is OFF; the persistent Supervisor gateway remains available',
+      } } });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp();
+    await settleApp();
+    expect(document.body.textContent).toContain('DEGRADED');
+    expect(document.body.textContent).toContain('Workload is OFF');
+    expect(document.body.textContent).toContain('machine-a');
   });
 });
 

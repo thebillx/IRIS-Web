@@ -20,3 +20,9 @@ This repository is an independent, clean-sheet implementation. Do not copy sourc
 - Run focused validation first, followed by the appropriate broad checks.
 - Preserve owner work. Never perform destructive cleanup of changes or files you do not own.
 - Do not push, merge, create remotes, or publish automatically unless the current mission explicitly authorizes the exact action.
+
+## Task continuity
+
+- Keep one canonical checkpoint per task at `.agents/handoffs/<task-slug>.json`, using `node scripts/task-checkpoint.mjs save <task-slug>` with the documented JSON input. Preserve existing handoffs; do not replace an unknown owner file.
+- Before takeover, run `node scripts/task-checkpoint.mjs inspect <task-slug>`. `EXECUTE` means the recorded source and next action agree; proceed only within existing authority. `ASK` means resolve essential missing information. `STOP` means conflicting source or owner work. `VERIFY` means inspect an uncertain mutation result before retrying.
+- Record the objective, project/workspace, actual branch/HEAD, state, completed work, changed files, test commands/results, remaining work, blockers/questions and exact next action. Update after meaningful progress. Never invent missing requirements, claim unverified tests passed or replay an unknown mutation.

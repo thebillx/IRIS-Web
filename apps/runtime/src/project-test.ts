@@ -5,6 +5,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { RuntimeError } from '@iris/domain';
 import { node24Path } from './node-runtime.js';
+import { safeErrorMessage } from './output-redaction.js';
 import { inspectPrivateRegularFile } from './private-fs.js';
 
 const execFileAsync = promisify(execFile);
@@ -120,7 +121,7 @@ export class ProjectValidationJobManager {
     } catch (error) {
       result = {
         scriptName: job.scriptName, packageManager: job.packageManager, passed: false, exitCode: null, timedOut: false,
-        stdout: '', stderr: error instanceof Error ? error.message : 'Validation failed', outputTruncated: false,
+        stdout: '', stderr: safeErrorMessage(error, 'Validation failed'), outputTruncated: false,
       };
     }
     const finished: ProjectValidationJobSnapshot = {

@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { RuntimeError } from '@iris/domain';
 import { catalogToolNames } from './mcp-catalog.js';
 import { loadOrCreateTunnelServiceSecret } from './credentials.js';
 import { MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
@@ -18,6 +19,79 @@ const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 describe('outer supervisor native control', () => {
+  it('serves the trusted source and connector identity to the local Web bridge', async () => {
+    const harness = await startHarness(true);
+    try {
+      const response = await fetch(new URL('/identity', harness.server.healthUrl), {
+        headers: { authorization: `Bearer ${harness.secret}` },
+      });
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        state: 'VERIFIED',
+        tunnelBinding: { mode: 'FULL' },
+      });
+    } finally {
+      await harness.server.close();
+    }
+  });
+
+  it('publishes one gateway catalog and routes runtime tools without losing supervisor authority', async () => {
+    const harness = await startHarness(true);
+    try {
+      const listed = await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      expect(toolNames(listed)).toContain('source_identity');
+      expect(toolNames(listed)).toContain('runtime_status');
+      expect(structured(await rpcTool(harness, 'source_identity', {}))).toMatchObject({ state: 'VERIFIED', commitSha: 'a'.repeat(40) });
+      expect(structured(await rpcTool(harness, 'runtime_status', {}))).toMatchObject({ status: 'ready' });
+      harness.runtimeAvailable = false;
+      expect(await rpcTool(harness, 'runtime_status', {})).toMatchObject({ result: { isError: true, structuredContent: { code: 'RUNTIME_NOT_RUNNING' } } });
+      expect(structured(await rpcTool(harness, 'workload_off', {}))).toMatchObject({ workloadState: 'OFF' });
+    } finally {
+      await harness.server.close();
+    }
+  });
+
+  it('rejects stale unified gateway identity before dispatching a tool', async () => {
+    const harness = await startHarness(true, true);
+    try {
+      const stale = await postRpc(harness, {
+        jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'supervisor_status', arguments: {} },
+      }, {
+        'Mcp-Name': 'supervisor_status',
+        'x-iris-connector-profile': 'FULL',
+        'x-iris-deployment-epoch': '1',
+        'x-iris-runtime-id': 'stale-runtime',
+      });
+      expect(stale.status).toBe(409);
+      await expect(stale.json()).resolves.toMatchObject({ error: { code: 'CONNECTOR_MANIFEST_STALE' } });
+
+      const staleRuntime = await postRpc(harness, {
+        jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'supervisor_status', arguments: {} },
+      }, {
+        'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
+        'Mcp-Name': 'supervisor_status',
+        'x-iris-connector-profile': 'FULL',
+        'x-iris-deployment-epoch': '2',
+        'x-iris-runtime-id': 'stale-runtime',
+      });
+      expect(staleRuntime.status).toBe(409);
+      await expect(staleRuntime.json()).resolves.toMatchObject({ error: { code: 'RUNTIME_IDENTITY_MISMATCH' } });
+
+      const valid = await postRpc(harness, {
+        jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'supervisor_status', arguments: {} },
+      }, {
+        'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
+        'Mcp-Name': 'supervisor_status',
+        'x-iris-connector-profile': 'FULL',
+        'x-iris-deployment-epoch': '2',
+        'x-iris-runtime-id': 'runtime-a',
+      });
+      expect(valid.status).toBe(200);
+    } finally {
+      await harness.server.close();
+    }
+  });
+
   it('implements the authenticated tunnel-client initialize handshake without widening native tools', async () => {
     const harness = await startHarness();
     const initialize = {
@@ -49,7 +123,7 @@ describe('outer supervisor native control', () => {
         'Mcp-Method': 'tools/list',
       });
       expect(toolNames(listed)).toEqual([
-        'supervisor_status', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
+        'supervisor_status', 'supervisor_doctor', 'workload_on', 'workload_off', 'workload_restart', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
         'activation_status', 'activation_prepare', 'activation_apply', 'activation_confirm', 'activation_rollback',
       ]);
       expect(catalogToolNames('FULL')).not.toContain('admin_tunnel_recycle');
@@ -92,6 +166,10 @@ describe('outer supervisor native control', () => {
       const listed = await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
       expect(toolNames(listed)).toEqual([
         'supervisor_status',
+        'supervisor_doctor',
+        'workload_on',
+        'workload_off',
+        'workload_restart',
         'admin_status',
         'runtime_reconcile',
         'admin_recycle',
@@ -111,6 +189,10 @@ describe('outer supervisor native control', () => {
       }
       expect(adminToolDefinitions().map((tool) => tool.name)).toContain('admin_status');
       expect(structured(await rpcTool(harness, 'supervisor_status', {}))).toMatchObject({ supervisor: 'outer', workloadRuntimeId: 'runtime-a' });
+      expect(structured(await rpcTool(harness, 'supervisor_doctor', {}))).toMatchObject({ code: 'NONE' });
+      expect(structured(await rpcTool(harness, 'workload_off', {}))).toMatchObject({ workloadState: 'OFF' });
+      expect(structured(await rpcTool(harness, 'workload_on', {}))).toMatchObject({ workloadState: 'ON' });
+      expect(structured(await rpcTool(harness, 'workload_restart', {}))).toMatchObject({ workloadState: 'ON' });
       expect(structured(await rpcTool(harness, 'admin_status', {}))).toMatchObject({ adminIdentity: 'admin-a' });
       expect(structured(await rpcTool(harness, 'runtime_reconcile', {}))).toMatchObject({ readiness: 'READY', workloadAnchorsPreserved: true });
       expect(structured(await rpcTool(harness, 'activation_status', {}))).toMatchObject({ proxied: 'activation_status' });
@@ -169,14 +251,18 @@ describe('outer supervisor native control', () => {
   });
 });
 
-async function startHarness() {
+async function startHarness(unified = false, identityGuard = false) {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-native-supervisor-control-'));
   roots.push(dataRoot);
   const secret = await loadOrCreateTunnelServiceSecret(dataRoot);
   const recycleInputs: AdminRecycleInput[] = [];
-  const harness = { workloadRuntimeId: 'runtime-a' };
+  const harness = { workloadRuntimeId: 'runtime-a', runtimeAvailable: true };
   const operations: SupervisorNativeOperations = {
     supervisorStatus: async () => ({ supervisor: 'outer', workloadRuntimeId: harness.workloadRuntimeId }),
+    supervisorDoctor: async () => ({ code: 'NONE' }),
+    workloadOn: async () => ({ workloadState: 'ON' }),
+    workloadOff: async () => ({ workloadState: 'OFF' }),
+    workloadRestart: async () => ({ workloadState: 'ON' }),
     adminStatus: async () => ({ adminIdentity: recycleInputs.length === 0 ? 'admin-a' : 'admin-b' }),
     runtimeReconcile: async () => ({ readiness: 'READY', workloadAnchorsPreserved: true }),
     adminRecycle: async (input) => {
@@ -185,9 +271,33 @@ async function startHarness() {
     },
     adminTunnelRecycle: async (input: AdminTunnelRecycleInput) => ({ ...input, readiness: 'READY' }),
     adminToolCall: async (name): Promise<SupervisorAdminToolCallResult> => ({ structuredContent: { proxied: name }, isError: false }),
+    ...(unified ? {
+      runtimeToolDefinitions: [{ name: 'runtime_status', inputSchema: { type: 'object' } }],
+      runtimeToolCall: async (name: string) => harness.runtimeAvailable
+        ? { content: [{ type: 'text', text: JSON.stringify({ status: 'ready', name }) }], structuredContent: { status: 'ready', name }, isError: false }
+        : { content: [{ type: 'text', text: JSON.stringify({ code: 'RUNTIME_NOT_RUNNING', message: 'Runtime tools are unavailable while workload is OFF' }) }], structuredContent: { code: 'RUNTIME_NOT_RUNNING' }, isError: true },
+      sourceIdentity: async () => ({ state: 'VERIFIED', commitSha: 'a'.repeat(40), runtimeId: 'runtime-a', deploymentEpoch: 2, tunnelBinding: { mode: 'FULL' } }),
+      ...(identityGuard ? {
+        authorizeMcpRequest: async (headers: Readonly<Record<string, string | string[] | undefined>>) => {
+          if (headers['x-iris-connector-profile'] !== 'FULL') throw new Error('profile mismatch');
+          if (headers['x-iris-deployment-epoch'] !== '2') throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'stale epoch');
+          if (headers['x-iris-runtime-id'] !== harness.workloadRuntimeId) throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'stale runtime');
+        },
+      } : {}),
+    } : {}),
   };
   const server = await startSupervisorNativeControlServer(dataRoot, await freePort(), operations);
-  return { ...harness, dataRoot, secret, recycleInputs, server, get workloadRuntimeId() { return harness.workloadRuntimeId; }, set workloadRuntimeId(value: string) { harness.workloadRuntimeId = value; } };
+  return {
+    ...harness,
+    dataRoot,
+    secret,
+    recycleInputs,
+    server,
+    get workloadRuntimeId() { return harness.workloadRuntimeId; },
+    set workloadRuntimeId(value: string) { harness.workloadRuntimeId = value; },
+    get runtimeAvailable() { return harness.runtimeAvailable; },
+    set runtimeAvailable(value: boolean) { harness.runtimeAvailable = value; },
+  };
 }
 
 async function rpcTool(harness: Awaited<ReturnType<typeof startHarness>>, name: string, args: object): Promise<Record<string, unknown>> {

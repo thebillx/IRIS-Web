@@ -69,6 +69,10 @@ describe('runtime lifecycle integration', () => {
     expect(developmentEnvironment.IRIS_AGENT_EXECUTOR).toBe('development');
     expect(developmentEnvironment.OPENAI_API_KEY).toBeUndefined();
     expect(developmentEnvironment.IRIS_OPENAI_MODEL).toBeUndefined();
+
+    const acceptanceEnvironment = runtimeChildEnvironment('/private/tmp/iris-acceptance-test', 46110, { PATH: node24Path() }, undefined, true);
+    expect(acceptanceEnvironment.IRIS_RUNTIME_PORT).toBe('46110');
+    expect(acceptanceEnvironment.IRIS_RUNTIME_PORT_STRICT).toBe('1');
   });
 
   it('rejects a stale expected activation source identity before spawning a runtime', async () => {
@@ -334,7 +338,7 @@ describe('runtime lifecycle integration', () => {
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
     expect(mcp.result.tools.map((tool) => tool.name)).toEqual([
-      'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'ado_discovery', 'ado_workitem_read', 'ado_hierarchy_read', 'ado_context_search', 'ado_backlog_list', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete',
+      'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'ado_discovery', 'ado_workitem_read', 'ado_hierarchy_read', 'ado_context_search', 'ado_backlog_list', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select', 'workspace_select_v27', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete',
       'mission_start', 'mission_checkpoint', 'mission_resume', 'mission_rebind', 'mission_cancel', 'mission_complete', 'mission_evidence', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git', 'code_review', 'security_audit', 'catalog_identity',
     ]);
 
@@ -355,7 +359,7 @@ describe('runtime lifecycle integration', () => {
     const restartedSessions = await json<{ sessions: Array<{ id: string }> }>(`${second.endpoint.apiUrl}/sessions`, {
       headers: { 'x-iris-client-id': 'client-a' },
     });
-    expect(restartedSessions.sessions).toEqual([]);
+    expect(restartedSessions.sessions).toEqual([expect.objectContaining({ id: sessionA.id })]);
     await stopRuntime(dataRoot, 15_000);
   }, 45_000);
 });

@@ -3,6 +3,7 @@ import { catalogIdentityPayload, catalogToolNames, orderToolDefinitions, type Mc
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import type { RuntimeState } from './state.js';
+import { redactStructuredValue, safeErrorMessage, safeSerialize } from './output-redaction.js';
 
 export const MCP_PROTOCOL_VERSION = '2026-07-28' as const;
 export const LEGACY_MCP_PROTOCOL_VERSION = '2025-11-25' as const;
@@ -124,7 +125,7 @@ async function handleMcpTransportRequest(
       const runtimeError = error instanceof RuntimeError ? error : null;
       return jsonRpcResult(rpc.id ?? null, toolError(
         runtimeError?.code ?? 'INVALID_REQUEST',
-        error instanceof Error ? error.message : 'Tool call failed',
+        safeErrorMessage(error, 'Tool call failed'),
         runtimeError?.publicDetails === undefined ? {} : { ...runtimeError.publicDetails },
       ));
     }
@@ -222,14 +223,22 @@ async function executeTool(
     return identity.session;
   }
   if (name === 'session_close') {
-    const identity = resolveSessionIdentity(args, request, state);
+    const identity = resolveSessionIdentity(args, request, state, true);
     return capabilities.execute({ capabilityId: 'session.delete', clientId: identity.clientId, sessionId: identity.sessionId });
   }
   if (name === 'workspace_select') {
+    if (optionalString(args, 'workspaceId') !== undefined) throw new RuntimeError('INVALID_REQUEST', 'workspaceId requires workspace_select_v27');
     const identity = resolveSessionIdentity(args, request, state);
+    return capabilities.execute({ capabilityId: 'session.current_project.set', clientId: identity.clientId, sessionId: identity.sessionId,
+      projectId: requiredString(args, 'projectId') });
+  }
+  if (name === 'workspace_select_v27') {
+    const identity = resolveSessionIdentity(args, request, state);
+    const workspaceId = optionalString(args, 'workspaceId');
     return capabilities.execute({
       capabilityId: 'session.current_project.set', clientId: identity.clientId, sessionId: identity.sessionId,
       projectId: requiredString(args, 'projectId'),
+      ...(workspaceId === undefined ? {} : { workspaceId }),
     });
   }
   if (name === 'mission_list_waiting_supervisor') {
@@ -425,6 +434,7 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'session_get', description: 'Read the owned IRIS runtime session and its current project.', inputSchema: { type: 'object', properties: sessionProperty, additionalProperties: false } },
     { name: 'session_close', description: 'Close the owned IRIS runtime session when the logical conversation no longer needs it.', inputSchema: { type: 'object', properties: sessionProperty, additionalProperties: false } },
     { name: 'workspace_select', description: 'Select one registered project as the current workspace for this IRIS session only.', inputSchema: { type: 'object', required: ['projectId'], properties: { ...sessionProperty, projectId: { type: 'string', description: 'Registered project ID returned by list_projects.' } }, additionalProperties: false } },
+    { name: 'workspace_select_v27', description: 'Select one registered project and optional active workspace as the current scope for this IRIS session only.', inputSchema: { type: 'object', required: ['projectId'], properties: { ...sessionProperty, projectId: { type: 'string', description: 'Registered project ID returned by list_projects.' }, workspaceId: { type: 'string', description: 'Optional active workspace ID returned by the workspace capability.' } }, additionalProperties: false } },
     { name: 'mission_list_waiting_supervisor', description: 'List broker-bound missions durably waiting for supervisor review. This is read-only supervisor transport and grants no execution permission.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
     { name: 'mission_get', description: 'Read one durable mission with tasks, governed actions, evidence, supervisor-gate representation, timeline, and broker checkpoint state when available.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
     { name: 'mission_events', description: 'Read a bounded merged mission timeline containing governed mission events, supervisor checkpoints, and accepted directives.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
@@ -458,6 +468,7 @@ function resolveSessionIdentity(
   args: Record<string, unknown>,
   request: Request,
   state: RuntimeState | undefined,
+  allowInvalidBinding = false,
 ): { clientId: string; sessionId: string; session: ReturnType<RuntimeState['getSessionForClient']> } {
   const clientId = requiredHeader(request, CLIENT_ID_HEADER);
   const argumentSessionId = optionalString(args, 'sessionId');
@@ -470,7 +481,7 @@ function resolveSessionIdentity(
     throw new RuntimeError('INVALID_REQUEST', 'IRIS session is required; call session_open first and pass its sessionId.');
   }
   if (state === undefined) throw new RuntimeError('INVALID_REQUEST', 'IRIS session validation is unavailable');
-  return { clientId, sessionId, session: state.getSessionForClient(sessionId, clientId) };
+  return { clientId, sessionId, session: allowInvalidBinding ? state.getSessionForDetach(sessionId, clientId) : state.getSessionForClient(sessionId, clientId) };
 }
 
 function requireBrokerContext(state: RuntimeState | undefined, broker: MissionBrokerService | undefined): { state: RuntimeState; broker: MissionBrokerService } {
@@ -512,12 +523,14 @@ function toolOutcome(outcome: CapabilityOutcome): ReturnType<typeof toolResult> 
 }
 
 function toolResult(value: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value, isError: false as const };
+  const safeValue = redactStructuredValue(value);
+  return { content: [{ type: 'text' as const, text: safeSerialize(safeValue) }], structuredContent: safeValue, isError: false as const };
 }
 
 function toolError(code: string, message: string, extra: Record<string, unknown> = {}) {
-  const structuredContent = { code, message, ...extra };
-  return { content: [{ type: 'text' as const, text: JSON.stringify(structuredContent) }], structuredContent, isError: true as const };
+  const safeMessage = safeErrorMessage(new Error(message), 'Operation failed');
+  const structuredContent = redactStructuredValue({ code, message: safeMessage, ...extra });
+  return { content: [{ type: 'text' as const, text: safeSerialize(structuredContent) }], structuredContent, isError: true as const };
 }
 
 function requiredHeader(request: Request, name: string): string {
@@ -673,7 +686,7 @@ function jsonRpcError(id: string | number | null, code: number, message: string,
 }
 
 function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
-  return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers } });
+  return new Response(safeSerialize(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers } });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

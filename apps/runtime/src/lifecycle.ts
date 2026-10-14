@@ -20,6 +20,7 @@ export interface RuntimeObservedStatus {
 export interface StartRuntimeOptions {
   readonly dataRoot?: string;
   readonly preferredPort?: number;
+  readonly strictPort?: boolean;
   readonly startupDeadlineMs?: number;
   readonly sourceRoot?: string;
   readonly protectedReferenceRoot?: string;
@@ -146,7 +147,7 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
     cwd: runtimeSourceRoot,
     detached: true,
     stdio: 'ignore',
-    env: runtimeChildEnvironment(dataRoot, options.preferredPort, process.env, options.protectedReferenceRoot),
+    env: runtimeChildEnvironment(dataRoot, options.preferredPort, process.env, options.protectedReferenceRoot, options.strictPort),
   });
   child.unref();
   return waitForRunningRuntime(
@@ -223,12 +224,14 @@ export function runtimeChildEnvironment(
   preferredPort?: number,
   source: NodeJS.ProcessEnv = process.env,
   protectedReferenceRoot?: string,
+  strictPort = false,
 ): NodeJS.ProcessEnv {
   const configuredProtectedReferenceRoot = protectedReferenceRoot ?? source.IRIS_PROTECTED_REFERENCE_ROOT?.trim();
   const environment: NodeJS.ProcessEnv = {
     PATH: node24Path(),
     [RUNTIME_DATA_ENV]: dataRoot,
     ...(preferredPort === undefined ? {} : { IRIS_RUNTIME_PORT: String(preferredPort) }),
+    ...(strictPort ? { IRIS_RUNTIME_PORT_STRICT: '1' } : {}),
     ...(configuredProtectedReferenceRoot === undefined || configuredProtectedReferenceRoot.length === 0
       ? {}
       : { IRIS_PROTECTED_REFERENCE_ROOT: configuredProtectedReferenceRoot }),

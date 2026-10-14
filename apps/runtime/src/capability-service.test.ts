@@ -16,6 +16,40 @@ const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('capability execution and owner approval', () => {
+  it('keeps workspace capabilities bound to the session workspace after scratch revocation', async () => {
+    const fixture = await serviceFixture();
+    const resources = new VNextResourceRegistry(fixture.state, fixture.dataRoot);
+    const scratch = await resources.createScratch(fixture.project.id);
+    await fixture.state.bindSessionWorkspace(fixture.session.id, fixture.session.clientId, fixture.project.id, scratch.workspaceId);
+
+    const write = await fixture.service.execute({
+      capabilityId: 'fs.write', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, workspaceId: scratch.workspaceId, path: 'bound.txt', mode: 'CREATE', content: 'bound',
+    });
+    expect(write.status).toBe('executed');
+    await resources.revokeScratch(fixture.project.id, scratch.workspaceId);
+
+    await expect(fixture.service.execute({
+      capabilityId: 'fs.write', clientId: fixture.session.clientId, sessionId: fixture.session.id,
+      projectId: fixture.project.id, workspaceId: scratch.workspaceId, path: 'revoked.txt', mode: 'CREATE', content: 'blocked',
+    })).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
+  });
+
+  it('rejects concurrent operations for another workspace without rebinding the session', async () => {
+    const fixture = await serviceFixture();
+    const resources = new VNextResourceRegistry(fixture.state, fixture.dataRoot);
+    const first = await resources.createScratch(fixture.project.id);
+    const second = await resources.createScratch(fixture.project.id);
+    await fixture.state.bindSessionWorkspace(fixture.session.id, fixture.session.clientId, fixture.project.id, first.workspaceId);
+
+    const attempts = await Promise.allSettled([
+      fixture.service.execute({ capabilityId: 'fs.stat', clientId: fixture.session.clientId, sessionId: fixture.session.id, projectId: fixture.project.id, workspaceId: second.workspaceId, path: '.', expectedEffects: ['READ'] }),
+      fixture.service.execute({ capabilityId: 'fs.stat', clientId: fixture.session.clientId, sessionId: fixture.session.id, projectId: fixture.project.id, workspaceId: second.workspaceId, path: '.', expectedEffects: ['READ'] }),
+    ]);
+    expect(attempts.every((attempt) => attempt.status === 'rejected' && attempt.reason.code === 'CAPABILITY_DENIED')).toBe(true);
+    expect(fixture.state.getSessionWorkspaceBinding(fixture.session.id, fixture.session.clientId)).toEqual({ projectId: fixture.project.id, workspaceId: first.workspaceId });
+  });
+
   it('auto-executes project-scoped writes/deletes under FULL_LOCAL_OWNER and audits without file contents', async () => {
     const fixture = await serviceFixture();
     const target = path.join(fixture.projectRoot, 'auto.txt');

@@ -12,6 +12,7 @@ import type { SecurityAuditService } from './security-audit/service.js';
 import { handleV21OwnerRoute } from './server-v21-routes.js';
 import { handleHermesMcpRequest } from './hermes-mcp.js';
 import type { McpCatalogRuntimeContext } from './mcp-catalog.js';
+import { safePublicError, safeSerialize } from './output-redaction.js';
 
 export const LOOPBACK_ADDRESS = '127.0.0.1' as const;
 export const CLIENT_ID_HEADER = 'x-iris-client-id' as const;
@@ -42,6 +43,7 @@ export interface RuntimeServerContext {
   readonly tunnelServiceSecret?: string;
   readonly connectorDeploymentEpoch?: number;
   readonly connectorRuntimeId?: string;
+  readonly singleConnector?: boolean;
   readonly catalogRuntimeContext?: McpCatalogRuntimeContext;
   readonly requestShutdown: () => void;
 }
@@ -59,12 +61,12 @@ export function requireLoopbackAddress(address: string): typeof LOOPBACK_ADDRESS
   return LOOPBACK_ADDRESS;
 }
 
-export async function startRuntimeServer(context: RuntimeServerContext, preferredPort: number): Promise<RuntimeServerHandle> {
+export async function startRuntimeServer(context: RuntimeServerContext, preferredPort: number, allowPortFallback = true): Promise<RuntimeServerHandle> {
   requirePort(preferredPort);
   const server = createServer((request, response) => {
     void routeRequest(request, response, context).catch((error: unknown) => writeError(response, error));
   });
-  const port = await listenWithFallback(server, preferredPort);
+  const port = await listenWithFallback(server, preferredPort, allowPortFallback);
   const apiUrl = `http://${LOOPBACK_ADDRESS}:${port}`;
   return {
     server,
@@ -78,11 +80,11 @@ export async function startRuntimeServer(context: RuntimeServerContext, preferre
   };
 }
 
-async function listenWithFallback(server: Server, preferredPort: number): Promise<number> {
+async function listenWithFallback(server: Server, preferredPort: number, allowPortFallback: boolean): Promise<number> {
   try {
     return await listen(server, preferredPort);
   } catch (error: unknown) {
-    if (preferredPort !== 0 && isAddressInUse(error)) return listen(server, 0);
+    if (allowPortFallback && preferredPort !== 0 && isAddressInUse(error)) return listen(server, 0);
     throw new RuntimeError('PORT_UNAVAILABLE', 'IRIS runtime could not bind its loopback listener', { cause: error });
   }
 }
@@ -123,6 +125,10 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   }
 
   const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+  if (context.singleConnector && url.pathname === '/mcp-pro') {
+    writeEmptyNotFound(response);
+    return;
+  }
   const runtimeOrigin = `http://${request.headers.host!}`;
   if (request.method === 'GET' && url.pathname === '/.well-known/oauth-protected-resource/mcp') {
     writeJson(response, 200, {
@@ -377,6 +383,21 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     );
     return;
   }
+  if (request.method === 'POST' && url.pathname === '/repositories/reconcile') {
+    const body = await readJsonBody(request);
+    const keys = ['projectId', 'previousRepositoryId', 'previousDevice', 'expectedRepositoryId'];
+    if (body === null || Object.keys(body).some((key) => !keys.includes(key))) throw new RuntimeError('INVALID_REQUEST', 'Unsupported repository reconciliation field');
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'repository.reconcile',
+      projectId: stringField(body, 'projectId'),
+      previousRepositoryId: stringField(body, 'previousRepositoryId'),
+      previousDevice: stringField(body, 'previousDevice'),
+      expectedRepositoryId: stringField(body, 'expectedRepositoryId'),
+      clientId: optionalClientId(request),
+      sessionId: optionalSessionId(request),
+    }));
+    return;
+  }
   if (request.method === 'POST' && url.pathname === '/projects') {
     const body = await readJsonBody(request);
     await writeCapabilityOutcome(response, await context.capabilities.execute({
@@ -411,6 +432,50 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
       agentId: body === null ? undefined : optionalStringField(body, 'agentId'),
       agentRole: body === null ? undefined : optionalAgentRoleField(body, 'agentRole'),
     }), 201);
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/jobs') {
+    const projectId = requiredQueryProjectId(url);
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'job.list', projectId, clientId: requiredClientId(request), sessionId: requiredSessionId(request),
+    }));
+    return;
+  }
+  const jobLogsMatch = /^\/jobs\/([^/]+)\/logs$/.exec(url.pathname);
+  if (jobLogsMatch !== null && request.method === 'GET') {
+    const projectId = requiredQueryProjectId(url);
+    const stream = url.searchParams.get('stream');
+    if (stream !== 'stdout' && stream !== 'stderr') throw new RuntimeError('INVALID_REQUEST', 'stream must be stdout or stderr');
+    const cursor = url.searchParams.get('cursor') ?? undefined;
+    const maxBytesValue = url.searchParams.get('maxBytes');
+    const maxBytes = maxBytesValue === null ? undefined : Number(maxBytesValue);
+    if (maxBytes !== undefined && !Number.isSafeInteger(maxBytes)) throw new RuntimeError('INVALID_REQUEST', 'maxBytes must be an integer');
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'job.logs', projectId, jobId: decodeURIComponent(jobLogsMatch[1]!), stream, cursor, maxBytes,
+      clientId: requiredClientId(request), sessionId: requiredSessionId(request),
+    }));
+    return;
+  }
+  const jobMatch = /^\/jobs\/([^/]+)$/.exec(url.pathname);
+  if (jobMatch !== null && request.method === 'GET') {
+    const projectId = requiredQueryProjectId(url);
+    const jobId = decodeURIComponent(jobMatch[1]!);
+    const view = url.searchParams.get('view') ?? 'status';
+    if (view !== 'status' && view !== 'result') throw new RuntimeError('INVALID_REQUEST', 'view must be status or result');
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: view === 'status' ? 'job.status' : 'job.result', projectId, jobId,
+      clientId: requiredClientId(request), sessionId: requiredSessionId(request),
+    }));
+    return;
+  }
+  const jobCancelMatch = /^\/jobs\/([^/]+)\/cancel$/.exec(url.pathname);
+  if (jobCancelMatch !== null && request.method === 'POST') {
+    const body = await readJsonBody(request);
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'job.cancel', projectId: stringField(body, 'projectId'), jobId: decodeURIComponent(jobCancelMatch[1]!),
+      clientId: requiredClientId(request), sessionId: requiredSessionId(request),
+    }));
     return;
   }
 
@@ -449,6 +514,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
       sessionId: decodeURIComponent(currentProjectMatch[1]!),
       clientId: requiredClientId(request),
       projectId: nullableStringField(body, 'projectId'),
+      ...(optionalStringField(body!, 'workspaceId') === undefined ? {} : { workspaceId: optionalStringField(body!, 'workspaceId') }),
     }));
     return;
   }
@@ -534,6 +600,12 @@ function optionalClientId(request: IncomingMessage): string | undefined {
 function requiredSessionId(request: IncomingMessage): string {
   const value = optionalSessionId(request);
   if (value === undefined) throw new RuntimeError('CONTROL_DENIED', `${SESSION_ID_HEADER} is required for capability execution`);
+  return value;
+}
+
+function requiredQueryProjectId(url: URL): string {
+  const value = url.searchParams.get('projectId')?.trim() ?? '';
+  if (value.length === 0 || value.length > 200 || value.includes('\0')) throw new RuntimeError('INVALID_REQUEST', 'projectId query parameter is required');
   return value;
 }
 
@@ -713,7 +785,7 @@ function writeJson(response: ServerResponse, status: number, value: unknown, hea
     ...securityHeaders(),
     ...headers,
   });
-  response.end(JSON.stringify(value));
+  response.end(safeSerialize(value));
 }
 
 function writeEmptyNotFound(response: ServerResponse): void {
@@ -726,7 +798,7 @@ function writeJsonThen(response: ServerResponse, status: number, value: unknown,
     'content-type': 'application/json; charset=utf-8',
     ...securityHeaders(),
   });
-  response.end(JSON.stringify(value), () => setImmediate(after));
+  response.end(safeSerialize(value), () => setImmediate(after));
 }
 
 function securityHeaders(): Record<string, string> {
@@ -755,7 +827,7 @@ function writeError(response: ServerResponse, error: unknown): void {
           : runtimeError.code === 'RUNTIME_SHUTTING_DOWN'
             ? 503
             : 500;
-  writeJson(response, status, { error: { code: runtimeError.code, message: runtimeError.message } });
+  writeJson(response, status, { error: safePublicError(runtimeError.code, runtimeError.message) });
 }
 
 async function writeFetchResponse(response: ServerResponse, fetchResponse: Response): Promise<void> {

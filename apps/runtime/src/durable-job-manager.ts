@@ -9,9 +9,10 @@ import { promisify } from 'node:util';
 import { RuntimeError, type CapabilityEffect, type JobId, type MissionExecutionAssociation, type WorkspaceId } from '@iris/domain';
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
 import { resolveExecutionProfile, resolveServerOwnedCodeReviewExecutionProfile, type ExecutionProfilePlan } from './execution-profiles.js';
-import { boundedTail, StreamingRedactor } from './output-redaction.js';
+import { boundedTail, safeErrorMessage, StreamingRedactor } from './output-redaction.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { observeProcessStart } from './macos-safety.js';
+import type { ProductionSafetyController } from './production-safety.js';
 
 const execFileAsync = promisify(execFile);
 const JOB_FILE = 'vnext-jobs.json';
@@ -114,7 +115,7 @@ interface RunnerResult {
 export class DurableJobManager {
   private mutationTail: Promise<void> = Promise.resolve();
 
-  public constructor(private readonly dataRoot: string, private readonly resources: VNextResourceRegistry) {}
+  public constructor(private readonly dataRoot: string, private readonly resources: VNextResourceRegistry, private readonly safety?: ProductionSafetyController) {}
 
   public async prepare(input: ShellExecutionInput): Promise<PreparedShellExecution> {
     return this.prepareWithResolver(input, resolveExecutionProfile);
@@ -266,8 +267,8 @@ export class DurableJobManager {
       timedOut,
       stdoutTail: stdoutBounded.text,
       stderrTail: stderrBounded.text,
-      stdoutTruncated: stdoutBounded.truncated || (await stat(stdoutPath)).size > INLINE_OUTPUT_BYTES,
-      stderrTruncated: stderrBounded.truncated || (await stat(stderrPath)).size > INLINE_OUTPUT_BYTES,
+      stdoutTruncated: stdoutBounded.truncated || stdoutRedactor.wasQuarantined || (await stat(stdoutPath)).size > INLINE_OUTPUT_BYTES,
+      stderrTruncated: stderrBounded.truncated || stderrRedactor.wasQuarantined || (await stat(stderrPath)).size > INLINE_OUTPUT_BYTES,
       logArtifactIds,
       producedArtifactIds: [],
       startedAt,
@@ -276,6 +277,10 @@ export class DurableJobManager {
   }
 
   public async start(prepared: PreparedShellExecution, requestId: string, effects: readonly CapabilityEffect[], mission?: MissionExecutionAssociation): Promise<Record<string, unknown>> {
+    return this.withSafety(() => this.startUnlocked(prepared, requestId, effects, mission));
+  }
+
+  private async startUnlocked(prepared: PreparedShellExecution, requestId: string, effects: readonly CapabilityEffect[], mission?: MissionExecutionAssociation): Promise<Record<string, unknown>> {
     if (!REQUEST_ID.test(requestId)) {
       await cleanupServerOwnedPaths(prepared.plan.cleanupPaths);
       throw new RuntimeError('INVALID_REQUEST', 'requestId is invalid');
@@ -414,6 +419,12 @@ export class DurableJobManager {
     return statusView(await this.reconcile(job));
   }
 
+  public async list(projectId: string): Promise<readonly Record<string, unknown>[]> {
+    const document = await this.readDocument();
+    const jobs = document.jobs.filter((job) => job.projectId === projectId && job.executionProfile !== 'codex-review');
+    return Promise.all(jobs.map(async (job) => statusView(await this.reconcile(job))));
+  }
+
   public async logs(projectId: string, jobId: string, stream: 'stdout' | 'stderr', cursor?: string, maxBytes = 16 * 1024): Promise<Record<string, unknown>> {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > LOG_WINDOW_MAX) throw new RuntimeError('INVALID_REQUEST', 'maxBytes is outside the bounded log window');
     const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId));
@@ -511,10 +522,12 @@ export class DurableJobManager {
   }
 
   public async markCodeReviewFinalized(projectId: string, jobId: string): Promise<void> {
-    const job = await this.getOwnedCodeReviewJob(projectId, jobId);
-    if (!isTerminal(job.state)) throw new RuntimeError('PRECONDITION_FAILED', 'Native code review is not terminal');
-    if (job.reviewFinalizedAt !== null && job.reviewFinalizedAt !== undefined) return;
-    await this.replaceJob({ ...job, reviewFinalizedAt: new Date().toISOString() });
+    await this.withSafety(async () => {
+      const job = await this.getOwnedCodeReviewJob(projectId, jobId);
+      if (!isTerminal(job.state)) throw new RuntimeError('PRECONDITION_FAILED', 'Native code review is not terminal');
+      if (job.reviewFinalizedAt !== null && job.reviewFinalizedAt !== undefined) return;
+      await this.replaceJob({ ...job, reviewFinalizedAt: new Date().toISOString() });
+    });
   }
 
   public async assertMissionCodeReviewsFinalized(missionId: string): Promise<void> {
@@ -579,6 +592,10 @@ export class DurableJobManager {
   }
 
   public async cancel(projectId: string, jobId: string): Promise<Record<string, unknown>> {
+    return this.withSafety(() => this.cancelUnlocked(projectId, jobId));
+  }
+
+  private async cancelUnlocked(projectId: string, jobId: string): Promise<Record<string, unknown>> {
     const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId));
     if (job.state !== 'RUNNING') return { jobId, state: job.state, cancelRequested: false };
     const claim = await readClaim(job.claimPath);
@@ -597,8 +614,10 @@ export class DurableJobManager {
   }
 
   public async recover(): Promise<void> {
-    const document = await this.readDocument();
-    for (const job of document.jobs) if (job.state === 'RUNNING' || job.state === 'QUEUED') await this.reconcile(job);
+    await this.withSafety(async () => {
+      const document = await this.readDocument();
+      for (const job of document.jobs) if (job.state === 'RUNNING' || job.state === 'QUEUED') await this.reconcile(job);
+    });
   }
 
   private async reconcile(job: DurableJobRecord): Promise<DurableJobRecord> {
@@ -734,7 +753,11 @@ export class DurableJobManager {
     return this.serialized(async () => { const document = await this.readDocument(); await this.writeDocument({ schemaVersion: 1, jobs: document.jobs.map((candidate) => candidate.jobId === job.jobId ? job : candidate) }); });
   }
   private serialized(operation: () => Promise<void>): Promise<void> {
-    const result = this.mutationTail.then(operation, operation); this.mutationTail = result.then(() => undefined, () => undefined); return result;
+    const result = this.mutationTail.then(() => this.withSafety(operation), () => this.withSafety(operation)); this.mutationTail = result.then(() => undefined, () => undefined); return result;
+  }
+  private async withSafety<T>(operation: () => Promise<T>): Promise<T> {
+    const lease = this.safety === undefined ? null : await this.safety.beginMutation('durable-jobs');
+    try { return await operation(); } finally { await lease?.release(); }
   }
   private async writeDocument(document: JobDocument): Promise<void> {
     const filename = path.join(this.dataRoot, JOB_FILE); const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
@@ -824,7 +847,7 @@ async function readLogTail(filename: string, maxBytes: number): Promise<{ readon
   }
 }
 
-function statusView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, requestId: job.requestId, projectId: job.projectId, workspaceId: job.workspaceId, state: job.state, startedAt: job.startedAt, finishedAt: job.finishedAt, pid: job.pid, processStartMarker: job.processStartMarker, processGroupId: job.processGroupId, runnerIdentity: job.runnerIdentity, effectiveEffects: job.effectiveEffects }; }
+function statusView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, requestId: job.requestId, projectId: job.projectId, workspaceId: job.workspaceId, state: job.state, startedAt: job.startedAt, finishedAt: job.finishedAt, exitCode: job.exitCode, signal: job.signal, pid: job.pid, processStartMarker: job.processStartMarker, processGroupId: job.processGroupId, runnerIdentity: job.runnerIdentity, effectiveEffects: job.effectiveEffects }; }
 function resultView(job: DurableJobRecord): Record<string, unknown> { return { jobId: job.jobId, state: job.state, exitCode: job.exitCode, signal: job.signal, startedAt: job.startedAt, finishedAt: job.finishedAt, logArtifactIds: job.logArtifactIds, artifactIds: job.artifactIds }; }
 function isTerminal(state: DurableJobState): boolean { return state === 'SUCCEEDED' || state === 'FAILED' || state === 'CANCELLED' || state === 'LOST' || state === 'INTERRUPTED'; }
 function persistedIdentityMatchesClaim(job: DurableJobRecord, claim: RunnerClaim): boolean {
@@ -863,14 +886,14 @@ async function waitForRunnerClaim(filename: string, resultPath: string, jobId: s
     if (claim !== null && claim.jobId === jobId && claim.runnerIdentity === runnerIdentity && claim.runnerPid === spawnedRunnerPid) return claim;
     const bootstrapResult = await readRunnerResult(resultPath);
     if (bootstrapResult !== null) {
-      const detail = bootstrapResult.error === null ? 'unknown bootstrap failure' : bootstrapResult.error.replace(/\s+/g, ' ').slice(-300);
+      const detail = bootstrapResult.error === null ? 'unknown bootstrap failure' : safeErrorMessage(new Error(bootstrapResult.error), 'unknown bootstrap failure');
       throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Durable runner failed before publishing a verifiable claim: ${detail}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not publish a verifiable runner claim before target spawn');
 }
-async function waitForClaim(filename: string, resultPath: string, jobId: string, runnerIdentity: string): Promise<RunnerClaim> { const deadline = Date.now() + 8000; while (Date.now() < deadline) { const claim = await readClaim(filename); if (claim !== null && claim.jobId === jobId && claim.runnerIdentity === runnerIdentity) return claim; const runnerResult = await readRunnerResult(resultPath); if (runnerResult !== null) { const detail = runnerResult.error === null ? 'runner terminated before target claim' : runnerResult.error.replace(/\s+/g, ' ').slice(-300); throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Durable runner failed before publishing a target claim: ${detail}`); } await new Promise((resolve) => setTimeout(resolve, 25)); } throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not publish a verified target process claim'); }
+async function waitForClaim(filename: string, resultPath: string, jobId: string, runnerIdentity: string): Promise<RunnerClaim> { const deadline = Date.now() + 8000; while (Date.now() < deadline) { const claim = await readClaim(filename); if (claim !== null && claim.jobId === jobId && claim.runnerIdentity === runnerIdentity) return claim; const runnerResult = await readRunnerResult(resultPath); if (runnerResult !== null) { const detail = runnerResult.error === null ? 'runner terminated before target claim' : safeErrorMessage(new Error(runnerResult.error), 'runner failed before target claim'); throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Durable runner failed before publishing a target claim: ${detail}`); } await new Promise((resolve) => setTimeout(resolve, 25)); } throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not publish a verified target process claim'); }
 async function waitForTrustedTerminalResult(filename: string, jobId: string, runnerIdentity: string, timeoutMs: number): Promise<RunnerResult | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

@@ -83,7 +83,7 @@ describe('V2 mission execution foundation', () => {
     expect(missionDenied).toMatchObject({ decision: plainDenied.decision, projectId: plainDenied.projectId, target: plainDenied.target, reason: plainDenied.reason });
     expect(plainDenied.decision).toBe('DENY');
   });
-  it('persists mission, task, action, supervisor-gate, and timeline identity independently from transient sessions', async () => {
+  it('persists mission, task, action, supervisor-gate, and timeline identity alongside durable sessions', async () => {
     const f = await fixture();
     const prepared = await preparedMission(f);
     let mission = await f.state.setMissionState(prepared.mission.id, f.session.clientId, f.session.id, 'RUNNING');
@@ -101,7 +101,9 @@ describe('V2 mission execution foundation', () => {
     expect(persisted.tasks[0]?.id).toBe(prepared.taskId);
     expect(persisted.tasks[0]?.actions[0]?.id).toBe(prepared.actionId);
     expect(persisted.supervisorGate.state).toBe('PENDING');
-    expect(restartedState.listSessions()).toEqual([]);
+    expect(restartedState.listSessions()).toEqual([
+      expect.objectContaining({ id: f.session.id, clientId: f.session.clientId, currentProjectId: f.project.id, executionState: 'READY' }),
+    ]);
   });
 
   it('binds a prepared mission action to governed execution, records bounded evidence, and rejects replay', async () => {

@@ -16,6 +16,7 @@ export interface EffectAssertionResult {
 }
 
 const BASE_EFFECTS: Readonly<Record<CapabilityId, readonly CapabilityEffect[]>> = {
+  'repository.reconcile': ['READ', 'WRITE', 'EXECUTE'],
   'runtime.status': ['READ'],
   'project.list': ['READ'],
   'project.info': ['READ'],
@@ -67,6 +68,7 @@ const BASE_EFFECTS: Readonly<Record<CapabilityId, readonly CapabilityEffect[]>> 
   'shell.run': ['EXECUTE'],
   'shell.start': ['EXECUTE'],
   'job.status': ['READ'],
+  'job.list': ['READ'],
   'job.logs': ['READ'],
   'job.result': ['READ'],
   'job.cancel': ['WRITE', 'EXECUTE', 'DESTRUCTIVE'],

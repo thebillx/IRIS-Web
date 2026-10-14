@@ -3,6 +3,7 @@ import { RuntimeError } from '@iris/domain';
 import { readTunnelServiceSecret } from './credentials.js';
 import { LEGACY_MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import { adminToolDefinitions, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
+import { redactStructuredValue, safeErrorMessage, safeSerialize } from './output-redaction.js';
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const SERVER_NAME = 'IRIS Native Supervisor Control';
@@ -36,11 +37,29 @@ export interface AdminTunnelRecycleInput {
 
 export interface SupervisorNativeOperations {
   supervisorStatus(): Promise<unknown>;
+  supervisorDoctor(): Promise<unknown>;
+  workloadOn(): Promise<unknown>;
+  workloadOff(): Promise<unknown>;
+  workloadRestart(): Promise<unknown>;
   adminStatus(): Promise<unknown>;
   runtimeReconcile(): Promise<unknown>;
   adminRecycle(input: AdminRecycleInput): Promise<unknown>;
   adminTunnelRecycle(input: AdminTunnelRecycleInput): Promise<unknown>;
   adminToolCall(name: string, args: Record<string, unknown>): Promise<SupervisorAdminToolCallResult>;
+  /** Runtime tools are proxied only through the Supervisor-owned unified gateway. */
+  runtimeToolDefinitions?: readonly Record<string, unknown>[];
+  runtimeToolCall?: (name: string, args: Record<string, unknown>) => Promise<SupervisorNativeToolCallResult>;
+  sourceIdentity?: () => Promise<unknown>;
+  /** Validate the connector identity before dispatching any authenticated MCP request. */
+  authorizeMcpRequest?: (headers: SupervisorNativeRequestHeaders) => Promise<void>;
+}
+
+export type SupervisorNativeRequestHeaders = Readonly<Record<string, string | string[] | undefined>>;
+
+export interface SupervisorNativeToolCallResult {
+  readonly content: readonly Record<string, unknown>[];
+  readonly structuredContent?: unknown;
+  readonly isError?: boolean;
 }
 
 export interface SupervisorNativeControlHandle {
@@ -92,9 +111,31 @@ async function handleRequest(
     writeJson(response, 200, { ok: true, owner: OWNER, pid: process.pid });
     return;
   }
+  if (request.method === 'GET' && request.url === '/identity') {
+    if (operations.sourceIdentity === undefined) {
+      writeJson(response, 503, { error: 'identity_unavailable' });
+      return;
+    }
+    writeJson(response, 200, await operations.sourceIdentity());
+    return;
+  }
   if (request.method !== 'POST' || request.url !== '/mcp') {
     writeJson(response, 404, { error: 'not_found' });
     return;
+  }
+  if (operations.authorizeMcpRequest !== undefined) {
+    try {
+      await operations.authorizeMcpRequest(request.headers);
+    } catch (error: unknown) {
+      const runtimeError = error instanceof RuntimeError
+        ? error
+        : new RuntimeError('CONTROL_DENIED', 'Supervisor MCP request identity could not be verified', { cause: error });
+      const status = runtimeError.code === 'CONTROL_DENIED' ? 403
+        : runtimeError.code === 'CONNECTOR_BINDING_MISMATCH' || runtimeError.code === 'CONNECTOR_MANIFEST_STALE' || runtimeError.code === 'RUNTIME_IDENTITY_MISMATCH' ? 409
+          : 500;
+      writeJson(response, status, { error: { code: runtimeError.code, message: safeErrorMessage(runtimeError, 'Supervisor control operation failed') } });
+      return;
+    }
   }
   const rpc = await readJsonRpc(request);
   if (rpc === null) {
@@ -149,7 +190,7 @@ async function handleRequest(
     return;
   }
   if (rpc.method === 'tools/list') {
-    writeJsonRpcResult(response, rpc.id ?? null, { tools: nativeToolDefinitions() });
+    writeJsonRpcResult(response, rpc.id ?? null, { tools: unifiedToolDefinitions(operations) });
     return;
   }
   if (rpc.method !== 'tools/call') {
@@ -174,6 +215,35 @@ async function handleRequest(
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.supervisorStatus()));
       return;
     }
+    if (name === 'supervisor_doctor') {
+      requireNoArguments(args);
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.supervisorDoctor()));
+      return;
+    }
+    if (name === 'workload_on') {
+      requireNoArguments(args);
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.workloadOn()));
+      return;
+    }
+    if (name === 'workload_off') {
+      requireNoArguments(args);
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.workloadOff()));
+      return;
+    }
+    if (name === 'workload_restart') {
+      requireNoArguments(args);
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.workloadRestart()));
+      return;
+    }
+    if (name === 'source_identity') {
+      requireNoArguments(args);
+      if (operations.sourceIdentity === undefined) {
+        writeJsonRpcResult(response, rpc.id ?? null, toolResult({ state: 'SOURCE_IDENTITY_UNVERIFIED' }));
+        return;
+      }
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.sourceIdentity()));
+      return;
+    }
     if (name === 'admin_status') {
       requireNoArguments(args);
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.adminStatus()));
@@ -195,10 +265,15 @@ async function handleRequest(
     if (ACTIVATION_NAMES.has(name)) {
       const result = await operations.adminToolCall(name, args);
       writeJsonRpcResult(response, rpc.id ?? null, {
-        content: [{ type: 'text', text: JSON.stringify(result.structuredContent) }],
+        content: [{ type: 'text', text: safeSerialize(result.structuredContent) }],
         structuredContent: result.structuredContent,
         isError: result.isError,
       });
+      return;
+    }
+    if (operations.runtimeToolCall !== undefined
+      && (operations.runtimeToolDefinitions ?? []).some((definition) => definition.name === name)) {
+      writeJsonRpcResult(response, rpc.id ?? null, await operations.runtimeToolCall(name, args));
       return;
     }
   } catch (error) {
@@ -208,7 +283,7 @@ async function handleRequest(
   writeJsonRpcError(response, rpc.id ?? null, -32601, 'Unknown supervisor tool');
 }
 
-export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
+export function nativeToolDefinitions(includeSourceIdentity = false): readonly Record<string, unknown>[] {
   const noArgs = { type: 'object', properties: {}, additionalProperties: false };
   const activation = adminToolDefinitions().filter((tool) => typeof tool.name === 'string' && ACTIVATION_NAMES.has(tool.name));
   return [
@@ -218,6 +293,36 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
       inputSchema: noArgs,
       annotations: { readOnlyHint: true },
     },
+    {
+      name: 'supervisor_doctor',
+      description: 'Read truthful supervisor status and recovery diagnostics while the workload is running or intentionally OFF.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'workload_on',
+      description: 'Start only the supervisor-owned workload; the authenticated control gateway remains the authority.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    {
+      name: 'workload_off',
+      description: 'Stop only the verified supervisor-owned workload and preserve the control gateway and ownership metadata.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    {
+      name: 'workload_restart',
+      description: 'Idempotently restart the supervisor-owned workload through the explicit whole-stack restart boundary.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    ...(includeSourceIdentity ? [{
+      name: 'source_identity',
+      description: 'Read authenticated machine, deployment, tunnel, and source-tree identity from the Supervisor-owned candidate.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: true },
+    }] : []),
     {
       name: 'admin_status',
       description: 'Read the supervisor-owned admin child identity and bounded activation capability visibility without mutation.',
@@ -260,6 +365,20 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
     },
     ...activation,
   ];
+}
+
+function unifiedToolDefinitions(operations: SupervisorNativeOperations): readonly Record<string, unknown>[] {
+  const definitions = [
+    ...nativeToolDefinitions(operations.sourceIdentity !== undefined),
+    ...(operations.runtimeToolDefinitions ?? []),
+  ];
+  const seen = new Set<string>();
+  return definitions.filter((definition) => {
+    const name = typeof definition.name === 'string' ? definition.name : null;
+    if (name === null || seen.has(name)) return false;
+    seen.add(name);
+    return true;
+  });
 }
 
 function adminRecycleArguments(args: Record<string, unknown>): AdminRecycleInput {
@@ -312,15 +431,16 @@ function requiredBoundedString(args: Record<string, unknown>, key: string, maxLe
 }
 
 function toolResult(value: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value, isError: false as const };
+  const safeValue = redactStructuredValue(value);
+  return { content: [{ type: 'text' as const, text: safeSerialize(safeValue) }], structuredContent: safeValue, isError: false as const };
 }
 
 function toolErrorResult(error: unknown) {
   const code = error instanceof RuntimeError ? error.code : 'PERSISTENCE_FAILURE';
-  const message = error instanceof RuntimeError ? error.message : 'Supervisor native control operation failed';
-  const structuredContent = { error: { code, message } };
+  const message = safeErrorMessage(error, 'Supervisor native control operation failed');
+  const structuredContent = redactStructuredValue({ error: { code, message } });
   return {
-    content: [{ type: 'text' as const, text: JSON.stringify(structuredContent) }],
+    content: [{ type: 'text' as const, text: safeSerialize(structuredContent) }],
     structuredContent,
     isError: true as const,
   };
@@ -357,7 +477,7 @@ function writeJson(response: ServerResponse, status: number, value: unknown): vo
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
   });
-  response.end(JSON.stringify(value));
+  response.end(safeSerialize(value));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

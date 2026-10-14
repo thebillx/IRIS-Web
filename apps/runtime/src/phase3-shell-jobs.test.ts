@@ -7,6 +7,7 @@ import { PermissionAuditStore } from './audit.js';
 import { CapabilityService, type CapabilityOutcome } from './capability-service.js';
 import { DurableJobManager } from './durable-job-manager.js';
 import { executePhase3GroupedTool, phase3GroupedToolDefinitions } from './mcp-phase3.js';
+import { resolveDirectSessionIdentity } from './mcp-direct-context.js';
 import { catalogToolNames } from './mcp-catalog.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
@@ -24,6 +25,14 @@ afterEach(async () => {
 });
 
 describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
+  it('atomically reuses one tunnel session when direct calls race', async () => {
+    const fixture = await serviceFixture();
+    const request = new Request('http://127.0.0.1/mcp', { headers: { 'x-iris-client-id': 'phase3-racing-client' } });
+    const identities = await Promise.all(Array.from({ length: 8 }, () => resolveDirectSessionIdentity({}, request, fixture.state, fixture.projectA.id, 'tunnel-service')));
+    expect(new Set(identities.map((identity) => identity.sessionId)).size).toBe(1);
+    expect(fixture.state.listSessionsForClient('phase3-racing-client')).toHaveLength(1);
+  });
+
   it('AC-SEC-009 + AC-RDJ-006 rejects unknown/raw/inline execution forms and still runs a physical script in a project without package.json', async () => {
     const fixture = await serviceFixture();
     const primary = await fixture.resources.primaryWorkspace(fixture.projectA.id);
@@ -71,7 +80,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
       capabilityId: 'shell.run', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
       projectId: fixture.projectA.id, workspaceId: primaryB.workspaceId, executable: 'node', argv: ['hello.mjs'], cwd: '.',
       executionProfile: 'node-script', envOverrides: {}, timeoutMs: 5000, expectedEffects: ALL_EXECUTION_EFFECTS,
-    })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
   });
 
   it('DT-M02 + DT-M05 runs project-tool without session/effect ceremony and enforces macOS workspace confinement', async () => {
@@ -209,6 +218,11 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
       executionProfile: 'node-script', envOverrides: {}, timeoutMs: 5000, requestId, expectedEffects: ALL_EXECUTION_EFFECTS,
     }));
     expect(second.jobId).toBe(first.jobId);
+    const listed = executedValue<{ jobs: Array<Record<string, unknown>> }>(await fixture.service.execute({
+      capabilityId: 'job.list', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,
+      projectId: fixture.projectA.id, expectedEffects: ['READ'],
+    }));
+    expect(listed.jobs.some((job) => job.jobId === first.jobId && job.projectId === fixture.projectA.id && job.workspaceId === primary.workspaceId)).toBe(true);
 
     let cursor: string | undefined;
     let log = '';
@@ -323,7 +337,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     const fixture = await serviceFixture();
     expect(phase3GroupedToolDefinitions().map((tool) => tool.name)).toEqual(['shell','job']);
     expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['shell','job','workspace','fs','artifact','project_validation_run','project_validation_start']));
-    expect(catalogToolNames('FULL')).toHaveLength(56);
+    expect(catalogToolNames('FULL')).toHaveLength(57);
     expect(catalogToolNames('PRO')).toEqual(['list_projects','project_info','git_status','file_read','search']);
 
     await expect(runDeclaredProjectScript(fixture.projectARoot, 'anything')).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });

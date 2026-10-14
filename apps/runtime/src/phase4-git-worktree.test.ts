@@ -31,7 +31,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     const fixture = await serviceFixture();
     const definitions = phase4GroupedToolDefinitions();
     expect(definitions.map((tool) => tool.name)).toEqual(['git']);
-    expect(catalogToolNames('FULL')).toHaveLength(56);
+    expect(catalogToolNames('FULL')).toHaveLength(57);
     expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['git_status','git_local','remote_publish','workspace','fs','artifact','shell','job','git']));
     expect(catalogToolNames('PRO')).toEqual(['list_projects','project_info','git_status','file_read','search']);
 
@@ -153,6 +153,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     }));
     expect(created.workspace).toMatchObject({ role: 'WORKTREE', physicalRoot: destination, repositoryId: repoId, lifecycleState: 'ACTIVE' });
     expect((await lstat(path.join(destination, '.git'))).isFile()).toBe(true);
+    await fixture.state.bindSessionWorkspace(fixture.session.id, fixture.session.clientId, fixture.project.id, created.workspace.workspaceId);
 
     const read = executedValue<{ text: string }>(await fixture.service.execute({
       capabilityId: 'fs.read', clientId: fixture.session.clientId, sessionId: fixture.session.id,
@@ -162,6 +163,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     expect(await readFile(path.join(fixture.projectRoot, 'owned.txt'))).toEqual(beforeBytes);
     expect(await readFile(path.join(fixture.projectRoot, 'owner-untracked.txt'))).toEqual(beforeUntracked);
     expect((await git(fixture.projectRoot, ['status', '--porcelain=v1', '--untracked-files=all'])).stdout).toBe(beforeStatus);
+    await fixture.state.bindSessionWorkspace(fixture.session.id, fixture.session.clientId, fixture.project.id, fixture.primary.workspaceId);
 
     const sibling = path.join(path.dirname(fixture.projectRoot), `${path.basename(fixture.projectRoot)}-unrelated`);
     await mkdir(sibling);
@@ -171,7 +173,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     await expect(fixture.service.execute({
       capabilityId: 'fs.stat', clientId: fixture.session.clientId, sessionId: fixture.session.id,
       projectId: fixture.project.id, workspaceId: randomUUID(), path: '.', expectedEffects: ['READ'],
-    })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
 
     await expect(fixture.service.execute({
       capabilityId: 'git.worktree_add', operation: 'worktree_add', clientId: fixture.session.clientId, sessionId: fixture.session.id,
@@ -190,6 +192,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
       projectId: fixture.project.id, workspaceId: fixture.primary.workspaceId, repositoryId: repoId,
       branchName: 'feature/forged', baseRef: fixture.baseline, destinationPath: destination, expectedEffects: ['READ','WRITE','EXECUTE'],
     }));
+    await fixture.state.bindSessionWorkspace(fixture.session.id, fixture.session.clientId, fixture.project.id, created.workspace.workspaceId);
 
     const foreign = path.join(path.dirname(fixture.projectRoot), `${path.basename(fixture.projectRoot)}-foreign`);
     await mkdir(foreign);
@@ -233,6 +236,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
       projectId: fixture.project.id, workspaceId: fixture.primary.workspaceId, repositoryId: repoId,
       branchName: 'feature/remove', baseRef: fixture.baseline, destinationPath: destination, expectedEffects: ['READ','WRITE','EXECUTE'],
     }));
+    await fixture.state.bindSessionWorkspace(fixture.session.id, fixture.session.clientId, fixture.project.id, created.workspace.workspaceId);
     await writeFile(path.join(destination, 'dirty.txt'), 'dirty\n');
     await expect(fixture.service.execute({
       capabilityId: 'git.worktree_remove', operation: 'worktree_remove', clientId: fixture.session.clientId, sessionId: fixture.session.id,
@@ -241,6 +245,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
     expect((await fixture.resources.getWorkspace(fixture.project.id, created.workspace.workspaceId)).lifecycleState).toBe('ACTIVE');
 
+    await fixture.state.bindSessionWorkspace(fixture.session.id, fixture.session.clientId, fixture.project.id, fixture.primary.workspaceId);
     await expect(fixture.service.execute({
       capabilityId: 'git.worktree_remove', operation: 'worktree_remove', clientId: fixture.session.clientId, sessionId: fixture.session.id,
       projectId: fixture.project.id, workspaceId: fixture.primary.workspaceId, repositoryId: repoId,
@@ -250,9 +255,10 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
       capabilityId: 'git.worktree_remove', operation: 'worktree_remove', clientId: fixture.session.clientId, sessionId: fixture.session.id,
       projectId: fixture.project.id, workspaceId: randomUUID(), repositoryId: repoId,
       expectedEffects: ['READ','WRITE','EXECUTE','DESTRUCTIVE'],
-    })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
 
     await rm(path.join(destination, 'dirty.txt'));
+    await fixture.state.bindSessionWorkspace(fixture.session.id, fixture.session.clientId, fixture.project.id, created.workspace.workspaceId);
     const removed = executedValue<Record<string, unknown>>(await fixture.service.execute({
       capabilityId: 'git.worktree_remove', operation: 'worktree_remove', clientId: fixture.session.clientId, sessionId: fixture.session.id,
       projectId: fixture.project.id, workspaceId: created.workspace.workspaceId, repositoryId: repoId,

@@ -3,7 +3,20 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts", "./ado/knowledge-gate": "./src/ado/knowledge-gate/index.ts", "./ado/wiki": "./src/ado/wiki/index.ts" },
-  "scripts": { "test": "vitest run", "typecheck": "tsc -p tsconfig.json" },
-  "devDependencies": { "@types/node": "^24.3.0" }
+  "exports": {
+    ".": "./src/index.ts",
+    "./safe-output": {
+      "types": "./src/safe-output.d.mts",
+      "import": "./src/safe-output.mjs"
+    },
+    "./ado/knowledge-gate": "./src/ado/knowledge-gate/index.ts",
+    "./ado/wiki": "./src/ado/wiki/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0"
+  }
 }

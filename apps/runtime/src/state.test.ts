@@ -1,13 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RuntimeError, type MissionSnapshot } from '@iris/domain';
 import type { AgentExecutor } from './agent-executor.js';
 import { MissionLedgerStore, missionArchiveEligible } from './mission-store.js';
 import { FoundationStateStore } from './persistence.js';
 import { RuntimeState } from './state.js';
+import { primaryWorkspaceId, VNextResourceRegistry } from './resource-registry.js';
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
@@ -31,6 +32,137 @@ describe('runtime machine, client, and session state', () => {
     expect(state.getSessionForClient(firstSession.id, 'client-a').currentProjectId).toBe(firstProject.id);
     expect(state.getSessionForClient(secondSession.id, 'client-b').currentProjectId).toBe(secondProject.id);
     expect(state.listClients()).toHaveLength(2);
+  });
+
+  it('serializes project selection with submission publication', async () => {
+    const dataRoot = await temp('iris-session-selection-race-');
+    const projectRoot = await temp('iris-session-selection-project-');
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async () => ({ text: 'selection-safe' }),
+    };
+    const state = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const project = await state.registerProject('Selection project', projectRoot);
+    const session = state.createSession('selection-client', 'selection-agent', 'owner');
+
+    const selecting = state.setSessionCurrentProject(session.id, session.clientId, project.id);
+    const submitting = state.submitInstruction(session.id, session.clientId, 'selection-race', 'preserve both events');
+    await Promise.all([selecting, submitting]);
+
+    const final = state.getSessionForClient(session.id, session.clientId);
+    expect(final.currentProjectId).toBe(project.id);
+    expect(final.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
+  });
+
+  it('binds durable sessions to the current machine runtime authority', async () => {
+    const dataRoot = await temp('iris-session-authority-');
+    const authority = { machineId: randomUUID(), runtimeId: randomUUID() };
+    const first = new RuntimeState(new FoundationStateStore(dataRoot), undefined, undefined, undefined, authority);
+    const session = first.createSession('authority-client');
+    expect(session.id).toBeTruthy();
+    expect(() => new RuntimeState(new FoundationStateStore(dataRoot), undefined, undefined, undefined, { ...authority, machineId: randomUUID() }))
+      .toThrowError(expect.objectContaining({ code: 'AUTHORITY_CHANGED' }));
+    const resumed = new RuntimeState(new FoundationStateStore(dataRoot), undefined, undefined, undefined, authority);
+    expect(resumed.getSessionForClient(session.id, session.clientId).id).toBe(session.id);
+  });
+
+  it('persists the actual workspace binding and invalidates resume after workspace revocation', async () => {
+    const dataRoot = await realpath(await temp('iris-session-workspace-binding-'));
+    const projectRoot = await realpath(await temp('iris-session-workspace-project-'));
+    const first = new RuntimeState(new FoundationStateStore(dataRoot));
+    const project = await first.registerProject('Workspace binding project', projectRoot);
+    const workspace = await new VNextResourceRegistry(first, dataRoot).createScratch(project.id);
+    const session = first.createSession('workspace-client');
+    await first.setSessionCurrentProject(session.id, session.clientId, project.id);
+    await first.bindSessionWorkspace(session.id, session.clientId, project.id, workspace.workspaceId);
+    await expect(first.assertSessionWorkspace(session.id, session.clientId, project.id, workspace.workspaceId)).resolves.toBeUndefined();
+    await expect(first.assertSessionWorkspace(session.id, session.clientId, project.id, primaryWorkspaceId(project.id)))
+      .rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+    const otherProjectRoot = await realpath(await temp('iris-session-workspace-other-project-'));
+    const otherProject = await first.registerProject('Other workspace binding project', otherProjectRoot);
+    await expect(first.selectSessionWorkspace(session.id, session.clientId, otherProject.id, randomUUID()))
+      .rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
+    expect(first.getSessionForClient(session.id, session.clientId).currentProjectId).toBe(project.id);
+    expect(first.getSessionWorkspaceBinding(session.id, session.clientId)).toEqual({ projectId: project.id, workspaceId: workspace.workspaceId });
+
+    const replacement = new RuntimeState(new FoundationStateStore(dataRoot));
+    expect(replacement.getSessionWorkspaceBinding(session.id, session.clientId)).toEqual({ projectId: project.id, workspaceId: workspace.workspaceId });
+    await replacement.revalidateSessionBindings();
+    expect(replacement.getSessionForClient(session.id, session.clientId).id).toBe(session.id);
+
+    await new VNextResourceRegistry(replacement, dataRoot).revokeScratch(project.id, workspace.workspaceId);
+    await replacement.revalidateSessionBindings();
+    expect(() => replacement.getSessionForClient(session.id, session.clientId)).toThrowError(expect.objectContaining({ code: 'AUTHORITY_CHANGED' }));
+    await expect(replacement.deleteSessionDurable(session.id, session.clientId)).resolves.toBeUndefined();
+    expect(() => replacement.getSessionForDetach(session.id, session.clientId)).toThrowError(expect.objectContaining({ code: 'SESSION_NOT_FOUND' }));
+  });
+
+  it('rolls back fenced session admission when publication fails so the same submission can retry', async () => {
+    const dataRoot = await temp('iris-session-publication-rollback-');
+    let executions = 0;
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async ({ instruction }) => { executions += 1; return { text: `result:${instruction}` }; },
+    };
+    const state = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const session = state.createSession('publication-client');
+    const publication = vi.spyOn(state as unknown as { persistSessions: () => void }, 'persistSessions')
+      .mockImplementationOnce(() => { throw new RuntimeError('PERSISTENCE_FAILURE', 'injected session publication failure'); });
+
+    await expect(state.submitInstruction(session.id, session.clientId, 'retry-after-publication', 'retry this work'))
+      .rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    publication.mockRestore();
+
+    const retried = await state.submitInstruction(session.id, session.clientId, 'retry-after-publication', 'retry this work');
+    expect(executions).toBe(1);
+    expect(retried.interactions.map((event) => event.kind)).toEqual(['user', 'assistant']);
+  });
+
+  it('atomically ensures one durable tunnel session per client and project', async () => {
+    const dataRoot = await temp('iris-session-ensure-');
+    const projectRoot = await temp('iris-session-ensure-project-');
+    const state = new RuntimeState(new FoundationStateStore(dataRoot));
+    const project = await state.registerProject('Ensure project', projectRoot);
+    const ensured = await Promise.all(Array.from({ length: 8 }, () => state.ensureSessionForProjectDurable('tunnel-client', 'iris-tunnel-service', 'other', project.id)));
+    expect(new Set(ensured.map((session) => session.id)).size).toBe(1);
+    expect(state.listSessionsForClient('tunnel-client')).toHaveLength(1);
+    const publication = vi.spyOn(state as unknown as { persistSessions: () => void }, 'persistSessions')
+      .mockImplementationOnce(() => { throw new RuntimeError('PERSISTENCE_FAILURE', 'injected ensure publication failure'); });
+    await expect(state.ensureSessionForProjectDurable('new-tunnel-client', 'iris-tunnel-service', 'other', project.id))
+      .rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    publication.mockRestore();
+    expect(state.listSessionsForClient('new-tunnel-client')).toHaveLength(0);
+    await expect(state.ensureSessionForProjectDurable('new-tunnel-client', 'iris-tunnel-service', 'other', project.id)).resolves.toMatchObject({ currentProjectId: project.id });
+  });
+
+  it('returns an uncertain persistence outcome without appending a false failure after executor completion', async () => {
+    const dataRoot = await temp('iris-session-completion-publication-');
+    let executions = 0;
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async ({ instruction }) => { executions += 1; return { text: `result:${instruction}` }; },
+    };
+    const state = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const session = state.createSession('completion-publication-client');
+    const originalPublish = (state as unknown as { persistSessions: () => void }).persistSessions.bind(state);
+    const publication = vi.spyOn(state as unknown as { persistSessions: () => void }, 'persistSessions')
+      .mockImplementationOnce(originalPublish)
+      .mockImplementationOnce(() => { throw new RuntimeError('PERSISTENCE_FAILURE', 'injected completion publication failure'); });
+
+    await expect(state.submitInstruction(session.id, session.clientId, 'completion-uncertain', 'complete once'))
+      .rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE', message: expect.stringContaining('outcome is uncertain') });
+    expect(executions).toBe(1);
+    expect(state.getSessionForClient(session.id, session.clientId)).toMatchObject({ executionState: 'UNCERTAIN' });
+    expect(state.getSessionForClient(session.id, session.clientId).interactions.map((event) => event.kind)).toEqual(['user', 'error']);
+    expect(JSON.parse(await readFile(path.join(dataRoot, 'sessions.json'), 'utf8'))).toMatchObject({ sessions: [{ snapshot: { executionState: 'WORKING' } }] });
+
+    publication.mockRestore();
+    const duplicate = await state.submitInstruction(session.id, session.clientId, 'completion-uncertain', 'complete once');
+    expect(executions).toBe(1);
+    expect(duplicate.executionState).toBe('UNCERTAIN');
+    await expect(state.submitInstruction(session.id, session.clientId, 'new-after-uncertain', 'do not replay'))
+      .rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    expect(state.getSessionForClient(session.id, session.clientId).executionState).toBe('UNCERTAIN');
   });
 
   it('supports concurrent agent roles on one daemon without sharing session identity', async () => {
@@ -331,6 +463,59 @@ describe('runtime machine, client, and session state', () => {
     ]);
     expect(new Set((await state.listProjects()).map((project) => project.id))).toEqual(new Set([first.id, second.id]));
   });
+
+  it('rehydrates an ordinary session across runtime replacement and keeps submission deduplication owner-scoped', async () => {
+    const dataRoot = await temp('iris-durable-session-');
+    let executions = 0;
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async ({ instruction }) => { executions += 1; return { text: `result:${instruction}` }; },
+    };
+    const first = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const session = first.createSession('durable-client', 'durable-agent', 'owner');
+    await first.submitInstruction(session.id, session.clientId, 'durable-submission', 'persist this session');
+
+    const replacement = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    expect(replacement.getSessionForClient(session.id, session.clientId)).toMatchObject({
+      id: session.id,
+      clientId: session.clientId,
+      executionState: 'READY',
+      interactions: expect.arrayContaining([expect.objectContaining({ submissionId: 'durable-submission', kind: 'assistant' })]),
+    });
+    await replacement.submitInstruction(session.id, session.clientId, 'durable-submission', 'persist this session');
+    expect(executions).toBe(1);
+    expect(() => replacement.getSessionForClient(session.id, 'another-client')).toThrowError(expect.objectContaining({ code: 'CONTROL_DENIED' }));
+  });
+
+  it('marks an in-flight session uncertain after replacement without replaying its submission', async () => {
+    const dataRoot = await temp('iris-durable-session-interrupted-');
+    let release: ((value: { text: string }) => void) | undefined;
+    let executions = 0;
+    const executor: AgentExecutor = {
+      descriptor: { type: 'other', productionModelConnected: false },
+      execute: async () => {
+        executions += 1;
+        return new Promise<{ text: string }>((resolve) => { release = resolve; });
+      },
+    };
+    const first = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    const session = first.createSession('interrupted-client', 'interrupted-agent', 'owner');
+    const pending = first.submitInstruction(session.id, session.clientId, 'interrupted-submission', 'do not replay');
+    const persisted = JSON.parse(await readFile(path.join(dataRoot, 'sessions.json'), 'utf8')) as { sessions: Array<{ snapshot: { executionState: string } }> };
+    expect(persisted.sessions[0]?.snapshot.executionState).toBe('WORKING');
+
+    const replacement = new RuntimeState(new FoundationStateStore(dataRoot), executor);
+    expect(replacement.getSessionForClient(session.id, session.clientId).executionState).toBe('UNCERTAIN');
+    const recovered = JSON.parse(await readFile(path.join(dataRoot, 'sessions.json'), 'utf8')) as { sessions: Array<{ snapshot: { executionState: string } }> };
+    expect(recovered.sessions[0]?.snapshot.executionState).toBe('UNCERTAIN');
+    await expect(replacement.submitInstruction(session.id, session.clientId, 'interrupted-submission', 'do not replay')).resolves.toMatchObject({ executionState: 'UNCERTAIN' });
+    await expect(replacement.submitInstruction(session.id, session.clientId, 'new-after-uncertain', 'do not start')).rejects.toThrowError(expect.objectContaining({ code: 'PERSISTENCE_FAILURE' }));
+    expect(executions).toBe(1);
+
+    release?.({ text: 'late result' });
+    await pending;
+  });
+
 });
 
 function seededMission(

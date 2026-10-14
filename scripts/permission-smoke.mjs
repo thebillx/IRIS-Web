@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -12,9 +13,10 @@ const projectRoot = await mkdtemp(path.join(artifactRoot, 'permission-smoke-proj
 const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-permission-smoke-data-'));
 const outsideRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-permission-smoke-outside-'));
 const node = resolveCanonicalNode();
-const environment = node24Environment(process.env, { IRIS_RUNTIME_DATA_ROOT: dataRoot });
+const ownerAccessToken = randomBytes(32).toString('base64url');
+await writeFile(path.join(dataRoot, 'owner-access.json'), `${JSON.stringify({ schemaVersion: 1, secret: ownerAccessToken })}\n`, { mode: 0o600 });
+const environment = node24Environment(process.env, { IRIS_RUNTIME_DATA_ROOT: dataRoot, IRIS_OWNER_ACCESS_TOKEN: ownerAccessToken });
 let dev;
-let ownerAccessToken = '';
 
 try {
   const endpoints = endpointPromise();
@@ -29,8 +31,7 @@ try {
   pipeAndDiscover(dev.stdout, endpoints.observe);
   dev.once('exit', (code) => endpoints.exit(code, stderr.join('')));
 
-  const { runtimeUrl, webUrl, ownerToken } = await endpoints.ready;
-  ownerAccessToken = ownerToken;
+  const { runtimeUrl, webUrl } = await endpoints.ready;
   const health = await requestJson(`${webUrl}health`);
   if (health.apiUrl !== runtimeUrl) throw new Error('Web proxy did not attach to the discovered runtime');
 
@@ -110,15 +111,14 @@ try {
 function endpointPromise() {
   let runtimeUrl;
   let webUrl;
-  let ownerToken;
   let resolveReady;
   let rejectReady;
   const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
   const timeout = globalThis.setTimeout(() => rejectReady(new Error('Timed out waiting for runtime/Web owner endpoints')), 20_000);
   const check = () => {
-    if (runtimeUrl !== undefined && webUrl !== undefined && ownerToken !== undefined) {
+    if (runtimeUrl !== undefined && webUrl !== undefined) {
       globalThis.clearTimeout(timeout);
-      resolveReady({ runtimeUrl, webUrl, ownerToken });
+      resolveReady({ runtimeUrl, webUrl });
     }
   };
   return {
@@ -126,15 +126,12 @@ function endpointPromise() {
     observe(line) {
       const runtimeMatch = /^IRIS_RUNTIME_URL=(http:\/\/127\.0\.0\.1:\d+)$/.exec(line.trim());
       if (runtimeMatch) runtimeUrl = `${runtimeMatch[1]}`;
-      const ownerMatch = /^IRIS_OWNER_URL=(http:\/\/127\.0\.0\.1:\d+\/)#owner=([A-Za-z0-9_-]{40,128})$/.exec(line.trim());
-      if (ownerMatch) {
-        webUrl = ownerMatch[1];
-        ownerToken = ownerMatch[2];
-      }
+      const webMatch = /^IRIS_WEB_URL=(http:\/\/127\.0\.0\.1:\d+\/)$/.exec(line.trim());
+      if (webMatch) webUrl = webMatch[1];
       check();
     },
     exit(code, stderr) {
-      if (runtimeUrl === undefined || webUrl === undefined || ownerToken === undefined) {
+      if (runtimeUrl === undefined || webUrl === undefined) {
         globalThis.clearTimeout(timeout);
         rejectReady(new Error(`pnpm dev exited before readiness (${code ?? 'signal'}): ${stderr}`));
       }

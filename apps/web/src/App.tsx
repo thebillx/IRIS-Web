@@ -13,12 +13,29 @@ type Health = {
   connectedSessions: number;
   agentExecutorType: 'local-development-executor' | 'production-provider-executor' | 'other';
   productionModelConnected: boolean;
+  machineId?: string;
   apiUrl: string;
   mcpUrl: string;
 };
+type SupervisorStatus = {
+  state?: string;
+  readiness?: string;
+  workloadState?: string;
+  workloadDesiredState?: string;
+  code?: string;
+  detail?: string;
+  affectedJobs?: number | null;
+  machineId?: string;
+  tunnel?: { state?: string; code?: string; detail?: string };
+};
+type DurableJob = { jobId: string; requestId: string; projectId: string; workspaceId: string; state: string; startedAt: string; finishedAt: string | null; exitCode?: number | null; signal?: string | null; cancelRequested?: boolean };
+type JobLog = { stream: 'stdout' | 'stderr'; text: string; cursor: string; eof: boolean; bytes: number };
+type JobResult = { jobId: string; state: string; exitCode: number | null; signal: string | null; startedAt: string; finishedAt: string | null; logArtifactIds: string[]; artifactIds: string[] };
+type JobLogs = Record<string, Partial<Record<'stdout' | 'stderr', JobLog>>>;
+type JobViewState = 'IDLE' | 'LOADING' | 'READY' | 'EMPTY' | 'ERROR' | 'UNAVAILABLE';
 
 type Project = { id: string; name: string; rootPath: string };
-type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED';
+type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED' | 'UNCERTAIN';
 type SessionInteraction = {
   id: string;
   timestamp: string;
@@ -131,12 +148,20 @@ type MissionLifecycleAction = 'resume' | 'cancel';
 const WEB_CLIENT_ID_KEY = 'iris.web.clientId';
 const WEB_OWNER_TOKEN_KEY = 'iris.web.ownerToken';
 const WEB_SELECTED_SESSION_KEY = 'iris.web.selectedSessionId';
+const OWNER_ACCESS_TOKEN_PATTERN = /^[A-Za-z0-9_-]{40,128}$/;
+
+declare global {
+  interface Window {
+    __IRIS_OWNER_ACCESS_TOKEN__?: unknown;
+  }
+}
 
 export function App(): ReactElement {
   const [clientId] = useState(webClientId);
   const [ownerAccessToken] = useState(readOwnerAccessToken);
   const [view, setView] = useState<View>('runtime');
   const [health, setHealth] = useState<Health | null>(null);
+  const [supervisorStatus, setSupervisorStatus] = useState<SupervisorStatus | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [defaultProjectId, setDefaultProjectId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -150,11 +175,38 @@ export function App(): ReactElement {
   const [submittingSessionIds, setSubmittingSessionIds] = useState<Set<string>>(() => new Set());
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [jobs, setJobs] = useState<DurableJob[]>([]);
+  const [jobLogs, setJobLogs] = useState<JobLogs>({});
+  const [jobResults, setJobResults] = useState<Record<string, JobResult>>({});
+  const [jobViewState, setJobViewState] = useState<JobViewState>('IDLE');
+  const [jobError, setJobError] = useState('');
+  const jobGeneration = useRef(0);
+  const jobAbort = useRef<AbortController | null>(null);
+  const jobCacheContext = useRef<string | null>(null);
+  const jobContext = useRef<{ sessionId: string; clientId: string; projectId: string } | null>(null);
+
+  const refreshSupervisor = useCallback(async () => {
+    if (ownerAccessToken.length === 0) { setSupervisorStatus(null); return; }
+    try {
+      const response = await authorizedFetch(ownerAccessToken, '/supervisor-control/healthz');
+      if (!response.ok) throw new Error('Supervisor bridge unavailable');
+      const control = await supervisorCall<SupervisorStatus>(ownerAccessToken, 'supervisor_status');
+      setSupervisorStatus(control);
+    } catch {
+      setSupervisorStatus({ state: 'BLOCKED', code: 'SUPERVISOR_BRIDGE_UNAVAILABLE', detail: 'Authenticated Supervisor control is unavailable' });
+    }
+  }, [ownerAccessToken]);
 
   const refresh = useCallback(async () => {
+    const supervisorRefresh = refreshSupervisor();
     try {
       const healthResponse = await fetch('/health');
-      if (!healthResponse.ok) throw new Error('Runtime unavailable');
+      if (!healthResponse.ok) {
+        await supervisorRefresh;
+        setHealth(null);
+        setError('Runtime unavailable. Persistent Supervisor status was checked separately.');
+        return;
+      }
       setHealth(await healthResponse.json() as Health);
       if (ownerAccessToken.length === 0) {
         setProjects([]);
@@ -162,7 +214,7 @@ export function App(): ReactElement {
         setSessions([]);
         setMissions([]);
         setPermissions(null);
-        setError('Owner access is locked. Open the IRIS_OWNER_URL printed by pnpm dev.');
+        setError('Owner access is locked. Provide IRIS_OWNER_ACCESS_TOKEN to the local dev process or use the managed Supervisor Web binding.');
         return;
       }
       const [projectsResponse, sessionsResponse, missionsResponse, permissionsResponse] = await Promise.all([
@@ -185,12 +237,13 @@ export function App(): ReactElement {
       setSelectedSessionId(nextSelectedSessionId);
       persistSelectedSessionId(nextSelectedSessionId);
       setPermissions(await permissionsResponse.json() as PermissionSnapshot);
+      await supervisorRefresh;
       setError('');
     } catch (cause) {
       setHealth(null);
       setError(cause instanceof Error ? cause.message : 'Runtime unavailable');
     }
-  }, [clientId, ownerAccessToken]);
+  }, [clientId, ownerAccessToken, refreshSupervisor]);
 
   useEffect(() => {
     void refresh();
@@ -199,6 +252,110 @@ export function App(): ReactElement {
   }, [refresh]);
 
   const selectedSession = sessions.find((candidate) => candidate.id === selectedSessionId) ?? null;
+  const jobSessionId = selectedSession?.id ?? null;
+  const jobClientId = selectedSession?.clientId ?? null;
+  const jobProjectId = selectedSession?.currentProjectId ?? null;
+  const jobContextKey = jobSessionId !== null && jobClientId !== null && jobProjectId !== null
+    ? `${jobSessionId}\u0000${jobClientId}\u0000${jobProjectId}`
+    : null;
+  jobContext.current = jobSessionId !== null && jobClientId !== null && jobProjectId !== null
+    ? { sessionId: jobSessionId, clientId: jobClientId, projectId: jobProjectId }
+    : null;
+  const refreshJobs = useCallback(async () => {
+    const context = jobSessionId !== null && jobClientId !== null && jobProjectId !== null
+      ? { sessionId: jobSessionId, clientId: jobClientId, projectId: jobProjectId }
+      : null;
+    const generation = jobGeneration.current + 1;
+    jobGeneration.current = generation;
+    jobAbort.current?.abort();
+    if (context === null || ownerAccessToken.length === 0) {
+      setJobs([]); setJobLogs({}); setJobResults({}); setJobError(''); setJobViewState('IDLE');
+      return;
+    }
+    const controller = new AbortController();
+    jobAbort.current = controller;
+    setJobViewState('LOADING');
+    setJobError('');
+    try {
+      const response = await authorizedFetch(ownerAccessToken, `/jobs?projectId=${encodeURIComponent(context.projectId)}`, {
+        signal: controller.signal,
+        headers: { 'x-iris-client-id': context.clientId, 'x-iris-session-id': context.sessionId },
+      });
+      const body = response.ok ? await response.json() as { jobs?: DurableJob[] } : null;
+      if (generation !== jobGeneration.current || controller.signal.aborted) return;
+      if (!response.ok || !Array.isArray(body?.jobs)) {
+        setJobs([]); setJobLogs({}); setJobResults({});
+        setJobViewState(response.status === 401 || response.status === 403 ? 'UNAVAILABLE' : 'ERROR');
+        setJobError(response.ok ? 'Runtime returned an invalid durable job response' : `Durable jobs unavailable (${response.status})`);
+        return;
+      }
+      const scopedJobs = body.jobs.filter((job) => job.projectId === context.projectId);
+      const jobIds = new Set(scopedJobs.map((job) => job.jobId));
+      setJobs(scopedJobs);
+      setJobLogs((current) => Object.fromEntries(Object.entries(current).filter(([jobId]) => jobIds.has(jobId))));
+      setJobResults((current) => Object.fromEntries(Object.entries(current).filter(([jobId]) => jobIds.has(jobId))));
+      setJobError('');
+      setJobViewState(scopedJobs.length === 0 ? 'EMPTY' : 'READY');
+    } catch (cause) {
+      if (controller.signal.aborted || generation !== jobGeneration.current) return;
+      setJobs([]); setJobLogs({}); setJobResults({});
+      setJobViewState('ERROR');
+      setJobError(cause instanceof Error ? cause.message : 'Durable job status is unavailable');
+    }
+  }, [jobClientId, jobProjectId, jobSessionId, ownerAccessToken]);
+
+  useEffect(() => {
+    if (jobCacheContext.current === jobContextKey) return;
+    jobCacheContext.current = jobContextKey;
+    setJobs([]);
+    setJobLogs({});
+    setJobResults({});
+    setJobError('');
+    setJobViewState(jobContextKey === null ? 'IDLE' : 'LOADING');
+  }, [jobContextKey]);
+
+  useEffect(() => {
+    void refreshJobs();
+    const timer = window.setInterval(() => void refreshJobs(), 3_000);
+    return () => { window.clearInterval(timer); jobAbort.current?.abort(); };
+  }, [refreshJobs]);
+
+  const cancelJob = useCallback(async (job: DurableJob) => {
+    const context = jobContext.current;
+    if (context === null || context.projectId !== job.projectId) return;
+    const response = await authorizedFetch(ownerAccessToken, `/jobs/${encodeURIComponent(job.jobId)}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-iris-client-id': context.clientId, 'x-iris-session-id': context.sessionId }, body: JSON.stringify({ projectId: job.projectId }) });
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
+    if (!response.ok) throw new Error(await responseMessage(response, 'Job cancellation was not verified'));
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
+    await refreshJobs();
+  }, [ownerAccessToken, refreshJobs]);
+
+  const readJobLogs = useCallback(async (job: DurableJob, stream: 'stdout' | 'stderr', cursor?: string) => {
+    const context = jobContext.current;
+    if (context === null || context.projectId !== job.projectId) return;
+    const query = `/jobs/${encodeURIComponent(job.jobId)}/logs?projectId=${encodeURIComponent(job.projectId)}&stream=${stream}${cursor === undefined ? '' : `&cursor=${encodeURIComponent(cursor)}`}`;
+    const response = await authorizedFetch(ownerAccessToken, query, { headers: { 'x-iris-client-id': context.clientId, 'x-iris-session-id': context.sessionId } });
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
+    if (!response.ok) throw new Error(await responseMessage(response, 'Job output is unavailable'));
+    const log = await response.json() as JobLog;
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
+    setJobLogs((current) => {
+      const previous = current[job.jobId]?.[stream];
+      const append = cursor !== undefined && previous?.cursor === cursor;
+      return { ...current, [job.jobId]: { ...current[job.jobId], [stream]: { ...log, text: append ? `${previous.text}${log.text}` : log.text } } };
+    });
+  }, [ownerAccessToken]);
+
+  const readJobResult = useCallback(async (job: DurableJob) => {
+    const context = jobContext.current;
+    if (context === null || context.projectId !== job.projectId) return;
+    const response = await authorizedFetch(ownerAccessToken, `/jobs/${encodeURIComponent(job.jobId)}?projectId=${encodeURIComponent(job.projectId)}&view=result`, { headers: { 'x-iris-client-id': context.clientId, 'x-iris-session-id': context.sessionId } });
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
+    if (!response.ok) throw new Error(await responseMessage(response, 'Job result is unavailable'));
+    const result = await response.json() as JobResult;
+    if (jobContext.current?.sessionId !== context.sessionId || jobContext.current?.projectId !== context.projectId) return;
+    setJobResults((current) => ({ ...current, [job.jobId]: result }));
+  }, [ownerAccessToken]);
   const visibleApprovals = (permissions?.pendingApprovals ?? []).filter((approval) =>
     approvalBelongsToSessionContext(approval, clientId, selectedSessionId),
   );
@@ -354,6 +511,13 @@ export function App(): ReactElement {
     await refresh();
   };
 
+  const supervisorOperation = async (name: 'workload_on' | 'workload_off' | 'workload_restart' | 'supervisor_doctor') => {
+    const result = await supervisorCall<SupervisorStatus>(ownerAccessToken, name);
+    setSupervisorStatus(result);
+    setNotice(`${name.replaceAll('_', ' ')} completed only after Supervisor verification.`);
+    await refresh();
+  };
+
   const resolveApproval = async (approval: PendingApproval, decision: ApprovalChoice) => {
     if (!approvalBelongsToSessionContext(approval, clientId, selectedSessionId)) {
       throw new Error('Switch to the session that owns this approval before resolving it.');
@@ -384,6 +548,28 @@ export function App(): ReactElement {
     setNotice('Session resumed.');
   };
 
+  const detachSession = async () => {
+    const target = selectedSession;
+    if (target === null) return;
+    if (target.executionState === 'WORKING') {
+      throw new Error('This session has an active execution; verify it before detaching.');
+    }
+    const response = await authorizedFetch(ownerAccessToken, `/sessions/${encodeURIComponent(target.id)}`, {
+      method: 'DELETE', headers: { 'x-iris-client-id': target.clientId },
+    });
+    if (response.status === 409) {
+      setNotice('Detaching this session requires an owner decision. Nothing was detached.');
+      setView('approvals');
+      await refresh();
+      return;
+    }
+    if (!response.ok) throw new Error(await responseMessage(response, 'Could not detach session'));
+    persistSelectedSessionId(null);
+    setSelectedSessionId(null);
+    setNotice('Session detached. Its durable record was removed after runtime verification.');
+    await refresh();
+  };
+
   const run = (operation: () => Promise<void>) => {
     setError('');
     void operation().catch((cause) => setError(cause instanceof Error ? cause.message : 'Operation failed'));
@@ -397,14 +583,10 @@ export function App(): ReactElement {
     ? []
     : (permissions?.recentDecisions ?? []).filter((event) => event.sessionId === selectedSession.id).slice(0, 5);
   const productStatus = health === null
-    ? 'Disconnected'
-    : visibleApprovals.length > 0
-      ? 'Approval required'
-      : selectedSession?.executionState === 'WORKING'
-        ? 'Working'
-        : selectedSession?.executionState === 'FAILED'
-          ? 'Error'
-          : health.status === 'ready' ? 'Ready' : 'Working';
+    ? 'Offline'
+    : visibleApprovals.length > 0 || selectedSession?.executionState === 'FAILED' || health.status !== 'ready'
+      ? 'Needs Attention'
+      : 'Online';
 
   return <div className="app-frame">
     <header className="web-header">
@@ -412,47 +594,70 @@ export function App(): ReactElement {
         <span className="brand-mark" aria-hidden="true">I</span>
         <div><strong>IRIS</strong><small>Local Workspace</small></div>
       </div>
-      <nav aria-label="IRIS sections">
-        <button className={view === 'runtime' ? 'is-active' : ''} onClick={() => setView('runtime')}>Workspace</button>
-        <button className={view === 'permissions' ? 'is-active' : ''} onClick={() => setView('permissions')}>Settings · Permissions</button>
-        <button className={view === 'approvals' ? 'is-active' : ''} onClick={() => setView('approvals')}>
-          Approval Center{visibleApprovals.length > 0 ? ` (${visibleApprovals.length})` : ''}
-        </button>
-      </nav>
+      <div className="header-context" aria-label="Machine context">
+        <span>Local control plane</span>
+        <strong>{health?.machineId ? `Machine ${health.machineId.slice(0, 8)}` : 'Identity pending'}</strong>
+      </div>
       <span className={`header-status ${health ? 'is-online' : ''}`}>{productStatus}</span>
     </header>
 
-    <main>
-      {error && <p className="error" role="alert">{error}</p>}
-      {notice && <p className="notice" role="status">{notice}</p>}
-      {view === 'runtime' && <RuntimePage
-        health={health}
-        projects={projects}
-        defaultProject={defaultProject}
-        activeProject={activeProject}
-        sessions={sessions}
-        missions={missions}
-        selectedSession={selectedSession}
-        sessionActivity={currentSessionActivity}
-        pendingApprovalCount={visibleApprovals.length}
-        instruction={instruction}
-        isSubmitting={selectedSession !== null && submittingSessionIds.has(selectedSession.id)}
-        name={name}
-        rootPath={rootPath}
-        setName={setName}
-        setRootPath={setRootPath}
-        setInstruction={setInstruction}
-        onCreateSession={() => run(createSession)}
-        onSubmitInstruction={() => run(submitInstruction)}
-        onSelectSession={selectSession}
-        onRegisterProject={() => run(registerProject)}
-        onSelectProject={(projectId) => run(() => selectProject(projectId))}
-        onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
-        onRequestMissionLifecycleAction={(mission, action) => run(() => requestMissionLifecycleAction(mission, action))}
-      />}
-      {view === 'permissions' && <PermissionsPage permissions={permissions} onRequestMode={(mode) => run(() => requestMode(mode))} />}
-      {view === 'approvals' && <ApprovalCenter approvals={visibleApprovals} selectedSession={selectedSession} onReview={setSelectedApproval} />}
-    </main>
+    <div className="app-shell">
+      <aside className="app-sidebar" aria-label="IRIS navigation">
+        <div className="sidebar-heading"><span className="sidebar-kicker">Control center</span><strong>Operate locally</strong></div>
+        <nav className="sidebar-nav" aria-label="IRIS sections">
+          <button className={view === 'runtime' ? 'is-active' : ''} onClick={() => setView('runtime')}><span className="nav-glyph" aria-hidden="true" />Workspace</button>
+          <button className={view === 'permissions' ? 'is-active' : ''} onClick={() => setView('permissions')}><span className="nav-glyph" aria-hidden="true" />Settings · Permissions</button>
+          <button className={view === 'approvals' ? 'is-active' : ''} onClick={() => setView('approvals')}><span className="nav-glyph" aria-hidden="true" />Approval Center{visibleApprovals.length > 0 ? ` (${visibleApprovals.length})` : ''}</button>
+        </nav>
+        <div className="sidebar-footer">
+          <span className={`identity-dot ${health ? 'is-online' : ''}`} aria-hidden="true" />
+          <div><strong>Local authority</strong><small>{health ? 'Runtime connected' : 'Awaiting runtime'}</small></div>
+        </div>
+      </aside>
+
+      <main>
+        {error && <p className="error" role="alert">{error}</p>}
+        {notice && <p className="notice" role="status">{notice}</p>}
+        {view === 'runtime' && <RuntimePage
+          health={health}
+          supervisorStatus={supervisorStatus}
+          projects={projects}
+          defaultProject={defaultProject}
+          activeProject={activeProject}
+          sessions={sessions}
+          missions={missions}
+          selectedSession={selectedSession}
+          sessionActivity={currentSessionActivity}
+          pendingApprovalCount={visibleApprovals.length}
+          instruction={instruction}
+          isSubmitting={selectedSession !== null && submittingSessionIds.has(selectedSession.id)}
+          name={name}
+          rootPath={rootPath}
+          setName={setName}
+          setRootPath={setRootPath}
+          setInstruction={setInstruction}
+          onCreateSession={() => run(createSession)}
+          onSubmitInstruction={() => run(submitInstruction)}
+          onSelectSession={selectSession}
+          onDetachSession={() => run(detachSession)}
+          onRegisterProject={() => run(registerProject)}
+          onSelectProject={(projectId) => run(() => selectProject(projectId))}
+          onSupervisorOperation={(operation) => run(() => supervisorOperation(operation))}
+          jobs={jobs}
+          jobLogs={jobLogs}
+          jobResults={jobResults}
+          jobViewState={jobViewState}
+          jobError={jobError}
+          onCancelJob={(job) => run(() => cancelJob(job))}
+          onReadJobLogs={(job, stream, cursor) => run(() => readJobLogs(job, stream, cursor))}
+          onReadJobResult={(job) => run(() => readJobResult(job))}
+          onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
+          onRequestMissionLifecycleAction={(mission, action) => run(() => requestMissionLifecycleAction(mission, action))}
+        />}
+        {view === 'permissions' && <PermissionsPage permissions={permissions} onRequestMode={(mode) => run(() => requestMode(mode))} />}
+        {view === 'approvals' && <ApprovalCenter approvals={visibleApprovals} selectedSession={selectedSession} onReview={setSelectedApproval} />}
+      </main>
+    </div>
 
     <ApprovalReview
       approval={selectedApproval}
@@ -464,6 +669,7 @@ export function App(): ReactElement {
 
 export function RuntimePage(props: {
   health: Health | null;
+  supervisorStatus?: SupervisorStatus | null;
   projects: Project[];
   defaultProject: Project | null;
   activeProject: Project | null;
@@ -482,8 +688,18 @@ export function RuntimePage(props: {
   onCreateSession(): void;
   onSubmitInstruction(): void;
   onSelectSession(sessionId: string): void;
+  onDetachSession?(): void;
   onRegisterProject(): void;
   onSelectProject(projectId: string): void;
+  onSupervisorOperation?(operation: 'workload_on' | 'workload_off' | 'workload_restart' | 'supervisor_doctor'): void;
+  jobs?: DurableJob[];
+  jobLogs?: JobLogs;
+  jobResults?: Record<string, JobResult>;
+  jobViewState?: JobViewState;
+  jobError?: string;
+  onCancelJob?(job: DurableJob): void;
+  onReadJobLogs?(job: DurableJob, stream: 'stdout' | 'stderr', cursor?: string): void;
+  onReadJobResult?(job: DurableJob): void;
   onRequestMissionOrchestrator(mission: Mission, targetMode: OrchestratorMode): void;
   onRequestMissionLifecycleAction?(mission: Mission, action: MissionLifecycleAction): void;
 }): ReactElement {
@@ -491,12 +707,25 @@ export function RuntimePage(props: {
     ? 'Disconnected'
     : props.pendingApprovalCount > 0
       ? 'Approval required'
+      : props.selectedSession?.executionState === 'UNCERTAIN'
+        ? 'Outcome uncertain'
       : props.selectedSession?.executionState === 'WORKING'
         ? 'Working'
         : props.selectedSession?.executionState === 'FAILED' ? 'Failed' : 'Ready';
+  const activeJobSummary = props.jobViewState === 'LOADING'
+    ? '…'
+    : props.jobViewState === 'ERROR' || props.jobViewState === 'UNAVAILABLE' || props.jobViewState === 'IDLE'
+      ? '—'
+      : String((props.jobs ?? []).filter((job) => job.state === 'QUEUED' || job.state === 'RUNNING').length);
 
   return <>
-    <div className="page-heading"><div><p className="eyebrow">Daily workspace</p><h1>IRIS</h1><p>One local daemon, your projects, and resumable browser sessions.</p></div></div>
+    <div className="page-heading"><div><p className="eyebrow">Daily workspace</p><h1>IRIS</h1><p>One local daemon, your projects, and resumable browser sessions.</p></div><span className="page-context">Owner workspace<br /><strong>Local-first operations</strong></span></div>
+    <div className="ops-summary" aria-label="Operational summary">
+      <article className="ops-card ops-card--runtime"><span className="ops-card-label">Runtime</span><strong>{props.health?.status ?? 'UNKNOWN'}</strong><span className="ops-card-detail">{props.health?.runtimeId ?? 'No runtime identity'}</span></article>
+      <article className="ops-card ops-card--gateway"><span className="ops-card-label">Supervisor gateway</span><strong>{props.supervisorStatus?.state ?? 'UNKNOWN'}</strong><span className="ops-card-detail">{props.supervisorStatus?.readiness ?? 'Control path not verified'}</span></article>
+      <article className="ops-card ops-card--tunnel"><span className="ops-card-label">Tunnel</span><strong>{props.supervisorStatus?.tunnel?.state ?? 'UNKNOWN'}</strong><span className="ops-card-detail">{props.supervisorStatus?.tunnel?.detail ?? 'Provider state not reported'}</span></article>
+      <article className="ops-card ops-card--jobs"><span className="ops-card-label">Active jobs</span><strong>{activeJobSummary}</strong><span className="ops-card-detail">{props.jobViewState === 'LOADING' ? 'Checking project scope' : props.jobViewState === 'ERROR' || props.jobViewState === 'UNAVAILABLE' ? 'Status unavailable' : 'Captured to this project'}</span></article>
+    </div>
     <div className="workspace-grid">
       <aside className="workspace-rail">
         <section className="active-project-card" aria-labelledby="active-project-heading">
@@ -513,7 +742,7 @@ export function RuntimePage(props: {
         <section className="sessions-card" aria-labelledby="sessions-heading">
           <div className="section-title-row"><div><p className="section-label">Sessions</p><h2 id="sessions-heading">Your sessions</h2></div><button onClick={props.onCreateSession}>+ New</button></div>
           {props.sessions.length === 0
-            ? <div className="empty-state"><p>No sessions yet.</p><span>Start one to work with a project. Sessions live in the local daemon and resume across browser refreshes while that daemon is running.</span></div>
+            ? <div className="empty-state"><p>No sessions yet.</p><span>Start one to work with a project. Sessions live in the local daemon and resume across supported runtime replacement.</span></div>
             : <div className="session-list">{props.sessions.map((session, index) => {
               const selected = session.id === props.selectedSession?.id;
               const project = session.currentProjectId === null ? null : props.projects.find((candidate) => candidate.id === session.currentProjectId) ?? null;
@@ -531,7 +760,7 @@ export function RuntimePage(props: {
           {props.selectedSession === null
             ? <div className="empty-state prominent"><p>Create a session or resume one from the list.</p><button onClick={props.onCreateSession}>Create session</button></div>
             : <>
-              <div className="session-summary"><div><span>Role</span><strong>{props.selectedSession.agentRole}</strong></div><div><span>Agent</span><strong>{humanAgentName(props.selectedSession.agentId)}</strong></div><div><span>Started</span><strong><time dateTime={props.selectedSession.createdAt}>{formatSessionTime(props.selectedSession.createdAt)}</time></strong></div></div>
+              <div className="session-summary"><div><span>Role</span><strong>{props.selectedSession.agentRole}</strong></div><div><span>Agent</span><strong>{humanAgentName(props.selectedSession.agentId)}</strong></div><div><span>Started</span><strong><time dateTime={props.selectedSession.createdAt}>{formatSessionTime(props.selectedSession.createdAt)}</time></strong></div><button type="button" onClick={props.onDetachSession} disabled={props.onDetachSession === undefined || props.selectedSession.executionState === 'WORKING'}>Detach session</button></div>
               <label>Active project<select value={props.selectedSession.currentProjectId ?? ''} onChange={(event) => props.onSelectProject(event.target.value)}><option value="">No active project</option>{props.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
               {props.health?.agentExecutorType === 'local-development-executor' && !props.health.productionModelConnected
                 ? <p className="executor-note">Development executor active · no production model connected.</p>
@@ -555,10 +784,10 @@ export function RuntimePage(props: {
                   maxLength={8000}
                   rows={3}
                   placeholder={props.health === null ? 'Runtime unavailable' : 'Tell IRIS what to do…'}
-                  disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting}
+                  disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.selectedSession.executionState === 'UNCERTAIN' || props.isSubmitting}
                   onChange={(event) => props.setInstruction(event.target.value)}
                 />
-                <div className="composer-actions"><span>{props.selectedSession.executionState === 'WORKING' ? 'Runtime is working on this session.' : 'Enter sends only when you choose Send.'}</span><button type="submit" disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting || props.instruction.trim().length === 0}>{props.isSubmitting ? 'Sending…' : 'Send'}</button></div>
+                <div className="composer-actions"><span>{props.selectedSession.executionState === 'WORKING' ? 'Runtime is working on this session.' : props.selectedSession.executionState === 'UNCERTAIN' ? 'Execution outcome is uncertain; verify durable state before continuing.' : 'Enter sends only when you choose Send.'}</span><button type="submit" disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.selectedSession.executionState === 'UNCERTAIN' || props.isSubmitting || props.instruction.trim().length === 0}>{props.isSubmitting ? 'Sending…' : 'Send'}</button></div>
               </form>
               <details className="session-runtime-activity"><summary>Runtime activity</summary>{props.sessionActivity.length === 0 ? <p>No recorded runtime activity in this session yet.</p> : <ul>{props.sessionActivity.map((event) => <li key={event.id}><strong>{humanCapability(event.capabilityId)}</strong><span>{event.result.toLowerCase()}</span></li>)}</ul>}</details>
             </>}
@@ -569,6 +798,48 @@ export function RuntimePage(props: {
         <section className="projects-card"><div className="section-title-row"><div><p className="section-label">Projects</p><h2>Registered locally</h2></div></div>
           {props.projects.length === 0 ? <div className="empty-state"><p>No registered projects.</p><span>Register an existing local folder. IRIS never scans your filesystem implicitly.</span></div> : <ul className="project-list">{props.projects.map((project) => <li key={project.id}><div><strong>{project.name}</strong><code>{project.rootPath}</code></div>{project.id === props.defaultProject?.id ? <span>Default</span> : null}</li>)}</ul>}
           <div className="project-register"><label>Name<input value={props.name} onChange={(event) => props.setName(event.target.value)} /></label><label>Absolute path<input value={props.rootPath} onChange={(event) => props.setRootPath(event.target.value)} /></label><button onClick={props.onRegisterProject}>Register project</button></div>
+        </section>
+
+        <section className="runtime-control-card" aria-labelledby="supervisor-control-heading">
+          <div className="section-title-row"><div><p className="section-label">Supervisor control</p><h2 id="supervisor-control-heading">Machine and workload</h2></div><span className={`session-state ${props.supervisorStatus?.state === 'READY' ? 'is-ready' : ''}`}>{props.supervisorStatus?.state ?? 'BLOCKED'}</span></div>
+          <dl>
+            <dt>Machine identity</dt><dd>{props.supervisorStatus?.machineId ?? props.health?.machineId ?? 'Unverified'}</dd>
+            <dt>Gateway</dt><dd>{props.supervisorStatus === null || props.supervisorStatus === undefined || props.supervisorStatus.code === 'SUPERVISOR_BRIDGE_UNAVAILABLE' ? 'Unavailable' : 'Authenticated owner bridge'}</dd>
+            <dt>Workload</dt><dd>{props.supervisorStatus?.workloadState ?? props.supervisorStatus?.detail ?? 'Unknown'}</dd>
+            <dt>Tunnel</dt><dd>{props.supervisorStatus?.tunnel?.state ?? 'Unknown'}</dd>
+            <dt>Keep-awake</dt><dd>BLOCKED · no ownership-safe provider contract</dd>
+            <dt>Jobs affected by OFF</dt><dd>{props.supervisorStatus?.affectedJobs === null || props.supervisorStatus?.affectedJobs === undefined ? 'Not reported by Supervisor' : props.supervisorStatus.affectedJobs}</dd>
+          </dl>
+          <div className="composer-actions">
+            <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('workload_on')}>Workload ON</button>
+            <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('workload_off')}>Workload OFF</button>
+            <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('workload_restart')}>Restart</button>
+            <button disabled={props.onSupervisorOperation === undefined} onClick={() => props.onSupervisorOperation?.('supervisor_doctor')}>Doctor</button>
+          </div>
+          {props.supervisorStatus?.detail ? <p className="muted">{props.supervisorStatus.detail}</p> : null}
+        </section>
+
+        <section className="jobs-card" aria-labelledby="jobs-heading">
+          <div className="section-title-row"><div><p className="section-label">Durable jobs</p><h2 id="jobs-heading">Authoritative job status</h2></div><span>{props.jobs?.length ?? 0}</span></div>
+          {props.jobViewState === 'LOADING' ? <p className="muted" role="status">Loading durable jobs…</p>
+            : props.jobViewState === 'ERROR' ? <p className="error" role="alert">Job status error: {props.jobError || 'Durable job status is unavailable'}</p>
+              : props.jobViewState === 'UNAVAILABLE' ? <p className="muted" role="status">Durable jobs unavailable: {props.jobError || 'Owner access was not verified'}</p>
+                : props.jobViewState === 'IDLE' ? <p className="muted">Select a project session to view durable jobs.</p>
+                  : props.jobViewState === 'EMPTY' || (props.jobViewState === undefined && (props.jobs ?? []).length === 0) ? <p className="muted">No durable jobs reported for this project.</p>
+                    : <ul className="project-list">{(props.jobs ?? []).map((job) => {
+                      const result = props.jobResults?.[job.jobId];
+                      const logs = props.jobLogs?.[job.jobId] ?? {};
+                      const stdout = logs.stdout;
+                      const stderr = logs.stderr;
+                      const terminal = !['RUNNING', 'QUEUED'].includes(job.state);
+                      const stateLabel = job.state === 'LOST' || job.state === 'INTERRUPTED' || job.state === 'UNCERTAIN' ? `${job.state} · VERIFY OUTCOME` : job.state;
+                      return <li key={job.jobId}><div><strong>{stateLabel}{job.cancelRequested ? ' · CANCEL_PENDING' : ''}</strong><code>{job.jobId} · project {job.projectId} · workspace {job.workspaceId}</code>
+                        {job.finishedAt ? <small>Finished {job.finishedAt}{job.exitCode === null || job.exitCode === undefined ? '' : ` · exit ${job.exitCode}`}{job.signal ? ` · signal ${job.signal}` : ''}</small> : null}
+                        {result ? <small>Result verified: {result.state}{result.finishedAt ? ` · ${result.finishedAt}` : ''}</small> : null}
+                        {stdout ? <><strong>stdout</strong><pre>{stdout.text || '(empty)'}</pre>{stdout.eof ? null : <button onClick={() => props.onReadJobLogs?.(job, 'stdout', stdout.cursor)}>More stdout</button>}</> : null}
+                        {stderr ? <><strong>stderr</strong><pre>{stderr.text || '(empty)'}</pre>{stderr.eof ? null : <button onClick={() => props.onReadJobLogs?.(job, 'stderr', stderr.cursor)}>More stderr</button>}</> : null}
+                      </div><div><button onClick={() => props.onReadJobLogs?.(job, 'stdout')}>stdout</button><button onClick={() => props.onReadJobLogs?.(job, 'stderr')}>stderr</button>{terminal ? <button onClick={() => props.onReadJobResult?.(job)}>Result</button> : null}<button disabled={job.state !== 'RUNNING' && job.state !== 'QUEUED'} onClick={() => props.onCancelJob?.(job)}>Cancel job</button></div></li>;
+                    })}</ul>}
         </section>
 
         {props.health && <details className="runtime-details"><summary>Runtime details</summary><dl>
@@ -778,10 +1049,17 @@ function interactionLabel(kind: SessionInteraction['kind']): string {
 function readOwnerAccessToken(): string {
   const hash = new URLSearchParams(window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash);
   const supplied = hash.get('owner');
-  if (supplied !== null && /^[A-Za-z0-9_-]{40,128}$/.test(supplied)) {
+  if (supplied !== null && OWNER_ACCESS_TOKEN_PATTERN.test(supplied)) {
     window.sessionStorage.setItem(WEB_OWNER_TOKEN_KEY, supplied);
     window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
     return supplied;
+  }
+  const bootstrapped = typeof window.__IRIS_OWNER_ACCESS_TOKEN__ === 'string' && OWNER_ACCESS_TOKEN_PATTERN.test(window.__IRIS_OWNER_ACCESS_TOKEN__)
+    ? window.__IRIS_OWNER_ACCESS_TOKEN__
+    : null;
+  if (bootstrapped !== null) {
+    window.sessionStorage.setItem(WEB_OWNER_TOKEN_KEY, bootstrapped);
+    return bootstrapped;
   }
   return window.sessionStorage.getItem(WEB_OWNER_TOKEN_KEY) ?? '';
 }
@@ -791,6 +1069,18 @@ function authorizedFetch(token: string, input: RequestInfo | URL, init: RequestI
   const headers = new Headers(init.headers);
   headers.set('authorization', `Bearer ${token}`);
   return fetch(input, { ...init, headers });
+}
+
+async function supervisorCall<T>(token: string, name: 'supervisor_status' | 'supervisor_doctor' | 'workload_on' | 'workload_off' | 'workload_restart'): Promise<T> {
+  const response = await authorizedFetch(token, '/supervisor-control/mcp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'mcp-protocol-version': '2025-06-18', 'mcp-method': 'tools/call', 'mcp-name': name },
+    body: JSON.stringify({ jsonrpc: '2.0', id: crypto.randomUUID(), method: 'tools/call', params: { name, arguments: {} } }),
+  });
+  if (!response.ok) throw new Error(await responseMessage(response, 'Supervisor control is unavailable'));
+  const body = await response.json() as { result?: { isError?: boolean; structuredContent?: T }; error?: { message?: string } };
+  if (body.error !== undefined || body.result?.isError === true || body.result?.structuredContent === undefined) throw new Error(body.error?.message ?? 'Supervisor operation was not verified');
+  return body.result.structuredContent;
 }
 
 export function webClientId(): string {

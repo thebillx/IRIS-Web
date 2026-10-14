@@ -3,6 +3,7 @@ import { RuntimeError } from '@iris/domain';
 import type { CapabilityService } from './capability-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import type { RuntimeState } from './state.js';
+import { redactStructuredValue, safeErrorMessage, safeSerialize } from './output-redaction.js';
 
 export const HERMES_MCP_PROTOCOL_VERSION = '2025-11-25' as const;
 
@@ -62,7 +63,7 @@ export async function handleHermesMcpRequest(
     const result = await executeTool(params.name, args, context, capabilities);
     return rpcResult(rpc.id ?? null, result);
   } catch (error) {
-    const message = error instanceof RuntimeError ? error.message : 'Governed Hermes tool execution failed';
+    const message = safeErrorMessage(error, 'Governed Hermes tool execution failed');
     const code = error instanceof RuntimeError ? error.code : 'CAPABILITY_DENIED';
     return rpcResult(rpc.id ?? null, toolError(code, message));
   }
@@ -264,14 +265,18 @@ function requiredString(args: Record<string, unknown>, name: string, max: number
   }
   return trim ? value.trim() : value;
 }
-function toolResult(value: unknown) { return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value, isError: false as const }; }
+function toolResult(value: unknown) {
+  const safeValue = redactStructuredValue(value);
+  return { content: [{ type: 'text' as const, text: safeSerialize(safeValue) }], structuredContent: safeValue, isError: false as const };
+}
 function toolError(code: string, message: string, extra: Record<string, unknown> = {}) {
-  const structuredContent = { code, message, ...extra };
-  return { content: [{ type: 'text' as const, text: JSON.stringify(structuredContent) }], structuredContent, isError: true as const };
+  const safeMessage = safeErrorMessage(new Error(message), 'Operation failed');
+  const structuredContent = redactStructuredValue({ code, message: safeMessage, ...extra });
+  return { content: [{ type: 'text' as const, text: safeSerialize(structuredContent) }], structuredContent, isError: true as const };
 }
 function rpcResult(id: string | number | null, result: unknown): Response { return json({ jsonrpc: '2.0', id, result }); }
 function rpcError(id: string | number | null, code: number, message: string, status = 200): Response { return json({ jsonrpc: '2.0', id, error: { code, message } }, status); }
 function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
-  return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers } });
+  return new Response(safeSerialize(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers } });
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }

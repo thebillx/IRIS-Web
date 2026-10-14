@@ -447,6 +447,7 @@ describe('native Ponytail code-review capability', () => {
       physicalRoot: worktreeRoot,
       createdByAction: null,
     });
+    await fixture.state.bindSessionWorkspace(fixture.session.id, fixture.session.clientId, fixture.project.id, worktree.workspaceId);
 
     const fakeCodex = await fakeCodexExecutable(await temp('iris-fake-codex-worktree-'), commonGitDir);
     process.env.IRIS_CODEX_EXECUTABLE = fakeCodex;

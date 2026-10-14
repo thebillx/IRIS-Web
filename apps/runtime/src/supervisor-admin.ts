@@ -7,6 +7,7 @@ import { readTunnelServiceSecret } from './credentials.js';
 import { runtimeStatus } from './lifecycle.js';
 import { MCP_PROTOCOL_VERSION } from './mcp.js';
 import type { ActivationController } from './activation-controller.js';
+import { redactStructuredValue, safeErrorMessage, safeSerialize } from './output-redaction.js';
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const ADMIN_SERVER_NAME = 'IRIS Supervisor Admin';
@@ -87,7 +88,7 @@ export async function readSupervisorAdminSnapshot(dataRoot: string): Promise<Sup
   const endpoint = observed.endpoint;
   let fullCatalogId: string | null = null;
   let fullToolCount: number | null = null;
-  let proToolCount: number | null = null;
+  let proToolCount: number | null = registry?.connectors.length === 1 ? 0 : null;
   if (endpoint !== null && registry !== null && serviceSecret !== null && observed.state === 'running') {
     const full = registry.connectors.find((candidate) => candidate.mode === 'FULL');
     const pro = registry.connectors.find((candidate) => candidate.mode === 'PRO');
@@ -381,10 +382,10 @@ function requirePositiveIntegerArgument(args: Record<string, unknown>, key: stri
 
 function toolErrorResult(error: unknown) {
   const code = error instanceof RuntimeError ? error.code : 'PERSISTENCE_FAILURE';
-  const message = error instanceof RuntimeError ? error.message : 'Admin activation operation failed';
-  const structuredContent = { error: { code, message } };
+  const message = safeErrorMessage(error, 'Admin activation operation failed');
+  const structuredContent = redactStructuredValue({ error: { code, message } });
   return {
-    content: [{ type: 'text' as const, text: JSON.stringify(structuredContent) }],
+    content: [{ type: 'text' as const, text: safeSerialize(structuredContent) }],
     structuredContent,
     isError: true as const,
   };
@@ -664,7 +665,8 @@ async function readJsonRpc(request: IncomingMessage): Promise<JsonRpcRequest | n
 }
 
 function toolResult(value: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value, isError: false as const };
+  const safeValue = redactStructuredValue(value);
+  return { content: [{ type: 'text' as const, text: safeSerialize(safeValue) }], structuredContent: safeValue, isError: false as const };
 }
 
 function writeJsonRpcResult(response: ServerResponse, id: string | number | null, result: unknown): void {
@@ -681,7 +683,7 @@ function writeJson(response: ServerResponse, status: number, value: unknown): vo
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
   });
-  response.end(JSON.stringify(value));
+  response.end(safeSerialize(value));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

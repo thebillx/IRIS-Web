@@ -14,6 +14,7 @@ import { executeAdoTool, isAdoTool } from './mcp-ado.js';
 import { augmentV21ToolDefinitions, V21_LIFECYCLE_TOOL_NAMES } from './mcp-v21-definitions.js';
 import { executeV21LifecycleTool, isCapabilityOutcome, toolError, toolOutcome, toolResult } from './mcp-v21-tools.js';
 import type { RuntimeState } from './state.js';
+import { safeErrorMessage, safeSerialize } from './output-redaction.js';
 
 interface JsonRpcRequest {
   readonly jsonrpc: '2.0';
@@ -90,7 +91,7 @@ export async function handleMcpV21Request(
   } catch (error) {
     const runtimeError = error instanceof RuntimeError
       ? error
-      : new RuntimeError('INVALID_REQUEST', error instanceof Error ? error.message : 'Lifecycle/Phase 2 tool call failed');
+      : new RuntimeError('INVALID_REQUEST', safeErrorMessage(error, 'Lifecycle/Phase 2 tool call failed'));
     return jsonRpcResult(rpc.id ?? null, toolError(
       runtimeError.code,
       runtimeError.message,
@@ -126,11 +127,11 @@ function jsonRpcError(id: string | number | null, code: number, message: string,
 }
 
 function cloneJsonResponse(base: Response, value: unknown): Response {
-  return new Response(JSON.stringify(value), { status: base.status, headers: new Headers(base.headers) });
+  return new Response(safeSerialize(value), { status: base.status, headers: new Headers(base.headers) });
 }
 
 function json(value: unknown, status = 200): Response {
-  return new Response(JSON.stringify(value), {
+  return new Response(safeSerialize(value), {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' },
   });

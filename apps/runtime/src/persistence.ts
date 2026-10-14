@@ -1,8 +1,10 @@
+import { constants as fsConstants, type Stats } from 'node:fs';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { open, rename, rm } from 'node:fs/promises';
+import { lstat, open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { RuntimeError, type ProjectReference } from '@iris/domain';
-import { inspectPrivateRegularFile } from './private-fs.js';
+import { securePrivateJsonWrite } from './macos-safety.js';
+import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
 
 const RUNTIME_ID_FILE = 'runtime-id.json';
 const STATE_FILE = 'state.json';
@@ -41,6 +43,11 @@ export interface RuntimeControlDocument {
 export interface OwnerAccessDocument {
   readonly schemaVersion: 1;
   readonly secret: string;
+}
+
+export interface OwnerAccessRotationResult {
+  readonly status: 'ROTATED';
+  readonly credentialType: 'OWNER_ACCESS_SECRET';
 }
 
 export async function loadOrCreateRuntimeId(dataRoot: string): Promise<string> {
@@ -121,6 +128,46 @@ export async function readOwnerAccessSecret(dataRoot: string): Promise<string | 
   }
 }
 
+/**
+ * Replace the Owner Access Secret without returning either the old or new value.
+ * Lifecycle and process-ownership checks belong to the Supervisor; this helper
+ * owns only exact-root validation, atomic publication, and post-write proof.
+ */
+export async function rotateOwnerAccessSecret(dataRoot: string, replacement: string): Promise<OwnerAccessRotationResult> {
+  const resolvedRoot = path.resolve(dataRoot);
+  const rootProblem = await privateDirectoryProblem(resolvedRoot, 'Runtime data root');
+  if (rootProblem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', rootProblem);
+
+  const current = await readOwnerAccessSecret(resolvedRoot);
+  if (current === null) throw new RuntimeError('CREDENTIAL_MISSING', 'Owner access credential is unavailable');
+  if (!isPrivateSecret(replacement) || replacement === current) {
+    throw new RuntimeError('CREDENTIAL_INVALID', 'Owner access replacement credential is invalid');
+  }
+
+  const rootHandle = await open(resolvedRoot, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const rootIdentity = await rootHandle.stat();
+    await assertSameDirectoryIdentity(resolvedRoot, rootIdentity);
+    try {
+      await securePrivateJsonWrite(rootHandle, OWNER_ACCESS_FILE, JSON.stringify({
+        schemaVersion: 1,
+        secret: replacement,
+      } satisfies OwnerAccessDocument));
+      await assertSameDirectoryIdentity(resolvedRoot, rootIdentity);
+      const published = await readOwnerAccessSecret(resolvedRoot);
+      if (published === null || published === current) {
+        throw new Error('Owner access credential publication could not be verified');
+      }
+      return { status: 'ROTATED', credentialType: 'OWNER_ACCESS_SECRET' };
+    } catch (error) {
+      if (error instanceof RuntimeError && error.code === 'AUTHORITY_INDETERMINATE') throw error;
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Owner access credential rotation outcome is unknown; verify before retrying', { cause: error });
+    }
+  } finally {
+    await rootHandle.close();
+  }
+}
+
 export class FoundationStateStore {
   public constructor(public readonly dataRoot: string) {}
 
@@ -197,7 +244,7 @@ export async function removeRuntimeControlIfInstance(dataRoot: string, instanceI
   await rm(path.join(dataRoot, CONTROL_FILE));
 }
 
-async function writeJsonAtomic(filename: string, value: unknown): Promise<void> {
+async function writeJsonAtomic(filename: string, value: unknown, durable = false): Promise<void> {
   const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
@@ -207,11 +254,30 @@ async function writeJsonAtomic(filename: string, value: unknown): Promise<void> 
     await handle.close();
     handle = undefined;
     await rename(temporary, filename);
+    if (durable) await syncDirectory(path.dirname(filename));
   } catch (error) {
     await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
     if (error instanceof RuntimeError) throw error;
     throw new RuntimeError('PERSISTENCE_FAILURE', 'Atomic state publication failed', { cause: error });
+  }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertSameDirectoryIdentity(directory: string, expected: Stats): Promise<void> {
+  const current = await lstat(directory).catch((error: unknown) => {
+    throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime data root identity could not be revalidated', { cause: error });
+  });
+  if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== expected.dev || current.ino !== expected.ino) {
+    throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime data root identity changed during Owner access rotation');
   }
 }
 

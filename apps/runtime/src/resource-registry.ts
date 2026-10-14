@@ -42,6 +42,13 @@ export interface RepositoryRegistrationInput {
   readonly commonGitDirInode: string;
 }
 
+export interface RepositoryReconciliationInput {
+  readonly projectId: string;
+  readonly previousRepositoryId: string;
+  readonly previousDevice: string;
+  readonly expectedRepositoryId: string;
+}
+
 export interface WorktreeAuthorizationInput {
   readonly projectId: string;
   readonly repositoryId: RepositoryId;
@@ -206,6 +213,72 @@ export class VNextResourceRegistry {
       const repository: RepositoryRecord = { ...input, createdAt: new Date().toISOString() };
       await this.writeDocument({ ...document, repositories: [...document.repositories, repository] });
       return repository;
+    });
+  }
+
+  public reconcileRepository(
+    input: RepositoryReconciliationInput,
+    inspect: (repository: RepositoryRecord, workspaces: readonly WorkspaceRecord[]) => Promise<{
+      identity: RepositoryRegistrationInput;
+      evidence: unknown;
+    }>,
+    approvedFingerprint?: string,
+  ) {
+    return this.serializeMutation(async () => {
+      assertUuid(input.projectId, 'projectId');
+      assertUuid(input.previousRepositoryId, 'previousRepositoryId');
+      assertUuid(input.expectedRepositoryId, 'expectedRepositoryId');
+      if (!/^[0-9]+$/.test(input.previousDevice)) throw new RuntimeError('INVALID_REQUEST', 'previousDevice must be a decimal device number');
+      const document = await this.readDocument();
+      const candidates = document.repositories.filter((entry) => entry.projectId === input.projectId);
+      if (candidates.length > 1) throw new RuntimeError('CAPABILITY_DENIED', 'Repository registration is ambiguous');
+      const repository = candidates[0];
+      if (repository === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Repository reconciliation requires an existing binding');
+      if (repository.repositoryId !== input.previousRepositoryId && repository.repositoryId !== input.expectedRepositoryId) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository binding changed since recovery was requested');
+      }
+      if (repository.repositoryId === input.previousRepositoryId && repository.commonGitDirDevice !== input.previousDevice) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Previous device does not match the registered binding');
+      }
+      const workspaces = document.workspaces.filter((entry) => entry.repositoryId === repository.repositoryId);
+      if (workspaces.some((entry) => entry.projectId !== input.projectId || entry.role !== 'WORKTREE'
+        || (entry.lifecycleState !== 'ACTIVE' && entry.lifecycleState !== 'DELETED'))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository workspace ownership or lifecycle is ambiguous');
+      }
+      const { identity, evidence } = await inspect(repository, workspaces.filter((entry) => entry.lifecycleState === 'ACTIVE'));
+      if (identity.repositoryId !== input.expectedRepositoryId || identity.projectId !== input.projectId
+        || identity.primaryWorkspaceId !== repository.primaryWorkspaceId
+        || identity.commonGitDir !== repository.commonGitDir || identity.commonGitDirInode !== repository.commonGitDirInode) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Recovery permits only device-number drift of the existing repository');
+      }
+      if (document.repositories.some((entry) => entry !== repository
+        && (entry.repositoryId === identity.repositoryId || entry.commonGitDir === identity.commonGitDir))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository recovery conflicts with another registration');
+      }
+      const projects = await this.state.listProjects();
+      const roots = [projects.find((entry) => entry.id === input.projectId)?.rootPath, ...workspaces.map((entry) => entry.physicalRoot)];
+      if (projects.some((entry) => entry.id !== input.projectId && roots.includes(entry.rootPath))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository recovery overlaps another registered project');
+      }
+      // Normalize the old binding so a retry after atomic publication has the same fingerprint.
+      const fingerprint = createHash('sha256').update(JSON.stringify({
+        repository: { ...repository, repositoryId: input.previousRepositoryId, commonGitDirDevice: input.previousDevice },
+        workspaces: workspaces.map((entry) => ({ ...entry, repositoryId: input.previousRepositoryId })),
+        identity, evidence,
+      })).digest('hex');
+      const changed = repository.repositoryId !== identity.repositoryId || repository.commonGitDirDevice !== identity.commonGitDirDevice;
+      if (approvedFingerprint !== undefined) {
+        if (approvedFingerprint !== fingerprint) throw new RuntimeError('CAPABILITY_DENIED', 'Repository recovery evidence changed after owner approval');
+        if (changed) await this.writeDocument({
+          ...document,
+          repositories: document.repositories.map((entry) => entry === repository ? { ...entry, ...identity } : entry),
+          workspaces: document.workspaces.map((entry) => entry.repositoryId === repository.repositoryId ? { ...entry, repositoryId: identity.repositoryId } : entry),
+        });
+      }
+      return { operation: 'repository_reconcile', projectId: input.projectId,
+        previousRepositoryId: input.previousRepositoryId, repositoryId: identity.repositoryId,
+        workspaceIds: [repository.primaryWorkspaceId, ...workspaces.map((entry) => entry.workspaceId)],
+        commonGitDir: identity.commonGitDir, fingerprint, changed };
     });
   }
 

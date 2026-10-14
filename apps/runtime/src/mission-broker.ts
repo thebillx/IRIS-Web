@@ -12,6 +12,7 @@ import {
 } from '@iris/domain';
 import { inspectPrivateRegularFile } from './private-fs.js';
 import type { RuntimeState } from './state.js';
+import type { ProductionSafetyController } from './production-safety.js';
 
 const BROKER_FILE = 'mission-broker.json';
 const MAX_RECORDS = 100;
@@ -83,6 +84,7 @@ export class MissionBrokerService {
   public constructor(
     private readonly state: RuntimeState,
     private readonly store: MissionBrokerStore,
+    private readonly safety?: ProductionSafetyController,
   ) {}
 
   public async list(): Promise<readonly MissionBrokerSnapshot[]> {
@@ -259,7 +261,8 @@ export class MissionBrokerService {
   private async serializeBrokerAccess<T>(operation: (document: MissionBrokerDocument) => Promise<T>): Promise<T> {
     let result!: T;
     const queued = this.mutationTail.then(async () => {
-      result = await operation(await this.store.read());
+      const lease = this.safety === undefined ? null : await this.safety.beginMutation('mission-broker');
+      try { result = await operation(await this.store.read()); } finally { await lease?.release(); }
     });
     this.mutationTail = queued.then(() => undefined, () => undefined);
     await queued;
