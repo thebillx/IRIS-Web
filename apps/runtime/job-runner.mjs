@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { access, lstat, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { StreamingRedactor } from '../../scripts/job-runner-redaction.mjs';
+import { safeErrorMessage, StreamingRedactor } from '../../scripts/job-runner-redaction.mjs';
 
 const HELPER = new URL('./macos-safety-helper.py', import.meta.url).pathname;
 const args = process.argv.slice(2);
@@ -189,7 +189,7 @@ async function publishFailure(error) {
       signal: null,
       timedOut,
       cancelled,
-      error: error instanceof Error ? error.message.slice(0, 500) : 'runner failure',
+      error: safeErrorMessage(error, 'runner failure'),
       reviewOutputSha256: null,
       reviewOutputBytes: null,
       finishedAt: new Date().toISOString(),

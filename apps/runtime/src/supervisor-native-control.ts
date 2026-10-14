@@ -3,6 +3,7 @@ import { RuntimeError } from '@iris/domain';
 import { readTunnelServiceSecret } from './credentials.js';
 import { LEGACY_MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import { adminToolDefinitions, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
+import { redactStructuredValue, safeErrorMessage, safeSerialize } from './output-redaction.js';
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const SERVER_NAME = 'IRIS Native Supervisor Control';
@@ -132,7 +133,7 @@ async function handleRequest(
       const status = runtimeError.code === 'CONTROL_DENIED' ? 403
         : runtimeError.code === 'CONNECTOR_BINDING_MISMATCH' || runtimeError.code === 'CONNECTOR_MANIFEST_STALE' || runtimeError.code === 'RUNTIME_IDENTITY_MISMATCH' ? 409
           : 500;
-      writeJson(response, status, { error: { code: runtimeError.code, message: runtimeError.message } });
+      writeJson(response, status, { error: { code: runtimeError.code, message: safeErrorMessage(runtimeError, 'Supervisor control operation failed') } });
       return;
     }
   }
@@ -264,7 +265,7 @@ async function handleRequest(
     if (ACTIVATION_NAMES.has(name)) {
       const result = await operations.adminToolCall(name, args);
       writeJsonRpcResult(response, rpc.id ?? null, {
-        content: [{ type: 'text', text: JSON.stringify(result.structuredContent) }],
+        content: [{ type: 'text', text: safeSerialize(result.structuredContent) }],
         structuredContent: result.structuredContent,
         isError: result.isError,
       });
@@ -430,15 +431,16 @@ function requiredBoundedString(args: Record<string, unknown>, key: string, maxLe
 }
 
 function toolResult(value: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value, isError: false as const };
+  const safeValue = redactStructuredValue(value);
+  return { content: [{ type: 'text' as const, text: safeSerialize(safeValue) }], structuredContent: safeValue, isError: false as const };
 }
 
 function toolErrorResult(error: unknown) {
   const code = error instanceof RuntimeError ? error.code : 'PERSISTENCE_FAILURE';
-  const message = error instanceof RuntimeError ? error.message : 'Supervisor native control operation failed';
-  const structuredContent = { error: { code, message } };
+  const message = safeErrorMessage(error, 'Supervisor native control operation failed');
+  const structuredContent = redactStructuredValue({ error: { code, message } });
   return {
-    content: [{ type: 'text' as const, text: JSON.stringify(structuredContent) }],
+    content: [{ type: 'text' as const, text: safeSerialize(structuredContent) }],
     structuredContent,
     isError: true as const,
   };
@@ -475,7 +477,7 @@ function writeJson(response: ServerResponse, status: number, value: unknown): vo
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
   });
-  response.end(JSON.stringify(value));
+  response.end(safeSerialize(value));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

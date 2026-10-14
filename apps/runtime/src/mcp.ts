@@ -3,6 +3,7 @@ import { catalogIdentityPayload, catalogToolNames, orderToolDefinitions, type Mc
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import type { RuntimeState } from './state.js';
+import { redactStructuredValue, safeErrorMessage, safeSerialize } from './output-redaction.js';
 
 export const MCP_PROTOCOL_VERSION = '2026-07-28' as const;
 export const LEGACY_MCP_PROTOCOL_VERSION = '2025-11-25' as const;
@@ -124,7 +125,7 @@ async function handleMcpTransportRequest(
       const runtimeError = error instanceof RuntimeError ? error : null;
       return jsonRpcResult(rpc.id ?? null, toolError(
         runtimeError?.code ?? 'INVALID_REQUEST',
-        error instanceof Error ? error.message : 'Tool call failed',
+        safeErrorMessage(error, 'Tool call failed'),
         runtimeError?.publicDetails === undefined ? {} : { ...runtimeError.publicDetails },
       ));
     }
@@ -522,12 +523,14 @@ function toolOutcome(outcome: CapabilityOutcome): ReturnType<typeof toolResult> 
 }
 
 function toolResult(value: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value, isError: false as const };
+  const safeValue = redactStructuredValue(value);
+  return { content: [{ type: 'text' as const, text: safeSerialize(safeValue) }], structuredContent: safeValue, isError: false as const };
 }
 
 function toolError(code: string, message: string, extra: Record<string, unknown> = {}) {
-  const structuredContent = { code, message, ...extra };
-  return { content: [{ type: 'text' as const, text: JSON.stringify(structuredContent) }], structuredContent, isError: true as const };
+  const safeMessage = safeErrorMessage(new Error(message), 'Operation failed');
+  const structuredContent = redactStructuredValue({ code, message: safeMessage, ...extra });
+  return { content: [{ type: 'text' as const, text: safeSerialize(structuredContent) }], structuredContent, isError: true as const };
 }
 
 function requiredHeader(request: Request, name: string): string {
@@ -683,7 +686,7 @@ function jsonRpcError(id: string | number | null, code: number, message: string,
 }
 
 function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
-  return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers } });
+  return new Response(safeSerialize(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers } });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

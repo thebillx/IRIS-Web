@@ -12,6 +12,7 @@ import type { SecurityAuditService } from './security-audit/service.js';
 import { handleV21OwnerRoute } from './server-v21-routes.js';
 import { handleHermesMcpRequest } from './hermes-mcp.js';
 import type { McpCatalogRuntimeContext } from './mcp-catalog.js';
+import { safePublicError, safeSerialize } from './output-redaction.js';
 
 export const LOOPBACK_ADDRESS = '127.0.0.1' as const;
 export const CLIENT_ID_HEADER = 'x-iris-client-id' as const;
@@ -784,7 +785,7 @@ function writeJson(response: ServerResponse, status: number, value: unknown, hea
     ...securityHeaders(),
     ...headers,
   });
-  response.end(JSON.stringify(value));
+  response.end(safeSerialize(value));
 }
 
 function writeEmptyNotFound(response: ServerResponse): void {
@@ -797,7 +798,7 @@ function writeJsonThen(response: ServerResponse, status: number, value: unknown,
     'content-type': 'application/json; charset=utf-8',
     ...securityHeaders(),
   });
-  response.end(JSON.stringify(value), () => setImmediate(after));
+  response.end(safeSerialize(value), () => setImmediate(after));
 }
 
 function securityHeaders(): Record<string, string> {
@@ -826,7 +827,7 @@ function writeError(response: ServerResponse, error: unknown): void {
           : runtimeError.code === 'RUNTIME_SHUTTING_DOWN'
             ? 503
             : 500;
-  writeJson(response, status, { error: { code: runtimeError.code, message: runtimeError.message } });
+  writeJson(response, status, { error: safePublicError(runtimeError.code, runtimeError.message) });
 }
 
 async function writeFetchResponse(response: ServerResponse, fetchResponse: Response): Promise<void> {

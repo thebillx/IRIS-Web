@@ -13,6 +13,7 @@ import { inspectConnectorRegistry } from './connector-registry.js';
 import { loadOrCreateMachineId } from './machine-identity.js';
 import { assessConnectorRegistryIdentity } from './identity-coherence.js';
 import { startRuntimeServer, type RuntimeServerHandle } from './server.js';
+import { safeErrorMessage } from './output-redaction.js';
 import { RuntimeState } from './state.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { MissionLedgerStore } from './mission-store.js';
@@ -250,7 +251,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
         },
         requestShutdown: () => {
           void close().catch((error: unknown) => {
-            process.stderr.write(`IRIS controlled shutdown failed: ${error instanceof Error ? error.message : String(error)}\n`);
+            process.stderr.write(`IRIS controlled shutdown failed: ${safeErrorMessage(error, 'Controlled shutdown failed')}\n`);
           });
         },
       },

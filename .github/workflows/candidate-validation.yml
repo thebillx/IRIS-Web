@@ -63,6 +63,9 @@ jobs:
           if [ -f scripts/iris-acceptance.test.mjs ]; then
             node --test scripts/iris-acceptance.test.mjs
           fi
+          if [ -f scripts/job-runner-redaction.node-test.mjs ] && [ -f scripts/dev-environment.test.mjs ]; then
+            node --test scripts/job-runner-redaction.node-test.mjs scripts/dev-environment.test.mjs
+          fi
 
       - name: Run focused runtime suites
         run: |

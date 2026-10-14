@@ -7,6 +7,7 @@ import { createSupervisor } from './supervisor.js';
 import { withStrictSupervisorOperationLock } from './supervisor-operation-lock.js';
 import { installLaunchAgent, launchAgentLoaded, launchdPaths, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
+import { safeErrorMessage } from './output-redaction.js';
 
 const command = process.argv[2];
 const legacyRuntimeControl = process.env.IRIS_STACK_CLI !== '1';
@@ -104,7 +105,7 @@ try {
   }
 } catch (error) {
   const code = error instanceof Error && 'code' in error ? String((error as { readonly code?: unknown }).code ?? 'IRIS_COMMAND_FAILED') : 'IRIS_COMMAND_FAILED';
-  const message = error instanceof Error ? error.message : 'IRIS command failed';
+  const message = safeErrorMessage(error, 'IRIS command failed');
   process.stderr.write(`IRIS_COMMAND_FAILED code=${code} message=${message}\n`);
   process.exitCode = 1;
 }

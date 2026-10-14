@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 import { RuntimeError, type CapabilityEffect, type JobId, type MissionExecutionAssociation, type WorkspaceId } from '@iris/domain';
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
 import { resolveExecutionProfile, resolveServerOwnedCodeReviewExecutionProfile, type ExecutionProfilePlan } from './execution-profiles.js';
-import { boundedTail, StreamingRedactor } from './output-redaction.js';
+import { boundedTail, safeErrorMessage, StreamingRedactor } from './output-redaction.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { observeProcessStart } from './macos-safety.js';
 import type { ProductionSafetyController } from './production-safety.js';
@@ -267,8 +267,8 @@ export class DurableJobManager {
       timedOut,
       stdoutTail: stdoutBounded.text,
       stderrTail: stderrBounded.text,
-      stdoutTruncated: stdoutBounded.truncated || (await stat(stdoutPath)).size > INLINE_OUTPUT_BYTES,
-      stderrTruncated: stderrBounded.truncated || (await stat(stderrPath)).size > INLINE_OUTPUT_BYTES,
+      stdoutTruncated: stdoutBounded.truncated || stdoutRedactor.wasQuarantined || (await stat(stdoutPath)).size > INLINE_OUTPUT_BYTES,
+      stderrTruncated: stderrBounded.truncated || stderrRedactor.wasQuarantined || (await stat(stderrPath)).size > INLINE_OUTPUT_BYTES,
       logArtifactIds,
       producedArtifactIds: [],
       startedAt,
@@ -886,14 +886,14 @@ async function waitForRunnerClaim(filename: string, resultPath: string, jobId: s
     if (claim !== null && claim.jobId === jobId && claim.runnerIdentity === runnerIdentity && claim.runnerPid === spawnedRunnerPid) return claim;
     const bootstrapResult = await readRunnerResult(resultPath);
     if (bootstrapResult !== null) {
-      const detail = bootstrapResult.error === null ? 'unknown bootstrap failure' : bootstrapResult.error.replace(/\s+/g, ' ').slice(-300);
+      const detail = bootstrapResult.error === null ? 'unknown bootstrap failure' : safeErrorMessage(new Error(bootstrapResult.error), 'unknown bootstrap failure');
       throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Durable runner failed before publishing a verifiable claim: ${detail}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not publish a verifiable runner claim before target spawn');
 }
-async function waitForClaim(filename: string, resultPath: string, jobId: string, runnerIdentity: string): Promise<RunnerClaim> { const deadline = Date.now() + 8000; while (Date.now() < deadline) { const claim = await readClaim(filename); if (claim !== null && claim.jobId === jobId && claim.runnerIdentity === runnerIdentity) return claim; const runnerResult = await readRunnerResult(resultPath); if (runnerResult !== null) { const detail = runnerResult.error === null ? 'runner terminated before target claim' : runnerResult.error.replace(/\s+/g, ' ').slice(-300); throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Durable runner failed before publishing a target claim: ${detail}`); } await new Promise((resolve) => setTimeout(resolve, 25)); } throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not publish a verified target process claim'); }
+async function waitForClaim(filename: string, resultPath: string, jobId: string, runnerIdentity: string): Promise<RunnerClaim> { const deadline = Date.now() + 8000; while (Date.now() < deadline) { const claim = await readClaim(filename); if (claim !== null && claim.jobId === jobId && claim.runnerIdentity === runnerIdentity) return claim; const runnerResult = await readRunnerResult(resultPath); if (runnerResult !== null) { const detail = runnerResult.error === null ? 'runner terminated before target claim' : safeErrorMessage(new Error(runnerResult.error), 'runner failed before target claim'); throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Durable runner failed before publishing a target claim: ${detail}`); } await new Promise((resolve) => setTimeout(resolve, 25)); } throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not publish a verified target process claim'); }
 async function waitForTrustedTerminalResult(filename: string, jobId: string, runnerIdentity: string, timeoutMs: number): Promise<RunnerResult | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

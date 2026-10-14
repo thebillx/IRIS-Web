@@ -3,6 +3,7 @@ import type { CapabilityOutcome, CapabilityService } from './capability-service.
 import type { DurableMissionLifecycleService } from './durable-mission-service.js';
 import type { McpPrincipal } from './mcp.js';
 import type { RuntimeState } from './state.js';
+import { redactStructuredValue, safeErrorMessage, safeSerialize } from './output-redaction.js';
 
 const CLIENT_ID_HEADER = 'x-iris-client-id';
 const SESSION_ID_HEADER = 'x-iris-session-id';
@@ -97,12 +98,14 @@ export function toolOutcome(outcome: CapabilityOutcome): ReturnType<typeof toolR
 }
 
 export function toolResult(value: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value, isError: false as const };
+  const safeValue = redactStructuredValue(value);
+  return { content: [{ type: 'text' as const, text: safeSerialize(safeValue) }], structuredContent: safeValue, isError: false as const };
 }
 
 export function toolError(code: string, message: string, extra: Record<string, unknown> = {}) {
-  const structuredContent = { code, message, ...extra };
-  return { content: [{ type: 'text' as const, text: JSON.stringify(structuredContent) }], structuredContent, isError: true as const };
+  const safeMessage = safeErrorMessage(new Error(message), 'Operation failed');
+  const structuredContent = redactStructuredValue({ code, message: safeMessage, ...extra });
+  return { content: [{ type: 'text' as const, text: safeSerialize(structuredContent) }], structuredContent, isError: true as const };
 }
 
 async function createLifecycleMission(
