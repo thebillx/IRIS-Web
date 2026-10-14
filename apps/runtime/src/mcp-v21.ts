@@ -1,3 +1,4 @@
+import { serializeToolCatalog } from './catalog-response.js';
 import { RuntimeError } from '@iris/domain';
 import type { CapabilityService } from './capability-service.js';
 import type { DurableMissionLifecycleService } from './durable-mission-service.js';
@@ -112,10 +113,7 @@ async function augmentToolList(base: Response): Promise<Response> {
   if (!base.ok) return base;
   const payload = await base.json() as unknown;
   if (!isRecord(payload) || !isRecord(payload.result) || !Array.isArray(payload.result.tools)) return cloneJsonResponse(base, payload);
-  return cloneJsonResponse(base, {
-    ...payload,
-    result: { ...payload.result, tools: augmentV21ToolDefinitions(payload.result.tools) },
-  });
+  return new Response(serializeToolCatalog(payload.id, fullMcpToolDefinitionsV21()), { status: base.status, headers: new Headers(base.headers) });
 }
 
 function jsonRpcResult(id: string | number | null, result: unknown): Response {

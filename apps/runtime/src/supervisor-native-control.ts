@@ -1,3 +1,4 @@
+import { serializeToolCatalog } from './catalog-response.js';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { RuntimeError } from '@iris/domain';
 import { readTunnelServiceSecret } from './credentials.js';
@@ -190,7 +191,9 @@ async function handleRequest(
     return;
   }
   if (rpc.method === 'tools/list') {
-    writeJsonRpcResult(response, rpc.id ?? null, { tools: unifiedToolDefinitions(operations) });
+    const catalog = serializeToolCatalog(rpc.id, unifiedToolDefinitions(operations));
+    response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+    response.end(catalog);
     return;
   }
   if (rpc.method !== 'tools/call') {

@@ -1,3 +1,4 @@
+import { serializeToolCatalog } from './catalog-response.js';
 import path from 'node:path';
 import { RuntimeError } from '@iris/domain';
 import type { CapabilityService } from './capability-service.js';
@@ -46,7 +47,7 @@ export async function handleHermesMcpRequest(
   }
   if (rpc.method === 'notifications/initialized') return new Response(null, { status: 202 });
   if (rpc.method === 'ping') return rpcResult(rpc.id ?? null, {});
-  if (rpc.method === 'tools/list') return rpcResult(rpc.id ?? null, { tools: TOOLS });
+  if (rpc.method === 'tools/list') return new Response(serializeToolCatalog(rpc.id, TOOLS), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } });
   if (rpc.method !== 'tools/call') {
     if (rpc.id === undefined) return new Response(null, { status: 202 });
     return rpcError(rpc.id, -32601, 'Method not found', 404);

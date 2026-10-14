@@ -1,3 +1,4 @@
+import { serializeToolCatalog } from './catalog-response.js';
 import { RuntimeError, type MissionCheckpoint, type MissionExecutionAssociation, type MissionState, type MissionTaskState, type MissionTimelineEvent, type OrchestratorMode, type SupervisorDecision, type SupervisorDirective, type SupervisorGateState } from '@iris/domain';
 import { catalogIdentityPayload, catalogToolNames, orderToolDefinitions, type McpCatalogRuntimeContext } from './mcp-catalog.js';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
@@ -103,7 +104,7 @@ async function handleMcpTransportRequest(
   if (methodHeader !== null && methodHeader !== rpc.method) return jsonRpcError(rpc.id ?? null, -32600, 'Mcp-Method does not match JSON-RPC method', 400);
 
   if (rpc.method === 'ping') return jsonRpcResult(rpc.id ?? null, {});
-  if (rpc.method === 'tools/list') return jsonRpcResult(rpc.id ?? null, { tools: profile === 'pro' ? proToolDefinitions() : orderToolDefinitions('FULL', toolDefinitions()) });
+  if (rpc.method === 'tools/list') return new Response(serializeToolCatalog(rpc.id, profile === 'pro' ? proToolDefinitions() : orderToolDefinitions('FULL', toolDefinitions())), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } });
 
   if (rpc.method === 'tools/call') {
     const params = isRecord(rpc.params) ? rpc.params : null;

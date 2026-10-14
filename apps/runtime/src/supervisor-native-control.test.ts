@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { RuntimeError } from '@iris/domain';
 import { catalogToolNames } from './mcp-catalog.js';
 import { loadOrCreateTunnelServiceSecret } from './credentials.js';
-import { MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
+import { fullMcpToolDefinitions, MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import {
   startSupervisorNativeControlServer,
   type AdminRecycleInput,
@@ -41,6 +41,8 @@ describe('outer supervisor native control', () => {
       const listed = await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
       expect(toolNames(listed)).toContain('source_identity');
       expect(toolNames(listed)).toContain('runtime_status');
+      const result = listed.result as { tools: { name: string; inputSchema: { properties: { expectedSha256?: { pattern: string } } } }[] };
+      expect(result.tools.find((tool) => tool.name === 'file_edit')?.inputSchema.properties.expectedSha256?.pattern).toBe('^[0-9a-fA-F]{64}$');
       expect(structured(await rpcTool(harness, 'source_identity', {}))).toMatchObject({ state: 'VERIFIED', commitSha: 'a'.repeat(40) });
       expect(structured(await rpcTool(harness, 'runtime_status', {}))).toMatchObject({ status: 'ready' });
       harness.runtimeAvailable = false;
@@ -272,7 +274,7 @@ async function startHarness(unified = false, identityGuard = false) {
     adminTunnelRecycle: async (input: AdminTunnelRecycleInput) => ({ ...input, readiness: 'READY' }),
     adminToolCall: async (name): Promise<SupervisorAdminToolCallResult> => ({ structuredContent: { proxied: name }, isError: false }),
     ...(unified ? {
-      runtimeToolDefinitions: [{ name: 'runtime_status', inputSchema: { type: 'object' } }],
+      runtimeToolDefinitions: fullMcpToolDefinitions(),
       runtimeToolCall: async (name: string) => harness.runtimeAvailable
         ? { content: [{ type: 'text', text: JSON.stringify({ status: 'ready', name }) }], structuredContent: { status: 'ready', name }, isError: false }
         : { content: [{ type: 'text', text: JSON.stringify({ code: 'RUNTIME_NOT_RUNNING', message: 'Runtime tools are unavailable while workload is OFF' }) }], structuredContent: { code: 'RUNTIME_NOT_RUNNING' }, isError: true },
