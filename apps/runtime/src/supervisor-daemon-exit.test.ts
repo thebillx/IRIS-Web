@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -29,7 +29,7 @@ async function fixture() {
 async function program(root: string, ports: number[], body: string) {
   const script = `
 import { pathToFileURL } from 'node:url';
-import { createServer } from 'node:net';
+import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 const [root, source, ...ports] = process.argv.slice(1);
 const { createSupervisor } = await import(pathToFileURL(source + '/apps/runtime/src/supervisor.ts').href);
@@ -42,22 +42,21 @@ ${body}
 }
 
 describe('Supervisor actual exit status under SuccessfulExit:false KeepAlive', () => {
-  it('returns OS exit zero only after a real bind failure is durable; relaunch does not spawn', async () => {
+  it('returns OS exit zero for an ambiguous occupied control port without rewriting workload authority', async () => {
     const { root, ports } = await fixture();
     const result = await program(root, ports, `
-const occupied = createServer();
+const occupied = createServer((_request, response) => { response.setHeader('connection', 'close'); response.writeHead(401); response.end(); });
 await new Promise(resolve => occupied.listen(0, '127.0.0.1', resolve));
 const occupiedPort = occupied.address().port;
 const supervisor = await createSupervisor({ dataRoot: root, sourceRoot: source, supervisorControlPort: occupiedPort, adminPort: Number(ports[0]), adminTunnelHealthPort: Number(ports[1]), webPort: Number(ports[2]) });
+const before = await readFile(root + '/supervisor/state.json').catch(() => null);
 try { await supervisor.runSupervisorDaemon(); } finally { await new Promise(resolve => occupied.close(resolve)); }
-const first = JSON.parse(await readFile(root + '/supervisor/state.json', 'utf8'));
-await supervisor.runSupervisorDaemon();
-const second = JSON.parse(await readFile(root + '/supervisor/state.json', 'utf8'));
-if (!first.recovery.terminal || first.recovery.lastFailureCode !== 'SUPERVISOR_NOT_RUNNING' || second.runtime !== null || second.startupOperations.length !== 0) process.exitCode = 2;
-else console.log(JSON.stringify({ terminal: true, repeatedLaunchBlocked: true, children: 0 }));
+const after = await readFile(root + '/supervisor/state.json').catch(() => null);
+if (before !== null || after !== null) process.exitCode = 2;
+else console.log(JSON.stringify({ ambiguousOwnershipPreserved: true, children: 0 }));
 `);
-    expect(JSON.parse(result.stdout)).toEqual({ terminal: true, repeatedLaunchBlocked: true, children: 0 });
-    expect(result.stderr).toContain('durable failure requires owner reconciliation');
+    expect(JSON.parse(result.stdout)).toEqual({ ambiguousOwnershipPreserved: true, children: 0 });
+    expect(result.stderr).toContain('ownership is ambiguous');
     expect(result.stdout).not.toContain('READY');
     expect(renderLaunchAgent(root, canonicalNodeRuntime().path, path.join(sourceRoot, 'apps/runtime/src/control.ts'))).toContain('<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>');
   }, 15000);

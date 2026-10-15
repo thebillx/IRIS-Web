@@ -14,11 +14,12 @@ import { credentialPaths, inspectCredentialStatus, loadOrCreateTunnelServiceSecr
 import { ensureRuntimeDataRoot, resolveRuntimeDataRoot, resolveSourceRoot } from './data-root.js';
 import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, isSupportedCatalogVersion, type McpCatalogIdentity } from './mcp-catalog.js';
 import { observeProcessStart } from './macos-safety.js';
-import { proMcpToolDefinitions } from './mcp.js';
+import { MCP_PROTOCOL_VERSION, proMcpToolDefinitions } from './mcp.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
 import { loadOrCreateRuntimeId, readEndpoint, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
 import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
+import { readMachineId } from './machine-identity.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput } from './supervisor-native-control.js';
@@ -27,6 +28,7 @@ import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
 import { readSupervisorStateFile, writeSupervisorStateFile, unresolvedStartup, validStartupOperations, type StartupOperation, type StartupState } from './supervisor-startup.js';
 
 const execFileAsync = promisify(execFile);
+const MACOS_SAFETY_HELPER = path.resolve(import.meta.dirname, '..', 'macos-safety-helper.py');
 const SUPERVISOR_DIRECTORY = 'supervisor';
 const STATE_FILE = 'state.json';
 const PROFILE_DIRECTORY = 'tunnel-profiles';
@@ -264,6 +266,10 @@ export class Supervisor {
       const workloadUsesControlPlaneSource = sameSourceRoot(state.workloadSourceRoot, this.sourceRoot);
       const runtimeNodeChanged = observed.state === 'running' && state.runtime !== null
         && !sameExecutablePath(state.runtime.executable, canonicalNodeRuntime().path);
+      if (observed.state === 'running' && state.runtime !== null
+        && !await this.runningOwnershipIsVerified(state, state.runtime, state.workloadSourceRoot)) {
+        throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Running Runtime ownership conflicts with its durable source-bound journal');
+      }
       if (observed.state === 'running' && !registryChanged && !runtimeNodeChanged) {
         if (state.runtime === null) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'A running IRIS runtime is not owned by this supervisor; use explicit runtime adoption or stop it through its existing owner');
         assertRuntimeOwnership(state.runtime, observed);
@@ -761,17 +767,30 @@ export class Supervisor {
       adminToolCall: (name, args) => this.adminToolCall(name, args),
     });
       this.nativeControlActive = true;
-      await this.up();
-      const state = await this.readState();
-      if (state.recovery.windowStartedAt !== null && recoveryWindowExpired(state.recovery)) {
-        await this.writeState({ ...state, recovery: emptyRecovery() });
-      }
       while (!stopping) {
         await delay(5_000);
-        if (stopping) break;
-        await this.automaticRecoveryTick();
       }
     } catch (error) {
+      if (isAddressInUse(error)) {
+        const owner = await inspectSupervisorNativeOwner(this.dataRoot, this.supervisorControlPort, this.sourceRoot);
+        if (owner === 'verified') {
+          console.error('Authenticated identity-bound Supervisor control is already running');
+          return;
+        }
+        // A listener that cannot prove the expected data-root credential, process
+        // start identity, executable, and source argv is not ours. Exit
+        // deliberately so SuccessfulExit:false does not create a relaunch loop,
+        // and do not poison shared workload state with authority we do not hold.
+        console.error('Supervisor control ownership is ambiguous; owner reconciliation required');
+        return;
+      }
+      if (persisted.schemaVersion !== 4) {
+        // Native-control startup has not established authority to migrate a
+        // historical document. Historical ownership is migrated only by the
+        // governed lifecycle paths that verify and journal every live child.
+        console.error('Supervisor startup failed before historical ownership could be verified; state preserved');
+        return;
+      }
       const failure = await this.readState();
       await this.writeState({ ...failure, recovery: { ...failure.recovery, terminal: true, lastFailureCode: runtimeErrorCode(error), nextAttemptAt: null } });
       console.error('Supervisor startup or recovery failed; durable failure requires owner reconciliation');
@@ -793,29 +812,135 @@ export class Supervisor {
   }
 
   public async supervisorNativeStatus(): Promise<Record<string, unknown>> {
-    const [state, registry, observed] = await Promise.all([
+    const [state, registryInspection, machineId] = await Promise.all([
       this.readState(),
-      readConnectorRegistry(this.dataRoot),
-      runtimeStatus(this.dataRoot),
+      inspectConnectorRegistry(this.dataRoot).catch(() => null),
+      readMachineId(this.dataRoot).catch(() => null),
     ]);
-    const adminResult = await callSupervisorAdminTool(this.dataRoot, this.adminPort, 'admin_status', {});
-    const admin = requireSuccessfulAdminResult(adminResult, 'admin_status');
+    const runtimeProbe = await this.probeOwnedRuntime(state, state.runtime);
+    const observed = runtimeProbe.observed;
+    const registry = registryInspection?.registry ?? null;
     const expectedAdminEnvironmentDigest = launchEnvironmentDigest(
       supervisorAdminChildEnvironment(this.dataRoot, this.adminPort, this.protectedReferenceRoot),
     );
     const adminChildEnvironmentDigest = state.admin?.environmentDigest ?? null;
     const adminChildWorkingDirectory = state.admin?.workingDirectory ?? null;
-    const adminSourceCoherent = await adminProcessMatchesControlSource(state.admin, this.sourceRoot);
+    const adminOwnershipVerified = await this.runningOwnershipIsVerified(state, state.admin, this.sourceRoot);
+    const adminSourceCoherent = adminOwnershipVerified
+      && await adminProcessMatchesControlSource(state.admin, this.sourceRoot);
+    const adminListenerBefore = adminOwnershipVerified && adminSourceCoherent
+      ? await ownedAdminOwnsListener(state.admin, this.adminPort, this.sourceRoot, true)
+      : false;
+    const adminResult = adminListenerBefore
+      ? await callSupervisorAdminTool(this.dataRoot, this.adminPort, 'admin_status', {}).catch(() => null)
+      : null;
+    const adminListenerOwnershipVerified = adminResult !== null
+      && await ownedAdminOwnsListener(state.admin, this.adminPort, this.sourceRoot);
+    const admin = adminResult !== null && !adminResult.isError && isRecord(adminResult.structuredContent)
+      ? adminResult.structuredContent
+      : null;
+    const runtimeIdentityCoherent = state.runtime !== null && observed.state === 'running' && observed.endpoint !== null
+      ? runtimeOwnershipMatches(state.runtime, observed)
+      : false;
+    const [fullTunnelOwnershipVerified, proTunnelOwnershipVerified, adminTunnelProbe] = await Promise.all([
+      this.runningOwnershipIsVerified(state, state.tunnels.full, this.sourceRoot),
+      this.runningOwnershipIsVerified(state, state.tunnels.pro, this.sourceRoot),
+      this.probeAdminTunnel(state, state.adminTunnel),
+    ]);
+    const runtimeOwnershipVerified = runtimeProbe.ownershipVerified;
+    const runtimeListenerOwnershipVerified = runtimeProbe.listenerOwnershipVerified;
+    const adminTunnelOwnershipVerified = adminTunnelProbe.ownershipVerified;
+    const adminTunnelListenerOwnershipVerified = adminTunnelProbe.listenerOwnershipVerified;
+    const adminTunnelStatus = adminTunnelProbe.status;
+    const [confirmedState, confirmedRegistryInspection] = await Promise.all([
+      this.readState().catch(() => null),
+      inspectConnectorRegistry(this.dataRoot).catch(() => null),
+    ]);
+    const authoritySnapshotCoherent = confirmedState !== null
+      && JSON.stringify(confirmedState) === JSON.stringify(state)
+      && JSON.stringify(confirmedRegistryInspection) === JSON.stringify(registryInspection);
+    const adminEnvironmentCoherent = adminChildEnvironmentDigest !== null
+      && adminChildEnvironmentDigest === expectedAdminEnvironmentDigest;
+    const activeBindingIdentity = admin !== null && isRecord(admin.activeBindingIdentity) ? admin.activeBindingIdentity : null;
+    const adminIdentityCoherent = activeBindingIdentity !== null
+      && activeBindingIdentity.machineId === machineId
+      && activeBindingIdentity.runtimeId === observed.endpoint?.runtimeId;
+    const adminAuthenticated = admin !== null
+      && admin.readiness === 'READY'
+      && admin.adminEndpointOwner === 'PERSISTENT_SUPERVISOR_OR_CONTROL_PLANE'
+      && admin.adminProcessId === state.admin?.pid
+      && admin.supervisorId === state.supervisorId
+      && admin.runtimeId === observed.endpoint?.runtimeId
+      && admin.instanceId === observed.endpoint?.instanceId
+      && admin.deploymentEpoch === registry?.deploymentEpoch;
+    const fullBinding = registry?.connectors.find((binding) => binding.mode === 'FULL') ?? null;
+    const proBinding = registry?.connectors.find((binding) => binding.mode === 'PRO') ?? null;
+    const machineBindingCoherent = machineId !== null && registry !== null && registry.admin !== null
+      && registry.connectors.every((binding) => binding.machineId === machineId)
+      && registry.admin.machineId === machineId;
+    const connectorBindingCoherent = machineId !== null && observed.endpoint !== null
+      && fullBinding !== null && proBinding !== null
+      && registry?.connectors.every((binding) => binding.machineId === machineId
+        && binding.runtimeId === observed.endpoint?.runtimeId
+        && binding.deploymentEpoch === registry.deploymentEpoch
+        && binding.leaseGeneration > 0) === true
+      && state.tunnels.full?.tunnelId === fullBinding.tunnelId
+      && state.tunnels.full.profilePath === fullBinding.managedProfilePath
+      && state.tunnels.full.runtimeId === observed.endpoint.runtimeId
+      && state.tunnels.full.instanceId === observed.endpoint.instanceId
+      && state.tunnels.full.deploymentEpoch === registry.deploymentEpoch
+      && state.tunnels.pro?.tunnelId === proBinding.tunnelId
+      && state.tunnels.pro.profilePath === proBinding.managedProfilePath
+      && state.tunnels.pro.runtimeId === observed.endpoint.runtimeId
+      && state.tunnels.pro.instanceId === observed.endpoint.instanceId
+      && state.tunnels.pro.deploymentEpoch === registry.deploymentEpoch;
+    const adminTunnelBindingCoherent = registry?.admin !== null && registry?.admin !== undefined
+      && machineId !== null
+      && registry.admin.machineId === machineId
+      && registry.admin.leaseGeneration > 0
+      && state.adminTunnel?.tunnelId === registry.admin.tunnelId
+      && state.adminTunnel.profilePath === registry.admin.managedProfilePath;
+    const registryStale = sameSourceRoot(state.workloadSourceRoot, this.sourceRoot)
+      && (registryInspection?.changed === true || (registryInspection?.staleConnectorIds.length ?? 0) > 0);
+    const readinessFailures: ReadonlyArray<readonly [boolean, string]> = [
+      [!authoritySnapshotCoherent, 'AUTHORITY_CHANGED'],
+      [state.schemaVersion !== 4, 'STATE_SCHEMA_UNSUPPORTED'],
+      [state.startupOperations.some(unresolvedStartup), 'STARTUP_RECONCILIATION_REQUIRED'],
+      [state.recovery.terminal, 'RECOVERY_REQUIRED'],
+      [machineId === null, 'MACHINE_IDENTITY_UNVERIFIED'],
+      [registryInspection === null, 'CONNECTOR_REGISTRY_UNAVAILABLE'],
+      [registryStale, 'CONNECTOR_REGISTRY_STALE'],
+      [!machineBindingCoherent, 'MACHINE_IDENTITY_MISMATCH'],
+      [!runtimeIdentityCoherent, 'RUNTIME_IDENTITY_MISMATCH'],
+      [!runtimeOwnershipVerified, 'RUNTIME_OWNERSHIP_UNVERIFIED'],
+      [!runtimeListenerOwnershipVerified, 'RUNTIME_LISTENER_OWNERSHIP_UNVERIFIED'],
+      [!connectorBindingCoherent, 'CONNECTOR_BINDING_MISMATCH'],
+      [!fullTunnelOwnershipVerified || !proTunnelOwnershipVerified, 'WORKLOAD_TUNNEL_OWNERSHIP_UNVERIFIED'],
+      [!adminOwnershipVerified, 'ADMIN_OWNERSHIP_UNVERIFIED'],
+      [!adminSourceCoherent, 'ADMIN_SOURCE_MISMATCH'],
+      [!adminListenerOwnershipVerified, 'ADMIN_LISTENER_OWNERSHIP_UNVERIFIED'],
+      [!adminEnvironmentCoherent, 'ADMIN_ENVIRONMENT_MISMATCH'],
+      [!adminAuthenticated, 'ADMIN_READINESS_UNVERIFIED'],
+      [!adminIdentityCoherent, 'ADMIN_IDENTITY_MISMATCH'],
+      [!adminTunnelOwnershipVerified, 'ADMIN_TUNNEL_OWNERSHIP_UNVERIFIED'],
+      [!adminTunnelListenerOwnershipVerified, 'ADMIN_TUNNEL_LISTENER_OWNERSHIP_UNVERIFIED'],
+      [!adminTunnelBindingCoherent, 'ADMIN_TUNNEL_BINDING_MISMATCH'],
+      [adminTunnelStatus.state !== 'READY', 'ADMIN_TUNNEL_NOT_READY'],
+    ];
+    const readinessCode = readinessFailures.find(([failed]) => failed)?.[1] ?? 'READY';
     return {
       supervisorControlOwner: 'OUTER_SUPERVISOR_DAEMON',
       supervisorProcessId: process.pid,
       supervisorProcessIdentity: currentProcessIdentity(),
       controlSourceRoot: this.sourceRoot,
+      controlDataRoot: this.dataRoot,
       protectedReferenceRoot: this.protectedReferenceRoot ?? null,
-      readiness: !state.startupOperations.some(unresolvedStartup) && !state.recovery.terminal && observed.state === 'running' && state.admin !== null && state.adminTunnel !== null && adminSourceCoherent ? 'READY' : 'DEGRADED',
+      readiness: readinessCode === 'READY' ? 'READY' : 'DEGRADED',
+      readinessCode,
+      machineId,
       workloadRuntimeId: observed.endpoint?.runtimeId ?? null,
       workloadInstanceId: observed.endpoint?.instanceId ?? null,
-      workloadCatalogId: typeof admin.fullCatalogId === 'string' ? admin.fullCatalogId : null,
+      workloadCatalogId: typeof admin?.fullCatalogId === 'string' ? admin.fullCatalogId : null,
       deploymentEpoch: registry?.deploymentEpoch ?? null,
       adminTunnelBindingId: registry?.admin?.tunnelId ?? null,
       adminChildIdentity: ownedProcessIdentity(state.admin),
@@ -824,7 +949,21 @@ export class Supervisor {
       adminChildEnvironmentDigest,
       expectedAdminEnvironmentDigest,
       adminSourceCoherent,
-      adminEnvironmentCoherent: adminChildEnvironmentDigest !== null && adminChildEnvironmentDigest === expectedAdminEnvironmentDigest,
+      adminEnvironmentCoherent,
+      adminIdentityCoherent,
+      adminAuthenticated,
+      adminListenerOwnershipVerified,
+      authoritySnapshotCoherent,
+      runtimeOwnershipVerified,
+      runtimeListenerOwnershipVerified,
+      adminOwnershipVerified,
+      fullTunnelOwnershipVerified,
+      proTunnelOwnershipVerified,
+      adminTunnelOwnershipVerified,
+      adminTunnelListenerOwnershipVerified,
+      machineBindingCoherent,
+      connectorBindingCoherent,
+      adminTunnelBindingCoherent,
       workloadTunnelIdentity: ownedProcessIdentity(state.tunnels.full),
       adminTunnelIdentity: ownedProcessIdentity(state.adminTunnel),
       workloadProfileDigest: state.tunnels.full?.profileDigest ?? null,
@@ -832,34 +971,137 @@ export class Supervisor {
     };
   }
 
-  public async adminNativeStatus(): Promise<Record<string, unknown>> {
-    const state = await this.readState();
-    const [statusResult, toolNames] = await Promise.all([
-      callSupervisorAdminTool(this.dataRoot, this.adminPort, 'admin_status', {}),
-      listSupervisorAdminToolNames(this.dataRoot, this.adminPort),
-    ]);
-    const status = requireSuccessfulAdminResult(statusResult, 'admin_status');
-    const expectedAdminEnvironmentDigest = launchEnvironmentDigest(
-      supervisorAdminChildEnvironment(this.dataRoot, this.adminPort, this.protectedReferenceRoot),
+  private async runningOwnershipIsVerified(
+    state: SupervisorStateDocument,
+    record: OwnedProcess | null,
+    expectedSourceRoot: string,
+  ): Promise<boolean> {
+    return this.ownershipIsVerified(state, record, expectedSourceRoot, ['RUNNING']);
+  }
+
+  private async ownershipIsVerified(
+    state: SupervisorStateDocument,
+    record: OwnedProcess | null,
+    expectedSourceRoot: string,
+    allowedStates: readonly StartupState[],
+  ): Promise<boolean> {
+    if (state.schemaVersion !== 4 || record === null || await inspectProcess(record) !== 'running') return false;
+    const journals = state.startupOperations.filter((operation) => allowedStates.includes(operation.state)
+      && (operation.state !== 'OWNERSHIP_VERIFIED' || operation.transactionId === this.startupTransactionId)
+      && startupOperationOwns(operation, record));
+    if (journals.length !== 1) return false;
+    const journal = journals[0]!;
+    try {
+      if (!sameSourceRoot(journal.sourceRoot, expectedSourceRoot)
+        || !sameSourceRoot(journal.dataRoot, this.dataRoot)) return false;
+      await this.assertStartupBinding(journal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async probeOwnedRuntime(
+    state: SupervisorStateDocument,
+    record: OwnedProcess | null,
+    allowVerifiedStartup = false,
+  ): Promise<{ readonly observed: RuntimeObservedStatus; readonly ownershipVerified: boolean; readonly listenerOwnershipVerified: boolean }> {
+    const unavailable = (endpoint: RuntimeObservedStatus['endpoint'] = null): RuntimeObservedStatus => ({
+      state: 'indeterminate', endpoint, health: null, reason: 'RUNTIME_LISTENER_OWNERSHIP_UNVERIFIED',
+    });
+    if (record === null) {
+      const observed = await runtimeStatus(this.dataRoot);
+      return {
+        observed: observed.state === 'stopped' ? observed : unavailable(observed.endpoint),
+        ownershipVerified: false,
+        listenerOwnershipVerified: false,
+      };
+    }
+    const ownershipVerified = await this.ownershipIsVerified(
+      state,
+      record,
+      state.workloadSourceRoot,
+      allowVerifiedStartup ? ['RUNNING', 'OWNERSHIP_VERIFIED'] : ['RUNNING'],
     );
-    const adminChildEnvironmentDigest = state.admin?.environmentDigest ?? null;
-    const adminChildWorkingDirectory = state.admin?.workingDirectory ?? null;
-    const adminSourceCoherent = await adminProcessMatchesControlSource(state.admin, this.sourceRoot);
+    if (!ownershipVerified) return { observed: unavailable(), ownershipVerified, listenerOwnershipVerified: false };
+    const endpointBefore = await readEndpoint(this.dataRoot).catch(() => null);
+    const runtimePort = endpointBefore === null ? null : localRuntimePort(endpointBefore.apiUrl);
+    if (endpointBefore === null || runtimePort === null || !matchesRecordedRuntime(record, endpointBefore)
+      || !await ownedProcessOwnsRecordedListeners(record, [runtimePort])) {
+      return { observed: unavailable(endpointBefore), ownershipVerified, listenerOwnershipVerified: false };
+    }
+    const observed = await runtimeStatus(this.dataRoot);
+    const endpointAfter = await readEndpoint(this.dataRoot).catch(() => null);
+    const listenerOwnershipVerified = observed.endpoint !== null && endpointAfter !== null
+      && sameEndpoint(endpointBefore, observed.endpoint) && sameEndpoint(endpointBefore, endpointAfter)
+      && await ownedProcessOwnsRecordedListeners(record, [runtimePort]);
     return {
-      adminChildIdentity: ownedProcessIdentity(state.admin),
-      adminChildStartedAt: state.admin?.startedAt ?? null,
-      adminChildWorkingDirectory,
-      adminChildEnvironmentDigest,
-      expectedAdminEnvironmentDigest,
-      protectedReferenceRoot: this.protectedReferenceRoot ?? null,
-      adminSourceCoherent,
-      adminEnvironmentCoherent: adminChildEnvironmentDigest !== null && adminChildEnvironmentDigest === expectedAdminEnvironmentDigest,
-      readiness: !state.startupOperations.some(unresolvedStartup) && !state.recovery.terminal && adminSourceCoherent ? (status.readiness ?? 'DEGRADED') : 'DEGRADED',
-      activationStatusAvailable: toolNames.includes('activation_status'),
-      activationPrepareAvailable: toolNames.includes('activation_prepare'),
-      activationApplyAvailable: toolNames.includes('activation_apply'),
-      activationConfirmAvailable: toolNames.includes('activation_confirm'),
-      activationRollbackAvailable: toolNames.includes('activation_rollback'),
+      observed: listenerOwnershipVerified ? observed : unavailable(endpointAfter ?? observed.endpoint),
+      ownershipVerified,
+      listenerOwnershipVerified,
+    };
+  }
+
+  public async adminNativeStatus(): Promise<Record<string, unknown>> {
+    const [initialState, initialRegistry] = await Promise.all([
+      this.readState(),
+      inspectConnectorRegistry(this.dataRoot).catch(() => null),
+    ]);
+    const supervisorStatus = await this.supervisorNativeStatus();
+    const [probeState, probeRegistry] = await Promise.all([
+      this.readState().catch(() => null),
+      inspectConnectorRegistry(this.dataRoot).catch(() => null),
+    ]);
+    const initialAuthorityCoherent = probeState !== null
+      && JSON.stringify(probeState) === JSON.stringify(initialState)
+      && JSON.stringify(probeRegistry) === JSON.stringify(initialRegistry)
+      && supervisorStatus.authoritySnapshotCoherent === true;
+    const supervisorContractReady = supervisorStatus.readiness === 'READY'
+      && supervisorStatus.adminEnvironmentCoherent === true
+      && supervisorStatus.adminIdentityCoherent === true;
+    const adminBefore = initialAuthorityCoherent && supervisorContractReady
+      && supervisorStatus.adminOwnershipVerified === true
+      && supervisorStatus.adminSourceCoherent === true
+      && supervisorStatus.adminListenerOwnershipVerified === true
+      && supervisorStatus.adminAuthenticated === true
+      && await this.runningOwnershipIsVerified(initialState, initialState.admin, this.sourceRoot)
+      && await ownedAdminOwnsListener(initialState.admin, this.adminPort, this.sourceRoot, true);
+    const toolNames = adminBefore
+      ? await listSupervisorAdminToolNames(this.dataRoot, this.adminPort).catch(() => null)
+      : null;
+    const [confirmedState, confirmedRegistry] = await Promise.all([
+      this.readState().catch(() => null),
+      inspectConnectorRegistry(this.dataRoot).catch(() => null),
+    ]);
+    const authoritySnapshotCoherent = toolNames !== null && confirmedState !== null
+      && JSON.stringify(confirmedState) === JSON.stringify(initialState)
+      && JSON.stringify(confirmedRegistry) === JSON.stringify(initialRegistry)
+      && await this.runningOwnershipIsVerified(initialState, initialState.admin, this.sourceRoot)
+      && await ownedAdminOwnsListener(initialState.admin, this.adminPort, this.sourceRoot);
+    const readinessCode = !initialAuthorityCoherent ? 'AUTHORITY_CHANGED'
+      : !supervisorContractReady
+        ? typeof supervisorStatus.readinessCode === 'string' ? supervisorStatus.readinessCode : 'SUPERVISOR_AUTHORITY_UNVERIFIED'
+        : authoritySnapshotCoherent ? 'READY' : 'ADMIN_AUTHORITY_UNVERIFIED';
+    const ready = readinessCode === 'READY';
+    return {
+      adminChildIdentity: supervisorStatus.adminChildIdentity ?? null,
+      adminChildStartedAt: supervisorStatus.adminChildStartedAt ?? null,
+      adminChildWorkingDirectory: supervisorStatus.adminChildWorkingDirectory ?? null,
+      adminChildEnvironmentDigest: supervisorStatus.adminChildEnvironmentDigest ?? null,
+      expectedAdminEnvironmentDigest: supervisorStatus.expectedAdminEnvironmentDigest ?? null,
+      protectedReferenceRoot: supervisorStatus.protectedReferenceRoot ?? null,
+      adminSourceCoherent: supervisorStatus.adminSourceCoherent === true,
+      adminEnvironmentCoherent: supervisorStatus.adminEnvironmentCoherent === true,
+      adminListenerOwnershipVerified: supervisorStatus.adminListenerOwnershipVerified === true && authoritySnapshotCoherent,
+      adminOwnershipVerified: supervisorStatus.adminOwnershipVerified === true && authoritySnapshotCoherent,
+      authoritySnapshotCoherent,
+      readiness: ready ? 'READY' : 'DEGRADED',
+      readinessCode,
+      activationStatusAvailable: ready && toolNames?.includes('activation_status') === true,
+      activationPrepareAvailable: ready && toolNames?.includes('activation_prepare') === true,
+      activationApplyAvailable: ready && toolNames?.includes('activation_apply') === true,
+      activationConfirmAvailable: ready && toolNames?.includes('activation_confirm') === true,
+      activationRollbackAvailable: ready && toolNames?.includes('activation_rollback') === true,
     };
   }
 
@@ -1194,7 +1436,8 @@ export class Supervisor {
 
   private async statusFrom(state: SupervisorStateDocument, registry: ConnectorRegistryDocument, credentials: CredentialStatus): Promise<SupervisorStackStatus> {
     if (state.startupOperations.some(unresolvedStartup)) return { ...unavailableStatus(credentials, 'PROCESS_OWNERSHIP_AMBIGUOUS', 'Startup ownership or cleanup requires reconciliation'), recovery: recoveryView(state.recovery), registryPresent: true };
-    const runtime = await runtimeStatus(this.dataRoot);
+    const durableState = await this.readState();
+    const runtime = (await this.probeOwnedRuntime(durableState, durableState.runtime, true)).observed;
     const runtimeLayer = runtime.state === 'running' && state.runtime !== null
       ? ownershipLayer(state.runtime, runtime)
       : runtime.state === 'stopped' && state.runtime === null ? layer('FAILED', 'RUNTIME_NOT_RUNNING', 'IRIS runtime is stopped')
@@ -1208,7 +1451,7 @@ export class Supervisor {
     const tunnelLayer = tunnelResults.every((result) => result.state === 'READY') ? layer('READY', 'READY', 'FULL and PRO workload tunnel clients are healthy') : combineLayers(tunnelResults, 'TUNNEL_NOT_RUNNING', 'One or more supervisor-owned workload tunnel clients is not ready');
     const isolatedAdminRequired = this.nativeControlActive || state.adminTunnel !== null;
     const adminTunnelLayer = isolatedAdminRequired
-      ? await this.probeAdminTunnel(state.adminTunnel)
+      ? (await this.probeAdminTunnel(durableState, durableState.adminTunnel, true)).status
       : layer('READY', 'LEGACY_ADMIN_TRANSPORT', 'Isolated admin tunnel is required only for the persistent native supervisor daemon');
     const nativeControlLayer = isolatedAdminRequired
       ? await this.probeNativeControl()
@@ -1568,16 +1811,44 @@ export class Supervisor {
       : layer('FAILED', 'CONTROL_PLANE_UNREACHABLE', 'Outer supervisor native control endpoint is not authenticated and ready');
   }
 
-  private async probeAdminTunnel(record: OwnedProcess | null): Promise<LayerStatus> {
-    if (record === null) return layer('FAILED', 'TUNNEL_NOT_RUNNING', 'Isolated admin tunnel is not supervisor-owned');
-    const inspected = await inspectProcess(record);
-    if (inspected === 'ambiguous') return layer('FAILED', 'PROCESS_OWNERSHIP_AMBIGUOUS', 'Isolated admin tunnel process identity is ambiguous');
-    if (inspected === 'stopped') return layer('FAILED', 'TUNNEL_NOT_RUNNING', 'Isolated admin tunnel process is stopped');
+  private async probeAdminTunnel(
+    state: SupervisorStateDocument,
+    record: OwnedProcess | null,
+    allowVerifiedStartup = false,
+  ): Promise<{ readonly status: LayerStatus; readonly ownershipVerified: boolean; readonly listenerOwnershipVerified: boolean }> {
+    if (record === null) return {
+      status: layer('FAILED', 'TUNNEL_NOT_RUNNING', 'Isolated admin tunnel is not supervisor-owned'),
+      ownershipVerified: false,
+      listenerOwnershipVerified: false,
+    };
+    const ownershipVerified = await this.ownershipIsVerified(
+      state,
+      record,
+      this.sourceRoot,
+      allowVerifiedStartup ? ['RUNNING', 'OWNERSHIP_VERIFIED'] : ['RUNNING'],
+    );
+    if (!ownershipVerified) return {
+      status: layer('FAILED', 'PROCESS_OWNERSHIP_AMBIGUOUS', 'Isolated admin tunnel durable ownership is unverified'),
+      ownershipVerified: false,
+      listenerOwnershipVerified: false,
+    };
+    if (!await ownedProcessOwnsRecordedListeners(record, [this.adminTunnelHealthPort])) return {
+      status: layer('FAILED', 'ADMIN_TUNNEL_LISTENER_OWNERSHIP_UNVERIFIED', 'Isolated admin tunnel listener ownership is unverified'),
+      ownershipVerified: true,
+      listenerOwnershipVerified: false,
+    };
     try {
       await waitForTunnel(record.executable, this.adminTunnelHealthPort, 2_000);
-      return layer('READY', 'READY', 'Isolated admin tunnel health and readiness are healthy');
+      const listenerOwnershipVerified = await ownedProcessOwnsRecordedListeners(record, [this.adminTunnelHealthPort]);
+      return listenerOwnershipVerified
+        ? { status: layer('READY', 'READY', 'Isolated admin tunnel health and readiness are healthy'), ownershipVerified: true, listenerOwnershipVerified: true }
+        : { status: layer('FAILED', 'ADMIN_TUNNEL_LISTENER_OWNERSHIP_UNVERIFIED', 'Isolated admin tunnel listener ownership changed during readiness'), ownershipVerified: true, listenerOwnershipVerified: false };
     } catch (error) {
-      return layer('FAILED', runtimeErrorCode(error), 'Isolated admin tunnel readiness failed');
+      return {
+        status: layer('FAILED', runtimeErrorCode(error), 'Isolated admin tunnel readiness failed'),
+        ownershipVerified: true,
+        listenerOwnershipVerified: await ownedProcessOwnsRecordedListeners(record, [this.adminTunnelHealthPort]),
+      };
     }
   }
 
@@ -2390,12 +2661,28 @@ async function adminProcessMatchesControlSource(record: OwnedProcess | null, con
   if (record === null || record.workingDirectory === undefined || record.workingDirectory === null) return false;
   if (!sameSourceRoot(record.workingDirectory, controlSourceRoot)) return false;
   if (await inspectProcess(record) !== 'running') return false;
-  const command = await commandForPid(record.pid);
-  if (command === null) return false;
   const sourceEntrypoint = path.resolve(import.meta.dirname, 'supervisor-admin-main.ts');
   const builtEntrypoint = path.resolve(import.meta.dirname, 'supervisor-admin-main.js');
-  const expectedEntrypoint = existsSync(sourceEntrypoint) ? sourceEntrypoint : builtEntrypoint;
-  return commandIncludesPath(command, expectedEntrypoint);
+  const execution = await processExecutionForPid(record.pid);
+  return execution !== null && execution.unsafeEnvironmentVariables.length === 0
+    && processArgumentsRunEntrypoint(execution.arguments, sourceEntrypoint, builtEntrypoint);
+}
+
+async function ownedAdminOwnsListener(
+  record: OwnedProcess | null, port: number, controlSourceRoot: string, sourceAlreadyVerified = false,
+): Promise<boolean> {
+  if (record === null || !sourceAlreadyVerified && !await adminProcessMatchesControlSource(record, controlSourceRoot)) return false;
+  const identity = observeProcessStart(record.pid);
+  if (identity.state !== 'live' || record.processStartMarker !== identity.marker
+    || await loopbackListenerOwner(port) !== record.pid) return false;
+  const executable = await executableForPid(record.pid);
+  if (executable === null || record.processExecutable === undefined || record.processExecutable === null
+    || !sameExecutablePath(executable, record.processExecutable)) return false;
+  const sourceEntrypoint = path.resolve(import.meta.dirname, 'supervisor-admin-main.ts');
+  const builtEntrypoint = path.resolve(import.meta.dirname, 'supervisor-admin-main.js');
+  const execution = await processExecutionForPid(record.pid);
+  return execution !== null && execution.unsafeEnvironmentVariables.length === 0
+    && processArgumentsRunEntrypoint(execution.arguments, sourceEntrypoint, builtEntrypoint);
 }
 
 async function spawnManaged(
@@ -2578,6 +2865,128 @@ async function supervisorNativeEndpointResponds(dataRoot: string, port: number):
   }
 }
 
+interface SupervisorNativeOwnerIdentityEvidence {
+  readonly listenerPid: number;
+  readonly processStartMarker: string;
+  readonly canonicalExecutable: string;
+  readonly arguments: readonly string[];
+  readonly unsafeEnvironmentVariables: readonly string[];
+}
+
+async function inspectSupervisorNativeOwner(
+  dataRoot: string,
+  port: number,
+  sourceRoot: string,
+): Promise<'verified' | 'ambiguous'> {
+  try {
+    const listenerPid = await loopbackListenerOwner(port);
+    if (listenerPid === null) return 'ambiguous';
+    const identity = observeProcessStart(listenerPid);
+    if (identity.state !== 'live') return 'ambiguous';
+    const executable = await executableForPid(listenerPid);
+    if (executable === null || !sameExecutablePath(executable, canonicalNodeRuntime().path)) return 'ambiguous';
+    const sourceEntrypoint = path.resolve(sourceRoot, 'apps/runtime/src/control.ts');
+    const builtEntrypoint = path.resolve(sourceRoot, 'apps/runtime/dist/control.js');
+    const execution = await processExecutionForPid(listenerPid);
+    if (execution === null || execution.unsafeEnvironmentVariables.length > 0
+      || !processArgumentsRunEntrypoint(execution.arguments, sourceEntrypoint, builtEntrypoint, 'supervisor')) return 'ambiguous';
+    const secret = await readTunnelServiceSecret(dataRoot);
+    if (secret === null) return 'ambiguous';
+    const response = await fetch(`http://127.0.0.1:${port}/healthz`, {
+      headers: { authorization: `Bearer ${secret}` },
+      signal: AbortSignal.timeout(500),
+      cache: 'no-store',
+    });
+    if (!response.ok) return 'ambiguous';
+    const value = await response.json() as unknown;
+    if (!isRecord(value) || value.ok !== true || value.owner !== 'OUTER_SUPERVISOR_DAEMON'
+      || value.pid !== listenerPid) return 'ambiguous';
+    const observedRuntime = await runtimeStatus(dataRoot);
+    const expectedRuntimeId = observedRuntime.endpoint?.runtimeId ?? null;
+    const expectedInstanceId = observedRuntime.endpoint?.instanceId ?? null;
+    const status = await readNativeSupervisorStatus(secret, port);
+    if (status === null || status.supervisorProcessId !== listenerPid
+      || typeof status.controlSourceRoot !== 'string'
+      || !sameSourceRoot(status.controlSourceRoot, sourceRoot)
+      || typeof status.controlDataRoot !== 'string'
+      || !sameSourceRoot(status.controlDataRoot, dataRoot)
+      || status.workloadRuntimeId !== expectedRuntimeId
+      || status.workloadInstanceId !== expectedInstanceId) return 'ambiguous';
+    const confirmedIdentity = observeProcessStart(listenerPid);
+    const confirmedListenerPid = await loopbackListenerOwner(port);
+    const confirmedExecutable = await executableForPid(listenerPid);
+    const confirmedExecution = await processExecutionForPid(listenerPid);
+    return confirmedIdentity.state === 'live' && confirmedListenerPid !== null
+      && confirmedExecutable !== null && confirmedExecution !== null
+      && sameExecutablePath(confirmedExecutable, canonicalNodeRuntime().path)
+      && confirmedExecution.unsafeEnvironmentVariables.length === 0
+      && processArgumentsRunEntrypoint(confirmedExecution.arguments, sourceEntrypoint, builtEntrypoint, 'supervisor')
+      && supervisorNativeOwnerIdentityIsStable(
+        {
+          listenerPid,
+          processStartMarker: identity.marker,
+          canonicalExecutable: realpathSync(executable),
+          arguments: execution.arguments,
+          unsafeEnvironmentVariables: execution.unsafeEnvironmentVariables,
+        },
+        {
+          listenerPid: confirmedListenerPid,
+          processStartMarker: confirmedIdentity.marker,
+          canonicalExecutable: realpathSync(confirmedExecutable),
+          arguments: confirmedExecution.arguments,
+          unsafeEnvironmentVariables: confirmedExecution.unsafeEnvironmentVariables,
+        },
+      )
+      ? 'verified' : 'ambiguous';
+  } catch {
+    return 'ambiguous';
+  }
+}
+
+function supervisorNativeOwnerIdentityIsStable(
+  initial: SupervisorNativeOwnerIdentityEvidence,
+  confirmed: SupervisorNativeOwnerIdentityEvidence,
+): boolean {
+  return initial.listenerPid === confirmed.listenerPid
+    && initial.processStartMarker === confirmed.processStartMarker
+    && initial.canonicalExecutable === confirmed.canonicalExecutable
+    && sameStringVector(initial.arguments, confirmed.arguments)
+    && sameStringVector(initial.unsafeEnvironmentVariables, confirmed.unsafeEnvironmentVariables)
+    && initial.unsafeEnvironmentVariables.length === 0
+    && confirmed.unsafeEnvironmentVariables.length === 0;
+}
+
+/** @internal Pure deterministic identity comparison; performs no I/O and cannot access credentials. */
+export function supervisorNativeOwnerIdentityIsStableForTest(
+  initial: SupervisorNativeOwnerIdentityEvidence,
+  confirmed: SupervisorNativeOwnerIdentityEvidence,
+): boolean {
+  return supervisorNativeOwnerIdentityIsStable(initial, confirmed);
+}
+
+async function readNativeSupervisorStatus(secret: string, port: number): Promise<Record<string, unknown> | null> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${secret}`,
+        'content-type': 'application/json',
+        'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
+        'Mcp-Name': 'supervisor_status',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name: 'supervisor_status', arguments: {} } }),
+      signal: AbortSignal.timeout(5_000),
+      cache: 'no-store',
+    });
+    if (!response.ok) return null;
+    const value = await response.json() as unknown;
+    return isRecord(value) && isRecord(value.result) && value.result.isError !== true && isRecord(value.result.structuredContent)
+      ? value.result.structuredContent : null;
+  } catch {
+    return null;
+  }
+}
+
 async function adminEndpointResponds(dataRoot: string, port: number): Promise<boolean> {
   const secret = await readTunnelServiceSecret(dataRoot);
   if (secret === null) return false;
@@ -2714,6 +3123,11 @@ function actionForCode(code: string): string {
 
 function runtimeErrorCode(error: unknown): RuntimeFailureCode { return error instanceof RuntimeError ? error.code : 'SUPERVISOR_NOT_RUNNING'; }
 
+function isAddressInUse(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error
+    && (error as NodeJS.ErrnoException).code === 'EADDRINUSE';
+}
+
 function isMissingProcess(error: unknown): boolean { return typeof error === 'object' && error !== null && 'code' in error && (error as NodeJS.ErrnoException).code === 'ESRCH'; }
 
 function isNotFound(error: unknown): boolean { return typeof error === 'object' && error !== null && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT'; }
@@ -2784,7 +3198,27 @@ function ownershipSourceRoot(record: OwnedProcess, state: SupervisorStateDocumen
 
 function startupOperationOwns(operation: StartupOperation, record: OwnedProcess): boolean {
   return startupOperationOwnsIdentity(operation, record)
-    && isOwnedProcess(operation.ownedProcess) && sameListenerPorts(operation.ownedProcess.listenerPorts, record.listenerPorts);
+    && isOwnedProcess(operation.ownedProcess) && sameOwnedProcessAuthority(operation.ownedProcess, record);
+}
+
+function sameOwnedProcessAuthority(left: OwnedProcess, right: OwnedProcess): boolean {
+  return left.component === right.component
+    && left.pid === right.pid
+    && left.startedAt === right.startedAt
+    && sameExecutablePath(left.executable, right.executable)
+    && left.profilePath === right.profilePath
+    && left.tunnelId === right.tunnelId
+    && left.marker === right.marker
+    && left.processStartTimeMs === right.processStartTimeMs
+    && left.processStartMarker === right.processStartMarker
+    && left.processExecutable === right.processExecutable
+    && sameListenerPorts(left.listenerPorts, right.listenerPorts)
+    && left.runtimeId === right.runtimeId
+    && left.instanceId === right.instanceId
+    && left.deploymentEpoch === right.deploymentEpoch
+    && left.profileDigest === right.profileDigest
+    && left.workingDirectory === right.workingDirectory
+    && left.environmentDigest === right.environmentDigest;
 }
 
 function startupOperationOwnsIdentity(operation: StartupOperation, record: OwnedProcess): boolean {
@@ -2843,6 +3277,15 @@ function assertRuntimeOwnership(record: OwnedProcess, observed: RuntimeObservedS
   }
 }
 
+function runtimeOwnershipMatches(record: OwnedProcess, observed: RuntimeObservedStatus): boolean {
+  try {
+    assertRuntimeOwnership(record, observed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function localRuntimePort(apiUrl: string): number | null {
   try {
     const endpoint = new URL(apiUrl);
@@ -2860,6 +3303,81 @@ async function processOwnsLoopbackListener(pid: number, port: number): Promise<b
     const fields = stdout.split('\n');
     return fields.includes(`p${pid}`) && fields.includes(`n127.0.0.1:${port}`);
   } catch { return false; }
+}
+
+async function ownedProcessOwnsRecordedListeners(record: OwnedProcess, expectedPorts: readonly number[]): Promise<boolean> {
+  if (!sameListenerPorts(record.listenerPorts, expectedPorts) || await inspectProcess(record) !== 'running') return false;
+  for (const port of expectedPorts) if (await loopbackListenerOwner(port) !== record.pid) return false;
+  if (await inspectProcess(record) !== 'running') return false;
+  for (const port of expectedPorts) if (await loopbackListenerOwner(port) !== record.pid) return false;
+  return true;
+}
+
+async function loopbackListenerOwner(port: number): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpn'], {
+      encoding: 'utf8', timeout: 1_000, maxBuffer: 16_384,
+    });
+    const owners = new Set<number>();
+    let pid: number | null = null;
+    for (const field of stdout.split('\n')) {
+      if (/^p\d+$/.test(field)) pid = Number(field.slice(1));
+      else if (field === `n127.0.0.1:${port}` && pid !== null) owners.add(pid);
+    }
+    return owners.size === 1 ? [...owners][0]! : null;
+  } catch {
+    return null;
+  }
+}
+
+interface ProcessExecutionInspection {
+  readonly arguments: readonly string[];
+  readonly unsafeEnvironmentVariables: readonly string[];
+}
+
+async function processExecutionForPid(pid: number): Promise<ProcessExecutionInspection | null> {
+  try {
+    const { stdout } = await execFileAsync('/usr/bin/python3', ['-I', '-S', MACOS_SAFETY_HELPER, 'process-arguments', String(pid)], {
+      encoding: 'utf8', timeout: 2_000, maxBuffer: 64 * 1024, env: { PATH: '/usr/bin:/bin' },
+    });
+    const parsed = JSON.parse(stdout) as unknown;
+    if (!isRecord(parsed) || !Array.isArray(parsed.arguments) || !Array.isArray(parsed.unsafeEnvironmentVariables)
+      || Object.keys(parsed).length !== 2
+      || parsed.arguments.length === 0 || parsed.arguments.length > 256
+      || !parsed.arguments.every((argument) => typeof argument === 'string' && argument.length > 0 && argument.length <= 16_384)
+      || parsed.unsafeEnvironmentVariables.length > 32
+      || !parsed.unsafeEnvironmentVariables.every((name) => typeof name === 'string'
+        && (name === 'NODE_OPTIONS' || name === 'NODE_PATH' || name.startsWith('DYLD_') || name.startsWith('TSX_')))) return null;
+    return parsed as unknown as ProcessExecutionInspection;
+  } catch {
+    return null;
+  }
+}
+
+function processArgumentsRunEntrypoint(
+  argumentsList: readonly string[], sourceEntrypoint: string, builtEntrypoint: string, trailingArgument?: string,
+): boolean {
+  if (argumentsList.length < 2 || !sameExecutablePath(argumentsList[0]!, canonicalNodeRuntime().path)) return false;
+  const sourceLoader = path.resolve(path.dirname(sourceEntrypoint), '..', 'node_modules', 'tsx', 'dist');
+  const sourceArguments = [
+    argumentsList[0]!, '--require', path.join(sourceLoader, 'preflight.cjs'),
+    '--import', pathToFileURL(path.join(sourceLoader, 'loader.mjs')).href,
+    sourceEntrypoint, ...(trailingArgument === undefined ? [] : [trailingArgument]),
+  ];
+  const builtArguments = [argumentsList[0]!, builtEntrypoint, ...(trailingArgument === undefined ? [] : [trailingArgument])];
+  return sameArgumentVector(argumentsList, sourceArguments) || sameArgumentVector(argumentsList, builtArguments);
+}
+
+function sameArgumentVector(actual: readonly string[], expected: readonly string[]): boolean {
+  if (actual.length !== expected.length) return false;
+  return actual.every((argument, index) => {
+    const expectedArgument = expected[index]!;
+    return path.isAbsolute(expectedArgument) ? path.isAbsolute(argument) && sameExecutablePath(argument, expectedArgument) : argument === expectedArgument;
+  });
+}
+
+function sameStringVector(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function sameOwnedRuntime(left: OwnedProcess, right: OwnedProcess): boolean {

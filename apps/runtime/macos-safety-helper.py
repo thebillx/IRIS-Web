@@ -15,6 +15,10 @@ PATH_BUFFER_BYTES = 1024
 PROC_PIDTBSDINFO = 3
 MAXCOMLEN = 16
 MAX_FILE_BYTES = 1024 * 1024
+MAX_PROCESS_ARGUMENT_BYTES = 1024 * 1024
+MAX_PROCESS_ARGUMENTS = 256
+CTL_KERN = 1
+KERN_PROCARGS2 = 49
 
 
 class ProcBsdInfo(ctypes.Structure):
@@ -89,6 +93,77 @@ def process_executable(pid_text):
     if not os.path.isabs(executable) or any(c in executable for c in ('\r', '\n', '\0')):
         fail('process executable is invalid')
     sys.stdout.write(executable + '\n')
+
+
+def process_arguments(pid_text):
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        fail('pid is invalid')
+    if pid <= 0:
+        fail('pid is invalid')
+    libsystem = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    libsystem.sysctl.argtypes = [
+        ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t,
+    ]
+    libsystem.sysctl.restype = ctypes.c_int
+    mib = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, pid)
+    size = ctypes.c_size_t(0)
+    if libsystem.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        fail('process arguments are unavailable')
+    if size.value < ctypes.sizeof(ctypes.c_int) or size.value > MAX_PROCESS_ARGUMENT_BYTES:
+        fail('process arguments exceed the bounded size')
+    buffer = ctypes.create_string_buffer(size.value)
+    if libsystem.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        fail('process arguments are unavailable')
+    content = buffer.raw[:size.value]
+    argument_count = int.from_bytes(content[:4], byteorder=sys.byteorder, signed=True)
+    if argument_count <= 0 or argument_count > MAX_PROCESS_ARGUMENTS:
+        fail('process argument count is invalid')
+    offset = content.find(b'\0', 4)
+    if offset < 0:
+        fail('process executable arguments are malformed')
+    offset += 1
+    while offset < len(content) and content[offset] == 0:
+        offset += 1
+    arguments = []
+    for _ in range(argument_count):
+        end = content.find(b'\0', offset)
+        if end < 0:
+            fail('process arguments are malformed')
+        try:
+            argument = content[offset:end].decode('utf-8', errors='strict')
+        except UnicodeDecodeError:
+            fail('process argument encoding is invalid')
+        if not argument or any(character in argument for character in ('\r', '\n', '\0')):
+            fail('process argument is invalid')
+        arguments.append(argument)
+        offset = end + 1
+    unsafe_environment_variables = set()
+    while offset < len(content):
+        end = content.find(b'\0', offset)
+        if end < 0:
+            break
+        entry = content[offset:end]
+        offset = end + 1
+        if not entry:
+            continue
+        name, separator, _ = entry.partition(b'=')
+        if not separator:
+            continue
+        try:
+            decoded_name = name.decode('ascii', errors='strict')
+        except UnicodeDecodeError:
+            continue
+        if (decoded_name in ('NODE_OPTIONS', 'NODE_PATH')
+                or decoded_name.startswith('DYLD_')
+                or decoded_name.startswith('TSX_')):
+            unsafe_environment_variables.add(decoded_name)
+    sys.stdout.write(json.dumps({
+        'arguments': arguments,
+        'unsafeEnvironmentVariables': sorted(unsafe_environment_variables),
+    }, separators=(',', ':')) + '\n')
 
 
 def validated_relative(root, target):
@@ -496,6 +571,11 @@ def main():
         if len(sys.argv) != 3:
             fail('process-executable requires pid')
         process_executable(sys.argv[2])
+        return
+    if operation == 'process-arguments':
+        if len(sys.argv) != 3:
+            fail('process-arguments requires pid')
+        process_arguments(sys.argv[2])
         return
     if operation == 'read-file':
         if len(sys.argv) != 4:

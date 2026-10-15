@@ -1,8 +1,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RuntimeError } from '@iris/domain';
 import type { ProcessStartObservation } from './macos-safety.js';
@@ -21,11 +24,11 @@ vi.mock('./lifecycle.js', async () => ({ ...await vi.importActual<typeof import(
 vi.mock('./supervisor-native-control.js', async () => ({ ...await vi.importActual<typeof import('./supervisor-native-control.js')>('./supervisor-native-control.js'), startSupervisorNativeControlServer: mocks.native }));
 vi.mock('./supervisor-admin.js', async () => ({ ...await vi.importActual<typeof import('./supervisor-admin.js')>('./supervisor-admin.js'), callSupervisorAdminTool: mocks.admin }));
 
-import { createSupervisor, type Supervisor } from './supervisor.js';
+import { createSupervisor, supervisorAdminChildEnvironment, supervisorNativeOwnerIdentityIsStableForTest, type Supervisor } from './supervisor.js';
 import { initializeConnectorRegistry, bindConnectorRuntime, readConnectorRegistry } from './connector-registry.js';
 import { loadOrCreateTunnelServiceSecret } from './credentials.js';
-import { loadOrCreateRuntimeId } from './persistence.js';
-import { canonicalNodeRuntime } from './node-runtime.js';
+import { loadOrCreateRuntimeId, writeEndpoint } from './persistence.js';
+import { canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
 
 interface ChildRecord {
@@ -208,6 +211,383 @@ describe('Supervisor production failure boundaries', () => {
     expect(await readFile(path.join(f.root, 'supervisor/state.json'), 'utf8')).not.toContain('synthetic-do-not-log');
     expect(log.mock.calls.flat().join(' ')).not.toContain('synthetic-do-not-log');
   });
+  it('does not overwrite workload state when a native-control listener has ambiguous ownership', async () => {
+    const f = await fixture();
+    const state = await f.internal.readState();
+    await f.internal.writeState(state, true);
+    const filename = path.join(f.root, 'supervisor/state.json');
+    const before = await readFile(filename);
+    let requests = 0;
+    let receivedAuthorization = false;
+    const occupied = createHttpServer((request, response) => {
+      requests += 1;
+      receivedAuthorization ||= request.headers.authorization !== undefined;
+      response.statusCode = 401;
+      response.end();
+    });
+    await new Promise<void>((resolve) => occupied.listen(f.ports[2]!, '127.0.0.1', resolve));
+    mocks.native.mockRejectedValue(Object.assign(new Error('synthetic occupied port'), { code: 'EADDRINUSE' }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await expect(f.supervisor.runSupervisorDaemon()).resolves.toBeUndefined();
+      expect(await readFile(filename)).toEqual(before);
+      expect(log.mock.calls.flat().join(' ')).toContain('ownership is ambiguous');
+      expect(requests).toBe(0);
+      expect(receivedAuthorization).toBe(false);
+    } finally {
+      await new Promise<void>((resolve, reject) => occupied.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+  it('accepts an identity-bound built Supervisor incumbent after pre-authentication OS proof', async () => {
+    const f = await fixture();
+    const state = await f.internal.readState();
+    await f.internal.writeState(state, true);
+    const filename = path.join(f.root, 'supervisor/state.json');
+    const before = await readFile(filename);
+    const secret = await loadOrCreateTunnelServiceSecret(f.root);
+    const incumbentSourceRoot = path.join(f.root, 'built-incumbent');
+    const builtDirectory = path.join(incumbentSourceRoot, 'apps/runtime/dist');
+    await mkdir(builtDirectory, { recursive: true, mode: 0o700 });
+    const controlEntrypoint = path.join(builtDirectory, 'control.js');
+    await writeFile(controlEntrypoint, `
+const { createServer } = require('node:http');
+const server = createServer((request, response) => {
+  if (request.headers.authorization !== 'Bearer ' + process.env.IRIS_TEST_SECRET) { response.statusCode = 401; response.end(); return; }
+  response.setHeader('content-type', 'application/json');
+  if (request.url === '/healthz') { response.end(JSON.stringify({ ok: true, owner: 'OUTER_SUPERVISOR_DAEMON', pid: process.pid })); return; }
+  response.end(JSON.stringify({ jsonrpc: '2.0', id: 'synthetic', result: { isError: false, structuredContent: {
+    supervisorProcessId: process.pid, controlSourceRoot: process.env.IRIS_TEST_SOURCE,
+    controlDataRoot: process.env.IRIS_TEST_ROOT, workloadRuntimeId: null, workloadInstanceId: null,
+  } } }));
+});
+server.listen(Number(process.env.IRIS_TEST_PORT), '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`, { mode: 0o600 });
+    const child = spawn(canonicalNodeRuntime().path, [controlEntrypoint, 'supervisor'], {
+      cwd: incumbentSourceRoot,
+      env: node24Environment(
+        { HOME: process.env.HOME ?? os.homedir(), TMPDIR: process.env.TMPDIR ?? os.tmpdir(), LANG: process.env.LANG ?? 'en_US.UTF-8' },
+        {
+          IRIS_TEST_SECRET: secret,
+          IRIS_TEST_PORT: String(f.ports[2]!),
+          IRIS_TEST_SOURCE: incumbentSourceRoot,
+          IRIS_TEST_ROOT: f.root,
+        },
+      ),
+      stdio: 'ignore',
+    });
+    if (child.pid === undefined) throw new Error('built Supervisor incumbent did not start');
+    const incumbentSupervisor = await createSupervisor({
+      dataRoot: f.root, sourceRoot: incumbentSourceRoot,
+      webPort: f.ports[0]!, adminPort: f.ports[1]!, supervisorControlPort: f.ports[2]!, adminTunnelHealthPort: f.ports[3]!,
+    });
+    mocks.native.mockRejectedValue(Object.assign(new Error('synthetic occupied port'), { code: 'EADDRINUSE' }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await vi.waitFor(async () => expect((await fetch(`http://127.0.0.1:${f.ports[2]!}/healthz`, {
+        headers: { authorization: `Bearer ${secret}` },
+      })).status).toBe(200));
+      await expect(incumbentSupervisor.runSupervisorDaemon()).resolves.toBeUndefined();
+      expect(await readFile(filename)).toEqual(before);
+      expect(log.mock.calls.flat().join(' ')).toContain('already running');
+    } finally {
+      process.kill(child.pid, 'SIGTERM');
+      await gone(child.pid);
+    }
+  }, 10_000);
+  it.each(['listener owner', 'process birth/PID reuse', 'executable', 'argv', 'valid argv mode', 'environment evidence'] as const)(
+    'fails closed when native Supervisor %s identity changes after authentication',
+    (changedIdentity) => {
+      const builtEntrypoint = path.join(sourceRoot, 'apps/runtime/dist/control.js');
+      const trustedArguments = [canonicalNodeRuntime().path, builtEntrypoint, 'supervisor'];
+      const sourceEntrypoint = path.join(sourceRoot, 'apps/runtime/src/control.ts');
+      const sourceLoader = path.join(sourceRoot, 'apps/runtime/node_modules/tsx/dist');
+      const trustedSourceArguments = [
+        canonicalNodeRuntime().path,
+        '--require', path.join(sourceLoader, 'preflight.cjs'),
+        '--import', pathToFileURL(path.join(sourceLoader, 'loader.mjs')).href,
+        sourceEntrypoint,
+        'supervisor',
+      ];
+      const initial = {
+        listenerPid: 41_101,
+        processStartMarker: '1:000001',
+        canonicalExecutable: canonicalNodeRuntime().path,
+        arguments: trustedArguments,
+        unsafeEnvironmentVariables: [] as string[],
+      };
+      const confirmed = {
+        listenerPid: changedIdentity === 'listener owner' ? 41_102 : initial.listenerPid,
+        processStartMarker: changedIdentity === 'process birth/PID reuse' ? '2:000002' : initial.processStartMarker,
+        canonicalExecutable: changedIdentity === 'executable' ? '/usr/bin/false' : initial.canonicalExecutable,
+        arguments: changedIdentity === 'argv'
+            ? [canonicalNodeRuntime().path, '-e', 'void 0', builtEntrypoint, 'supervisor']
+            : changedIdentity === 'valid argv mode' ? trustedSourceArguments : trustedArguments,
+        unsafeEnvironmentVariables: changedIdentity === 'environment evidence' ? ['NODE_OPTIONS'] : [],
+      };
+      const before = structuredClone({ initial, confirmed });
+      expect(supervisorNativeOwnerIdentityIsStableForTest(initial, confirmed)).toBe(false);
+      expect({ initial, confirmed }).toEqual(before);
+    },
+  );
+  it('rejects a credential-bearing eval listener that appends trusted entrypoint arguments', async () => {
+    const f = await fixture();
+    const state = await f.internal.readState();
+    await f.internal.writeState(state, true);
+    const filename = path.join(f.root, 'supervisor/state.json');
+    const before = await readFile(filename);
+    const secret = await loadOrCreateTunnelServiceSecret(f.root);
+    const controlEntrypoint = path.join(sourceRoot, 'apps/runtime/src/control.ts');
+    const script = `
+const { createServer } = require('node:http');
+const server = createServer((request, response) => {
+  if (request.headers.authorization !== 'Bearer ' + process.env.IRIS_TEST_SECRET) { response.statusCode = 401; response.end(); return; }
+  response.setHeader('content-type', 'application/json');
+  if (request.url === '/healthz') { response.end(JSON.stringify({ ok: true, owner: 'OUTER_SUPERVISOR_DAEMON', pid: process.pid })); return; }
+  response.end(JSON.stringify({ jsonrpc: '2.0', id: 'synthetic', result: { isError: false, structuredContent: {
+    supervisorProcessId: process.pid,
+    controlSourceRoot: process.env.IRIS_TEST_SOURCE,
+    controlDataRoot: process.env.IRIS_TEST_ROOT,
+    workloadRuntimeId: null,
+    workloadInstanceId: null,
+  } } }));
+});
+server.listen(Number(process.env.IRIS_TEST_PORT), '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`;
+    const child = spawn(canonicalNodeRuntime().path, ['-e', script, controlEntrypoint, 'supervisor'], {
+      env: { ...process.env, IRIS_TEST_SECRET: secret, IRIS_TEST_PORT: String(f.ports[2]!), IRIS_TEST_SOURCE: sourceRoot, IRIS_TEST_ROOT: f.root },
+      stdio: 'ignore',
+    });
+    if (child.pid === undefined) throw new Error('identity-bound fixture child did not start');
+    const childPid = child.pid;
+    mocks.native.mockRejectedValue(Object.assign(new Error('synthetic occupied port'), { code: 'EADDRINUSE' }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await vi.waitFor(async () => expect((await fetch(`http://127.0.0.1:${f.ports[2]!}/healthz`, {
+        headers: { authorization: `Bearer ${secret}` },
+      })).status).toBe(200));
+      await expect(f.supervisor.runSupervisorDaemon()).resolves.toBeUndefined();
+      expect(await readFile(filename)).toEqual(before);
+      expect(log.mock.calls.flat().join(' ')).toContain('ownership is ambiguous');
+      expect(mocks.actualObserve!(childPid).state).toBe('live');
+    } finally {
+      process.kill(childPid, 'SIGTERM');
+      await gone(childPid);
+    }
+  }, 10_000);
+  it('rejects trusted Supervisor argv when NODE_OPTIONS injects the listener implementation', async () => {
+    const f = await fixture();
+    const state = await f.internal.readState();
+    await f.internal.writeState(state, true);
+    const filename = path.join(f.root, 'supervisor/state.json');
+    const before = await readFile(filename);
+    const secret = await loadOrCreateTunnelServiceSecret(f.root);
+    const spoofSourceRoot = path.join(f.root, 'spoof-source');
+    const builtDirectory = path.join(spoofSourceRoot, 'apps/runtime/dist');
+    await mkdir(builtDirectory, { recursive: true, mode: 0o700 });
+    const controlEntrypoint = path.join(builtDirectory, 'control.js');
+    const preload = path.join(spoofSourceRoot, 'preload.cjs');
+    await writeFile(controlEntrypoint, "setInterval(() => undefined, 1000); process.on('SIGTERM', () => process.exit(0));\n", { mode: 0o600 });
+    await writeFile(preload, `
+const { createServer } = require('node:http');
+createServer((request, response) => {
+  if (request.headers.authorization !== 'Bearer ' + process.env.IRIS_TEST_SECRET) { response.statusCode = 401; response.end(); return; }
+  response.setHeader('content-type', 'application/json');
+  if (request.url === '/healthz') { response.end(JSON.stringify({ ok: true, owner: 'OUTER_SUPERVISOR_DAEMON', pid: process.pid })); return; }
+  response.end(JSON.stringify({ jsonrpc: '2.0', id: 'synthetic', result: { isError: false, structuredContent: {
+    supervisorProcessId: process.pid, controlSourceRoot: process.env.IRIS_TEST_SOURCE,
+    controlDataRoot: process.env.IRIS_TEST_ROOT, workloadRuntimeId: null, workloadInstanceId: null,
+  } } }));
+}).listen(Number(process.env.IRIS_TEST_PORT), '127.0.0.1');
+`, { mode: 0o600 });
+    const child = spawn(canonicalNodeRuntime().path, [controlEntrypoint, 'supervisor'], {
+      cwd: spoofSourceRoot,
+      env: {
+        ...process.env,
+        NODE_OPTIONS: `--require=${preload}`,
+        IRIS_TEST_SECRET: secret,
+        IRIS_TEST_PORT: String(f.ports[2]!),
+        IRIS_TEST_SOURCE: spoofSourceRoot,
+        IRIS_TEST_ROOT: f.root,
+      },
+      stdio: 'ignore',
+    });
+    if (child.pid === undefined) throw new Error('NODE_OPTIONS fixture child did not start');
+    const spoofSupervisor = await createSupervisor({
+      dataRoot: f.root, sourceRoot: spoofSourceRoot,
+      webPort: f.ports[0]!, adminPort: f.ports[1]!, supervisorControlPort: f.ports[2]!, adminTunnelHealthPort: f.ports[3]!,
+    });
+    mocks.native.mockRejectedValue(Object.assign(new Error('synthetic occupied port'), { code: 'EADDRINUSE' }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await vi.waitFor(async () => expect((await fetch(`http://127.0.0.1:${f.ports[2]!}/healthz`, {
+        headers: { authorization: `Bearer ${secret}` },
+      })).status).toBe(200));
+      await expect(spoofSupervisor.runSupervisorDaemon()).resolves.toBeUndefined();
+      expect(await readFile(filename)).toEqual(before);
+      expect(log.mock.calls.flat().join(' ')).toContain('ownership is ambiguous');
+      expect(mocks.actualObserve!(child.pid).state).toBe('live');
+    } finally {
+      process.kill(child.pid, 'SIGTERM');
+      await gone(child.pid);
+    }
+  }, 10_000);
+  it('rejects trusted source-mode Supervisor argv when TSX_TSCONFIG_PATH is present', async () => {
+    const f = await fixture();
+    const state = await f.internal.readState();
+    await f.internal.writeState(state, true);
+    const filename = path.join(f.root, 'supervisor/state.json');
+    const before = await readFile(filename);
+    const secret = await loadOrCreateTunnelServiceSecret(f.root);
+    const spoofSourceRoot = path.join(f.root, 'tsx-source');
+    const sourceDirectory = path.join(spoofSourceRoot, 'apps/runtime/src');
+    const loaderDirectory = path.join(spoofSourceRoot, 'apps/runtime/node_modules/tsx/dist');
+    await mkdir(sourceDirectory, { recursive: true, mode: 0o700 });
+    await mkdir(path.dirname(loaderDirectory), { recursive: true, mode: 0o700 });
+    await symlink(path.join(sourceRoot, 'apps/runtime/node_modules/tsx/dist'), loaderDirectory, 'dir');
+    const controlEntrypoint = path.join(sourceDirectory, 'control.ts');
+    const tsconfig = path.join(spoofSourceRoot, 'tsconfig.json');
+    await writeFile(tsconfig, '{"compilerOptions":{"module":"ESNext"}}\n', { mode: 0o600 });
+    await writeFile(controlEntrypoint, `
+import { createServer } from 'node:http';
+const server = createServer((request, response) => {
+  if (request.headers.authorization !== 'Bearer ' + process.env.IRIS_TEST_SECRET) { response.statusCode = 401; response.end(); return; }
+  response.setHeader('content-type', 'application/json');
+  if (request.url === '/healthz') { response.end(JSON.stringify({ ok: true, owner: 'OUTER_SUPERVISOR_DAEMON', pid: process.pid })); return; }
+  response.end(JSON.stringify({ jsonrpc: '2.0', id: 'synthetic', result: { isError: false, structuredContent: {
+    supervisorProcessId: process.pid, controlSourceRoot: process.env.IRIS_TEST_SOURCE,
+    controlDataRoot: process.env.IRIS_TEST_ROOT, workloadRuntimeId: null, workloadInstanceId: null,
+  } } }));
+});
+server.listen(Number(process.env.IRIS_TEST_PORT), '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`, { mode: 0o600 });
+    const child = spawn(canonicalNodeRuntime().path, [
+      '--require', path.join(loaderDirectory, 'preflight.cjs'),
+      '--import', pathToFileURL(path.join(loaderDirectory, 'loader.mjs')).href,
+      controlEntrypoint, 'supervisor',
+    ], {
+      cwd: spoofSourceRoot,
+      env: node24Environment(
+        { HOME: process.env.HOME ?? os.homedir(), TMPDIR: process.env.TMPDIR ?? os.tmpdir(), LANG: process.env.LANG ?? 'en_US.UTF-8' },
+        {
+          TSX_TSCONFIG_PATH: tsconfig,
+          IRIS_TEST_SECRET: secret,
+          IRIS_TEST_PORT: String(f.ports[2]!),
+          IRIS_TEST_SOURCE: spoofSourceRoot,
+          IRIS_TEST_ROOT: f.root,
+        },
+      ),
+      stdio: 'ignore',
+    });
+    if (child.pid === undefined) throw new Error('TSX_TSCONFIG_PATH fixture child did not start');
+    const spoofSupervisor = await createSupervisor({
+      dataRoot: f.root, sourceRoot: spoofSourceRoot,
+      webPort: f.ports[0]!, adminPort: f.ports[1]!, supervisorControlPort: f.ports[2]!, adminTunnelHealthPort: f.ports[3]!,
+    });
+    mocks.native.mockRejectedValue(Object.assign(new Error('synthetic occupied port'), { code: 'EADDRINUSE' }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await vi.waitFor(async () => expect((await fetch(`http://127.0.0.1:${f.ports[2]!}/healthz`, {
+        headers: { authorization: `Bearer ${secret}` },
+      })).status).toBe(200));
+      await expect(spoofSupervisor.runSupervisorDaemon()).resolves.toBeUndefined();
+      expect(await readFile(filename)).toEqual(before);
+      expect(log.mock.calls.flat().join(' ')).toContain('ownership is ambiguous');
+      expect(mocks.actualObserve!(child.pid).state).toBe('live');
+    } finally {
+      process.kill(child.pid, 'SIGTERM');
+      await gone(child.pid);
+    }
+  }, 10_000);
+  it('rejects an authenticated endpoint that claims another valid same-source PID', async () => {
+    const f = await fixture();
+    const state = await f.internal.readState();
+    await f.internal.writeState(state, true);
+    const filename = path.join(f.root, 'supervisor/state.json');
+    const before = await readFile(filename);
+    const secret = await loadOrCreateTunnelServiceSecret(f.root);
+    const controlEntrypoint = path.join(sourceRoot, 'apps/runtime/src/control.ts');
+    const decoy = spawn(canonicalNodeRuntime().path, ['-e', 'setInterval(() => undefined, 1000)', controlEntrypoint, 'supervisor'], { stdio: 'ignore' });
+    if (decoy.pid === undefined) throw new Error('same-source decoy did not start');
+    const script = `
+const { createServer } = require('node:http');
+const server = createServer((request, response) => {
+  if (request.headers.authorization !== 'Bearer ' + process.env.IRIS_TEST_SECRET) { response.statusCode = 401; response.end(); return; }
+  response.setHeader('content-type', 'application/json');
+  const claimed = Number(process.env.IRIS_TEST_CLAIMED_PID);
+  if (request.url === '/healthz') { response.end(JSON.stringify({ ok: true, owner: 'OUTER_SUPERVISOR_DAEMON', pid: claimed })); return; }
+  response.end(JSON.stringify({ jsonrpc: '2.0', id: 'synthetic', result: { isError: false, structuredContent: {
+    supervisorProcessId: claimed,
+    controlSourceRoot: process.env.IRIS_TEST_SOURCE,
+    controlDataRoot: process.env.IRIS_TEST_ROOT,
+    workloadRuntimeId: null,
+    workloadInstanceId: null,
+  } } }));
+});
+server.listen(Number(process.env.IRIS_TEST_PORT), '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`;
+    const listener = spawn(canonicalNodeRuntime().path, ['-e', script, controlEntrypoint, 'supervisor'], {
+      env: { ...process.env, IRIS_TEST_SECRET: secret, IRIS_TEST_PORT: String(f.ports[2]!), IRIS_TEST_CLAIMED_PID: String(decoy.pid), IRIS_TEST_SOURCE: sourceRoot, IRIS_TEST_ROOT: f.root },
+      stdio: 'ignore',
+    });
+    if (listener.pid === undefined) throw new Error('spoofing listener did not start');
+    mocks.native.mockRejectedValue(Object.assign(new Error('synthetic occupied port'), { code: 'EADDRINUSE' }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await vi.waitFor(async () => expect((await fetch(`http://127.0.0.1:${f.ports[2]!}/healthz`, { headers: { authorization: `Bearer ${secret}` } })).status).toBe(200));
+      await expect(f.supervisor.runSupervisorDaemon()).resolves.toBeUndefined();
+      expect(await readFile(filename)).toEqual(before);
+      expect(log.mock.calls.flat().join(' ')).toContain('ownership is ambiguous');
+      expect(mocks.actualObserve!(listener.pid).state).toBe('live');
+      expect(mocks.actualObserve!(decoy.pid).state).toBe('live');
+    } finally {
+      process.kill(listener.pid, 'SIGTERM');
+      process.kill(decoy.pid, 'SIGTERM');
+      await Promise.all([gone(listener.pid), gone(decoy.pid)]);
+    }
+  }, 10_000);
+  it.each([1, 2, 3])('preserves historical schema %s byte-for-byte when native control fails before authority', async (schemaVersion) => {
+    const f = await fixture();
+    const historical = { ...await f.internal.readState() } as Record<string, unknown>;
+    delete historical.startupOperations;
+    const filename = path.join(f.root, 'supervisor/state.json');
+    await writeSupervisorStateFile(filename, { ...historical, schemaVersion });
+    const before = await readFile(filename);
+    mocks.native.mockRejectedValue(new Error('synthetic pre-authority failure'));
+    await expect(f.supervisor.runSupervisorDaemon()).resolves.toBeUndefined();
+    expect(await readFile(filename)).toEqual(before);
+  });
+  it('starts and stops only native Supervisor control without activating workload children', async () => {
+    const f = await fixture();
+    const close = vi.fn().mockResolvedValue(undefined);
+    mocks.native.mockResolvedValue({ port: f.ports[2]!, mcpUrl: 'http://127.0.0.1/mcp', healthUrl: 'http://127.0.0.1/healthz', close });
+    const stateFile = path.join(f.root, 'supervisor/state.json');
+    const before = await readFile(stateFile).catch(() => null);
+    const up = vi.spyOn(f.supervisor, 'up');
+    const down = vi.spyOn(f.supervisor, 'down');
+
+    const running = f.supervisor.runSupervisorDaemon();
+    await vi.waitFor(() => expect(mocks.native).toHaveBeenCalledOnce());
+    const operations = mocks.native.mock.calls[0]?.[2] as { supervisorStatus(): Promise<Record<string, unknown>> };
+    expect(await operations.supervisorStatus()).toMatchObject({
+      supervisorControlOwner: 'OUTER_SUPERVISOR_DAEMON',
+      readiness: 'DEGRADED',
+      workloadRuntimeId: null,
+      adminChildIdentity: null,
+    });
+    expect(mocks.admin).not.toHaveBeenCalled();
+    process.emit('SIGTERM', 'SIGTERM');
+    await running;
+
+    expect(up).not.toHaveBeenCalled();
+    expect(down).not.toHaveBeenCalled();
+    expect(mocks.start).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(await readFile(stateFile).catch(() => null)).toEqual(before);
+  }, 10_000);
   it('S11 a new supervisor reconciles an incomplete verified intent from durable ownership', async () => {
     const f = await fixture(); const record = await child(f);
     const replacement = await createSupervisor({ dataRoot: f.root, sourceRoot, webPort: f.ports[0]!, adminPort: f.ports[1]!, supervisorControlPort: f.ports[2]!, adminTunnelHealthPort: f.ports[3]! });
@@ -301,6 +681,161 @@ async function adminFixture(): Promise<Fixture> {
 }
 
 describe('F-R1-01 public Admin recycle boundaries', () => {
+  it('does not probe a Runtime API listener owned by a different process', async () => {
+    const f = await fixture();
+    const originalState = await f.internal.readState();
+    const port = (await freePorts(1))[0]!;
+    const record = await f.internal.spawnManaged(
+      'runtime', canonicalNodeRuntime().path,
+      ['-e', 'setTimeout(()=>process.exit(0),10000);setInterval(()=>{},1000)', sourceRoot],
+      sourceRoot, {}, null, path.join(f.root, 'logs'), sourceRoot,
+    );
+    await f.internal.finishStartupTransaction();
+    const state = await f.internal.readState();
+    const operation = state.startupOperations.find((candidate) => candidate.pid === record.pid)!;
+    const runtimeId = randomUUID();
+    const instanceId = randomUUID();
+    const boundRecord = { ...record, runtimeId, instanceId, listenerPorts: [port] };
+    const boundOperation = { ...operation, ownedProcess: boundRecord };
+    await f.internal.writeState({ ...state, runtime: boundRecord, startupOperations: [boundOperation] }, true);
+    await writeEndpoint(f.root, {
+      schemaVersion: 1, runtimeId, instanceId, pid: record.pid, startedAt: record.startedAt,
+      apiUrl: `http://127.0.0.1:${port}`, mcpUrl: `http://127.0.0.1:${port}/mcp`,
+    });
+    const listener = createServer();
+    await new Promise<void>((resolve) => listener.listen(port, '127.0.0.1', resolve));
+    mocks.status.mockResolvedValue({
+      state: 'running',
+      endpoint: { schemaVersion: 1, runtimeId, instanceId, pid: record.pid, startedAt: record.startedAt, apiUrl: `http://127.0.0.1:${port}`, mcpUrl: `http://127.0.0.1:${port}/mcp` },
+      health: null,
+    });
+    try {
+      await expect(f.supervisor.supervisorNativeStatus()).resolves.toMatchObject({
+        readiness: 'DEGRADED',
+        runtimeListenerOwnershipVerified: false,
+      });
+      expect(mocks.status).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+      if (mocks.actualObserve!(record.pid).state === 'live') process.kill(record.pid, 'SIGTERM');
+      await gone(record.pid);
+      await f.internal.writeState(originalState, true);
+    }
+  }, 15_000);
+
+  it('does not trust Admin tunnel health from a listener owned by a different process', async () => {
+    const f = await fixture();
+    const port = f.ports[3]!;
+    const record = await f.internal.spawnManaged(
+      'tunnel-admin', canonicalNodeRuntime().path,
+      ['-e', 'setTimeout(()=>process.exit(0),10000);setInterval(()=>{},1000)', 'admin-tunnel-listener-owner-test'],
+      sourceRoot, {}, null, path.join(f.root, 'logs'), sourceRoot,
+    );
+    await f.internal.finishStartupTransaction();
+    const state = await f.internal.readState();
+    const operation = state.startupOperations.find((candidate) => candidate.pid === record.pid)!;
+    const boundRecord = { ...record, listenerPorts: [port] };
+    const boundOperation = { ...operation, ownedProcess: boundRecord };
+    f.backups.push(boundOperation);
+    await f.internal.writeState({ ...state, adminTunnel: boundRecord, startupOperations: [boundOperation] }, true);
+    const listener = createServer();
+    await new Promise<void>((resolve) => listener.listen(port, '127.0.0.1', resolve));
+    try {
+      await expect(f.supervisor.supervisorNativeStatus()).resolves.toMatchObject({
+        readiness: 'DEGRADED',
+        adminTunnelOwnershipVerified: true,
+        adminTunnelListenerOwnershipVerified: false,
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    }
+  }, 15_000);
+
+  it('reports authority change when cleanup intent becomes durable during the Admin probe', async () => {
+    const f = await adminFixture();
+    const original = await f.internal.readState();
+    let probeEnteredResolve!: () => void;
+    let probeRelease!: (value: { structuredContent: Record<string, unknown>; isError: false }) => void;
+    const probeEntered = new Promise<void>((resolve) => { probeEnteredResolve = resolve; });
+    const probeResult = new Promise<{ structuredContent: Record<string, unknown>; isError: false }>((resolve) => { probeRelease = resolve; });
+    mocks.admin.mockImplementation(async () => {
+      probeEnteredResolve();
+      return probeResult;
+    });
+
+    const statusPromise = f.supervisor.supervisorNativeStatus();
+    await probeEntered;
+    await f.internal.writeState({
+      ...original,
+      startupOperations: original.startupOperations.map((operation) => operation.component === 'admin' && operation.state === 'RUNNING'
+        ? { ...operation, state: 'CLEANUP_PENDING' as const }
+        : operation),
+    }, true);
+    probeRelease({ structuredContent: { readiness: 'READY', fullCatalogId: 'synthetic-catalog' }, isError: false });
+    try {
+      await expect(statusPromise).resolves.toMatchObject({
+        readiness: 'DEGRADED',
+        readinessCode: 'AUTHORITY_CHANGED',
+        authoritySnapshotCoherent: false,
+      });
+    } finally {
+      await f.internal.writeState(original, true);
+    }
+  }, 15_000);
+
+  it('does not accept authenticated Admin readiness from a listener owned by another process', async () => {
+    const f = await adminFixture();
+    const original = await f.internal.readState();
+    const alternatePort = (await freePorts(1))[0]!;
+    const entrypoint = path.join(sourceRoot, 'apps/runtime/src/supervisor-admin-main.ts');
+    const loaderRoot = path.join(sourceRoot, 'apps/runtime/node_modules/tsx/dist');
+    const alternate = spawn(canonicalNodeRuntime().path, [
+      '--require', path.join(loaderRoot, 'preflight.cjs'), '--import', pathToFileURL(path.join(loaderRoot, 'loader.mjs')).href, entrypoint,
+    ], {
+      cwd: sourceRoot,
+      env: node24Environment(
+        { HOME: process.env.HOME ?? os.homedir(), TMPDIR: process.env.TMPDIR ?? os.tmpdir(), LANG: process.env.LANG ?? 'en_US.UTF-8' },
+        supervisorAdminChildEnvironment(f.root, alternatePort),
+      ),
+      stdio: 'ignore',
+    });
+    if (alternate.pid === undefined) throw new Error('alternate Admin fixture did not start');
+    try {
+      const secret = await loadOrCreateTunnelServiceSecret(f.root);
+      await vi.waitFor(async () => expect((await fetch(`http://127.0.0.1:${alternatePort}/healthz`, {
+        headers: { authorization: `Bearer ${secret}` },
+      })).status).toBe(200));
+      const identity = mocks.actualObserve!(alternate.pid);
+      if (identity.state !== 'live' || original.admin === null) throw new Error('alternate Admin identity is unavailable');
+      await f.internal.writeState({
+        ...original,
+        admin: {
+          ...original.admin, pid: alternate.pid, startedAt: new Date().toISOString(),
+          processStartMarker: identity.marker, processExecutable: await realpath(canonicalNodeRuntime().path), processStartTimeMs: null,
+        },
+      }, true);
+
+      const status = await f.supervisor.supervisorNativeStatus();
+      expect(status).toMatchObject({
+        readiness: 'DEGRADED',
+        adminSourceCoherent: false,
+        adminListenerOwnershipVerified: false,
+        adminAuthenticated: false,
+      });
+      expect(mocks.admin).not.toHaveBeenCalled();
+      await expect(f.supervisor.adminNativeStatus()).resolves.toMatchObject({
+        readiness: 'DEGRADED',
+        adminListenerOwnershipVerified: false,
+        adminOwnershipVerified: false,
+      });
+      expect(mocks.admin).not.toHaveBeenCalled();
+    } finally {
+      await f.internal.writeState(original, true);
+      process.kill(alternate.pid, 'SIGTERM');
+      await gone(alternate.pid);
+    }
+  }, 15_000);
+
   it('success uses a new transaction and durably finishes old/new ownership', async () => {
     const f = await adminFixture(); const before = await f.internal.readState();
     const result = await f.supervisor.adminRecycle(); const after = await f.internal.readState();

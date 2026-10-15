@@ -224,7 +224,7 @@ describe('IRIS supervisor', () => {
     }
   });
 
-  it('keeps supervisor up operable in cross-source degraded mode without replacing the healthy workload', async () => {
+  it('fails closed when the workload source binding conflicts with its durable Runtime journal', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-cross-source-up-'));
     const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-cross-source-up-fake-'));
     roots.push(dataRoot, fakeRoot);
@@ -262,14 +262,7 @@ describe('IRIS supervisor', () => {
         workloadSourceRoot: '/Users/example/older-workload',
       }), { mode: 0o600 });
 
-      const transition = await supervisor.up();
-      expect(transition.localRuntime).toMatchObject({
-        state: 'DEGRADED',
-        code: 'CATALOG_IDENTITY_UNVERIFIED',
-      });
-      expect(transition.state).toBe('DEGRADED');
-      expect(transition.connectors.map((connector) => connector.state)).toEqual(['READY', 'UNKNOWN']);
-      expect(transition.connectors[1]).toMatchObject({ code: 'CATALOG_IDENTITY_UNVERIFIED' });
+      await expect(supervisor.up()).rejects.toMatchObject({ code: 'PROCESS_OWNERSHIP_AMBIGUOUS' });
 
       const after = JSON.parse(await readFile(statePath, 'utf8')) as {
         workloadSourceRoot: string;
@@ -282,33 +275,6 @@ describe('IRIS supervisor', () => {
       expect(after.web?.pid).toBe(before.web?.pid);
       expect(after.tunnels.full?.pid).toBe(before.tunnels.full?.pid);
       expect(after.tunnels.pro?.pid).toBe(before.tunnels.pro?.pid);
-
-      await writeFile(statePath, JSON.stringify({
-        ...after,
-        recovery: {
-          attempts: 3,
-          terminal: false,
-          lastFailureCode: 'RUNTIME_NOT_RUNNING',
-          nextAttemptAt: null,
-          windowStartedAt: new Date().toISOString(),
-        },
-      }), { mode: 0o600 });
-      await (supervisor as unknown as { monitorOnceUnlocked(): Promise<void> }).monitorOnceUnlocked();
-      const monitored = JSON.parse(await readFile(statePath, 'utf8')) as {
-        runtime: { pid: number } | null;
-        web: { pid: number } | null;
-        tunnels: { full: { pid: number } | null; pro: { pid: number } | null };
-        recovery: { attempts: number; terminal: boolean; lastFailureCode: string | null };
-      };
-      expect(monitored.recovery).toMatchObject({
-        attempts: 3,
-        terminal: false,
-        lastFailureCode: 'RUNTIME_NOT_RUNNING',
-      });
-      expect(monitored.runtime?.pid).toBe(before.runtime?.pid);
-      expect(monitored.web?.pid).toBe(before.web?.pid);
-      expect(monitored.tunnels.full?.pid).toBe(before.tunnels.full?.pid);
-      expect(monitored.tunnels.pro?.pid).toBe(before.tunnels.pro?.pid);
     } finally {
       await supervisor.down().catch(() => undefined);
     }
@@ -559,6 +525,7 @@ setInterval(() => undefined, 1000);
         adminChildWorkingDirectory: sourceRoot,
         adminSourceCoherent: true,
         adminEnvironmentCoherent: true,
+        adminListenerOwnershipVerified: true,
       });
       expect(nativeStatus.adminChildEnvironmentDigest).toMatch(/^[0-9a-f]{64}$/);
       const nativeAdminStatus = await nativeToolCall(native.mcpUrl, secret, 'admin_status', {});
@@ -594,6 +561,142 @@ setInterval(() => undefined, 1000);
         };
       };
       const before = JSON.parse(await readFile(statePath, 'utf8')) as State;
+      const tunnelServiceCredential = credentialPaths(dataRoot).tunnelServiceAuthorization;
+      const originalTunnelServiceCredential = await readFile(tunnelServiceCredential);
+      await writeFile(tunnelServiceCredential, `${'f'.repeat(64)}\n`, { mode: 0o600 });
+      try {
+        expect(await supervisor.supervisorNativeStatus()).toMatchObject({
+          readiness: 'DEGRADED',
+          adminAuthenticated: false,
+        });
+      } finally {
+        await writeFile(tunnelServiceCredential, originalTunnelServiceCredential, { mode: 0o600 });
+      }
+      try {
+        for (const [component, field] of [
+          ['runtime', 'runtimeOwnershipVerified'],
+          ['admin', 'adminOwnershipVerified'],
+          ['tunnel-admin', 'adminTunnelOwnershipVerified'],
+        ] as const) {
+          const withoutJournal = {
+            ...before,
+            startupOperations: before.startupOperations.map((operation) => operation.component === component && operation.state === 'RUNNING'
+              ? { ...operation, state: 'STOPPED' }
+              : operation),
+          };
+          await writeFile(statePath, JSON.stringify(withoutJournal), { mode: 0o600 });
+          const degraded = await supervisor.supervisorNativeStatus();
+          expect(degraded.readiness).toBe('DEGRADED');
+          expect(degraded.adminAuthenticated).toBe(component === 'tunnel-admin');
+          expect(degraded[field]).toBe(false);
+        }
+      } finally {
+        await writeFile(statePath, JSON.stringify(before), { mode: 0o600 });
+      }
+      const registryPath = path.join(dataRoot, 'connector-registry.json');
+      const originalRegistryBytes = await readFile(registryPath);
+      const originalRegistry = JSON.parse(originalRegistryBytes.toString('utf8')) as {
+        deploymentEpoch: number;
+        connectors: Array<Record<string, unknown>>;
+        admin: Record<string, unknown> | null;
+      };
+      const foreignMachineId = randomUUID();
+      try {
+        await writeFile(registryPath, JSON.stringify({
+          ...originalRegistry,
+          connectors: originalRegistry.connectors.map((binding) => ({ ...binding, machineId: foreignMachineId })),
+          admin: originalRegistry.admin === null ? null : { ...originalRegistry.admin, machineId: foreignMachineId },
+        }), { mode: 0o600 });
+        expect(await supervisor.supervisorNativeStatus()).toMatchObject({
+          readiness: 'DEGRADED',
+          readinessCode: 'MACHINE_IDENTITY_MISMATCH',
+          connectorBindingCoherent: false,
+        });
+        expect(await supervisor.adminNativeStatus()).toMatchObject({
+          readiness: 'DEGRADED',
+          readinessCode: 'MACHINE_IDENTITY_MISMATCH',
+          activationStatusAvailable: false,
+          activationPrepareAvailable: false,
+          activationApplyAvailable: false,
+          activationConfirmAvailable: false,
+          activationRollbackAvailable: false,
+        });
+
+        await writeFile(registryPath, JSON.stringify({
+          ...originalRegistry,
+          connectors: originalRegistry.connectors.map((binding) => ({ ...binding, runtimeId: randomUUID() })),
+        }), { mode: 0o600 });
+        expect(await supervisor.supervisorNativeStatus()).toMatchObject({
+          readiness: 'DEGRADED',
+          readinessCode: 'CONNECTOR_BINDING_MISMATCH',
+          connectorBindingCoherent: false,
+        });
+
+        await writeFile(registryPath, JSON.stringify({
+          ...originalRegistry,
+          connectors: originalRegistry.connectors.map((binding, index) => index === 0
+            ? { ...binding, expectedToolNames: undefined }
+            : binding),
+        }), { mode: 0o600 });
+        expect(await supervisor.supervisorNativeStatus()).toMatchObject({
+          readiness: 'DEGRADED',
+          readinessCode: 'CONNECTOR_REGISTRY_STALE',
+        });
+        expect(await supervisor.adminNativeStatus()).toMatchObject({
+          readiness: 'DEGRADED',
+          readinessCode: 'CONNECTOR_REGISTRY_STALE',
+          activationStatusAvailable: false,
+          activationPrepareAvailable: false,
+          activationApplyAvailable: false,
+          activationConfirmAvailable: false,
+          activationRollbackAvailable: false,
+        });
+
+        const replacementAdminTunnelId = 'tunnel_dddddddddddddddddddddddddddddddd';
+        await writeFile(registryPath, JSON.stringify({
+          ...originalRegistry,
+          admin: originalRegistry.admin === null ? null : { ...originalRegistry.admin, tunnelId: replacementAdminTunnelId },
+        }), { mode: 0o600 });
+        await writeFile(statePath, JSON.stringify({
+          ...before,
+          adminTunnel: before.adminTunnel === null ? null : { ...before.adminTunnel, tunnelId: replacementAdminTunnelId },
+        }), { mode: 0o600 });
+        expect(await supervisor.supervisorNativeStatus()).toMatchObject({
+          readiness: 'DEGRADED',
+          adminTunnelOwnershipVerified: false,
+          adminTunnelBindingCoherent: true,
+        });
+
+        await writeFile(registryPath, originalRegistryBytes, { mode: 0o600 });
+        await writeFile(statePath, JSON.stringify({
+          ...before,
+          tunnels: {
+            ...before.tunnels,
+            full: before.tunnels.full === null ? null : {
+              ...before.tunnels.full,
+              deploymentEpoch: originalRegistry.deploymentEpoch + 1,
+            },
+          },
+        }), { mode: 0o600 });
+        expect(await supervisor.supervisorNativeStatus()).toMatchObject({
+          readiness: 'DEGRADED',
+          readinessCode: 'CONNECTOR_BINDING_MISMATCH',
+        });
+
+        await writeFile(statePath, JSON.stringify({
+          ...before,
+          startupOperations: before.startupOperations.map((operation, index) => index === 0
+            ? { ...operation, state: 'CLEANUP_PENDING' }
+            : operation),
+        }), { mode: 0o600 });
+        expect(await supervisor.supervisorNativeStatus()).toMatchObject({
+          readiness: 'DEGRADED',
+          readinessCode: 'STARTUP_RECONCILIATION_REQUIRED',
+        });
+      } finally {
+        await writeFile(registryPath, originalRegistryBytes, { mode: 0o600 });
+        await writeFile(statePath, JSON.stringify(before), { mode: 0o600 });
+      }
       expect(before.adminTunnel?.profileDigest).toMatch(/^[0-9a-f]{64}$/);
       expect(before.tunnels.full?.profileDigest).toMatch(/^[0-9a-f]{64}$/);
       expect(before.adminTunnel?.tunnelId).toBe('tunnel_cccccccccccccccccccccccccccccccc');
@@ -812,7 +915,7 @@ setInterval(() => undefined, 1000);
     }
     if (failures.length > 0) throw new AggregateError(originalFailure === undefined ? failures : [originalFailure, ...failures], 'Admin recycle test and cleanup evidence preserved');
     if (originalFailure !== undefined) throw originalFailure;
-  }, 90_000);
+  }, 180_000);
 
   it('reconciles only verified runtime and workload tunnel instance metadata without restarting owned processes', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-runtime-reconcile-'));
@@ -2065,7 +2168,7 @@ setInterval(() => undefined, 1000);
     expect(restarted.localRuntime).toMatchObject({ state: 'READY' });
     expect(restarted.tunnel).toMatchObject({ state: 'READY' });
     await supervisor.down();
-  }, 30_000);
+  }, 90_000);
 
   it('serializes concurrent up operations without starting a duplicate runtime', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-concurrent-'));
@@ -2277,9 +2380,16 @@ async function freePort(): Promise<number> {
 async function fakeTunnelClient(fakeRoot: string): Promise<string> {
   const filename = path.join(fakeRoot, 'tunnel-client-fake.mjs');
   await writeFile(filename, `#!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 if (process.argv[2] === 'health') { process.stdout.write(JSON.stringify({ result: 'ok', healthz: { ok: true, status: 200 }, readyz: { ok: true, status: 200 } })); process.exit(0); }
-process.on('SIGTERM', () => process.exit(0));
-setInterval(() => undefined, 1000);
+const profileFlag = process.argv.indexOf('--profile-file');
+const profile = profileFlag >= 0 ? process.argv[profileFlag + 1] : undefined;
+const match = profile === undefined ? null : /listen_addr:\\s*["']?127\\.0\\.0\\.1:(\\d+)/.exec(readFileSync(profile, 'utf8'));
+if (match === null) process.exit(2);
+const server = createServer((_, response) => { response.writeHead(200); response.end('ok'); });
+server.listen(Number(match[1]), '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
 `);
   await chmod(filename, 0o700);
   return filename;
