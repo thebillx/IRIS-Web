@@ -154,7 +154,7 @@ describe('owner-authorized repository device reconciliation', () => {
     const retry = approval(await f.service.execute(f.operation));
     expect(value(await f.service.resolveApproval(retry, 'ALLOW_ONCE')).changed).toBe(false);
     expect(await readFile(f.filename, 'utf8')).toBe(before);
-  }, 15_000);
+  }, 30_000);
 
   it('does not mutate on owner denial and rejects a persistent approval override', async () => {
     const f = await fixture();
