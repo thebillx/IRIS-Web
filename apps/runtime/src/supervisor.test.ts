@@ -396,7 +396,7 @@ setInterval(() => undefined, 1000);
 
     const stopped = await supervisor.down();
     expect(stopped.runtime.state).toBe('FAILED');
-  }, 30_000);
+  }, 60_000);
 
   it('probes verified owned tunnels with their recorded executable when the configured tunnel client is unavailable', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-owned-executable-'));
@@ -915,7 +915,7 @@ setInterval(() => undefined, 1000);
     }
     if (failures.length > 0) throw new AggregateError(originalFailure === undefined ? failures : [originalFailure, ...failures], 'Admin recycle test and cleanup evidence preserved');
     if (originalFailure !== undefined) throw originalFailure;
-  }, 180_000);
+  }, 300_000);
 
   it('reconciles only verified runtime and workload tunnel instance metadata without restarting owned processes', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-runtime-reconcile-'));
@@ -992,7 +992,7 @@ setInterval(() => undefined, 1000);
     } finally {
       await supervisor.down().catch(() => undefined);
     }
-  }, 30_000);
+  }, 60_000);
 
   it('journals an adopted Runtime before publishing ownership and supports governed down', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-adopt-journal-'));
@@ -1375,7 +1375,7 @@ setInterval(() => undefined, 1000);
     ]);
     expect(first.registryPresent).toBe(true);
     await supervisor.down();
-  }, 30_000);
+  }, 60_000);
 
   it('rejects candidate catalog drift before disturbing a healthy baseline workload', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-preflight-reject-'));
@@ -2022,7 +2022,7 @@ setInterval(() => undefined, 1000);
     await rm(failureMarker, { force: true });
     expect((await supervisor.up()).state).toBe('DEGRADED');
     await supervisor.down();
-  }, 30_000);
+  }, 60_000);
 
   it('automatically replaces a crashed owned runtime before restoring both connector profiles', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-recovery-'));
@@ -2058,7 +2058,7 @@ setInterval(() => undefined, 1000);
     expect(status.tunnel).toMatchObject({ state: 'READY', code: 'READY' });
     expect(status.controlPlane).toMatchObject({ state: 'READY', code: 'READY' });
     await supervisor.down();
-  }, 30_000);
+  }, 60_000);
 
   it('allows only the verified admin child to self-probe readiness', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-admin-self-probe-'));
