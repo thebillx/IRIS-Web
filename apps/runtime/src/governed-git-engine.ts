@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstat, readFile, realpath } from 'node:fs/promises';
+import { lstat, readFile, readdir, readlink, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import {
@@ -10,7 +10,7 @@ import {
   type WorkspaceRecord,
 } from '@iris/domain';
 import { node24Environment } from './node-runtime.js';
-import { VNextResourceRegistry, primaryWorkspaceId } from './resource-registry.js';
+import { VNextResourceRegistry, primaryWorkspaceId, type RepositoryReconciliationInput } from './resource-registry.js';
 
 const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 120_000;
@@ -18,6 +18,12 @@ const NETWORK_TIMEOUT_MS = 10 * 60_000;
 const MAX_BUFFER = 1024 * 1024;
 const MAX_OUTPUT = 16 * 1024;
 const MAX_CAT_CONTENT = 64 * 1024;
+const MAX_EVIDENCE_BYTES = 8 * 1024 * 1024;
+const MAX_EVIDENCE_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_EVIDENCE_TOTAL_BYTES = 32 * 1024 * 1024;
+const MAX_EVIDENCE_FILES = 200;
+const MAX_GIT_ADMIN_ENTRIES = 20_000;
+const MAX_GIT_ADMIN_DEPTH = 32;
 const MAX_REF_ENTRIES = 200;
 const MAX_LOG_ENTRIES = 100;
 const MAX_GIT_PATHS = 24;
@@ -268,6 +274,77 @@ export class GovernedGitEngine {
     const binding = await this.resources.findRepository(projectId, identity.repositoryId);
     if (binding !== null) verifyRepositoryBinding(binding, identity);
     return identity;
+  }
+
+  public async reconcileRepository(input: RepositoryReconciliationInput, approvedFingerprint?: string) {
+    return this.resources.reconcileRepository(input, async (repository, workspaces) => {
+      if (deterministicRepositoryId(input.projectId, input.previousDevice, repository.commonGitDirInode) !== input.previousRepositoryId) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Previous repository identity is inconsistent');
+      }
+      const primary = await this.resources.primaryWorkspace(input.projectId);
+      const identity = await inspectRepositoryPhysicalIdentity(input.projectId, primary);
+      if (identity.commonGitDir !== repository.commonGitDir || identity.commonGitDirInode !== repository.commonGitDirInode) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository path or inode changed; automatic recovery is unsafe');
+      }
+      const commonMetadata = await lstat(identity.commonGitDir);
+      if (commonMetadata.birthtimeMs <= 0 || commonMetadata.birthtimeMs > Date.parse(repository.createdAt)) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository directory was replaced after registration or its creation time is unknown');
+      }
+      await assertNoGitLocks(identity.commonGitDir);
+      await assertStandaloneObjectDatabase(identity.commonGitDir);
+      const active = [primary, ...workspaces];
+      for (const workspace of active) await assertSafeRepositoryReconciliationConfig(workspace.physicalRoot);
+      const listing = await requireReconciliationGit(primary.physicalRoot, ['worktree', 'list', '--porcelain'], 'recovery worktree inventory');
+      const entries = parseWorktreePorcelain(listing.stdout);
+      if (entries.length !== active.length || entries.some((entry) => entry.locked || entry.prunable
+        || !active.some((workspace) => workspace.physicalRoot === entry.path))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Git worktree inventory is incomplete, locked, or not exclusively authorized');
+      }
+      const integrity = await requireReconciliationGit(primary.physicalRoot,
+        ['fsck', '--full', '--strict', '--no-dangling'], 'recovery reachable-object integrity');
+      const expectations = new Map(input.expectedWorktrees.map((entry) => [entry.workspaceId, entry]));
+      const evidence = [];
+      for (const workspace of active) {
+        await this.resources.getActiveWorkspace(input.projectId, workspace.workspaceId);
+        const physical = await inspectRepositoryPhysicalIdentity(input.projectId, workspace);
+        if (physical.repositoryId !== identity.repositoryId || physical.commonGitDir !== identity.commonGitDir) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'Linked worktree does not share the registered Git common directory');
+        }
+        const gitDir = (await requireReconciliationGit(workspace.physicalRoot, ['rev-parse', '--absolute-git-dir'], 'recovery Git directory')).stdout.trim();
+        await verifiedDirectoryPhysicalPath(gitDir, 'Recovery Git directory');
+        if (workspace.role === 'WORKTREE') {
+          const backlink = path.join(gitDir, 'gitdir');
+          const metadata = await lstat(backlink);
+          if (!metadata.isFile() || metadata.isSymbolicLink()
+            || (await readBoundedText(backlink, 4096, 'worktree backlink')).trim() !== path.join(workspace.physicalRoot, '.git')) {
+            throw new RuntimeError('CAPABILITY_DENIED', 'Linked worktree backlink is inconsistent');
+          }
+        } else if (gitDir !== identity.commonGitDir) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'PRIMARY Git directory does not match its common directory');
+        }
+        const head = (await requireReconciliationGit(workspace.physicalRoot, ['rev-parse', 'HEAD'], 'recovery HEAD')).stdout.trim();
+        const tree = (await requireReconciliationGit(workspace.physicalRoot, ['rev-parse', 'HEAD^{tree}'], 'recovery tree')).stdout.trim();
+        const branch = (await requireReconciliationGit(workspace.physicalRoot, ['rev-parse', '--symbolic-full-name', 'HEAD'], 'recovery branch')).stdout.trim();
+        const expected = expectations.get(workspace.workspaceId);
+        if (expected === undefined || expected.head !== head || expected.tree !== tree || expected.ref !== branch) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'Repository source or worktree ref differs from the explicit owner expectation');
+        }
+        const status = (await requireReconciliationGit(workspace.physicalRoot, ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=all'], 'recovery status')).stdout;
+        const workContent = await captureWorkContent(workspace.physicalRoot);
+        const rootMetadata = await lstat(workspace.physicalRoot, { bigint: true });
+        const marker = await lstat(path.join(workspace.physicalRoot, '.git'), { bigint: true });
+        evidence.push({ workspaceId: workspace.workspaceId, root: workspace.physicalRoot, gitDir,
+          rootInode: rootMetadata.ino.toString(), markerInode: marker.ino.toString(), head, tree, branch, status, workContent });
+      }
+      return { identity: { repositoryId: identity.repositoryId, projectId: identity.projectId,
+        primaryWorkspaceId: identity.primaryWorkspaceId, commonGitDir: identity.commonGitDir,
+        commonGitDirDevice: identity.commonGitDirDevice, commonGitDirInode: identity.commonGitDirInode },
+        evidence: { commonBirthtimeMs: commonMetadata.birthtimeMs,
+          objectIntegrity: { operation: 'git fsck --full --strict --no-dangling',
+            stdoutSha256: createHash('sha256').update(integrity.stdout).digest('hex'),
+            stderrSha256: createHash('sha256').update(integrity.stderr).digest('hex') },
+          workspaces: evidence } };
+    }, approvedFingerprint);
   }
 
   private async ensureRepositoryBinding(identity: GitRepositoryIdentity): Promise<RepositoryRecord> {
@@ -746,6 +823,63 @@ async function readBoundedText(filename: string, maxBytes: number, label: string
   return content.toString('utf8');
 }
 
+async function captureWorkContent(root: string): Promise<Record<string, unknown>> {
+  const index = await requireReconciliationGitBytes(root, ['ls-files', '--stage', '-z'], 'index evidence');
+  const staged = await requireReconciliationGitBytes(root, ['diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--no-color'], 'staged evidence');
+  const unstaged = await requireReconciliationGitBytes(root, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-color'], 'unstaged evidence');
+  const untrackedListing = await requireReconciliationGitBytes(root, ['ls-files', '--others', '--exclude-standard', '--full-name', '-z'], 'untracked evidence');
+  const paths = untrackedListing.toString('utf8').split('\0').filter(Boolean).sort();
+  if (paths.length > MAX_EVIDENCE_FILES) throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence exceeds the bounded file limit');
+  let totalBytes = 0;
+  const untracked = [];
+  for (const relative of paths) {
+    const absolute = path.resolve(root, relative);
+    if (path.isAbsolute(relative) || !pathIsWithin(root, absolute) || absolute === root) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence contains an unsafe path');
+    }
+    const before = await lstat(absolute, { bigint: true });
+    if (before.isSymbolicLink()) {
+      const target = await readlink(absolute);
+      const after = await lstat(absolute, { bigint: true });
+      if (before.ino !== after.ino || before.mtimeNs !== after.mtimeNs) throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence changed while inspected');
+      untracked.push({ path: relative, kind: 'symlink', size: target.length, sha256: createHash('sha256').update(`symlink:${target}`).digest('hex') });
+      continue;
+    }
+    if (!before.isFile() || before.size > BigInt(MAX_EVIDENCE_FILE_BYTES)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence is not a bounded physical file');
+    }
+    totalBytes += Number(before.size);
+    if (totalBytes > MAX_EVIDENCE_TOTAL_BYTES) throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence exceeds the bounded byte limit');
+    const content = await readFile(absolute);
+    const after = await lstat(absolute, { bigint: true });
+    if (before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Untracked owner evidence changed while inspected');
+    }
+    untracked.push({ path: relative, kind: 'file', size: content.byteLength, sha256: createHash('sha256').update(content).digest('hex') });
+  }
+  return {
+    indexSha256: createHash('sha256').update(index).digest('hex'),
+    stagedDiffSha256: createHash('sha256').update(staged).digest('hex'),
+    unstagedDiffSha256: createHash('sha256').update(unstaged).digest('hex'),
+    untracked,
+  };
+}
+
+async function requireReconciliationGitBytes(cwd: string, args: readonly string[], operation: string): Promise<Buffer> {
+  try {
+    const result = await execFileAsync('git', reconciliationGitArguments(args), {
+      cwd,
+      encoding: 'buffer',
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: MAX_EVIDENCE_BYTES,
+      env: reconciliationGitEnvironment(),
+    }) as unknown as { readonly stdout: Buffer };
+    return result.stdout;
+  } catch {
+    throw new RuntimeError('CAPABILITY_DENIED', `Bounded Git ${operation} could not be captured safely`);
+  }
+}
+
 async function verifiedDirectoryPhysicalPath(candidate: string, label: string): Promise<string> {
   const metadata = await lstat(candidate).catch((error: unknown) => {
     throw new RuntimeError('CAPABILITY_DENIED', `${label} is unavailable`, { cause: error });
@@ -766,8 +900,91 @@ async function assertMissing(target: string, message: string): Promise<void> {
   throw new RuntimeError('PRECONDITION_FAILED', message);
 }
 
+async function assertNoGitLocks(commonGitDir: string): Promise<void> {
+  await inspectGitLockDirectory(commonGitDir, true);
+}
+
+async function assertStandaloneObjectDatabase(commonGitDir: string): Promise<void> {
+  await assertMissing(path.join(commonGitDir, 'objects', 'info', 'alternates'),
+    'Repository reconciliation does not permit an external object store');
+  await assertMissing(path.join(commonGitDir, 'shallow'),
+    'Repository reconciliation does not permit a shallow history boundary');
+  const packDirectory = path.join(commonGitDir, 'objects', 'pack');
+  const packEntries = await readdir(packDirectory).catch((error: unknown) => {
+    if (isMissing(error)) return [];
+    throw new RuntimeError('CAPABILITY_DENIED', 'Repository object-pack state could not be inspected safely', { cause: error });
+  });
+  if (packEntries.some((entry) => entry.endsWith('.promisor'))) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Repository reconciliation does not permit promisor object packs');
+  }
+}
+
+async function assertSafeRepositoryReconciliationConfig(cwd: string): Promise<void> {
+  const result = await requireReconciliationGit(cwd,
+    ['config', '--includes', '--name-only', '--list'], 'recovery repository configuration inspection');
+  const names = result.stdout.split('\n').map((entry) => entry.trim().toLowerCase()).filter(Boolean);
+  if (names.some((name) => name.startsWith('fsck.'))) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Repository reconciliation does not permit local fsck policy overrides');
+  }
+  if (names.some((name) => name === 'extensions.partialclone'
+    || /^remote\..+\.(?:promisor|partialclonefilter)$/.test(name))) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Repository reconciliation does not permit a partial or promisor object store');
+  }
+  if (names.some((name) => name === 'core.worktree' || name.startsWith('filter.'))) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Repository reconciliation does not permit worktree redirects or process-capable filters');
+  }
+}
+
+async function inspectGitLockDirectory(directory: string, recursive: boolean): Promise<void> {
+  const pending: Array<{ readonly directory: string; readonly depth: number }> = [{ directory, depth: 0 }];
+  let inspected = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const root = await lstat(current.directory).catch((error: unknown) => {
+      if (current.depth === 0 && isMissing(error)) return null;
+      throw new RuntimeError('CAPABILITY_DENIED', 'Git administrative lock state could not be inspected', { cause: error });
+    });
+    if (root === null) continue;
+    if (!root.isDirectory() || root.isSymbolicLink()) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Git administrative lock scope is not a physical directory');
+    }
+    const entries = await readdir(current.directory).catch((error: unknown) => {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Git administrative lock state could not be inspected', { cause: error });
+    });
+    inspected += entries.length;
+    if (inspected > MAX_GIT_ADMIN_ENTRIES) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Git administrative lock inspection exceeds the bounded entry limit');
+    }
+    for (const name of entries.sort()) {
+      const candidate = path.join(current.directory, name);
+      const metadata = await lstat(candidate).catch((error: unknown) => {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Git administrative lock entry changed while inspected', { cause: error });
+      });
+      if (name.endsWith('.lock')) throw new RuntimeError('PRECONDITION_FAILED', 'Repository has an active or ambiguous Git lock');
+      if (!recursive) continue;
+      if (metadata.isSymbolicLink()) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Git administrative lock scope contains a symbolic link');
+      }
+      if (metadata.isDirectory()) {
+        if (current.depth >= MAX_GIT_ADMIN_DEPTH) {
+          throw new RuntimeError('CAPABILITY_DENIED', 'Git administrative lock inspection exceeds the bounded depth limit');
+        }
+        pending.push({ directory: candidate, depth: current.depth + 1 });
+      } else if (!metadata.isFile()) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Git administrative lock scope contains an unsupported entry');
+      }
+    }
+  }
+}
+
 async function requireGit(cwd: string, args: readonly string[], operation: string, timeout = GIT_TIMEOUT_MS): Promise<GitCommandResult> {
   const result = await runGit(cwd, args, timeout);
+  if (result.exitCode !== 0 || result.timedOut || result.outputLimitExceeded) throw gitFailure(operation, result);
+  return result;
+}
+
+async function requireReconciliationGit(cwd: string, args: readonly string[], operation: string, timeout = GIT_TIMEOUT_MS): Promise<GitCommandResult> {
+  const result = await runReconciliationGit(cwd, args, timeout);
   if (result.exitCode !== 0 || result.timedOut || result.outputLimitExceeded) throw gitFailure(operation, result);
   return result;
 }
@@ -778,13 +995,22 @@ async function optionalGit(cwd: string, args: readonly string[]): Promise<GitCom
 }
 
 async function runGit(cwd: string, args: readonly string[], timeout = GIT_TIMEOUT_MS): Promise<GitCommandResult> {
+  return runGitWithEnvironment(cwd, args, timeout,
+    { ...node24Environment(), GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '0' });
+}
+
+async function runReconciliationGit(cwd: string, args: readonly string[], timeout = GIT_TIMEOUT_MS): Promise<GitCommandResult> {
+  return runGitWithEnvironment(cwd, reconciliationGitArguments(args), timeout, reconciliationGitEnvironment());
+}
+
+async function runGitWithEnvironment(cwd: string, args: readonly string[], timeout: number, env: NodeJS.ProcessEnv): Promise<GitCommandResult> {
   try {
     const result = await execFileAsync('git', [...args], {
       cwd,
       encoding: 'utf8',
       timeout,
       maxBuffer: MAX_BUFFER,
-      env: { ...node24Environment(), GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '0' },
+      env,
     });
     return { stdout: result.stdout, stderr: result.stderr, exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
   } catch (error) {
@@ -798,6 +1024,20 @@ async function runGit(cwd: string, args: readonly string[], timeout = GIT_TIMEOU
       outputLimitExceeded: candidate.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
     };
   }
+}
+
+function reconciliationGitEnvironment(): NodeJS.ProcessEnv {
+  return node24Environment({}, {
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_NO_REPLACE_OBJECTS: '1',
+    LC_ALL: 'C',
+  });
+}
+
+function reconciliationGitArguments(args: readonly string[]): string[] {
+  return ['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', ...args];
 }
 
 function gitFailure(operation: string, result: GitCommandResult): RuntimeError {

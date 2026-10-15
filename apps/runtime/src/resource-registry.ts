@@ -42,6 +42,23 @@ export interface RepositoryRegistrationInput {
   readonly commonGitDirInode: string;
 }
 
+export interface RepositoryReconciliationInput {
+  readonly projectId: string;
+  readonly previousRepositoryId: string;
+  readonly previousDevice: string;
+  readonly expectedRepositoryId: string;
+  readonly expectedHead: string;
+  readonly expectedTree: string;
+  readonly expectedWorktrees: readonly RepositoryWorktreeExpectation[];
+}
+
+export interface RepositoryWorktreeExpectation {
+  readonly workspaceId: string;
+  readonly head: string;
+  readonly tree: string;
+  readonly ref: string;
+}
+
 export interface WorktreeAuthorizationInput {
   readonly projectId: string;
   readonly repositoryId: RepositoryId;
@@ -206,6 +223,109 @@ export class VNextResourceRegistry {
       const repository: RepositoryRecord = { ...input, createdAt: new Date().toISOString() };
       await this.writeDocument({ ...document, repositories: [...document.repositories, repository] });
       return repository;
+    });
+  }
+
+  public reconcileRepository(
+    input: RepositoryReconciliationInput,
+    inspect: (repository: RepositoryRecord, workspaces: readonly WorkspaceRecord[]) => Promise<{
+      identity: RepositoryRegistrationInput;
+      evidence: unknown;
+    }>,
+    approvedFingerprint?: string,
+  ) {
+    return this.serializeMutation(async () => {
+      assertUuid(input.projectId, 'projectId');
+      assertUuid(input.previousRepositoryId, 'previousRepositoryId');
+      assertUuid(input.expectedRepositoryId, 'expectedRepositoryId');
+      if (!/^[0-9]+$/.test(input.previousDevice)) throw new RuntimeError('INVALID_REQUEST', 'previousDevice must be a decimal device number');
+      assertGitObjectId(input.expectedHead, 'expectedHead');
+      assertGitObjectId(input.expectedTree, 'expectedTree');
+      if (!Array.isArray(input.expectedWorktrees) || input.expectedWorktrees.length === 0 || input.expectedWorktrees.length > 128) {
+        throw new RuntimeError('INVALID_REQUEST', 'expectedWorktrees must be a bounded non-empty list');
+      }
+      const expectationIds = new Set<string>();
+      for (const expectation of input.expectedWorktrees) {
+        if (!isRecord(expectation) || typeof expectation.workspaceId !== 'string'
+          || typeof expectation.head !== 'string' || typeof expectation.tree !== 'string'
+          || typeof expectation.ref !== 'string') {
+          throw new RuntimeError('INVALID_REQUEST', 'expectedWorktrees contains an invalid entry');
+        }
+        assertUuid(expectation.workspaceId, 'expectedWorktrees.workspaceId');
+        assertGitObjectId(expectation.head, 'expectedWorktrees.head');
+        assertGitObjectId(expectation.tree, 'expectedWorktrees.tree');
+        if (expectation.ref.length === 0 || expectation.ref.length > 1024 || expectation.ref.includes('\0') || /[\r\n]/.test(expectation.ref)) {
+          throw new RuntimeError('INVALID_REQUEST', 'expectedWorktrees.ref is invalid');
+        }
+        if (expectationIds.has(expectation.workspaceId)) throw new RuntimeError('INVALID_REQUEST', 'expectedWorktrees contains a duplicate workspace');
+        expectationIds.add(expectation.workspaceId);
+      }
+      const document = await this.readDocument();
+      const candidates = document.repositories.filter((entry) => entry.projectId === input.projectId);
+      if (candidates.length > 1) throw new RuntimeError('CAPABILITY_DENIED', 'Repository registration is ambiguous');
+      const repository = candidates[0];
+      if (repository === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Repository reconciliation requires an existing binding');
+      if (repository.repositoryId !== input.previousRepositoryId && repository.repositoryId !== input.expectedRepositoryId) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository binding changed since recovery was requested');
+      }
+      if (repository.repositoryId === input.previousRepositoryId && repository.commonGitDirDevice !== input.previousDevice) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Previous device does not match the registered binding');
+      }
+      const workspaces = document.workspaces.filter((entry) => entry.repositoryId === repository.repositoryId);
+      if (workspaces.some((entry) => entry.projectId !== input.projectId || entry.role !== 'WORKTREE'
+        || (entry.lifecycleState !== 'ACTIVE' && entry.lifecycleState !== 'DELETED'))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository workspace ownership or lifecycle is ambiguous');
+      }
+      const activeWorkspaces = workspaces.filter((entry) => entry.lifecycleState === 'ACTIVE');
+      const expectedWorkspaceIds = new Set<string>([repository.primaryWorkspaceId, ...activeWorkspaces.map((entry) => entry.workspaceId)]);
+      if (expectationIds.size !== expectedWorkspaceIds.size
+        || [...expectationIds].some((workspaceId) => !expectedWorkspaceIds.has(workspaceId))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Expected worktree source bindings do not match the active repository inventory');
+      }
+      const expectedPrimary = input.expectedWorktrees.find((entry) => entry.workspaceId === repository.primaryWorkspaceId);
+      if (expectedPrimary?.head !== input.expectedHead || expectedPrimary.tree !== input.expectedTree) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Expected primary source identity is inconsistent');
+      }
+      const projects = await this.state.listProjects();
+      const project = projects.find((entry) => entry.id === input.projectId);
+      if (project === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Repository project registration is unavailable');
+      const targetRoots = await Promise.all([project.rootPath, ...activeWorkspaces.map((entry) => entry.physicalRoot)]
+        .map((root) => verifyPhysicalDirectory(root, 'Repository recovery target root')));
+      const otherRoots = await Promise.all(projects.filter((entry) => entry.id !== input.projectId)
+        .map((entry) => verifyPhysicalDirectory(entry.rootPath, 'Other registered project root')));
+      if (targetRoots.some((target) => otherRoots.some((other) => pathsOverlap(target, other)))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository recovery overlaps another registered project');
+      }
+      const { identity, evidence } = await inspect(repository, activeWorkspaces);
+      if (identity.repositoryId !== input.expectedRepositoryId || identity.projectId !== input.projectId
+        || identity.primaryWorkspaceId !== repository.primaryWorkspaceId
+        || identity.commonGitDir !== repository.commonGitDir || identity.commonGitDirInode !== repository.commonGitDirInode) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Recovery permits only device-number drift of the existing repository');
+      }
+      if (document.repositories.some((entry) => entry !== repository
+        && (entry.repositoryId === identity.repositoryId || entry.commonGitDir === identity.commonGitDir))) {
+        throw new RuntimeError('CAPABILITY_DENIED', 'Repository recovery conflicts with another registration');
+      }
+      // Normalize the old binding so a retry after atomic publication has the same fingerprint.
+      const fingerprint = createHash('sha256').update(JSON.stringify({
+        repository: { ...repository, repositoryId: input.previousRepositoryId, commonGitDirDevice: input.previousDevice },
+        workspaces: workspaces.map((entry) => ({ ...entry, repositoryId: input.previousRepositoryId })),
+        identity, evidence,
+      })).digest('hex');
+      const changed = repository.repositoryId !== identity.repositoryId || repository.commonGitDirDevice !== identity.commonGitDirDevice;
+      if (approvedFingerprint !== undefined) {
+        if (approvedFingerprint !== fingerprint) throw new RuntimeError('CAPABILITY_DENIED', 'Repository recovery evidence changed after owner approval');
+        if (changed) await this.writeDocument({
+          ...document,
+          repositories: document.repositories.map((entry) => entry === repository ? { ...entry, ...identity } : entry),
+          workspaces: document.workspaces.map((entry) => entry.repositoryId === repository.repositoryId ? { ...entry, repositoryId: identity.repositoryId } : entry),
+        });
+      }
+      return { operation: 'repository_reconcile', projectId: input.projectId,
+        previousRepositoryId: input.previousRepositoryId, repositoryId: identity.repositoryId,
+        workspaceIds: [repository.primaryWorkspaceId, ...workspaces.map((entry) => entry.workspaceId)],
+        commonGitDir: identity.commonGitDir, fingerprint, changed,
+        source: { head: input.expectedHead, tree: input.expectedTree, worktrees: input.expectedWorktrees } };
     });
   }
 
@@ -432,7 +552,7 @@ async function verifyWorkspacePhysicalIdentity(workspace: WorkspaceRecord): Prom
   if (physical !== workspace.physicalRoot) throw new RuntimeError('CAPABILITY_DENIED', 'Workspace root changed through a filesystem alias');
 }
 
-async function verifyPhysicalDirectory(directory: string, label: string): Promise<void> {
+async function verifyPhysicalDirectory(directory: string, label: string): Promise<string> {
   if (!path.isAbsolute(directory) || directory.includes('\0') || path.resolve(directory) !== directory) {
     throw new RuntimeError('CAPABILITY_DENIED', `${label} must be a normalized absolute path`);
   }
@@ -444,6 +564,7 @@ async function verifyPhysicalDirectory(directory: string, label: string): Promis
     throw new RuntimeError('CAPABILITY_DENIED', `${label} physical identity cannot be resolved`, { cause: error });
   });
   if (physical !== directory) throw new RuntimeError('CAPABILITY_DENIED', `${label} changed through a filesystem alias`);
+  return physical;
 }
 
 async function verifyRepositoryDirectoryIdentity(commonGitDir: string, device: string, inode: string): Promise<void> {
@@ -577,6 +698,10 @@ function assertUuid(value: string, label: string): void {
   if (!isUuid(value)) throw new RuntimeError('INVALID_REQUEST', `${label} is invalid`);
 }
 
+function assertGitObjectId(value: string, label: string): void {
+  if (!/^[0-9a-f]{40}$/.test(value)) throw new RuntimeError('INVALID_REQUEST', `${label} must be a lowercase full Git object ID`);
+}
+
 function isUuid(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
@@ -584,6 +709,10 @@ function isUuid(value: unknown): value is string {
 function pathIsWithin(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return pathIsWithin(left, right) || pathIsWithin(right, left);
 }
 
 function isAlreadyExists(error: unknown): boolean {
