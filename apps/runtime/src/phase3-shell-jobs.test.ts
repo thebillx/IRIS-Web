@@ -328,7 +328,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
 
     await expect(runDeclaredProjectScript(fixture.projectARoot, 'anything')).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
     await writeFile(path.join(fixture.projectARoot, 'declared.mjs'), "console.log('safe-declared-script')\n");
-    await writeFile(path.join(fixture.projectARoot, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.0.0', scripts: { safe: 'node declared.mjs' } }));
+    await writeFile(path.join(fixture.projectARoot, 'package.json'), JSON.stringify({ packageManager: 'npm@11.17.0', scripts: { safe: 'node declared.mjs' } }));
     const validation = await runDeclaredProjectScript(fixture.projectARoot, 'safe');
     expect(validation.scriptName).toBe('safe');
     expect(validation.passed).toBe(true);
