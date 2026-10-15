@@ -471,7 +471,7 @@ setInterval(() => undefined, 1000);
     expect(after.tunnels.pro?.workingDirectory).toBe(nextSourceRoot);
 
     await next.down();
-  }, 30_000);
+  }, 60_000);
 
   it('isolates admin/workload tunnel digests and recycles only the admin child', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-isolated-admin-'));

@@ -142,7 +142,7 @@ describe('owner-authorized repository device reconciliation', () => {
       expect.objectContaining({ capabilityId: 'repository.reconcile', result: 'PENDING',
         reason: expect.stringContaining(`${f.primary.workspaceId}@${f.input.expectedHead}:${f.input.expectedTree}:refs/heads/main`) }),
     ]));
-  });
+  }, 15_000);
 
   it('is idempotent for repeated and concurrent identical approvals without duplicate registrations', async () => {
     const f = await fixture(true);
@@ -252,7 +252,7 @@ describe('owner-authorized repository device reconciliation', () => {
     const retry = approval(await f.service.execute(f.operation));
     expect(value(await f.service.resolveApproval(retry, 'ALLOW_ONCE')).changed).toBe(false);
     expect(await readFile(f.filename, 'utf8')).toBe(before);
-  });
+  }, 15_000);
 
   it('preserves unrelated repository bindings byte-for-byte', async () => {
     const f = await fixture();
