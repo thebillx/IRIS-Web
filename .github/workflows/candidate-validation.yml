@@ -1,0 +1,119 @@
+name: Candidate validation
+run-name: Exact-head validation ${{ inputs.target_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Approved 40-character commit SHA
+        required: true
+        type: string
+      target_tree:
+        description: Approved 40-character tree SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-validation-${{ inputs.target_sha }}
+  cancel-in-progress: false
+
+jobs:
+  exact-head:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      TARGET_SHA: ${{ inputs.target_sha }}
+      TARGET_TREE: ${{ inputs.target_tree }}
+      APPROVED_TARGET_SHA: 9a65c3b80dac5a6ded2b2840ba45c1ec206e461d
+      APPROVED_TARGET_TREE: 31ea2f90c2fb1d2cccad3beb06240250f55e708b
+    steps:
+      - name: Validate the approved target
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TARGET_TREE" =~ ^[0-9a-f]{40}$ ]]
+          test "$TARGET_SHA" = "$APPROVED_TARGET_SHA"
+          test "$TARGET_TREE" = "$APPROVED_TARGET_TREE"
+
+      - name: Check out the immutable target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify the exact checkout
+        id: source
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse 'HEAD^{commit}')"
+          actual_tree="$(git rev-parse 'HEAD^{tree}')"
+          test "$actual_sha" = "$TARGET_SHA"
+          test "$actual_tree" = "$TARGET_TREE"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          git rev-parse --verify 'HEAD^1^{commit}' >/dev/null
+          printf 'Validated commit: `%s`\nValidated tree: `%s`\n' "$actual_sha" "$actual_tree" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.20.0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.15.0
+
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Run Supervisor failure-stop and KeepAlive regressions
+        run: |
+          pnpm --filter @iris/runtime exec vitest run \
+            src/supervisor-startup.test.ts \
+            src/supervisor-daemon-exit.test.ts \
+            src/supervisor-failure-stop.test.ts
+
+      - name: Run legacy ownership and governed-shutdown regressions
+        run: |
+          pnpm --filter @iris/runtime exec vitest run src/supervisor.test.ts \
+            -t 'journals an adopted Runtime|migrates an authentic live schema|fails closed on missing or conflicting legacy|rejects a legacy Runtime endpoint|does not mutate an authentic legacy Runtime|leaves authentic legacy children unresolved|uses persisted spawn-time listeners'
+
+      - name: Run security and redaction regressions
+        run: |
+          pnpm --filter @iris/runtime exec vitest run \
+            src/phase55-security-acceptance.test.ts \
+            src/phase7-security-acceptance.test.ts \
+            src/phase7-external-integration.test.ts \
+            src/multi-worker/security-acceptance.test.ts
+          pnpm --filter @iris/runtime exec tsx -e '
+            import { redactOutput, StreamingRedactor } from "./src/output-redaction.ts";
+            const secret = "SYNTHETIC_REDACTION_MARKER_4b9c6a8f";
+            const stream = new StreamingRedactor([secret]);
+            const output = [
+              redactOutput(`Authorization: Bearer ${secret}`, [secret]),
+              redactOutput(`API_TOKEN=${secret}`, [secret]),
+              stream.push(`prefix ${secret.slice(0, 12)}`) + stream.push(`${secret.slice(12)} suffix`) + stream.finish(),
+            ].join("\n");
+            if (output.includes(secret)) throw new Error("Synthetic redaction marker leaked");
+          '
+
+      - name: Typecheck and build Runtime
+        run: |
+          pnpm --filter @iris/runtime typecheck
+          pnpm --filter @iris/runtime build
+
+      - name: Check the target diff and lint changed sources
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse 'HEAD^1^{commit}')"
+          git diff --check "$base_sha" "$TARGET_SHA"
+          changed_sources=()
+          while IFS= read -r file; do
+            [ -n "$file" ] && changed_sources+=("$file")
+          done < <(git diff --name-only --diff-filter=ACMR "$base_sha" "$TARGET_SHA" -- '*.js' '*.mjs' '*.ts' '*.tsx')
+          test "${#changed_sources[@]}" -gt 0
+          pnpm exec eslint "${changed_sources[@]}"
