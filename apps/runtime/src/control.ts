@@ -4,7 +4,7 @@ import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
 import { createSupervisor } from './supervisor.js';
-import { installLaunchAgent, launchAgentLoaded, launchdPaths, uninstallLaunchAgent } from './launchd.js';
+import { installLaunchAgent, launchAgentStatus, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 
 const command = process.argv[2];
@@ -79,7 +79,7 @@ try {
       await uninstallLaunchAgent(dataRoot);
       process.stdout.write('IRIS_LAUNCHD=UNINSTALLED\n');
     } else if (command === 'launchd' && process.argv[3] === 'status') {
-      process.stdout.write(`${JSON.stringify({ loaded: await launchAgentLoaded(), paths: launchdPaths(dataRoot) }, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(await launchAgentStatus(dataRoot), null, 2)}\n`);
     } else {
       process.stderr.write('Usage: iris <up|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|runtime-reconcile|startup-reconcile|supervisor|credentials|launchd>\n');
       process.exitCode = 2;

@@ -110,6 +110,22 @@ iris launchd uninstall
 ```
 
 It runs the built supervisor daemon, has no embedded secret, writes to controlled
-IRIS log paths, and uses a user-level `gui/<uid>` launchd domain. Build the
-runtime before installing the agent. Installation is never performed implicitly
-by `iris up`.
+IRIS log paths, and uses a user-level `gui/<uid>` launchd domain. Installation
+atomically publishes an owner-only plist at
+`~/Library/LaunchAgents/com.iris.supervisor.plist`, binds it to the physical
+source and data roots, and reconciles an uncertain bootstrap by inspecting that
+exact service before returning. A private schema-versioned record journals the
+prepared, installing, ready, uninstalling, and reconciliation-required states,
+including the pre-install disabled state. Live ownership requires the exact
+label, registered plist, executable arguments, working directory, and data-root
+environment recorded by that journal. Existing symlinks, conflicting plists,
+unsafe ownership, missing GUI sessions, ambiguous `launchctl` observations, and
+unresolved unloads fail closed without discarding the ownership evidence.
+An explicit install may migrate an exact, stopped schema-1 registration to
+schema 3 only after verifying its source, executable, arguments, plist, service
+absence, and explicit launchd disabled-state entry. The schema-1 evidence is
+journaled before any service mutation. Missing or ambiguous disabled-state
+entries and non-canonical service-not-found errors remain unresolved.
+Repeating an identical install or uninstall is safe and does not spawn a
+duplicate Supervisor. Build the runtime before installing the agent.
+Installation is never performed implicitly by `iris up`.
