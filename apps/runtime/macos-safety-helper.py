@@ -70,6 +70,27 @@ def process_start(pid_text):
     sys.stdout.write(f'{info.pbi_start_tvsec}:{info.pbi_start_tvusec:06d}\n')
 
 
+
+def process_executable(pid_text):
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        fail('pid is invalid')
+    if pid <= 0:
+        fail('pid is invalid')
+    libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    libproc.proc_pidpath.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(4096)
+    returned = libproc.proc_pidpath(pid, buffer, len(buffer))
+    if returned <= 0:
+        fail('process executable is unavailable')
+    executable = buffer.value.decode('utf-8', errors='strict')
+    if not os.path.isabs(executable) or any(c in executable for c in ('\r', '\n', '\0')):
+        fail('process executable is invalid')
+    sys.stdout.write(executable + '\n')
+
+
 def validated_relative(root, target):
     if not os.path.isabs(root) or not os.path.isabs(target):
         fail('project root and target must be absolute')
@@ -470,6 +491,11 @@ def main():
         if len(sys.argv) != 3:
             fail('process-start requires pid')
         process_start(sys.argv[2])
+        return
+    if operation == 'process-executable':
+        if len(sys.argv) != 3:
+            fail('process-executable requires pid')
+        process_executable(sys.argv[2])
         return
     if operation == 'read-file':
         if len(sys.argv) != 4:
