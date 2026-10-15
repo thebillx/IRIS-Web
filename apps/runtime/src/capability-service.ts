@@ -29,7 +29,7 @@ import { discoverDeclaredProjectValidation, ProjectValidationJobManager } from '
 import { ValidationCompatibilityAdapter } from './validation-compatibility.js';
 import { assertExpectedEffects, deriveCapabilityEffects } from './capability-effects.js';
 import { WorkspaceFilesystemEngine, type FsFindMode, type FsIgnoreMode, type FsReadMode, type FsWriteMode } from './filesystem-engine.js';
-import { VNextResourceRegistry } from './resource-registry.js';
+import { VNextResourceRegistry, type RepositoryReconciliationInput } from './resource-registry.js';
 import { DurableJobManager } from './durable-job-manager.js';
 import { CodeReviewManager } from './code-review-manager.js';
 import { GovernedGitEngine, type GitCompatibilityOperation, type Phase4GitOperationName, type Phase4GitRequest } from './governed-git-engine.js';
@@ -49,6 +49,7 @@ const MAX_PENDING_APPROVALS = 100;
 const APPROVAL_TTL_MS = 15 * 60_000;
 
 type CapabilityOperationCore =
+  | (RepositoryReconciliationInput & { readonly capabilityId: 'repository.reconcile'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined })
   | { readonly capabilityId: 'runtime.status'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.info'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string }
@@ -414,6 +415,19 @@ export class CapabilityService {
   private async evaluateOperation(operation: CapabilityOperation): Promise<PermissionDecisionRecord> {
     await this.authorizeWorkerOperation(operation);
     const request = requestForOperation(operation);
+    if (operation.capabilityId === 'repository.reconcile') {
+      if (operation.worker !== undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Repository reconciliation is owner-only');
+      const plan = await this.gitEngine().reconcileRepository(operation);
+      const effects = deriveCapabilityEffects(operation.capabilityId)!;
+      const assertion = assertExpectedEffects(effects, operation.expectedEffects);
+      const decision = await this.policy.evaluate({ ...request, effectiveEffects: effects });
+      const worktreeBindings = operation.expectedWorktrees
+        .map((entry) => `${entry.workspaceId}@${entry.head}:${entry.tree}:${entry.ref}`).join(',');
+      return { ...decision, workspaceId: plan.workspaceIds[0]!, resourceId: plan.fingerprint,
+        reason: `${decision.reason}; repository ${operation.previousRepositoryId} -> ${operation.expectedRepositoryId}; previous device ${operation.previousDevice}; source ${operation.expectedHead}:${operation.expectedTree}; worktrees ${worktreeBindings}`,
+        target: plan.commonGitDir, effectiveEffects: effects,
+        ...(!assertion.valid ? { decision: 'DENY' as const, reason: assertion.reason } : {}) };
+    }
     if (isPhase4GitOperation(operation)) {
       if (operation.capabilityId !== phase4GitCapabilityId(operation.operation)) {
         const base = await this.policy.evaluate(request);
@@ -568,6 +582,10 @@ export class CapabilityService {
   }
 
   private async executeAuthorized(operation: CapabilityOperation, decision: PermissionDecisionRecord): Promise<unknown> {
+    if (operation.capabilityId === 'repository.reconcile') {
+      if (decision.decision !== 'ALLOW_ONCE' || decision.resourceId == null) throw new RuntimeError('CAPABILITY_DENIED', 'Exact owner approval is required');
+      return this.gitEngine().reconcileRepository(operation, decision.resourceId);
+    }
     if (isPhase4GitOperation(operation)) {
       await this.authorizedProject(operation);
       return this.gitEngine().execute(operation, operation.mission?.actionId ?? null);
@@ -1053,6 +1071,8 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
   } else if (operation.capabilityId === 'mission.state.set' || operation.capabilityId === 'mission.task.create' || operation.capabilityId === 'mission.task.state.set' || operation.capabilityId === 'mission.action.prepare' || operation.capabilityId === 'mission.supervisor_gate.set') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId, ...('taskId' in operation ? { taskId: operation.taskId } : {}) };
+  } else if (operation.capabilityId === 'repository.reconcile') {
+    request = { capabilityId: operation.capabilityId, projectId: operation.projectId, clientId: operation.clientId, sessionId: operation.sessionId };
   } else if (operation.capabilityId === 'project.register') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, targetPath: operation.rootPath };
   } else if (operation.capabilityId === 'project.default.set') {
@@ -1164,6 +1184,7 @@ function describeOperation(operation: CapabilityOperation): string {
   }
   if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') return operation.capabilityId;
   if (operation.capabilityId === 'project.info') return `project.info projectId=${operation.projectId}`;
+  if (operation.capabilityId === 'repository.reconcile') return `repository.reconcile projectId=${operation.projectId} previousRepositoryId=${operation.previousRepositoryId} previousDevice=${operation.previousDevice} expectedRepositoryId=${operation.expectedRepositoryId} expectedHead=${operation.expectedHead} expectedTree=${operation.expectedTree} expectedWorktrees=${JSON.stringify(operation.expectedWorktrees)}`;
   if (operation.capabilityId === 'project.git_status') return `project.git_status projectId=${operation.projectId}`;
   if (operation.capabilityId === 'project.search') return `project.search projectId=${operation.projectId} queryLength=${operation.query.length}`;
   if (operation.capabilityId === 'ado.discovery') return `ado.discovery projectId=${operation.projectId} requestId=${operation.requestId}`;

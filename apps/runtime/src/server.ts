@@ -377,6 +377,25 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     );
     return;
   }
+  if (request.method === 'POST' && url.pathname === '/repositories/reconcile') {
+    const body = await readJsonBody(request);
+    const keys = ['projectId', 'previousRepositoryId', 'previousDevice', 'expectedRepositoryId',
+      'expectedHead', 'expectedTree', 'expectedWorktrees'];
+    if (body === null || Object.keys(body).some((key) => !keys.includes(key))) throw new RuntimeError('INVALID_REQUEST', 'Unsupported repository reconciliation field');
+    await writeCapabilityOutcome(response, await context.capabilities.execute({
+      capabilityId: 'repository.reconcile',
+      projectId: stringField(body, 'projectId'),
+      previousRepositoryId: stringField(body, 'previousRepositoryId'),
+      previousDevice: stringField(body, 'previousDevice'),
+      expectedRepositoryId: stringField(body, 'expectedRepositoryId'),
+      expectedHead: stringField(body, 'expectedHead'),
+      expectedTree: stringField(body, 'expectedTree'),
+      expectedWorktrees: repositoryWorktreeExpectations(body),
+      clientId: optionalClientId(request),
+      sessionId: optionalSessionId(request),
+    }));
+    return;
+  }
   if (request.method === 'POST' && url.pathname === '/projects') {
     const body = await readJsonBody(request);
     await writeCapabilityOutcome(response, await context.capabilities.execute({
@@ -600,6 +619,25 @@ function optionalStringField(body: Record<string, unknown>, name: string): strin
   if (value === undefined) return undefined;
   if (typeof value !== 'string') throw new RuntimeError('INVALID_REQUEST', `${name} must be a string`);
   return value;
+}
+
+function repositoryWorktreeExpectations(body: Record<string, unknown>): readonly {
+  readonly workspaceId: string;
+  readonly head: string;
+  readonly tree: string;
+  readonly ref: string;
+}[] {
+  const value = body.expectedWorktrees;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 128) {
+    throw new RuntimeError('INVALID_REQUEST', 'expectedWorktrees must be a bounded non-empty list');
+  }
+  return value.map((entry) => {
+    if (!isRecord(entry) || Object.keys(entry).some((key) => !['workspaceId', 'head', 'tree', 'ref'].includes(key))) {
+      throw new RuntimeError('INVALID_REQUEST', 'expectedWorktrees contains an invalid entry');
+    }
+    return { workspaceId: stringField(entry, 'workspaceId'), head: stringField(entry, 'head'),
+      tree: stringField(entry, 'tree'), ref: stringField(entry, 'ref') };
+  });
 }
 
 function optionalAgentRoleField(body: Record<string, unknown>, name: string): AgentRole | undefined {
