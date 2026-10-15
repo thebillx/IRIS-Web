@@ -312,7 +312,9 @@ describe('IRIS LaunchAgent artifact', () => {
     expect(metadata.legacyMigration.metadataSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(metadata.legacyMigration.plistSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(await readFile(paths.metadata, 'utf8')).not.toBe(legacy.metadata);
-    expect(await readFile(paths.plist, 'utf8')).not.toBe(legacy.plist);
+    expect(await readFile(paths.plist, 'utf8')).toBe(
+      renderLaunchAgent(subject.dataRoot, await realpath(canonicalNodeRuntime().path), controlScript),
+    );
     expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
     await uninstallLaunchAgent(subject.dataRoot, subject.fake.dependencies);
     expect(subject.fake.disabled).toBe(true);
