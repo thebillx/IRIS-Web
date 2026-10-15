@@ -27,8 +27,9 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: 9a65c3b80dac5a6ded2b2840ba45c1ec206e461d
-      APPROVED_TARGET_TREE: 31ea2f90c2fb1d2cccad3beb06240250f55e708b
+      APPROVED_TARGET_SHA: 83200233f5e01907be53263cdcae4e84fa509b8f
+      APPROVED_TARGET_TREE: 4e6c0a881c73cc526ab1c5ca59d285c6ce9f7300
+      BASELINE_SHA: 9a65c3b80dac5a6ded2b2840ba45c1ec206e461d
     steps:
       - name: Validate the approved target
         run: |
@@ -42,7 +43,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.target_sha }}
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify the exact checkout
@@ -55,6 +56,8 @@ jobs:
           test "$actual_tree" = "$TARGET_TREE"
           test -z "$(git status --porcelain --untracked-files=no)"
           git rev-parse --verify 'HEAD^1^{commit}' >/dev/null
+          test "$(git rev-parse "$BASELINE_SHA^{commit}")" = "$BASELINE_SHA"
+          git merge-base --is-ancestor "$BASELINE_SHA" "$TARGET_SHA"
           printf 'Validated commit: `%s`\nValidated tree: `%s`\n' "$actual_sha" "$actual_tree" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Node.js 24
@@ -73,21 +76,35 @@ jobs:
       - name: Run Supervisor failure-stop and KeepAlive regressions
         run: |
           pnpm --filter @iris/runtime exec vitest run \
+            src/launchd.test.ts \
             src/supervisor-startup.test.ts \
             src/supervisor-daemon-exit.test.ts \
             src/supervisor-failure-stop.test.ts
 
-      - name: Run legacy ownership and governed-shutdown regressions
+      - name: Run Supervisor and repository authority regressions
         run: |
-          pnpm --filter @iris/runtime exec vitest run src/supervisor.test.ts \
-            -t 'journals an adopted Runtime|migrates an authentic live schema|fails closed on missing or conflicting legacy|rejects a legacy Runtime endpoint|does not mutate an authentic legacy Runtime|leaves authentic legacy children unresolved|uses persisted spawn-time listeners'
+          pnpm --filter @iris/runtime exec vitest run \
+            src/supervisor.test.ts \
+            src/repository-reconcile.test.ts \
+            src/capability-service.test.ts \
+            src/server.test.ts
+
+      - name: Run project isolation regressions
+        run: |
+          pnpm --filter @iris/runtime exec vitest run \
+            src/activation-controller.test.ts \
+            src/durable-mission-service.test.ts \
+            src/phase2-foundation.test.ts \
+            src/phase7-external-integration.test.ts
 
       - name: Run security and redaction regressions
         run: |
           pnpm --filter @iris/runtime exec vitest run \
             src/phase55-security-acceptance.test.ts \
+            src/phase3-shell-jobs.test.ts \
             src/phase7-security-acceptance.test.ts \
             src/phase7-external-integration.test.ts \
+            src/multi-worker/observability.test.ts \
             src/multi-worker/security-acceptance.test.ts
           pnpm --filter @iris/runtime exec tsx -e '
             import { redactOutput, StreamingRedactor } from "./src/output-redaction.ts";
@@ -109,11 +126,10 @@ jobs:
       - name: Check the target diff and lint changed sources
         run: |
           set -euo pipefail
-          base_sha="$(git rev-parse 'HEAD^1^{commit}')"
-          git diff --check "$base_sha" "$TARGET_SHA"
+          git diff --check "$BASELINE_SHA" "$TARGET_SHA"
           changed_sources=()
           while IFS= read -r file; do
             [ -n "$file" ] && changed_sources+=("$file")
-          done < <(git diff --name-only --diff-filter=ACMR "$base_sha" "$TARGET_SHA" -- '*.js' '*.mjs' '*.ts' '*.tsx')
+          done < <(git diff --name-only --diff-filter=ACMR "$BASELINE_SHA" "$TARGET_SHA" -- '*.js' '*.mjs' '*.ts' '*.tsx')
           test "${#changed_sources[@]}" -gt 0
           pnpm exec eslint "${changed_sources[@]}"
