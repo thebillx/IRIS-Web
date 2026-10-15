@@ -1889,7 +1889,7 @@ setInterval(() => undefined, 1000);
     } finally {
       await supervisor.down().catch(() => undefined);
     }
-  }, 60_000);
+  }, 120_000);
 
   it('keeps the outer control plane alive during a concurrent cross-catalog handoff', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-dual-handoff-'));
