@@ -290,6 +290,15 @@ describe('runtime listener safety', () => {
     expect((await call(ownerAccessSecret)).status).toBe(200);
     expect(execute).toHaveBeenCalledExactlyOnceWith({ capabilityId: 'repository.reconcile', ...body,
       clientId: undefined, sessionId: undefined });
+    execute.mockClear();
+    const registryTransaction = { requestId: randomUUID(), expectedBeforeSha256: 'c'.repeat(64),
+      staleWorkspaceIds: [randomUUID()], existingWorktrees: [{ workspaceId: randomUUID(), physicalRoot: '/tmp/existing',
+        head: 'd'.repeat(40), tree: 'e'.repeat(40), ref: 'refs/heads/existing', rootDevice: '1', rootInode: '2',
+        gitAdminDevice: '1', gitAdminInode: '3', disposition: 'PRESERVE_UNTIL_RECOVERY_HANDOFF', authorizedAt: new Date(0).toISOString() }] };
+    expect((await call(ownerAccessSecret, { ...body, registryTransaction })).status).toBe(200);
+    expect(execute).toHaveBeenCalledExactlyOnceWith({ capabilityId: 'repository.reconcile', ...body, registryTransaction,
+      clientId: undefined, sessionId: undefined });
+    expect((await call(ownerAccessSecret, { ...body, registryTransaction: { ...registryTransaction, force: true } })).status).toBe(400);
   });
 
   it('returns only a product-safe agent execution failure payload', async () => {

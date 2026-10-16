@@ -10,7 +10,11 @@ import {
   type WorkspaceRecord,
 } from '@iris/domain';
 import { node24Environment } from './node-runtime.js';
-import { VNextResourceRegistry, primaryWorkspaceId, type RepositoryReconciliationInput } from './resource-registry.js';
+import { DurableMissionLifecycleStore } from './durable-mission-store.js';
+import { activeDurableJobWorkspaceReferences } from './durable-job-manager.js';
+import { MissionLedgerStore } from './mission-store.js';
+import { MultiWorkerStore } from './multi-worker/store.js';
+import { VNextResourceRegistry, primaryWorkspaceId, type ExistingWorktreeExpectation, type RepositoryReconciliationInput } from './resource-registry.js';
 
 const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 120_000;
@@ -113,8 +117,16 @@ interface GitCommandResult {
   readonly outputLimitExceeded: boolean;
 }
 
+export type RegistryReferenceInspector = (
+  dataRoot: string,
+  staleWorkspaces: readonly WorkspaceRecord[],
+) => Promise<unknown>;
+
 export class GovernedGitEngine {
-  public constructor(private readonly resources: VNextResourceRegistry) {}
+  public constructor(
+    private readonly resources: VNextResourceRegistry,
+    private readonly referenceInspector: RegistryReferenceInspector = inspectRegistryReferences,
+  ) {}
 
   public async preflight(request: Phase4GitRequest): Promise<Phase4GitPreflight> {
     validateOperationInput(request);
@@ -277,7 +289,7 @@ export class GovernedGitEngine {
   }
 
   public async reconcileRepository(input: RepositoryReconciliationInput, approvedFingerprint?: string) {
-    return this.resources.reconcileRepository(input, async (repository, workspaces) => {
+    return this.resources.reconcileRepository(input, async (repository, workspaces, staleWorkspaces) => {
       if (deterministicRepositoryId(input.projectId, input.previousDevice, repository.commonGitDirInode) !== input.previousRepositoryId) {
         throw new RuntimeError('CAPABILITY_DENIED', 'Previous repository identity is inconsistent');
       }
@@ -292,6 +304,7 @@ export class GovernedGitEngine {
       }
       await assertNoGitLocks(identity.commonGitDir);
       await assertStandaloneObjectDatabase(identity.commonGitDir);
+      const staleReferences = await this.referenceInspector(this.resources.dataRoot, staleWorkspaces);
       const active = [primary, ...workspaces];
       for (const workspace of active) await assertSafeRepositoryReconciliationConfig(workspace.physicalRoot);
       const listing = await requireReconciliationGit(primary.physicalRoot, ['worktree', 'list', '--porcelain'], 'recovery worktree inventory');
@@ -303,9 +316,12 @@ export class GovernedGitEngine {
       const integrity = await requireReconciliationGit(primary.physicalRoot,
         ['fsck', '--full', '--strict', '--no-dangling'], 'recovery reachable-object integrity');
       const expectations = new Map(input.expectedWorktrees.map((entry) => [entry.workspaceId, entry]));
+      const imports = new Map(input.registryTransaction?.existingWorktrees.map((entry) => [entry.workspaceId, entry]) ?? []);
+      const importedReferences = await collectRegistryReferences(this.resources.dataRoot,
+        workspaces.filter((entry) => imports.has(entry.workspaceId)));
       const evidence = [];
       for (const workspace of active) {
-        await this.resources.getActiveWorkspace(input.projectId, workspace.workspaceId);
+        if (!imports.has(workspace.workspaceId)) await this.resources.getActiveWorkspace(input.projectId, workspace.workspaceId);
         const physical = await inspectRepositoryPhysicalIdentity(input.projectId, workspace);
         if (physical.repositoryId !== identity.repositoryId || physical.commonGitDir !== identity.commonGitDir) {
           throw new RuntimeError('CAPABILITY_DENIED', 'Linked worktree does not share the registered Git common directory');
@@ -329,6 +345,13 @@ export class GovernedGitEngine {
         if (expected === undefined || expected.head !== head || expected.tree !== tree || expected.ref !== branch) {
           throw new RuntimeError('CAPABILITY_DENIED', 'Repository source or worktree ref differs from the explicit owner expectation');
         }
+        const imported = imports.get(workspace.workspaceId);
+        if (imported !== undefined) {
+          if (imported.head !== expected.head || imported.tree !== expected.tree || imported.ref !== expected.ref) {
+            throw new RuntimeError('CAPABILITY_DENIED', 'Existing worktree manifests disagree');
+          }
+          await verifyExistingWorktreeExpectation(imported, gitDir, physical);
+        }
         const status = (await requireReconciliationGit(workspace.physicalRoot, ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=all'], 'recovery status')).stdout;
         const workContent = await captureWorkContent(workspace.physicalRoot);
         const rootMetadata = await lstat(workspace.physicalRoot, { bigint: true });
@@ -343,7 +366,7 @@ export class GovernedGitEngine {
           objectIntegrity: { operation: 'git fsck --full --strict --no-dangling',
             stdoutSha256: createHash('sha256').update(integrity.stdout).digest('hex'),
             stderrSha256: createHash('sha256').update(integrity.stderr).digest('hex') },
-          workspaces: evidence } };
+          workspaces: evidence, staleReferences, importedReferences } };
     }, approvedFingerprint);
   }
 
@@ -917,6 +940,128 @@ async function assertStandaloneObjectDatabase(commonGitDir: string): Promise<voi
   if (packEntries.some((entry) => entry.endsWith('.promisor'))) {
     throw new RuntimeError('CAPABILITY_DENIED', 'Repository reconciliation does not permit promisor object packs');
   }
+}
+
+async function verifyExistingWorktreeExpectation(
+  expected: ExistingWorktreeExpectation,
+  gitDir: string,
+  physical: GitRepositoryIdentity,
+): Promise<void> {
+  const root = await lstat(expected.physicalRoot, { bigint: true });
+  const admin = await lstat(gitDir, { bigint: true });
+  const uid = typeof process.getuid === 'function' ? BigInt(process.getuid()) : root.uid;
+  if (!root.isDirectory() || root.isSymbolicLink() || root.uid !== uid || (root.mode & 0o022n) !== 0n
+    || root.dev.toString() !== expected.rootDevice || root.ino.toString() !== expected.rootInode
+    || !admin.isDirectory() || admin.isSymbolicLink() || admin.uid !== uid || (admin.mode & 0o022n) !== 0n
+    || admin.dev.toString() !== expected.gitAdminDevice || admin.ino.toString() !== expected.gitAdminInode
+    || physical.workspaceRoot !== expected.physicalRoot) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Existing worktree physical ownership does not match exact owner evidence');
+  }
+  const markerPath = path.join(expected.physicalRoot, '.git');
+  const backlinkPath = path.join(gitDir, 'gitdir');
+  const commonPath = path.join(gitDir, 'commondir');
+  const [marker, backlink, common] = await Promise.all([lstat(markerPath), lstat(backlinkPath), lstat(commonPath)]);
+  for (const metadata of [marker, backlink, common]) {
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || metadata.uid !== Number(uid)
+      || (metadata.mode & 0o022) !== 0) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Existing worktree Git authority pointer is not owner-controlled');
+    }
+  }
+  if ((await readBoundedText(markerPath, 4096, 'worktree Git marker')).trim() !== `gitdir: ${gitDir}`
+    || (await readBoundedText(backlinkPath, 4096, 'worktree backlink')).trim() !== markerPath) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Existing worktree Git authority pointers are inconsistent');
+  }
+  const resolvedCommon = await realpath(path.resolve(gitDir,
+    (await readBoundedText(commonPath, 4096, 'worktree common-directory pointer')).trim()));
+  if (resolvedCommon !== physical.commonGitDir) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Existing worktree common-directory pointer is inconsistent');
+  }
+}
+
+async function inspectRegistryReferences(dataRoot: string, staleWorkspaces: readonly WorkspaceRecord[]): Promise<unknown> {
+  const evidence = await collectRegistryReferences(dataRoot, staleWorkspaces);
+  if (evidence.jobs.length > 0 || evidence.missions.length > 0 || evidence.missionLifecycle.length > 0
+    || evidence.orchestration.length > 0 || evidence.processes.length > 0) {
+    throw new RuntimeError('CAPABILITY_DENIED', 'Stale workspace still has active job, mission, orchestration, or process references');
+  }
+  return evidence;
+}
+
+async function collectRegistryReferences(dataRoot: string, workspaces: readonly WorkspaceRecord[]): Promise<{
+  readonly jobs: readonly string[]; readonly missions: readonly string[]; readonly missionLifecycle: readonly string[];
+  readonly orchestration: readonly string[]; readonly processes: readonly string[];
+}> {
+  if (workspaces.length === 0) return { jobs: [], missions: [], missionLifecycle: [], orchestration: [], processes: [] };
+  const ids = new Set<string>(workspaces.map((entry) => entry.workspaceId));
+  const projectIds = new Set(workspaces.map((entry) => entry.projectId));
+  const jobs = await readOptionalPrivateJson(path.join(dataRoot, 'vnext-jobs.json'));
+  const activeJobs = activeDurableJobWorkspaceReferences(jobs, ids);
+  const missions = (await new MissionLedgerStore(dataRoot).read()).missions.filter((entry) => entry.projectId !== null
+    && projectIds.has(entry.projectId) && !['COMPLETED','FAILED','CANCELLED'].includes(entry.state)).map((entry) => entry.id);
+  const missionLifecycle = (await new DurableMissionLifecycleStore(dataRoot).read()).records.filter((entry) =>
+    projectIds.has(entry.projectId) && !['COMPLETED','FAILED','CANCELLED'].includes(entry.state)).map((entry) => entry.missionId);
+  const orchestration = await new MultiWorkerStore(dataRoot).read();
+  const activeOrchestration: string[] = [];
+  collectActiveWorkspaceReferences(orchestration, ids, activeOrchestration);
+  const processes = await cwdProcessReferences(workspaces.map((entry) => entry.physicalRoot));
+  return { jobs: activeJobs, missions, missionLifecycle, orchestration: activeOrchestration, processes };
+}
+
+async function readOptionalPrivateJson(filename: string): Promise<unknown> {
+  let metadata;
+  try { metadata = await lstat(filename); }
+  catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new RuntimeError('PERSISTENCE_FAILURE', 'Registry reference store is unavailable', { cause: error });
+  }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : metadata.uid;
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || metadata.uid !== uid || (metadata.mode & 0o077) !== 0) {
+    throw new RuntimeError('PERSISTENCE_FAILURE', 'Registry reference store is not a private owner file');
+  }
+  try { return JSON.parse(await readFile(filename, 'utf8')); }
+  catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Registry reference store is invalid', { cause: error }); }
+}
+
+function collectActiveWorkspaceReferences(value: unknown, ids: ReadonlySet<string>, found: string[]): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectActiveWorkspaceReferences(entry, ids, found);
+    return;
+  }
+  if (!isRecord(value)) return;
+  if (typeof value.workspaceId === 'string' && ids.has(value.workspaceId)
+    && typeof value.state === 'string' && ['PLANNING','PENDING','ASSIGNED','STARTING','RUNNING','WAITING','REVIEWING'].includes(value.state)) {
+    found.push(typeof value.id === 'string' ? value.id : value.workspaceId);
+  }
+  for (const entry of Object.values(value)) collectActiveWorkspaceReferences(entry, ids, found);
+}
+
+async function cwdProcessReferences(roots: readonly string[]): Promise<readonly string[]> {
+  const result = await execFileAsync('/usr/sbin/lsof', ['-a', '-d', 'cwd', '-Fn'], {
+    encoding: 'utf8', timeout: 10_000, maxBuffer: MAX_BUFFER,
+    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C', LC_ALL: 'C' },
+  }).catch(classifyCwdInspectionFailure);
+  let pid = '';
+  const references: string[] = [];
+  for (const line of result.stdout.split('\n')) {
+    if (line.startsWith('p')) pid = line.slice(1);
+    if (!line.startsWith('n')) continue;
+    const reported = line.slice(1);
+    const cwd = reported.endsWith(' (deleted)') ? reported.slice(0, -10) : reported;
+    if (roots.some((root) => cwd === root || cwd.startsWith(`${root}${path.sep}`))) references.push(pid);
+  }
+  return [...new Set(references)];
+}
+
+export function classifyCwdInspectionFailure(error: unknown): { readonly stdout: string; readonly stderr: string } {
+  const code = isRecord(error) && typeof error.code === 'number' ? error.code : null;
+  const stdout = isRecord(error) && typeof error.stdout === 'string' ? error.stdout : '';
+  const stderr = isRecord(error) && typeof error.stderr === 'string' ? error.stderr : '';
+  if (code === 1 && stdout.length === 0 && stderr.length === 0) return { stdout, stderr };
+  throw new RuntimeError('CAPABILITY_DENIED', 'Process CWD ownership could not be inspected', { cause: error });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 async function assertSafeRepositoryReconciliationConfig(cwd: string): Promise<void> {

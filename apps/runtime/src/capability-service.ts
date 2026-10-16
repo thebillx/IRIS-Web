@@ -423,8 +423,10 @@ export class CapabilityService {
       const decision = await this.policy.evaluate({ ...request, effectiveEffects: effects });
       const worktreeBindings = operation.expectedWorktrees
         .map((entry) => `${entry.workspaceId}@${entry.head}:${entry.tree}:${entry.ref}`).join(',');
+      const registryBinding = operation.registryTransaction === undefined ? ''
+        : `; registry request ${operation.registryTransaction.requestId}; before ${operation.registryTransaction.expectedBeforeSha256}; stale ${operation.registryTransaction.staleWorkspaceIds.join(',')}; worktreeManifestSha256 ${createHash('sha256').update(JSON.stringify(operation.registryTransaction.existingWorktrees)).digest('hex')}`;
       return { ...decision, workspaceId: plan.workspaceIds[0]!, resourceId: plan.fingerprint,
-        reason: `${decision.reason}; repository ${operation.previousRepositoryId} -> ${operation.expectedRepositoryId}; previous device ${operation.previousDevice}; source ${operation.expectedHead}:${operation.expectedTree}; worktrees ${worktreeBindings}`,
+        reason: `${decision.reason}; repository ${operation.previousRepositoryId} -> ${operation.expectedRepositoryId}; previous device ${operation.previousDevice}; source ${operation.expectedHead}:${operation.expectedTree}; worktrees ${worktreeBindings}${registryBinding}`,
         target: plan.commonGitDir, effectiveEffects: effects,
         ...(!assertion.valid ? { decision: 'DENY' as const, reason: assertion.reason } : {}) };
     }
@@ -1184,7 +1186,7 @@ function describeOperation(operation: CapabilityOperation): string {
   }
   if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') return operation.capabilityId;
   if (operation.capabilityId === 'project.info') return `project.info projectId=${operation.projectId}`;
-  if (operation.capabilityId === 'repository.reconcile') return `repository.reconcile projectId=${operation.projectId} previousRepositoryId=${operation.previousRepositoryId} previousDevice=${operation.previousDevice} expectedRepositoryId=${operation.expectedRepositoryId} expectedHead=${operation.expectedHead} expectedTree=${operation.expectedTree} expectedWorktrees=${JSON.stringify(operation.expectedWorktrees)}`;
+  if (operation.capabilityId === 'repository.reconcile') return `repository.reconcile projectId=${operation.projectId} previousRepositoryId=${operation.previousRepositoryId} previousDevice=${operation.previousDevice} expectedRepositoryId=${operation.expectedRepositoryId} expectedHead=${operation.expectedHead} expectedTree=${operation.expectedTree} expectedWorktrees=${JSON.stringify(operation.expectedWorktrees)} registryTransaction=${JSON.stringify(operation.registryTransaction ?? null)}`;
   if (operation.capabilityId === 'project.git_status') return `project.git_status projectId=${operation.projectId}`;
   if (operation.capabilityId === 'project.search') return `project.search projectId=${operation.projectId} queryLength=${operation.query.length}`;
   if (operation.capabilityId === 'ado.discovery') return `ado.discovery projectId=${operation.projectId} requestId=${operation.requestId}`;

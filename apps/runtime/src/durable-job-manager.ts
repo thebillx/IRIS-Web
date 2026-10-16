@@ -16,10 +16,12 @@ import { observeProcessStart } from './macos-safety.js';
 const execFileAsync = promisify(execFile);
 const JOB_FILE = 'vnext-jobs.json';
 const JOB_DIR = 'vnext-job-runtime';
-const MAX_JOBS = 200;
+export const MAX_DURABLE_JOBS = 200;
 const INLINE_OUTPUT_BYTES = 16 * 1024;
 const LOG_WINDOW_MAX = 64 * 1024;
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DURABLE_JOB_STATES = new Set<DurableJobState>(['QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST', 'INTERRUPTED']);
 const RUNNER_PATH = fileURLToPath(new URL('../job-runner.mjs', import.meta.url));
 
 export type DurableJobState = 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'LOST' | 'INTERRUPTED';
@@ -94,6 +96,23 @@ export interface DurableJobRecord {
 }
 
 interface JobDocument { readonly schemaVersion: 1; readonly jobs: readonly DurableJobRecord[] }
+
+export function validateDurableJobDocument(value: unknown): value is JobDocument {
+  return isRecord(value) && value.schemaVersion === 1 && Array.isArray(value.jobs)
+    && value.jobs.length <= MAX_DURABLE_JOBS;
+}
+
+export function activeDurableJobWorkspaceReferences(value: unknown, workspaceIds: ReadonlySet<string>): string[] {
+  if (value === null) return [];
+  if (!validateDurableJobDocument(value) || value.jobs.some((entry) => !isRecord(entry)
+    || typeof entry.jobId !== 'string' || !UUID.test(entry.jobId)
+    || typeof entry.workspaceId !== 'string' || !UUID.test(entry.workspaceId)
+    || !DURABLE_JOB_STATES.has(String(entry.state) as DurableJobState))) {
+    throw new RuntimeError('PERSISTENCE_FAILURE', 'vNext job store is invalid');
+  }
+  return value.jobs.filter((entry) => workspaceIds.has(entry.workspaceId)
+    && (entry.state === 'QUEUED' || entry.state === 'RUNNING')).map((entry) => entry.jobId);
+}
 interface RunnerOnlyClaim {
   readonly schemaVersion: 1; readonly jobId: string; readonly runnerIdentity: string;
   readonly runnerPid: number; readonly runnerProcessGroupId: number; readonly runnerStartMarker: string; readonly createdAt: string;
@@ -708,7 +727,7 @@ export class DurableJobManager {
     if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
     try {
       const parsed = JSON.parse(inspected.content) as JobDocument;
-      if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.jobs) || parsed.jobs.length > MAX_JOBS) throw new Error('schema');
+      if (!validateDurableJobDocument(parsed)) throw new Error('schema');
       return parsed;
     } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'vNext job store is invalid', { cause: error }); }
   }
@@ -717,7 +736,7 @@ export class DurableJobManager {
     return this.serialized(async () => {
       const document = await this.readDocument();
       const jobs = [...document.jobs];
-      if (jobs.length >= MAX_JOBS) {
+      if (jobs.length >= MAX_DURABLE_JOBS) {
         const evictable = jobs.findIndex((candidate) =>
           isTerminal(candidate.state)
           && (candidate.executionProfile !== 'codex-review' || (candidate.reviewFinalizedAt !== null && candidate.reviewFinalizedAt !== undefined)));
