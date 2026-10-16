@@ -15,6 +15,7 @@ import { activeDurableJobWorkspaceReferences } from './durable-job-manager.js';
 import { MissionLedgerStore } from './mission-store.js';
 import { MultiWorkerStore } from './multi-worker/store.js';
 import { VNextResourceRegistry, primaryWorkspaceId, type ExistingWorktreeExpectation, type RepositoryReconciliationInput } from './resource-registry.js';
+import { createPhysicalRepositoryObservation, type PhysicalRepositoryObservation } from './repository-physical-observation.js';
 
 const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 120_000;
@@ -286,6 +287,34 @@ export class GovernedGitEngine {
     const binding = await this.resources.findRepository(projectId, identity.repositoryId);
     if (binding !== null) verifyRepositoryBinding(binding, identity);
     return identity;
+  }
+
+  /** Read-only continuity evidence; this never changes registry authority or Git capability. */
+  public async observeRepositoryPhysical(projectId: string, workspaceId: string, logicalRepositoryId: string): Promise<PhysicalRepositoryObservation> {
+    const workspace = await this.resources.getActiveWorkspace(projectId, workspaceId);
+    const logical = await this.resources.findRepository(projectId, logicalRepositoryId);
+    if (logical === null) throw new RuntimeError('CAPABILITY_DENIED', 'Physical observation requires an existing logical repository authority');
+    if (workspace.repositoryId !== logical.repositoryId) throw new RuntimeError('CAPABILITY_DENIED', 'Physical observation requires an existing workspace repository binding');
+    const identity = await inspectRepositoryPhysicalIdentity(projectId, workspace);
+    if (identity.commonGitDir !== logical.commonGitDir || identity.commonGitDirInode !== logical.commonGitDirInode) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Physical observation does not match the existing logical repository');
+    }
+    const head = (await requireReconciliationGit(workspace.physicalRoot, ['rev-parse', 'HEAD'], 'observation HEAD')).stdout.trim();
+    const tree = (await requireReconciliationGit(workspace.physicalRoot, ['rev-parse', 'HEAD^{tree}'], 'observation tree')).stdout.trim();
+    const ref = (await requireReconciliationGit(workspace.physicalRoot, ['rev-parse', '--symbolic-full-name', 'HEAD'], 'observation ref')).stdout.trim();
+    const integrity = await requireReconciliationGit(workspace.physicalRoot,
+      ['fsck', '--full', '--strict', '--no-dangling'], 'observation reachable-object integrity');
+    const rootMetadata = await lstat(workspace.physicalRoot, { bigint: true });
+    return createPhysicalRepositoryObservation({
+      projectId, repositoryId: logical.repositoryId, primaryWorkspaceId: logical.primaryWorkspaceId,
+      commonGitDir: logical.commonGitDir, commonGitDirDevice: logical.commonGitDirDevice, commonGitDirInode: logical.commonGitDirInode,
+    }, {
+      projectId, primaryWorkspaceId: logical.primaryWorkspaceId, commonGitDir: identity.commonGitDir,
+      commonGitDirDevice: identity.commonGitDirDevice, commonGitDirInode: identity.commonGitDirInode,
+      physicalRoot: workspace.physicalRoot, physicalRootDevice: rootMetadata.dev.toString(), physicalRootInode: rootMetadata.ino.toString(),
+      head, tree, ref, sourceSha: head, sourceTree: tree,
+      objectIntegritySha256: createHash('sha256').update(`${integrity.stdout}\0${integrity.stderr}`).digest('hex'),
+    });
   }
 
   public async reconcileRepository(input: RepositoryReconciliationInput, approvedFingerprint?: string) {

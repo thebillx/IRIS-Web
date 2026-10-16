@@ -111,6 +111,15 @@ function value(outcome: CapabilityOutcome) {
 }
 
 describe('owner-authorized repository device reconciliation', () => {
+  it('records physical device continuity without changing logical registry authority', async () => {
+    const f = await fixture();
+    const before = await readFile(f.filename, 'utf8');
+    const observation = await f.engine.observeRepositoryPhysical(f.project.id, f.primary.workspaceId, f.input.previousRepositoryId);
+    expect(observation).toMatchObject({ authority: 'OBSERVATION_ONLY', logicalRepositoryId: f.input.previousRepositoryId,
+      registeredCommonGitDirDevice: f.input.previousDevice, observedCommonGitDirInode: f.current.commonGitDirInode });
+    expect(await readFile(f.filename, 'utf8')).toBe(before);
+  }, 120_000);
+
   it('fails governed Git on device mismatch and changes nothing before explicit owner approval', async () => {
     const f = await fixture();
     const before = await readFile(f.filename, 'utf8');
