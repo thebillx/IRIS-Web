@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { access, link, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -11,6 +11,7 @@ import { RUNTIME_DATA_ENV } from './data-root.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
 import { inspectRegistrationRoot } from './project-path.js';
 import { PROTECTED_REFERENCE_ROOT_ENV } from './permissions.js';
+import { readOwnerAccessSecret } from './persistence.js';
 
 const execFileAsync = promisify(execFile);
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
@@ -24,6 +25,7 @@ export interface LaunchdPaths {
   readonly stdout: string;
   readonly stderr: string;
   readonly sourceBindingMigration: string;
+  readonly sourceBindingApproval: string;
   readonly operationLock: string;
 }
 
@@ -41,6 +43,30 @@ export interface LaunchdDependencies {
   readonly launchctl?: (argumentsList: readonly string[]) => Promise<{ readonly stdout: string }>;
 }
 
+export interface LaunchAgentSourceApprovalInput {
+  readonly dataRoot: string;
+  readonly sourceRoot: string;
+  readonly controlScript: string;
+  readonly executable: string;
+  readonly executableArguments: readonly string[];
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly requestId: string;
+  readonly protectedReferenceRoot?: string;
+}
+
+export interface LaunchAgentSourceApprovalRecord extends LaunchAgentSourceApprovalInput {
+  readonly schemaVersion: 1;
+  readonly approvalId: string;
+  readonly state: 'ISSUED' | 'CONSUMED' | 'RECONCILIATION_REQUIRED';
+  readonly label: typeof LAUNCH_AGENT_LABEL;
+  readonly domain: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+  readonly issuedAt: string;
+  readonly signature: string;
+}
+
 export interface LaunchAgentSourceMigrationInput {
   readonly dataRoot: string;
   readonly sourceRoot: string;
@@ -49,7 +75,7 @@ export interface LaunchAgentSourceMigrationInput {
   readonly executableArguments: readonly string[];
   readonly sourceSha: string;
   readonly sourceTree: string;
-  readonly approvalFingerprint: string;
+  readonly approvalId: string;
   readonly requestId: string;
   readonly protectedReferenceRoot?: string;
 }
@@ -71,7 +97,7 @@ export interface LaunchAgentSourceMigrationRecord {
   readonly targetExecutableArguments: readonly string[];
   readonly targetSourceSha: string;
   readonly targetSourceTree: string;
-  readonly approvalFingerprint: string;
+  readonly approvalId: string;
   readonly protectedReferenceRoot?: string;
   readonly failureCode?: string;
 }
@@ -144,6 +170,7 @@ export function launchdPaths(dataRoot: string, homeDirectory = os.homedir()): La
     stdout: path.join(dataRoot, 'logs', 'supervisor.log'),
     stderr: path.join(dataRoot, 'logs', 'supervisor-error.log'),
     sourceBindingMigration: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-migration.json`),
+    sourceBindingApproval: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-approval.json`),
     operationLock: path.join(directory, `${LAUNCH_AGENT_LABEL}.operation.lock`),
   };
 }
@@ -186,6 +213,49 @@ export function renderLaunchAgent(
     '</plist>',
     '',
   ].join('\n');
+}
+
+/** Issues a one-time, owner-secret-bound migration authorization without mutating launchd. */
+export async function issueLaunchAgentSourceApproval(
+  input: LaunchAgentSourceApprovalInput,
+  dependencies: LaunchdDependencies = {},
+): Promise<LaunchAgentSourceApprovalRecord> {
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, async () => {
+    assertSupportedNodeVersion();
+    validateMigrationInput(input);
+    const preflight = await inspectMigrationBinding(input, dependencies);
+    const secret = await readOwnerAccessSecret(canonicalDataRoot);
+    if (secret === null) throw new RuntimeError('CONTROL_DENIED', 'Owner access approval is not initialized');
+    const existing = await readSourceApprovalRecord(paths.sourceBindingApproval, uid);
+    if (existing !== null) {
+      if (existing.state === 'ISSUED' && approvalMatches(existing, preflight, input) && verifySourceApproval(existing, secret)) return existing;
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing migration approval requires reconciliation before retry');
+    }
+    const record: LaunchAgentSourceApprovalRecord = {
+      ...input,
+      dataRoot: canonicalDataRoot,
+      sourceRoot: preflight.sourceRoot,
+      controlScript: preflight.controlScript,
+      executable: preflight.executable,
+      executableArguments: [...input.executableArguments],
+      ...(preflight.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: preflight.protectedReferenceRoot }),
+      schemaVersion: 1,
+      approvalId: randomUUID(),
+      state: 'ISSUED',
+      label: LAUNCH_AGENT_LABEL,
+      domain: preflight.domain,
+      beforeMetadataSha256: preflight.beforeMetadataSha256,
+      beforePlistSha256: preflight.beforePlistSha256,
+      issuedAt: new Date().toISOString(),
+      signature: '',
+    };
+    const signed = { ...record, signature: signSourceApproval(record, secret) };
+    await publishOwnedFile(paths.sourceBindingApproval, approvalContent(signed), 'IRIS source migration approval', uid);
+    return signed;
+  });
 }
 
 /**
@@ -249,7 +319,10 @@ async function migrateLaunchAgentSourceUnlocked(
       && existingMigration.targetSourceSha === input.sourceSha
       && existingMigration.targetSourceTree === input.sourceTree
       && (existingMigration.protectedReferenceRoot ?? null) === (canonicalProtectedReferenceRoot ?? null)
-      && existingMigration.approvalFingerprint === input.approvalFingerprint) return existingMigration;
+      && existingMigration.approvalId === input.approvalId) {
+      await verifyCommittedMigration(paths, existingMigration, uid);
+      return existingMigration;
+    }
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing source migration requires reconciliation before retry');
   }
 
@@ -265,6 +338,22 @@ async function migrateLaunchAgentSourceUnlocked(
   const legacyPlist = renderLaunchAgent(canonicalDataRoot, legacy.executable, legacy.controlScript, legacy.executableArguments);
   if (legacy.plist !== paths.plist || privatePlist.content !== legacyPlist) {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy LaunchAgent binding does not match its durable metadata');
+  }
+  const approval = await readSourceApprovalRecord(paths.sourceBindingApproval, uid);
+  const secret = await readOwnerAccessSecret(canonicalDataRoot);
+  if (secret === null) throw new RuntimeError('CONTROL_DENIED', 'Owner access approval is not initialized');
+  if (approval === null || approval.state !== 'ISSUED' || approval.approvalId !== input.approvalId
+    || !approvalMatches(approval, {
+      sourceRoot: canonicalSourceRoot,
+      controlScript: canonicalControlScript,
+      executable,
+      ...(canonicalProtectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: canonicalProtectedReferenceRoot }),
+      domain,
+      beforeMetadataSha256: sha256(legacyRecord.raw),
+      beforePlistSha256: sha256(legacyPlist),
+    }, input)
+    || !verifySourceApproval(approval, secret)) {
+    throw new RuntimeError('CONTROL_DENIED', 'Migration approval is missing, stale, conflicting or invalid');
   }
   const disabledBeforeMigration = await launchAgentDisabled(domain, launchctl);
   const targetPlist = renderLaunchAgent(
@@ -319,7 +408,7 @@ async function migrateLaunchAgentSourceUnlocked(
     targetExecutableArguments: [...input.executableArguments],
     targetSourceSha: input.sourceSha,
     targetSourceTree: input.sourceTree,
-    approvalFingerprint: input.approvalFingerprint,
+    approvalId: input.approvalId,
     ...(canonicalProtectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: canonicalProtectedReferenceRoot }),
   };
   const beforePublication = await observeLaunchAgent(dependencies);
@@ -332,6 +421,7 @@ async function migrateLaunchAgentSourceUnlocked(
   let plistChanged = false;
   let metadataChanged = false;
   let rollbackEvidenceUnknown = false;
+  let committed: LaunchAgentSourceMigrationRecord | undefined;
   try {
     try {
       await replaceOwnedFile(paths.plist, legacyPlist, targetPlist, 'IRIS private LaunchAgent', uid);
@@ -351,10 +441,18 @@ async function migrateLaunchAgentSourceUnlocked(
       else if (state === null) rollbackEvidenceUnknown = true;
       throw error;
     }
-    const committed = { ...applying, state: 'COMMITTED' as const };
+    committed = { ...applying, state: 'COMMITTED' as const };
     await replaceOwnedFile(migrationPath, migrationContent(applying), migrationContent(committed), 'IRIS source migration record', uid);
+    const consumedApproval = { ...approval, state: 'CONSUMED' as const };
+    await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(approval), approvalContent(consumedApproval), 'IRIS source migration approval', uid);
     return committed;
   } catch (error) {
+    if (committed !== undefined) {
+      const unresolved = { ...committed, state: 'RECONCILIATION_REQUIRED' as const, failureCode: 'APPROVAL_CONSUMPTION_UNKNOWN' };
+      await replaceOwnedFile(migrationPath, migrationContent(committed), migrationContent(unresolved), 'IRIS source migration record', uid).catch(() => undefined);
+      await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(approval), approvalContent({ ...approval, state: 'RECONCILIATION_REQUIRED' }), 'IRIS source migration approval', uid).catch(() => undefined);
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Source migration committed but approval consumption requires reconciliation', { cause: error });
+    }
     let rollbackFailed = false;
     if (metadataChanged) {
       try { await replaceOwnedFile(paths.metadata, metadataContent(targetMetadata), legacyRecord.raw, 'IRIS LaunchAgent metadata', uid); }
@@ -385,6 +483,29 @@ async function exactOwnedContent(filename: string, expected: string, uid: number
   } catch {
     return null;
   }
+}
+
+async function verifyCommittedMigration(paths: LaunchdPaths, record: LaunchAgentSourceMigrationRecord, uid: number): Promise<void> {
+  const targetPlist = renderLaunchAgent(record.dataRoot, record.targetExecutable, record.targetControlScript, record.targetExecutableArguments, record.protectedReferenceRoot);
+  const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+  if (privatePlist.state !== 'ok' || privatePlist.content !== targetPlist) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration target plist no longer matches');
+  const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+  if (registeredPlist.state !== 'missing') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration has an unexpected registered LaunchAgent');
+  const metadata = await readLaunchAgentMetadata(paths.metadata, uid);
+  if (metadata?.metadata.schemaVersion !== 3 || metadata.metadata.state !== 'PREPARED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration metadata is not in the expected prepared state');
+  requireMetadataBinding(metadata.metadata, {
+    schemaVersion: 3,
+    label: LAUNCH_AGENT_LABEL,
+    domain: record.domain,
+    dataRoot: record.dataRoot,
+    sourceRoot: record.targetSourceRoot,
+    executable: record.targetExecutable,
+    controlScript: record.targetControlScript,
+    plist: paths.plist,
+    registeredPlist: paths.registeredPlist,
+    plistSha256: sha256(targetPlist),
+    executableArguments: record.targetExecutableArguments,
+  });
 }
 
 export async function installLaunchAgent(
@@ -1128,13 +1249,136 @@ async function readSourceMigrationRecord(filename: string, uid: number): Promise
   }
 }
 
-function validateMigrationInput(input: LaunchAgentSourceMigrationInput): void {
+type MigrationBindingPreflight = {
+  readonly sourceRoot: string;
+  readonly controlScript: string;
+  readonly executable: string;
+  readonly protectedReferenceRoot?: string;
+  readonly domain: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+};
+
+async function inspectMigrationBinding(
+  input: LaunchAgentSourceApprovalInput,
+  dependencies: LaunchdDependencies,
+): Promise<MigrationBindingPreflight> {
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const canonicalSourceRoot = await requireCanonicalDirectory(input.sourceRoot, 'IRIS control source root', uid, false);
+  const canonicalControlScript = await requireCanonicalFile(input.controlScript, 'IRIS control script', uid);
+  if (sourceRootForControlScript(canonicalControlScript) !== canonicalSourceRoot) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Control script is outside the requested source root');
+  const executable = await realpath(input.executable).catch((error) => { throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Reviewed control executable cannot be resolved', { cause: error }); });
+  if (executable !== await realpath(canonicalNodeRuntime().path)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Reviewed control executable is not the supported Node runtime');
+  await requireTargetRuntimeEntries(input.executableArguments, uid);
+  await requireSourceGitIdentity(canonicalSourceRoot, input.sourceSha, input.sourceTree);
+  const canonicalProtectedReferenceRoot = input.protectedReferenceRoot === undefined
+    ? undefined
+    : await requireCanonicalDirectory(input.protectedReferenceRoot, 'IRIS protected reference root', uid, false);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  const domain = launchdDomain(dependencies);
+  const launchctl = dependencies.launchctl ?? systemLaunchctl;
+  await requireGuiDomain(domain, launchctl);
+  if ((await observeLaunchAgent(dependencies)).state !== 'ABSENT') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'A loaded LaunchAgent must be stopped before source migration');
+  const legacyRecord = await readLaunchAgentMetadata(paths.metadata, uid);
+  if (legacyRecord?.metadata.schemaVersion !== 1) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Source migration requires an exact schema-1 LaunchAgent record');
+  const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+  if (privatePlist.state !== 'ok') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy private LaunchAgent plist is unavailable');
+  const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+  if (registeredPlist.state !== 'missing') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'A registered LaunchAgent conflicts with source migration');
+  const legacy = legacyRecord.metadata;
+  const legacyPlist = renderLaunchAgent(canonicalDataRoot, legacy.executable, legacy.controlScript, legacy.executableArguments);
+  if (legacy.plist !== paths.plist || privatePlist.content !== legacyPlist) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy LaunchAgent binding does not match its durable metadata');
+  return {
+    sourceRoot: canonicalSourceRoot,
+    controlScript: canonicalControlScript,
+    executable,
+    ...(canonicalProtectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: canonicalProtectedReferenceRoot }),
+    domain,
+    beforeMetadataSha256: sha256(legacyRecord.raw),
+    beforePlistSha256: sha256(legacyPlist),
+  };
+}
+
+function approvalMatches(
+  approval: LaunchAgentSourceApprovalRecord,
+  preflight: MigrationBindingPreflight,
+  input: LaunchAgentSourceApprovalInput,
+): boolean {
+  return approval.dataRoot === input.dataRoot
+    && approval.sourceRoot === preflight.sourceRoot
+    && approval.controlScript === preflight.controlScript
+    && approval.executable === preflight.executable
+    && approval.executableArguments.length === input.executableArguments.length
+    && approval.executableArguments.every((argument, index) => argument === input.executableArguments[index])
+    && approval.sourceSha === input.sourceSha
+    && approval.sourceTree === input.sourceTree
+    && approval.requestId === input.requestId
+    && (approval.protectedReferenceRoot ?? null) === (preflight.protectedReferenceRoot ?? null)
+    && approval.domain === preflight.domain
+    && approval.beforeMetadataSha256 === preflight.beforeMetadataSha256
+    && approval.beforePlistSha256 === preflight.beforePlistSha256;
+}
+
+function sourceApprovalPayload(record: LaunchAgentSourceApprovalRecord): string {
+  return JSON.stringify({
+    schemaVersion: record.schemaVersion,
+    approvalId: record.approvalId,
+    dataRoot: record.dataRoot,
+    sourceRoot: record.sourceRoot,
+    controlScript: record.controlScript,
+    executable: record.executable,
+    executableArguments: record.executableArguments,
+    sourceSha: record.sourceSha,
+    sourceTree: record.sourceTree,
+    requestId: record.requestId,
+    protectedReferenceRoot: record.protectedReferenceRoot ?? null,
+    label: record.label,
+    domain: record.domain,
+    beforeMetadataSha256: record.beforeMetadataSha256,
+    beforePlistSha256: record.beforePlistSha256,
+  });
+}
+
+function signSourceApproval(record: LaunchAgentSourceApprovalRecord, secret: string): string {
+  return createHmac('sha256', secret).update(sourceApprovalPayload(record)).digest('hex');
+}
+
+function verifySourceApproval(record: LaunchAgentSourceApprovalRecord, secret: string): boolean {
+  const expected = signSourceApproval(record, secret);
+  const actual = Buffer.from(record.signature, 'utf8');
+  const candidate = Buffer.from(expected, 'utf8');
+  return actual.length === candidate.length && timingSafeEqual(actual, candidate);
+}
+
+function approvalContent(record: LaunchAgentSourceApprovalRecord): string {
+  return `${JSON.stringify(record, null, 2)}\n`;
+}
+
+async function readSourceApprovalRecord(filename: string, uid: number): Promise<LaunchAgentSourceApprovalRecord | null> {
+  const inspected = await inspectOwnedFile(filename, 'IRIS source migration approval', uid);
+  if (inspected.state === 'missing') return null;
+  if (inspected.state === 'invalid') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', inspected.reason);
+  try {
+    const value = JSON.parse(inspected.content) as Partial<LaunchAgentSourceApprovalRecord>;
+    if (value.schemaVersion !== 1 || value.label !== LAUNCH_AGENT_LABEL || typeof value.approvalId !== 'string'
+      || !['ISSUED', 'CONSUMED', 'RECONCILIATION_REQUIRED'].includes(String(value.state))
+      || typeof value.signature !== 'string' || typeof value.requestId !== 'string') throw new Error('invalid source approval record');
+    return value as LaunchAgentSourceApprovalRecord;
+  } catch (error) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'IRIS source migration approval is invalid', { cause: error });
+  }
+}
+
+function validateMigrationInput(input: LaunchAgentSourceMigrationInput | LaunchAgentSourceApprovalInput): void {
   for (const [name, value] of [['sourceSha', input.sourceSha], ['sourceTree', input.sourceTree]] as const) {
     if (!/^[a-f0-9]{40}$/.test(value)) throw new RuntimeError('INVALID_REQUEST', `${name} must be a lowercase hexadecimal object identifier`);
   }
-  if (!/^[a-f0-9]{64}$/.test(input.approvalFingerprint)) throw new RuntimeError('INVALID_REQUEST', 'approvalFingerprint must be a 64-character lowercase hexadecimal value');
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.requestId)) {
     throw new RuntimeError('INVALID_REQUEST', 'requestId must be a UUID');
+  }
+  if ('approvalId' in input && !/^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.approvalId)) {
+    throw new RuntimeError('INVALID_REQUEST', 'approvalId must be a UUID');
   }
   if (input.executableArguments.some((argument) => argument.includes('\0'))) {
     throw new RuntimeError('INVALID_REQUEST', 'executable arguments cannot contain NUL bytes');

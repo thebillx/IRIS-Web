@@ -1,10 +1,12 @@
 import path from 'node:path';
+import { createInterface } from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
 import { createSupervisor } from './supervisor.js';
-import { installLaunchAgent, launchAgentStatus, migrateLaunchAgentSource, uninstallLaunchAgent } from './launchd.js';
+import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 
 const command = process.argv[2];
@@ -87,10 +89,27 @@ try {
         executableArguments: ['--require', path.join(tsxDirectory, 'preflight.cjs'), '--import', pathToFileURL(path.join(tsxDirectory, 'loader.mjs')).href],
         sourceSha: migration.sourceSha,
         sourceTree: migration.sourceTree,
-        approvalFingerprint: migration.approvalFingerprint,
+        approvalId: migration.approvalId,
         requestId: migration.requestId,
         ...(migration.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: migration.protectedReferenceRoot }),
       }), null, 2)}\n`);
+    } else if (command === 'launchd' && process.argv[3] === 'authorize-migrate-source') {
+      const approval = parseLaunchdSourceApprovalOptions(process.argv.slice(4));
+      const runtimeDirectory = path.join(approval.sourceRoot, 'apps', 'runtime');
+      const tsxDirectory = path.join(runtimeDirectory, 'node_modules', 'tsx', 'dist');
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type APPROVE IRIS MIGRATION to issue the one-time local authorization: ');
+        if (confirmation.trim() !== 'APPROVE IRIS MIGRATION') throw new Error('Owner migration authorization was not confirmed');
+      } finally {
+        prompt.close();
+      }
+      const issued = await issueLaunchAgentSourceApproval({
+        ...approval,
+        dataRoot,
+        executableArguments: ['--require', path.join(tsxDirectory, 'preflight.cjs'), '--import', pathToFileURL(path.join(tsxDirectory, 'loader.mjs')).href],
+      });
+      process.stdout.write(`${JSON.stringify({ approvalId: issued.approvalId, requestId: issued.requestId, state: issued.state })}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'uninstall') {
       await uninstallLaunchAgent(dataRoot);
       process.stdout.write('IRIS_LAUNCHD=UNINSTALLED\n');
@@ -119,7 +138,7 @@ interface LaunchdSourceMigrationOptions {
   readonly executable: string;
   readonly sourceSha: string;
   readonly sourceTree: string;
-  readonly approvalFingerprint: string;
+  readonly approvalId: string;
   readonly requestId: string;
   readonly protectedReferenceRoot?: string;
 }
@@ -159,7 +178,7 @@ function parseLaunchdSourceMigrationOptions(argumentsList: readonly string[]): L
     if (value === undefined) throw new Error(LAUNCHD_SOURCE_MIGRATION_USAGE);
     return value;
   };
-  const allowed = new Set(['--source-root', '--control-script', '--executable', '--source-sha', '--source-tree', '--approval-fingerprint', '--request-id', '--protected-reference-root']);
+  const allowed = new Set(['--source-root', '--control-script', '--executable', '--source-sha', '--source-tree', '--approval-id', '--request-id', '--protected-reference-root']);
   if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_SOURCE_MIGRATION_USAGE);
   const protectedReferenceRoot = values.get('--protected-reference-root');
   return {
@@ -168,13 +187,51 @@ function parseLaunchdSourceMigrationOptions(argumentsList: readonly string[]): L
     executable: required('--executable'),
     sourceSha: required('--source-sha'),
     sourceTree: required('--source-tree'),
-    approvalFingerprint: required('--approval-fingerprint'),
+    approvalId: required('--approval-id'),
     requestId: required('--request-id'),
     ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }),
   };
 }
 
-const LAUNCHD_SOURCE_MIGRATION_USAGE = 'Usage: iris launchd migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --approval-fingerprint <fingerprint> --request-id <uuid> [--protected-reference-root <directory>]';
+interface LaunchdSourceApprovalOptions {
+  readonly sourceRoot: string;
+  readonly controlScript: string;
+  readonly executable: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly requestId: string;
+  readonly protectedReferenceRoot?: string;
+}
+
+function parseLaunchdSourceApprovalOptions(argumentsList: readonly string[]): LaunchdSourceApprovalOptions {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(LAUNCHD_SOURCE_APPROVAL_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => {
+    const value = values.get(name);
+    if (value === undefined) throw new Error(LAUNCHD_SOURCE_APPROVAL_USAGE);
+    return value;
+  };
+  const allowed = new Set(['--source-root', '--control-script', '--executable', '--source-sha', '--source-tree', '--request-id', '--protected-reference-root']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_SOURCE_APPROVAL_USAGE);
+  const protectedReferenceRoot = values.get('--protected-reference-root');
+  return {
+    sourceRoot: required('--source-root'),
+    controlScript: required('--control-script'),
+    executable: required('--executable'),
+    sourceSha: required('--source-sha'),
+    sourceTree: required('--source-tree'),
+    requestId: required('--request-id'),
+    ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }),
+  };
+}
+
+const LAUNCHD_SOURCE_MIGRATION_USAGE = 'Usage: iris launchd migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --approval-id <uuid> --request-id <uuid> [--protected-reference-root <directory>]';
+const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --request-id <uuid> [--protected-reference-root <directory>]';
 
 function printStatus(status: Awaited<ReturnType<Awaited<ReturnType<typeof createSupervisor>>['status']>>): void {
   process.stdout.write(`IRIS_STACK=${status.state}\n`);

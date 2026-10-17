@@ -6,6 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   installLaunchAgent,
+  issueLaunchAgentSourceApproval,
   LAUNCH_AGENT_LABEL,
   launchAgentStatus,
   launchdPaths,
@@ -159,8 +160,22 @@ async function fixture(): Promise<{ readonly dataRoot: string; readonly home: st
   const dataRoot = path.join(root, 'data');
   const home = path.join(root, 'home');
   await mkdir(dataRoot, { mode: 0o700 });
+  await writeFile(path.join(dataRoot, 'owner-access.json'), `${JSON.stringify({ schemaVersion: 1, secret: 'A'.repeat(43) })}\n`, { mode: 0o600 });
   await mkdir(path.join(home, 'Library'), { recursive: true, mode: 0o700 });
   return { dataRoot, home, fake: fakeLaunchd(home, dataRoot, await realpath(canonicalNodeRuntime().path)) };
+}
+
+async function approve(subject: Awaited<ReturnType<typeof fixture>>, target: Awaited<ReturnType<typeof reviewedSource>>, requestId: string) {
+  return issueLaunchAgentSourceApproval({
+    dataRoot: subject.dataRoot,
+    sourceRoot: target.root,
+    controlScript: target.controlScript,
+    executable: canonicalNodeRuntime().path,
+    executableArguments: target.executableArguments,
+    sourceSha: target.sourceSha,
+    sourceTree: target.sourceTree,
+    requestId,
+  }, subject.fake.dependencies);
 }
 
 async function install(subject: Awaited<ReturnType<typeof fixture>>) {
@@ -363,6 +378,7 @@ describe('IRIS LaunchAgent artifact', () => {
     const legacy = await writeLegacyLaunchAgent(subject);
     const target = await reviewedSource(subject);
     const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
     const result = await migrateLaunchAgentSource({
       dataRoot: subject.dataRoot,
       sourceRoot: target.root,
@@ -371,7 +387,7 @@ describe('IRIS LaunchAgent artifact', () => {
       executableArguments: target.executableArguments,
       sourceSha: target.sourceSha,
       sourceTree: target.sourceTree,
-      approvalFingerprint: 'a'.repeat(64),
+      approvalId: approval.approvalId,
       requestId,
     }, subject.fake.dependencies);
     const paths = launchdPaths(subject.dataRoot, subject.home);
@@ -400,10 +416,47 @@ describe('IRIS LaunchAgent artifact', () => {
       executableArguments: target.executableArguments,
       sourceSha: target.sourceSha,
       sourceTree: target.sourceTree,
-      approvalFingerprint: 'a'.repeat(64),
+      approvalId: approval.approvalId,
       requestId,
     }, subject.fake.dependencies)).resolves.toMatchObject({ state: 'COMMITTED', transactionId: result.transactionId });
     expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
+    await writeFile(paths.plist, `${await readFile(paths.plist, 'utf8')}\n`, { mode: 0o600 });
+    await expect(migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalId: approval.approvalId,
+      requestId,
+    }, subject.fake.dependencies)).rejects.toThrow(/target plist no longer matches/);
+  });
+
+  it('requires an untampered owner-secret-bound approval before publication', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    const tampered = JSON.parse(await readFile(paths.sourceBindingApproval, 'utf8')) as Record<string, unknown>;
+    tampered.sourceTree = '0'.repeat(40);
+    await writeFile(paths.sourceBindingApproval, `${JSON.stringify(tampered)}\n`, { mode: 0o600 });
+    await expect(migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalId: approval.approvalId,
+      requestId,
+    }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect(await readFile(paths.metadata, 'utf8')).toContain('"schemaVersion": 1');
+    expect(await readFile(paths.plist, 'utf8')).toContain(subject.dataRoot);
   });
 
   it('rejects a source migration before publication when the reviewed identity or target entrypoint is wrong', async () => {
@@ -421,7 +474,7 @@ describe('IRIS LaunchAgent artifact', () => {
       executableArguments: [...target.executableArguments, path.join(target.root, 'missing-entrypoint.mjs')],
       sourceSha: '0'.repeat(40),
       sourceTree: target.sourceTree,
-      approvalFingerprint: 'b'.repeat(64),
+      approvalId: randomUUID(),
       requestId: randomUUID(),
     }, subject.fake.dependencies)).rejects.toThrow(/reviewed control source identity|entrypoint/);
     expect(await readFile(paths.metadata, 'utf8')).toBe(beforeMetadata);
@@ -442,7 +495,7 @@ describe('IRIS LaunchAgent artifact', () => {
       executableArguments: target.executableArguments,
       sourceSha: target.sourceSha,
       sourceTree: target.sourceTree,
-      approvalFingerprint: 'c'.repeat(64),
+      approvalId: randomUUID(),
       requestId: randomUUID(),
     }, subject.fake.dependencies)).rejects.toThrow(/must be stopped/);
     expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
@@ -462,7 +515,7 @@ describe('IRIS LaunchAgent artifact', () => {
       executableArguments: target.executableArguments,
       sourceSha: target.sourceSha,
       sourceTree: target.sourceTree,
-      approvalFingerprint: 'd'.repeat(64),
+      approvalId: randomUUID(),
       requestId: randomUUID(),
     }, subject.fake.dependencies)).rejects.toThrow(/lifecycle operation/);
     expect(await readFile(paths.metadata, 'utf8')).toBe(legacy.metadata);
