@@ -28,6 +28,7 @@ export interface LaunchdPaths {
   readonly stderr: string;
   readonly sourceBindingMigration: string;
   readonly sourceBindingApproval: string;
+  readonly sourceBindingApprovalHistory: string;
   readonly operationLock: string;
 }
 
@@ -58,8 +59,15 @@ export interface LaunchAgentSourceApprovalInput {
   readonly protectedReferenceRoot?: string;
 }
 
+export interface LaunchAgentSourceApprovalReconciliationInput {
+  readonly dataRoot: string;
+  readonly requestId: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+}
+
 export interface LaunchAgentSourceApprovalRecord extends LaunchAgentSourceApprovalInput {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 1 | 2;
   readonly approvalId: string;
   readonly state: 'ISSUED' | 'CONSUMED' | 'RECONCILIATION_REQUIRED';
   readonly label: typeof LAUNCH_AGENT_LABEL;
@@ -181,6 +189,7 @@ export function launchdPaths(dataRoot: string, homeDirectory = os.homedir()): La
     stderr: path.join(dataRoot, 'logs', 'supervisor-error.log'),
     sourceBindingMigration: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-migration.json`),
     sourceBindingApproval: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-approval.json`),
+    sourceBindingApprovalHistory: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-approval.history.json`),
     operationLock: path.join(directory, `${LAUNCH_AGENT_LABEL}.operation.lock`),
   };
 }
@@ -240,8 +249,14 @@ export async function issueLaunchAgentSourceApproval(
     const secret = await readOwnerAccessSecret(canonicalDataRoot);
     if (secret === null) throw new RuntimeError('CONTROL_DENIED', 'Owner access approval is not initialized');
     const existing = await readSourceApprovalRecord(paths.sourceBindingApproval, uid);
-    if (existing !== null) {
-      if (existing.state === 'ISSUED' && approvalMatches(existing, preflight, input) && verifySourceApproval(existing, secret)) return existing;
+    const supersedingReconciledApproval = existing?.state === 'RECONCILIATION_REQUIRED';
+    if (existing !== null && existing.state === 'RECONCILIATION_REQUIRED') {
+      if (!verifySourceApproval(existing, secret)) {
+        throw new RuntimeError('CONTROL_DENIED', 'The existing migration approval cannot be authenticated for supersession');
+      }
+      await archiveSourceApproval(paths, existing, uid);
+    } else if (existing !== null) {
+      if (existing.schemaVersion === 2 && existing.state === 'ISSUED' && approvalMatches(existing, preflight, input) && verifySourceApproval(existing, secret)) return existing;
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing migration approval requires reconciliation before retry');
     }
     const record: LaunchAgentSourceApprovalRecord = {
@@ -252,7 +267,7 @@ export async function issueLaunchAgentSourceApproval(
       executable: preflight.executable,
       executableArguments: [...input.executableArguments],
       ...(preflight.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: preflight.protectedReferenceRoot }),
-      schemaVersion: 1,
+      schemaVersion: 2,
       approvalId: randomUUID(),
       state: 'ISSUED',
       label: LAUNCH_AGENT_LABEL,
@@ -265,8 +280,47 @@ export async function issueLaunchAgentSourceApproval(
       signature: '',
     };
     const signed = { ...record, signature: signSourceApproval(record, secret) };
-    await publishOwnedFile(paths.sourceBindingApproval, approvalContent(signed), 'IRIS source migration approval', uid);
+    if (supersedingReconciledApproval && existing !== null) {
+      await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(existing), approvalContent(signed), 'IRIS source migration approval', uid);
+    } else {
+      await publishOwnedFile(paths.sourceBindingApproval, approvalContent(signed), 'IRIS source migration approval', uid);
+    }
     return signed;
+  });
+}
+
+/** Revokes one authenticated stale approval without deleting its audit record. */
+export async function reconcileLaunchAgentSourceApproval(
+  input: LaunchAgentSourceApprovalReconciliationInput,
+  dependencies: LaunchdDependencies = {},
+): Promise<LaunchAgentSourceApprovalRecord> {
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, async () => {
+    validateApprovalReconciliationInput(input);
+    const approval = await readSourceApprovalRecord(paths.sourceBindingApproval, uid);
+    if (approval === null) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'No migration approval exists to reconcile');
+    if (approval.requestId !== input.requestId || approval.sourceSha !== input.sourceSha || approval.sourceTree !== input.sourceTree) {
+      throw new RuntimeError('CONTROL_DENIED', 'The requested approval does not match the durable approval record');
+    }
+    const secret = await readOwnerAccessSecret(canonicalDataRoot);
+    if (secret === null || !verifySourceApproval(approval, secret)) throw new RuntimeError('CONTROL_DENIED', 'The durable migration approval failed authentication');
+    if (approval.state === 'RECONCILIATION_REQUIRED') return approval;
+    if (approval.state !== 'ISSUED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `Migration approval is ${approval.state.toLowerCase()} and cannot be reconciled`);
+    const metadata = await inspectOwnedFile(paths.metadata, 'IRIS LaunchAgent metadata', uid);
+    const plist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+    if (metadata.state !== 'ok' || plist.state !== 'ok' || sha256(metadata.content) !== approval.beforeMetadataSha256 || sha256(plist.content) !== approval.beforePlistSha256) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Protected before-images changed; approval reconciliation is blocked');
+    }
+    const reconciled = approval.schemaVersion === 2
+      ? { ...approval, state: 'RECONCILIATION_REQUIRED' as const, signature: '' }
+      : { ...approval, state: 'RECONCILIATION_REQUIRED' as const };
+    const signedReconciled = approval.schemaVersion === 2
+      ? { ...reconciled, signature: signSourceApproval(reconciled, secret) }
+      : reconciled;
+    await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(approval), approvalContent(signedReconciled), 'IRIS source migration approval', uid);
+    return signedReconciled;
   });
 }
 
@@ -356,7 +410,7 @@ async function migrateLaunchAgentSourceUnlocked(
   const approval = await readSourceApprovalRecord(paths.sourceBindingApproval, uid);
   const secret = await readOwnerAccessSecret(canonicalDataRoot);
   if (secret === null) throw new RuntimeError('CONTROL_DENIED', 'Owner access approval is not initialized');
-  if (approval === null || approval.state !== 'ISSUED' || approval.approvalId !== input.approvalId
+  if (approval === null || approval.schemaVersion !== 2 || approval.state !== 'ISSUED' || approval.approvalId !== input.approvalId
     || !approvalMatches(approval, {
       sourceRoot: canonicalSourceRoot,
       controlScript: canonicalControlScript,
@@ -474,14 +528,17 @@ async function migrateLaunchAgentSourceUnlocked(
     }
     committed = { ...applying, state: 'COMMITTED' as const };
     await replaceOwnedFile(migrationPath, migrationContent(applying), migrationContent(committed), 'IRIS source migration record', uid);
-    const consumedApproval = { ...approval, state: 'CONSUMED' as const };
-    await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(approval), approvalContent(consumedApproval), 'IRIS source migration approval', uid);
+    const consumedApproval = { ...approval, state: 'CONSUMED' as const, signature: '' };
+    const signedConsumedApproval = { ...consumedApproval, signature: signSourceApproval(consumedApproval, secret) };
+    await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(approval), approvalContent(signedConsumedApproval), 'IRIS source migration approval', uid);
     return committed;
   } catch (error) {
     if (committed !== undefined) {
       const unresolved = { ...committed, state: 'RECONCILIATION_REQUIRED' as const, failureCode: 'APPROVAL_CONSUMPTION_UNKNOWN' };
       await replaceOwnedFile(migrationPath, migrationContent(committed), migrationContent(unresolved), 'IRIS source migration record', uid).catch(() => undefined);
-      await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(approval), approvalContent({ ...approval, state: 'RECONCILIATION_REQUIRED' }), 'IRIS source migration approval', uid).catch(() => undefined);
+      const unresolvedApproval = { ...approval, state: 'RECONCILIATION_REQUIRED' as const, signature: '' };
+      const signedUnresolvedApproval = { ...unresolvedApproval, signature: signSourceApproval(unresolvedApproval, secret) };
+      await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(approval), approvalContent(signedUnresolvedApproval), 'IRIS source migration approval', uid).catch(() => undefined);
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Source migration committed but approval consumption requires reconciliation', { cause: error });
     }
     let rollbackFailed = false;
@@ -1361,6 +1418,34 @@ async function replaceOwnedFile(filename: string, expected: string, content: str
   }
 }
 
+async function archiveSourceApproval(paths: LaunchdPaths, record: LaunchAgentSourceApprovalRecord, uid: number): Promise<void> {
+  const inspected = await inspectOwnedFile(paths.sourceBindingApprovalHistory, 'IRIS source migration approval history', uid);
+  let entries: readonly unknown[] = [];
+  if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
+  if (inspected.state === 'ok') {
+    try {
+      const parsed: unknown = JSON.parse(inspected.content);
+      if (!Array.isArray(parsed) || parsed.length > 64) throw new Error('invalid approval history');
+      entries = parsed;
+    } catch (error) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'IRIS source migration approval history is invalid', { cause: error });
+    }
+  }
+  const duplicate = entries.find((entry) => typeof entry === 'object' && entry !== null
+    && 'record' in entry && typeof entry.record === 'object' && entry.record !== null
+    && 'approvalId' in entry.record && entry.record.approvalId === record.approvalId);
+  if (duplicate !== undefined) {
+    if (typeof duplicate !== 'object' || duplicate === null || !('record' in duplicate)
+      || JSON.stringify(duplicate.record) !== JSON.stringify(record)) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'IRIS source migration approval history conflicts with the superseded approval');
+    }
+    return;
+  }
+  const content = `${JSON.stringify([...entries, { archivedAt: new Date().toISOString(), record }], null, 2)}\n`;
+  if (inspected.state === 'missing') await publishOwnedFile(paths.sourceBindingApprovalHistory, content, 'IRIS source migration approval history', uid);
+  else await replaceOwnedFile(paths.sourceBindingApprovalHistory, inspected.content, content, 'IRIS source migration approval history', uid);
+}
+
 function metadataContent(metadata: LaunchAgentMetadata): string {
   return `${JSON.stringify(metadata, null, 2)}\n`;
 }
@@ -1466,7 +1551,7 @@ function approvalMatches(
 }
 
 function sourceApprovalPayload(record: LaunchAgentSourceApprovalRecord): string {
-  return JSON.stringify({
+  const payload = {
     schemaVersion: record.schemaVersion,
     approvalId: record.approvalId,
     dataRoot: record.dataRoot,
@@ -1484,7 +1569,9 @@ function sourceApprovalPayload(record: LaunchAgentSourceApprovalRecord): string 
     beforePlistSha256: record.beforePlistSha256,
     runtimePreflightSha256: record.runtimePreflightSha256,
     runtimeLoaderSha256: record.runtimeLoaderSha256,
-  });
+    ...(record.schemaVersion >= 2 ? { state: record.state, issuedAt: record.issuedAt } : {}),
+  };
+  return JSON.stringify(payload);
 }
 
 function signSourceApproval(record: LaunchAgentSourceApprovalRecord, secret: string): string {
@@ -1508,11 +1595,12 @@ async function readSourceApprovalRecord(filename: string, uid: number): Promise<
   if (inspected.state === 'invalid') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', inspected.reason);
   try {
     const value = JSON.parse(inspected.content) as Partial<LaunchAgentSourceApprovalRecord>;
-    if (value.schemaVersion !== 1 || value.label !== LAUNCH_AGENT_LABEL || typeof value.approvalId !== 'string'
+    if (![1, 2].includes(Number(value.schemaVersion)) || value.label !== LAUNCH_AGENT_LABEL || typeof value.approvalId !== 'string'
       || !['ISSUED', 'CONSUMED', 'RECONCILIATION_REQUIRED'].includes(String(value.state))
       || typeof value.signature !== 'string' || typeof value.requestId !== 'string'
       || !/^[a-f0-9]{64}$/.test(String(value.runtimePreflightSha256))
-      || !/^[a-f0-9]{64}$/.test(String(value.runtimeLoaderSha256))) throw new Error('invalid source approval record');
+      || !/^[a-f0-9]{64}$/.test(String(value.runtimeLoaderSha256))
+      || (value.schemaVersion === 2 && typeof value.issuedAt !== 'string')) throw new Error('invalid source approval record');
     return value as LaunchAgentSourceApprovalRecord;
   } catch (error) {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'IRIS source migration approval is invalid', { cause: error });
@@ -1531,6 +1619,15 @@ function validateMigrationInput(input: LaunchAgentSourceMigrationInput | LaunchA
   }
   if (input.executableArguments.some((argument) => argument.includes('\0'))) {
     throw new RuntimeError('INVALID_REQUEST', 'executable arguments cannot contain NUL bytes');
+  }
+}
+
+function validateApprovalReconciliationInput(input: LaunchAgentSourceApprovalReconciliationInput): void {
+  if (!/^[a-f0-9]{40}$/.test(input.sourceSha) || !/^[a-f0-9]{40}$/.test(input.sourceTree)) {
+    throw new RuntimeError('INVALID_REQUEST', 'sourceSha and sourceTree must be lowercase hexadecimal object identifiers');
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.requestId)) {
+    throw new RuntimeError('INVALID_REQUEST', 'requestId must be a UUID');
   }
 }
 

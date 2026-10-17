@@ -6,7 +6,7 @@ import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
 import { createSupervisor } from './supervisor.js';
-import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, resolveReviewedRuntimeEntrypoints, uninstallLaunchAgent } from './launchd.js';
+import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, resolveReviewedRuntimeEntrypoints, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 
 const command = process.argv[2];
@@ -110,6 +110,17 @@ try {
         executableArguments: ['--require', tsx.preflight, '--import', pathToFileURL(tsx.loader).href],
       });
       process.stdout.write(`${JSON.stringify({ approvalId: issued.approvalId, requestId: issued.requestId, state: issued.state })}\n`);
+    } else if (command === 'launchd' && process.argv[3] === 'reconcile-migrate-approval') {
+      const reconciliation = parseLaunchdSourceApprovalReconciliationOptions(process.argv.slice(4));
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type RECONCILE IRIS MIGRATION APPROVAL to revoke the stale one-time authorization: ');
+        if (confirmation.trim() !== 'RECONCILE IRIS MIGRATION APPROVAL') throw new Error('Owner approval reconciliation was not confirmed');
+      } finally {
+        prompt.close();
+      }
+      const reconciled = await reconcileLaunchAgentSourceApproval({ ...reconciliation, dataRoot });
+      process.stdout.write(`${JSON.stringify({ approvalId: reconciled.approvalId, requestId: reconciled.requestId, sourceSha: reconciled.sourceSha, sourceTree: reconciled.sourceTree, state: reconciled.state })}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'uninstall') {
       await uninstallLaunchAgent(dataRoot);
       process.stdout.write('IRIS_LAUNCHD=UNINSTALLED\n');
@@ -141,6 +152,12 @@ interface LaunchdSourceMigrationOptions {
   readonly approvalId: string;
   readonly requestId: string;
   readonly protectedReferenceRoot?: string;
+}
+
+interface LaunchdSourceApprovalReconciliationOptions {
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly requestId: string;
 }
 
 const LAUNCHD_INSTALL_USAGE = 'Usage: iris launchd install [--runtime-data-root <external-directory>] [--protected-reference-root <existing-directory>]';
@@ -230,8 +247,27 @@ function parseLaunchdSourceApprovalOptions(argumentsList: readonly string[]): La
   };
 }
 
+function parseLaunchdSourceApprovalReconciliationOptions(argumentsList: readonly string[]): LaunchdSourceApprovalReconciliationOptions {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => {
+    const value = values.get(name);
+    if (value === undefined) throw new Error(LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE);
+    return value;
+  };
+  const allowed = new Set(['--source-sha', '--source-tree', '--request-id']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE);
+  return { sourceSha: required('--source-sha'), sourceTree: required('--source-tree'), requestId: required('--request-id') };
+}
+
 const LAUNCHD_SOURCE_MIGRATION_USAGE = 'Usage: iris launchd migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --approval-id <uuid> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --request-id <uuid> [--protected-reference-root <directory>]';
+const LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-migrate-approval --source-sha <commit> --source-tree <tree> --request-id <uuid>';
 
 function printStatus(status: Awaited<ReturnType<Awaited<ReturnType<typeof createSupervisor>>['status']>>): void {
   process.stdout.write(`IRIS_STACK=${status.state}\n`);

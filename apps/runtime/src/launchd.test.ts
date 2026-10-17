@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -11,6 +11,7 @@ import {
   launchAgentStatus,
   launchdPaths,
   migrateLaunchAgentSource,
+  reconcileLaunchAgentSourceApproval,
   renderLaunchAgent,
   resolveReviewedRuntimeEntrypoints,
   uninstallLaunchAgent,
@@ -529,6 +530,107 @@ describe('IRIS LaunchAgent artifact', () => {
     }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
     expect(await readFile(paths.metadata, 'utf8')).toContain('"schemaVersion": 1');
     expect(await readFile(paths.plist, 'utf8')).toContain(subject.dataRoot);
+  });
+
+  it('reconciles a stale approval and archives it before issuing a new source-bound approval', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const firstTarget = await reviewedSource(subject);
+    const firstRequestId = randomUUID();
+    const first = await approve(subject, firstTarget, firstRequestId);
+    const reconciled = await reconcileLaunchAgentSourceApproval({
+      dataRoot: subject.dataRoot,
+      requestId: firstRequestId,
+      sourceSha: firstTarget.sourceSha,
+      sourceTree: firstTarget.sourceTree,
+    }, subject.fake.dependencies);
+    expect(reconciled).toMatchObject({ approvalId: first.approvalId, state: 'RECONCILIATION_REQUIRED' });
+    const second = await approve(subject, firstTarget, randomUUID());
+    expect(second).toMatchObject({ state: 'ISSUED', sourceSha: firstTarget.sourceSha, sourceTree: firstTarget.sourceTree });
+    const history = JSON.parse(await readFile(launchdPaths(subject.dataRoot, subject.home).sourceBindingApprovalHistory, 'utf8')) as Array<{ record: { readonly approvalId: string; readonly state: string } }>;
+    expect(history).toHaveLength(1);
+    expect(history[0]?.record).toMatchObject({ approvalId: first.approvalId, state: 'RECONCILIATION_REQUIRED' });
+  });
+
+  it('refuses approval reconciliation when protected before-images changed or the signature is invalid', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    await writeFile(paths.metadata, `${await readFile(paths.metadata, 'utf8')}\n`, { mode: 0o600 });
+    await expect(reconcileLaunchAgentSourceApproval({ dataRoot: subject.dataRoot, requestId, sourceSha: target.sourceSha, sourceTree: target.sourceTree }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+    await writeFile(paths.metadata, (await writeLegacyLaunchAgent(subject)).metadata, { mode: 0o600 });
+    const tampered = JSON.parse(await readFile(paths.sourceBindingApproval, 'utf8')) as Record<string, unknown>;
+    tampered.signature = '0'.repeat(64);
+    await writeFile(paths.sourceBindingApproval, `${JSON.stringify(tampered)}\n`, { mode: 0o600 });
+    await expect(reconcileLaunchAgentSourceApproval({ dataRoot: subject.dataRoot, requestId, sourceSha: target.sourceSha, sourceTree: target.sourceTree }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect(JSON.parse(await readFile(paths.sourceBindingApproval, 'utf8'))).toMatchObject({ approvalId: approval.approvalId, state: 'ISSUED' });
+  });
+
+  it('does not reconcile an approval already consumed by migration', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    await migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalId: approval.approvalId,
+      requestId,
+    }, subject.fake.dependencies);
+    await expect(reconcileLaunchAgentSourceApproval({ dataRoot: subject.dataRoot, requestId, sourceSha: target.sourceSha, sourceTree: target.sourceTree }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+  });
+
+  it('fails closed when approval history contains a conflicting same-id entry', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    await reconcileLaunchAgentSourceApproval({ dataRoot: subject.dataRoot, requestId, sourceSha: target.sourceSha, sourceTree: target.sourceTree }, subject.fake.dependencies);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    await writeFile(paths.sourceBindingApprovalHistory, `${JSON.stringify([{ record: { approvalId: approval.approvalId } }])}\n`, { mode: 0o600 });
+    await expect(approve(subject, target, randomUUID())).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    expect(JSON.parse(await readFile(paths.sourceBindingApproval, 'utf8'))).toMatchObject({ approvalId: approval.approvalId, state: 'RECONCILIATION_REQUIRED' });
+  });
+
+  it('does not return a legacy schema-1 approval as reusable authorization', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const approval = await approve(subject, target, randomUUID());
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    const legacy = { ...approval, schemaVersion: 1 as const, signature: '' };
+    const legacyPayload = JSON.stringify({
+      schemaVersion: legacy.schemaVersion,
+      approvalId: legacy.approvalId,
+      dataRoot: legacy.dataRoot,
+      sourceRoot: legacy.sourceRoot,
+      controlScript: legacy.controlScript,
+      executable: legacy.executable,
+      executableArguments: legacy.executableArguments,
+      sourceSha: legacy.sourceSha,
+      sourceTree: legacy.sourceTree,
+      requestId: legacy.requestId,
+      protectedReferenceRoot: legacy.protectedReferenceRoot ?? null,
+      label: legacy.label,
+      domain: legacy.domain,
+      beforeMetadataSha256: legacy.beforeMetadataSha256,
+      beforePlistSha256: legacy.beforePlistSha256,
+      runtimePreflightSha256: legacy.runtimePreflightSha256,
+      runtimeLoaderSha256: legacy.runtimeLoaderSha256,
+    });
+    const signedLegacy = { ...legacy, signature: createHmac('sha256', 'A'.repeat(43)).update(legacyPayload).digest('hex') };
+    await writeFile(paths.sourceBindingApproval, `${JSON.stringify(signedLegacy)}\n`, { mode: 0o600 });
+    await expect(approve(subject, target, approval.requestId)).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
   });
 
   it('refuses bootstrap when a committed migration entrypoint changes before install', async () => {
