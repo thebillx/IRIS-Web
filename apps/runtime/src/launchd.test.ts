@@ -334,7 +334,7 @@ describe('IRIS LaunchAgent artifact', () => {
       sourceRoot,
       registeredPlist: paths.registeredPlist,
     });
-    expect(await launchAgentStatus(subject.dataRoot, subject.fake.dependencies)).toMatchObject({ loaded: true, disabled: false, registered: true });
+    expect(await launchAgentStatus(subject.dataRoot, subject.fake.dependencies)).toMatchObject({ loaded: true, disabled: false, disabledState: 'EXPLICIT_ENABLED', registered: true });
     await install(subject);
     expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
   });
@@ -389,8 +389,16 @@ describe('IRIS LaunchAgent artifact', () => {
     await expect(lstat(launchdPaths(enableFailure.dataRoot, enableFailure.home).registeredPlist)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('parses real print-disabled structure and refuses missing, duplicate, or malformed state', async () => {
-    for (const disabledOutput of ['missing', 'duplicate', 'malformed'] as const) {
+  it('parses real print-disabled structure and distinguishes no override from invalid state', async () => {
+    const noOverride = await fixture();
+    noOverride.fake.disabledOutput = 'missing';
+    await expect(install(noOverride)).resolves.toMatchObject({ registeredPlist: expect.stringContaining(LAUNCH_AGENT_LABEL) });
+    expect(noOverride.fake.calls.some((call) => call.startsWith('enable '))).toBe(false);
+    await expect(launchAgentStatus(noOverride.dataRoot, noOverride.fake.dependencies)).resolves.toMatchObject({ disabled: false, disabledState: 'NO_EXPLICIT_OVERRIDE' });
+    await expect(uninstallLaunchAgent(noOverride.dataRoot, noOverride.fake.dependencies)).resolves.toBeUndefined();
+    expect(noOverride.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+
+    for (const disabledOutput of ['duplicate', 'malformed'] as const) {
       const subject = await fixture();
       subject.fake.disabledOutput = disabledOutput;
       await expect(install(subject)).rejects.toThrow(/disabled state.+unknown/);

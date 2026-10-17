@@ -15,6 +15,8 @@ import { readOwnerAccessSecret } from './persistence.js';
 
 const execFileAsync = promisify(execFile);
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
+export type LaunchAgentDisabledState = 'EXPLICIT_ENABLED' | 'EXPLICIT_DISABLED' | 'NO_EXPLICIT_OVERRIDE' | 'UNKNOWN';
+type DisabledState = LaunchAgentDisabledState;
 
 export interface LaunchdPaths {
   readonly directory: string;
@@ -33,6 +35,7 @@ export interface LaunchdStatus {
   readonly domain: string;
   readonly loaded: boolean;
   readonly disabled: boolean;
+  readonly disabledState: LaunchAgentDisabledState;
   readonly registered: boolean;
   readonly paths: LaunchdPaths;
 }
@@ -93,6 +96,7 @@ export interface LaunchAgentSourceMigrationRecord {
   readonly beforeMetadataSha256: string;
   readonly beforePlistSha256: string;
   readonly legacyMetadataRaw: string;
+  readonly disabledStateBeforeMigration?: DisabledState;
   readonly targetSourceRoot: string;
   readonly targetControlScript: string;
   readonly targetExecutable: string;
@@ -125,6 +129,7 @@ interface LegacyMigrationEvidence {
   readonly plist: string;
   readonly observedState: 'ABSENT';
   readonly disabledBeforeMigration: boolean;
+  readonly disabledStateBeforeMigration?: DisabledState;
 }
 
 interface LaunchAgentMetadata {
@@ -141,6 +146,7 @@ interface LaunchAgentMetadata {
   readonly plistSha256: string;
   readonly state: 'PREPARED' | 'INSTALLING' | 'READY' | 'UNINSTALLING' | 'RECONCILIATION_REQUIRED';
   readonly disabledBeforeInstall: boolean;
+  readonly disabledStateBeforeInstall?: DisabledState;
   readonly unresolvedReason: 'BOOTSTRAP_OUTCOME_UNKNOWN' | 'LIVE_IDENTITY_UNVERIFIED' | 'PUBLISHED_STATE_CHANGED' | 'DISABLED_STATE_UNKNOWN' | 'BOOTOUT_OUTCOME_UNKNOWN' | null;
   readonly legacyMigration?: LegacyMigrationEvidence;
 }
@@ -365,7 +371,10 @@ async function migrateLaunchAgentSourceUnlocked(
     || !verifySourceApproval(approval, secret)) {
     throw new RuntimeError('CONTROL_DENIED', 'Migration approval is missing, stale, conflicting or invalid');
   }
-  const disabledBeforeMigration = await launchAgentDisabled(domain, launchctl);
+  const disabledStateBeforeMigration = await observeDisabledState(domain, launchctl);
+  if (disabledStateBeforeMigration === 'UNKNOWN') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${domain} is unknown`);
+  }
   const publishedEntrypoints = await requireTargetRuntimeEntries(input.executableArguments, uid);
   if (publishedEntrypoints.runtimePreflightSha256 !== runtimeEntrypoints.runtimePreflightSha256
     || publishedEntrypoints.runtimeLoaderSha256 !== runtimeEntrypoints.runtimeLoaderSha256
@@ -393,7 +402,8 @@ async function migrateLaunchAgentSourceUnlocked(
     registeredPlist: paths.registeredPlist,
     plistSha256: sha256(targetPlist),
     state: 'PREPARED',
-    disabledBeforeInstall: disabledBeforeMigration,
+    disabledBeforeInstall: disabledStateBeforeMigration === 'EXPLICIT_DISABLED',
+    disabledStateBeforeInstall: disabledStateBeforeMigration,
     unresolvedReason: null,
     legacyMigration: {
       fromSchemaVersion: 1,
@@ -404,7 +414,8 @@ async function migrateLaunchAgentSourceUnlocked(
       executableArguments: [...legacy.executableArguments],
       plist: legacy.plist,
       observedState: 'ABSENT',
-      disabledBeforeMigration,
+      disabledBeforeMigration: disabledStateBeforeMigration === 'EXPLICIT_DISABLED',
+      disabledStateBeforeMigration,
     },
   };
   const transactionId = randomUUID();
@@ -428,6 +439,7 @@ async function migrateLaunchAgentSourceUnlocked(
     targetSourceSha: input.sourceSha,
     targetSourceTree: input.sourceTree,
     approvalId: input.approvalId,
+    disabledStateBeforeMigration,
     ...(canonicalProtectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: canonicalProtectedReferenceRoot }),
   };
   const beforePublication = await observeLaunchAgent(dependencies);
@@ -641,7 +653,7 @@ async function installLaunchAgentUnlocked(
     await requirePublishedContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
     requireLiveLaunchAgentIdentity(observationBefore.stdout, existingMetadata);
     try {
-      await reconcileDisabledState(false, domain, serviceTarget, launchctl);
+      await ensureEnabledState(domain, serviceTarget, launchctl);
       await writeLaunchAgentMetadata(paths.metadata, { ...existingMetadata, state: 'READY', unresolvedReason: null }, uid);
     } catch (error) {
       await recordUnresolved(paths.metadata, existingMetadata, 'DISABLED_STATE_UNKNOWN', uid);
@@ -661,11 +673,15 @@ async function installLaunchAgentUnlocked(
   await requireCompatibleContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
   await requireCompatibleContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
 
-  const disabledBeforeInstall = existingMetadata?.disabledBeforeInstall ?? await launchAgentDisabled(domain, launchctl);
+  const disabledStateBeforeInstall = existingMetadata?.disabledStateBeforeInstall ?? await observeDisabledState(domain, launchctl);
+  if (disabledStateBeforeInstall === 'UNKNOWN') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${domain} is unknown`);
+  }
   const preparedMetadata: LaunchAgentMetadata = {
     ...desiredBinding,
     state: 'PREPARED',
-    disabledBeforeInstall,
+    disabledBeforeInstall: disabledStateBeforeInstall === 'EXPLICIT_DISABLED',
+    disabledStateBeforeInstall,
     unresolvedReason: null,
     ...(existingMetadata?.legacyMigration === undefined ? {} : { legacyMigration: existingMetadata.legacyMigration }),
   };
@@ -679,7 +695,7 @@ async function installLaunchAgentUnlocked(
   await writeLaunchAgentMetadata(paths.metadata, installingMetadata, uid);
 
   try {
-    await reconcileDisabledState(false, domain, serviceTarget, launchctl);
+    await ensureEnabledState(domain, serviceTarget, launchctl);
   } catch (error) {
     await rollbackFailedInstall(paths, installingMetadata, plist, 'DISABLED_STATE_UNKNOWN', uid, dependencies, error);
   }
@@ -703,7 +719,10 @@ async function installLaunchAgentUnlocked(
   try {
     await requirePublishedContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
     await requirePublishedContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
-    if (await launchAgentDisabled(domain, launchctl)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'The installed LaunchAgent is disabled');
+    const installedDisabledState = await observeDisabledState(domain, launchctl);
+    if (installedDisabledState === 'UNKNOWN' || installedDisabledState === 'EXPLICIT_DISABLED') {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'The installed LaunchAgent is disabled or its state is unknown');
+    }
     await writeLaunchAgentMetadata(paths.metadata, { ...installingMetadata, state: 'READY', unresolvedReason: null }, uid);
   } catch (error) {
     await rollbackFailedInstall(paths, installingMetadata, plist, 'PUBLISHED_STATE_CHANGED', uid, dependencies, error);
@@ -766,7 +785,7 @@ async function uninstallLaunchAgentUnlocked(dataRoot: string, dependencies: Laun
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Could not safely unload the IRIS LaunchAgent', { cause: bootoutError });
     }
   }
-  try { await reconcileDisabledState(metadata.disabledBeforeInstall, domain, `${domain}/${LAUNCH_AGENT_LABEL}`, launchctl); }
+  try { await restoreDisabledState(storedDisabledState(metadata), domain, `${domain}/${LAUNCH_AGENT_LABEL}`, launchctl); }
   catch (error) {
     await recordUnresolved(paths.metadata, metadata, 'DISABLED_STATE_UNKNOWN', uid);
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent disabled-state restoration requires reconciliation', { cause: error });
@@ -840,7 +859,9 @@ export async function launchAgentStatus(dataRoot: string, dependencies: LaunchdD
     if (metadata === null) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Loaded LaunchAgent has no durable ownership metadata');
     requireLiveLaunchAgentIdentity(observation.stdout, metadata);
   }
-  return { domain, loaded: observation.state === 'LOADED', disabled: await launchAgentDisabled(domain, launchctl), registered: registered.state === 'ok', paths };
+  const disabledState = await observeDisabledState(domain, launchctl);
+  if (disabledState === 'UNKNOWN') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${domain} is unknown`);
+  return { domain, loaded: observation.state === 'LOADED', disabled: disabledState === 'EXPLICIT_DISABLED', disabledState, registered: registered.state === 'ok', paths };
 }
 
 export async function launchAgentLoaded(dependencies: LaunchdDependencies = {}): Promise<boolean> {
@@ -900,7 +921,7 @@ async function rollbackFailedInstall(
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent rollback could not verify process exit', { cause: bootoutError });
     }
   }
-  try { await reconcileDisabledState(metadata.disabledBeforeInstall, domain, `${domain}/${LAUNCH_AGENT_LABEL}`, launchctl); }
+  try { await restoreDisabledState(storedDisabledState(metadata), domain, `${domain}/${LAUNCH_AGENT_LABEL}`, launchctl); }
   catch (error) {
     await recordUnresolved(paths.metadata, metadata, 'DISABLED_STATE_UNKNOWN', uid);
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent disabled-state rollback requires reconciliation', { cause: error });
@@ -958,11 +979,15 @@ async function migrateLegacyLaunchAgent(input: LegacyMigrationInput): Promise<La
   if (registered.state !== 'missing') {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy LaunchAgent registration conflicts with the schema migration');
   }
-  const disabledBeforeMigration = await launchAgentDisabled(input.domain, input.launchctl);
+  const disabledStateBeforeMigration = await observeDisabledState(input.domain, input.launchctl);
+  if (disabledStateBeforeMigration === 'UNKNOWN') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${input.domain} is unknown`);
+  }
   const migrated: LaunchAgentMetadata = {
     ...input.desiredBinding,
     state: 'PREPARED',
-    disabledBeforeInstall: disabledBeforeMigration,
+    disabledBeforeInstall: disabledStateBeforeMigration === 'EXPLICIT_DISABLED',
+    disabledStateBeforeInstall: disabledStateBeforeMigration,
     unresolvedReason: null,
     legacyMigration: {
       fromSchemaVersion: 1,
@@ -973,7 +998,8 @@ async function migrateLegacyLaunchAgent(input: LegacyMigrationInput): Promise<La
       executableArguments: [...legacy.executableArguments],
       plist: legacy.plist,
       observedState: 'ABSENT',
-      disabledBeforeMigration,
+      disabledBeforeMigration: disabledStateBeforeMigration === 'EXPLICIT_DISABLED',
+      disabledStateBeforeMigration,
     },
   };
   await replaceOwnedFile(input.paths.metadata, input.record.raw, metadataContent(migrated), 'IRIS LaunchAgent metadata', input.uid);
@@ -1068,18 +1094,41 @@ function decodeLaunchctlValue(value: string): string | null {
   } catch { return null; }
 }
 
-async function reconcileDisabledState(
-  expectedDisabled: boolean,
+async function ensureEnabledState(
   domain: string,
   serviceTarget: string,
   launchctl: NonNullable<LaunchdDependencies['launchctl']>,
 ): Promise<void> {
-  if (await launchAgentDisabled(domain, launchctl) === expectedDisabled) return;
+  const current = await observeDisabledState(domain, launchctl);
+  if (current === 'EXPLICIT_ENABLED' || current === 'NO_EXPLICIT_OVERRIDE') return;
+  if (current === 'UNKNOWN') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${domain} is unknown`);
   let commandError: unknown;
-  try { await launchctl([expectedDisabled ? 'disable' : 'enable', serviceTarget]); } catch (error) { commandError = error; }
-  if (await launchAgentDisabled(domain, launchctl) !== expectedDisabled) {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `Could not ${expectedDisabled ? 'disable' : 'enable'} the IRIS LaunchAgent`, { cause: commandError });
+  try { await launchctl(['enable', serviceTarget]); } catch (error) { commandError = error; }
+  const restored = await observeDisabledState(domain, launchctl);
+  if (restored !== 'EXPLICIT_ENABLED' && restored !== 'NO_EXPLICIT_OVERRIDE') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `Could not enable the IRIS LaunchAgent`, { cause: commandError });
   }
+}
+
+async function restoreDisabledState(
+  expected: DisabledState,
+  domain: string,
+  serviceTarget: string,
+  launchctl: NonNullable<LaunchdDependencies['launchctl']>,
+): Promise<void> {
+  if (expected === 'UNKNOWN') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'The original LaunchAgent disabled state is unknown');
+  const current = await observeDisabledState(domain, launchctl);
+  if (current === expected) return;
+  if (current === 'UNKNOWN') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${domain} is unknown`);
+  let commandError: unknown;
+  try { await launchctl([expected === 'EXPLICIT_DISABLED' ? 'disable' : 'enable', serviceTarget]); } catch (error) { commandError = error; }
+  if (await observeDisabledState(domain, launchctl) !== expected) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Could not restore the IRIS LaunchAgent disabled state', { cause: commandError });
+  }
+}
+
+function storedDisabledState(metadata: LaunchAgentMetadata): DisabledState {
+  return metadata.disabledStateBeforeInstall ?? (metadata.disabledBeforeInstall ? 'EXPLICIT_DISABLED' : 'EXPLICIT_ENABLED');
 }
 
 async function recordUnresolved(
@@ -1106,28 +1155,27 @@ async function requireGuiDomain(domain: string, launchctl: NonNullable<LaunchdDe
   catch (error) { throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The ${domain} launchd domain is unavailable`, { cause: error }); }
 }
 
-async function launchAgentDisabled(domain: string, launchctl: NonNullable<LaunchdDependencies['launchctl']>): Promise<boolean> {
+async function observeDisabledState(domain: string, launchctl: NonNullable<LaunchdDependencies['launchctl']>): Promise<DisabledState> {
   let stdout: string;
   try { ({ stdout } = await launchctl(['print-disabled', domain])); }
   catch (error) { throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `Could not inspect disabled services in ${domain}`, { cause: error }); }
-  const disabled = parseLaunchAgentDisabled(stdout);
-  if (disabled === null) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${domain} is unknown`);
-  return disabled;
+  return parseLaunchAgentDisabled(stdout);
 }
 
-function parseLaunchAgentDisabled(stdout: string): boolean | null {
-  if (stdout.length > 1_048_576 || stdout.includes('\0')) return null;
+function parseLaunchAgentDisabled(stdout: string): DisabledState {
+  if (stdout.length > 1_048_576 || stdout.includes('\0')) return 'UNKNOWN';
   const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
-  if (lines[0] !== 'disabled services = {' || lines.at(-1) !== '}' || lines.length < 3) return null;
-  const matches: boolean[] = [];
+  if (lines[0] !== 'disabled services = {' || lines.at(-1) !== '}' || lines.length < 2) return 'UNKNOWN';
+  const matches: DisabledState[] = [];
   for (const line of lines.slice(1, -1)) {
     const entry = /^("(?:[^"\\]|\\.)+")\s*=>\s*(enabled|disabled|true|false)$/.exec(line);
-    if (entry === null) return null;
+    if (entry === null) return 'UNKNOWN';
     let label: unknown;
-    try { label = JSON.parse(entry[1]!); } catch { return null; }
-    if (label === LAUNCH_AGENT_LABEL) matches.push(entry[2] === 'disabled' || entry[2] === 'true');
+    try { label = JSON.parse(entry[1]!); } catch { return 'UNKNOWN'; }
+    if (label === LAUNCH_AGENT_LABEL) matches.push(entry[2] === 'disabled' || entry[2] === 'true' ? 'EXPLICIT_DISABLED' : 'EXPLICIT_ENABLED');
   }
-  return matches.length === 1 ? matches[0]! : null;
+  if (matches.length > 1) return 'UNKNOWN';
+  return matches[0] ?? 'NO_EXPLICIT_OVERRIDE';
 }
 
 async function systemLaunchctl(argumentsList: readonly string[]): Promise<{ readonly stdout: string }> {
@@ -1332,7 +1380,8 @@ async function readSourceMigrationRecord(filename: string, uid: number): Promise
       || typeof value.transactionId !== 'string' || typeof value.requestId !== 'string'
       || typeof value.targetSourceSha !== 'string' || typeof value.targetSourceTree !== 'string'
       || !/^[a-f0-9]{64}$/.test(String(value.runtimePreflightSha256))
-      || !/^[a-f0-9]{64}$/.test(String(value.runtimeLoaderSha256))) throw new Error('invalid source migration record');
+      || !/^[a-f0-9]{64}$/.test(String(value.runtimeLoaderSha256))
+      || (value.disabledStateBeforeMigration !== undefined && !['EXPLICIT_ENABLED', 'EXPLICIT_DISABLED', 'NO_EXPLICIT_OVERRIDE', 'UNKNOWN'].includes(String(value.disabledStateBeforeMigration)))) throw new Error('invalid source migration record');
     return value as LaunchAgentSourceMigrationRecord;
   } catch (error) {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'IRIS source migration record is invalid', { cause: error });
@@ -1585,6 +1634,7 @@ function validLaunchAgentMetadata(value: unknown): value is LaunchAgentMetadata 
     && typeof metadata.plistSha256 === 'string' && /^[a-f0-9]{64}$/.test(metadata.plistSha256)
     && ['PREPARED', 'INSTALLING', 'READY', 'UNINSTALLING', 'RECONCILIATION_REQUIRED'].includes(metadata.state)
     && typeof metadata.disabledBeforeInstall === 'boolean'
+    && (metadata.disabledStateBeforeInstall === undefined || ['EXPLICIT_ENABLED', 'EXPLICIT_DISABLED', 'NO_EXPLICIT_OVERRIDE', 'UNKNOWN'].includes(metadata.disabledStateBeforeInstall))
     && (metadata.unresolvedReason === null || ['BOOTSTRAP_OUTCOME_UNKNOWN', 'LIVE_IDENTITY_UNVERIFIED', 'PUBLISHED_STATE_CHANGED', 'DISABLED_STATE_UNKNOWN', 'BOOTOUT_OUTCOME_UNKNOWN'].includes(metadata.unresolvedReason))
     && (metadata.legacyMigration === undefined || validLegacyMigrationEvidence(metadata.legacyMigration));
 }
@@ -1599,7 +1649,8 @@ function validLegacyMigrationEvidence(value: unknown): value is LegacyMigrationE
     && Array.isArray(migration.executableArguments)
     && migration.executableArguments.every((item) => typeof item === 'string' && !item.includes('\0'))
     && migration.observedState === 'ABSENT'
-    && typeof migration.disabledBeforeMigration === 'boolean';
+    && typeof migration.disabledBeforeMigration === 'boolean'
+    && (migration.disabledStateBeforeMigration === undefined || ['EXPLICIT_ENABLED', 'EXPLICIT_DISABLED', 'NO_EXPLICIT_OVERRIDE', 'UNKNOWN'].includes(migration.disabledStateBeforeMigration));
 }
 
 async function syncDirectory(directory: string): Promise<void> {
