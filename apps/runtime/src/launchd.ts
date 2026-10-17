@@ -12,6 +12,7 @@ import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './
 import { inspectRegistrationRoot } from './project-path.js';
 import { PROTECTED_REFERENCE_ROOT_ENV } from './permissions.js';
 import { readOwnerAccessSecret } from './persistence.js';
+import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, reserveRecoveryPolicyOperation } from './recovery-policy.js';
 
 const execFileAsync = promisify(execFile);
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
@@ -31,6 +32,7 @@ export interface LaunchdPaths {
   readonly sourceBindingApprovalHistory: string;
   readonly sourceBindingApprovalRecovery: string;
   readonly operationLock: string;
+  readonly recoveryAuthorizationPolicy: string;
 }
 
 export interface LaunchdStatus {
@@ -59,6 +61,7 @@ export interface LaunchAgentSourceApprovalInput {
   readonly sourceTree: string;
   readonly requestId: string;
   readonly protectedReferenceRoot?: string;
+  readonly recoveryPolicyId?: string;
 }
 
 export interface LaunchAgentSourceApprovalReconciliationInput {
@@ -107,6 +110,7 @@ export interface LaunchAgentSourceApprovalRecord extends LaunchAgentSourceApprov
   readonly runtimeLoaderSha256: string;
   readonly issuedAt: string;
   readonly signature: string;
+  readonly recoveryPolicyTransactionId?: string;
 }
 
 export interface LaunchAgentSourceMigrationInput {
@@ -120,6 +124,7 @@ export interface LaunchAgentSourceMigrationInput {
   readonly approvalId: string;
   readonly requestId: string;
   readonly protectedReferenceRoot?: string;
+  readonly recoveryPolicyId?: string;
 }
 
 export interface LaunchAgentSourceMigrationRecord {
@@ -145,6 +150,8 @@ export interface LaunchAgentSourceMigrationRecord {
   readonly approvalId: string;
   readonly protectedReferenceRoot?: string;
   readonly failureCode?: string;
+  readonly recoveryPolicyId?: string;
+  readonly recoveryPolicyTransactionId?: string;
 }
 
 interface LegacyLaunchAgentMetadata {
@@ -221,6 +228,7 @@ export function launchdPaths(dataRoot: string, homeDirectory = os.homedir()): La
     sourceBindingApprovalHistory: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-approval.history.json`),
     sourceBindingApprovalRecovery: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-approval-recovery.json`),
     operationLock: path.join(directory, `${LAUNCH_AGENT_LABEL}.operation.lock`),
+    recoveryAuthorizationPolicy: path.join(directory, `${LAUNCH_AGENT_LABEL}.recovery-policy.json`),
   };
 }
 
@@ -289,6 +297,27 @@ export async function issueLaunchAgentSourceApproval(
       if (existing.schemaVersion === 2 && existing.state === 'ISSUED' && approvalMatches(existing, preflight, input) && verifySourceApproval(existing, secret)) return existing;
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing migration approval requires reconciliation before retry');
     }
+    let policyTransactionId: string | undefined;
+    if (input.recoveryPolicyId !== undefined) {
+      const reservation = await reserveRecoveryPolicyOperation({
+        dataRoot: canonicalDataRoot,
+        policyId: input.recoveryPolicyId,
+        operation: 'MIGRATION_APPROVAL',
+        requestId: input.requestId,
+        sourceSha: input.sourceSha,
+        sourceTree: input.sourceTree,
+        sourceRoot: preflight.sourceRoot,
+        controlScript: preflight.controlScript,
+        executable: preflight.executable,
+        executableArguments: input.executableArguments,
+        runtimePreflightSha256: preflight.runtimePreflightSha256,
+        runtimeLoaderSha256: preflight.runtimeLoaderSha256,
+        beforeMetadataSha256: preflight.beforeMetadataSha256,
+        beforePlistSha256: preflight.beforePlistSha256,
+        protectedReferenceRoot: preflight.protectedReferenceRoot,
+      });
+      policyTransactionId = reservation.transactionId;
+    }
     const record: LaunchAgentSourceApprovalRecord = {
       ...input,
       dataRoot: canonicalDataRoot,
@@ -297,6 +326,7 @@ export async function issueLaunchAgentSourceApproval(
       executable: preflight.executable,
       executableArguments: [...input.executableArguments],
       ...(preflight.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: preflight.protectedReferenceRoot }),
+      ...(input.recoveryPolicyId === undefined ? {} : { recoveryPolicyId: input.recoveryPolicyId, recoveryPolicyTransactionId: policyTransactionId! }),
       schemaVersion: 2,
       approvalId: randomUUID(),
       state: 'ISSUED',
@@ -310,12 +340,18 @@ export async function issueLaunchAgentSourceApproval(
       signature: '',
     };
     const signed = { ...record, signature: signSourceApproval(record, secret) };
-    if (supersedingReconciledApproval && existing !== null) {
+    try {
+      if (supersedingReconciledApproval && existing !== null) {
       await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(existing), approvalContent(signed), 'IRIS source migration approval', uid);
-    } else {
-      await publishOwnedFile(paths.sourceBindingApproval, approvalContent(signed), 'IRIS source migration approval', uid);
+      } else {
+        await publishOwnedFile(paths.sourceBindingApproval, approvalContent(signed), 'IRIS source migration approval', uid);
+      }
+      if (policyTransactionId !== undefined) await finalizeRecoveryPolicyOperation({ dataRoot: canonicalDataRoot, policyId: input.recoveryPolicyId!, operation: 'MIGRATION_APPROVAL', requestId: input.requestId, transactionId: policyTransactionId, state: 'COMMITTED', sourceSha: input.sourceSha, sourceTree: input.sourceTree, sourceRoot: preflight.sourceRoot, controlScript: preflight.controlScript, executable: preflight.executable, executableArguments: input.executableArguments, runtimePreflightSha256: preflight.runtimePreflightSha256, runtimeLoaderSha256: preflight.runtimeLoaderSha256, beforeMetadataSha256: preflight.beforeMetadataSha256, beforePlistSha256: preflight.beforePlistSha256, protectedReferenceRoot: preflight.protectedReferenceRoot });
+      return signed;
+    } catch (error) {
+      if (policyTransactionId !== undefined) await finalizeRecoveryPolicyOperation({ dataRoot: canonicalDataRoot, policyId: input.recoveryPolicyId!, operation: 'MIGRATION_APPROVAL', requestId: input.requestId, transactionId: policyTransactionId, state: 'RECONCILIATION_REQUIRED', sourceSha: input.sourceSha, sourceTree: input.sourceTree, sourceRoot: preflight.sourceRoot, controlScript: preflight.controlScript, executable: preflight.executable, executableArguments: input.executableArguments, runtimePreflightSha256: preflight.runtimePreflightSha256, runtimeLoaderSha256: preflight.runtimeLoaderSha256, beforeMetadataSha256: preflight.beforeMetadataSha256, beforePlistSha256: preflight.beforePlistSha256, protectedReferenceRoot: preflight.protectedReferenceRoot }).catch(() => undefined);
+      throw error;
     }
-    return signed;
   });
 }
 
@@ -532,7 +568,8 @@ async function migrateLaunchAgentSourceUnlocked(
       && existingMigration.targetSourceSha === input.sourceSha
       && existingMigration.targetSourceTree === input.sourceTree
       && (existingMigration.protectedReferenceRoot ?? null) === (canonicalProtectedReferenceRoot ?? null)
-      && existingMigration.approvalId === input.approvalId) {
+      && existingMigration.approvalId === input.approvalId
+      && (input.recoveryPolicyId === undefined || existingMigration.recoveryPolicyId === input.recoveryPolicyId)) {
       await verifyCommittedMigration(paths, existingMigration, uid);
       return existingMigration;
     }
@@ -567,8 +604,13 @@ async function migrateLaunchAgentSourceUnlocked(
       runtimePreflightSha256: runtimeEntrypoints.runtimePreflightSha256,
       runtimeLoaderSha256: runtimeEntrypoints.runtimeLoaderSha256,
     }, input)
+    || (approval.recoveryPolicyId ?? null) !== (input.recoveryPolicyId ?? null)
+    || (input.recoveryPolicyId !== undefined && approval.recoveryPolicyTransactionId === undefined)
     || !verifySourceApproval(approval, secret)) {
     throw new RuntimeError('CONTROL_DENIED', 'Migration approval is missing, stale, conflicting or invalid');
+  }
+  if (input.recoveryPolicyId !== undefined) {
+    await assertRecoveryPolicyOperationCommitted({ dataRoot: canonicalDataRoot, policyId: input.recoveryPolicyId, operation: 'MIGRATION_APPROVAL', requestId: input.requestId, transactionId: approval.recoveryPolicyTransactionId!, sourceSha: input.sourceSha, sourceTree: input.sourceTree, sourceRoot: canonicalSourceRoot, controlScript: canonicalControlScript, executable, executableArguments: input.executableArguments, runtimePreflightSha256: runtimeEntrypoints.runtimePreflightSha256, runtimeLoaderSha256: runtimeEntrypoints.runtimeLoaderSha256, beforeMetadataSha256: sha256(legacyRecord.raw), beforePlistSha256: sha256(legacyPlist), protectedReferenceRoot: canonicalProtectedReferenceRoot });
   }
   const disabledStateBeforeMigration = await observeDisabledState(domain, launchctl);
   if (disabledStateBeforeMigration === 'UNKNOWN') {
@@ -645,14 +687,36 @@ async function migrateLaunchAgentSourceUnlocked(
   if (beforePublication.state !== 'ABSENT') {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'A same-label LaunchAgent appeared during source migration preflight');
   }
-  await publishOwnedFile(migrationPath, migrationContent(baseRecord), 'IRIS source migration record', uid);
-  const applying = { ...baseRecord, state: 'APPLYING' as const };
-  await replaceOwnedFile(migrationPath, migrationContent(baseRecord), migrationContent(applying), 'IRIS source migration record', uid);
+  let policyTransactionId: string | undefined;
+  if (input.recoveryPolicyId !== undefined) {
+    const reservation = await reserveRecoveryPolicyOperation({
+      dataRoot: canonicalDataRoot,
+      policyId: input.recoveryPolicyId,
+      operation: 'SOURCE_MIGRATION',
+      requestId: input.requestId,
+      sourceSha: input.sourceSha,
+      sourceTree: input.sourceTree,
+      sourceRoot: canonicalSourceRoot,
+      controlScript: canonicalControlScript,
+      executable,
+      executableArguments: input.executableArguments,
+      runtimePreflightSha256: runtimeEntrypoints.runtimePreflightSha256,
+      runtimeLoaderSha256: runtimeEntrypoints.runtimeLoaderSha256,
+      beforeMetadataSha256: sha256(legacyRecord.raw),
+      beforePlistSha256: sha256(legacyPlist),
+      protectedReferenceRoot: canonicalProtectedReferenceRoot,
+    });
+    policyTransactionId = reservation.transactionId;
+  }
+  const journaledBaseRecord: LaunchAgentSourceMigrationRecord = policyTransactionId === undefined ? baseRecord : { ...baseRecord, recoveryPolicyId: input.recoveryPolicyId!, recoveryPolicyTransactionId: policyTransactionId };
+  const applying = { ...journaledBaseRecord, state: 'APPLYING' as const };
   let plistChanged = false;
   let metadataChanged = false;
   let rollbackEvidenceUnknown = false;
   let committed: LaunchAgentSourceMigrationRecord | undefined;
   try {
+    await publishOwnedFile(migrationPath, migrationContent(journaledBaseRecord), 'IRIS source migration record', uid);
+    await replaceOwnedFile(migrationPath, migrationContent(journaledBaseRecord), migrationContent(applying), 'IRIS source migration record', uid);
     try {
       await replaceOwnedFile(paths.plist, legacyPlist, targetPlist, 'IRIS private LaunchAgent', uid);
       plistChanged = true;
@@ -676,8 +740,10 @@ async function migrateLaunchAgentSourceUnlocked(
     const consumedApproval = { ...approval, state: 'CONSUMED' as const, signature: '' };
     const signedConsumedApproval = { ...consumedApproval, signature: signSourceApproval(consumedApproval, secret) };
     await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(approval), approvalContent(signedConsumedApproval), 'IRIS source migration approval', uid);
+    if (policyTransactionId !== undefined) await finalizeRecoveryPolicyOperation({ dataRoot: canonicalDataRoot, policyId: input.recoveryPolicyId!, operation: 'SOURCE_MIGRATION', requestId: input.requestId, transactionId: policyTransactionId, state: 'COMMITTED', sourceSha: input.sourceSha, sourceTree: input.sourceTree, sourceRoot: canonicalSourceRoot, controlScript: canonicalControlScript, executable, executableArguments: input.executableArguments, runtimePreflightSha256: runtimeEntrypoints.runtimePreflightSha256, runtimeLoaderSha256: runtimeEntrypoints.runtimeLoaderSha256, beforeMetadataSha256: sha256(legacyRecord.raw), beforePlistSha256: sha256(legacyPlist), protectedReferenceRoot: canonicalProtectedReferenceRoot });
     return committed;
   } catch (error) {
+    if (policyTransactionId !== undefined) await finalizeRecoveryPolicyOperation({ dataRoot: canonicalDataRoot, policyId: input.recoveryPolicyId!, operation: 'SOURCE_MIGRATION', requestId: input.requestId, transactionId: policyTransactionId, state: 'RECONCILIATION_REQUIRED', sourceSha: input.sourceSha, sourceTree: input.sourceTree, sourceRoot: canonicalSourceRoot, controlScript: canonicalControlScript, executable, executableArguments: input.executableArguments, runtimePreflightSha256: runtimeEntrypoints.runtimePreflightSha256, runtimeLoaderSha256: runtimeEntrypoints.runtimeLoaderSha256, beforeMetadataSha256: sha256(legacyRecord.raw), beforePlistSha256: sha256(legacyPlist), protectedReferenceRoot: canonicalProtectedReferenceRoot }).catch(() => undefined);
     if (committed !== undefined) {
       const unresolved = { ...committed, state: 'RECONCILIATION_REQUIRED' as const, failureCode: 'APPROVAL_CONSUMPTION_UNKNOWN' };
       await replaceOwnedFile(migrationPath, migrationContent(committed), migrationContent(unresolved), 'IRIS source migration record', uid).catch(() => undefined);
@@ -1713,7 +1779,8 @@ function approvalMatches(
     && (approval.protectedReferenceRoot ?? null) === (preflight.protectedReferenceRoot ?? null)
     && approval.domain === preflight.domain
     && approval.beforeMetadataSha256 === preflight.beforeMetadataSha256
-    && approval.beforePlistSha256 === preflight.beforePlistSha256;
+    && approval.beforePlistSha256 === preflight.beforePlistSha256
+    && (input.recoveryPolicyId === undefined || approval.recoveryPolicyId === input.recoveryPolicyId);
 }
 
 function sourceApprovalPayload(record: LaunchAgentSourceApprovalRecord): string {
@@ -1735,6 +1802,7 @@ function sourceApprovalPayload(record: LaunchAgentSourceApprovalRecord): string 
     beforePlistSha256: record.beforePlistSha256,
     runtimePreflightSha256: record.runtimePreflightSha256,
     runtimeLoaderSha256: record.runtimeLoaderSha256,
+    ...(record.recoveryPolicyId === undefined ? {} : { recoveryPolicyId: record.recoveryPolicyId, recoveryPolicyTransactionId: record.recoveryPolicyTransactionId }),
     ...(record.schemaVersion >= 2 ? { state: record.state, issuedAt: record.issuedAt } : {}),
   };
   return JSON.stringify(payload);

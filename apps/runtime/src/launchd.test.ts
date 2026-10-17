@@ -19,6 +19,7 @@ import {
   type LaunchdDependencies,
 } from './launchd.js';
 import { canonicalNodeRuntime, node24Path } from './node-runtime.js';
+import { issueRecoveryAuthorizationPolicy } from './recovery-policy.js';
 import { promisify } from 'node:util';
 
 const roots: string[] = [];
@@ -506,6 +507,28 @@ describe('IRIS LaunchAgent artifact', () => {
       approvalId: approval.approvalId,
       requestId,
     }, subject.fake.dependencies)).rejects.toThrow(/target plist no longer matches/);
+  });
+
+  it('completes a policy-bound approval and migration with one request identity', async () => {
+    const subject = await fixture();
+    const legacy = await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const reviewedExecutable = await realpath(canonicalNodeRuntime().path);
+    const preflightSha = createHash('sha256').update(await readFile(target.executableArguments[1]!)).digest('hex');
+    const loaderSha = createHash('sha256').update(await readFile(target.executableArguments[3]!.slice('file://'.length))).digest('hex');
+    const policy = await issueRecoveryAuthorizationPolicy({
+      dataRoot: subject.dataRoot,
+      sourceBindings: [{ sourceSha: target.sourceSha, sourceTree: target.sourceTree, sourceRoot: target.root, controlScript: target.controlScript, executable: reviewedExecutable, executableArguments: target.executableArguments, runtimePreflightSha256: preflightSha, runtimeLoaderSha256: loaderSha }],
+      beforeMetadataSha256: createHash('sha256').update(legacy.metadata).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(legacy.plist).digest('hex'),
+      allowedOperations: ['MIGRATION_APPROVAL', 'SOURCE_MIGRATION'],
+      maxOperationCount: 2,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const requestId = randomUUID();
+    const approval = await issueLaunchAgentSourceApproval({ dataRoot: subject.dataRoot, sourceRoot: target.root, controlScript: target.controlScript, executable: reviewedExecutable, executableArguments: target.executableArguments, sourceSha: target.sourceSha, sourceTree: target.sourceTree, requestId, recoveryPolicyId: policy.policyId }, subject.fake.dependencies);
+    const result = await migrateLaunchAgentSource({ dataRoot: subject.dataRoot, sourceRoot: target.root, controlScript: target.controlScript, executable: reviewedExecutable, executableArguments: target.executableArguments, sourceSha: target.sourceSha, sourceTree: target.sourceTree, approvalId: approval.approvalId, requestId, recoveryPolicyId: policy.policyId }, subject.fake.dependencies);
+    expect(result.state).toBe('COMMITTED');
   });
 
   it('requires an untampered owner-secret-bound approval before publication', async () => {

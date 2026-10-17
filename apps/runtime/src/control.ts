@@ -8,6 +8,7 @@ import { readOwnerAccessSecret } from './persistence.js';
 import { createSupervisor } from './supervisor.js';
 import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, resolveReviewedRuntimeEntrypoints, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
+import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, reconcileRecoveryPolicyLock, reconcileRecoveryPolicyOperation, revokeRecoveryAuthorizationPolicy } from './recovery-policy.js';
 
 const command = process.argv[2];
 const legacyRuntimeControl = process.env.IRIS_STACK_CLI !== '1';
@@ -32,7 +33,32 @@ try {
     process.stdout.write(`${secret}\n`);
   } else {
     const supervisor = await createSupervisor({ dataRoot });
-    if (command === 'up') {
+    if (command === 'recovery-policy' && process.argv[3] === 'issue') {
+      const policy = parseRecoveryPolicyIssueOptions(process.argv.slice(4));
+      process.stdout.write(`RECOVERY_POLICY_SCOPE=${JSON.stringify(policy)}\n`);
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type AUTHORIZE IRIS RECOVERY POLICY to enroll the bounded recovery policy: ');
+        if (confirmation.trim() !== 'AUTHORIZE IRIS RECOVERY POLICY') throw new Error('Owner recovery policy authorization was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await issueRecoveryAuthorizationPolicy({ ...policy, sourceBindings: [{ sourceSha: policy.sourceSha, sourceTree: policy.sourceTree, sourceRoot: policy.sourceRoot, controlScript: policy.controlScript, executable: policy.executable, executableArguments: policy.executableArguments, runtimePreflightSha256: policy.runtimePreflightSha256, runtimeLoaderSha256: policy.runtimeLoaderSha256 }], dataRoot }), null, 2)}\n`);
+    } else if (command === 'recovery-policy' && process.argv[3] === 'status') {
+      process.stdout.write(`${JSON.stringify(await readRecoveryAuthorizationPolicy(dataRoot), null, 2)}\n`);
+    } else if (command === 'recovery-policy' && process.argv[3] === 'reconcile') {
+      const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
+      process.stdout.write(`${JSON.stringify(await reconcileRecoveryPolicyOperation({ ...recovery, dataRoot }), null, 2)}\n`);
+    } else if (command === 'recovery-policy' && process.argv[3] === 'reconcile-lock') {
+      const lock = parseRecoveryPolicyLockOptions(process.argv.slice(4));
+      await reconcileRecoveryPolicyLock(dataRoot, lock.lockId, lock.pid, lock.processStartMarker);
+      process.stdout.write('RECOVERY_POLICY_LOCK_RECONCILED=YES\n');
+    } else if (command === 'recovery-policy' && process.argv[3] === 'revoke') {
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type REVOKE IRIS RECOVERY POLICY to revoke the bounded recovery policy: ');
+        if (confirmation.trim() !== 'REVOKE IRIS RECOVERY POLICY') throw new Error('Owner recovery policy revocation was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await revokeRecoveryAuthorizationPolicy(dataRoot), null, 2)}\n`);
+    } else if (command === 'up') {
       printStatus(await supervisor.up());
     } else if (command === 'down') {
       printStatus(await supervisor.down());
@@ -92,6 +118,7 @@ try {
         approvalId: migration.approvalId,
         requestId: migration.requestId,
         ...(migration.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: migration.protectedReferenceRoot }),
+        ...(migration.recoveryPolicyId === undefined ? {} : { recoveryPolicyId: migration.recoveryPolicyId }),
       }), null, 2)}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'authorize-migrate-source') {
       const approval = parseLaunchdSourceApprovalOptions(process.argv.slice(4));
@@ -162,7 +189,8 @@ interface LaunchdSourceMigrationOptions {
   readonly sourceTree: string;
   readonly approvalId: string;
   readonly requestId: string;
-  readonly protectedReferenceRoot?: string;
+  readonly protectedReferenceRoot?: string | undefined;
+  readonly recoveryPolicyId?: string;
 }
 
 interface LaunchdSourceApprovalReconciliationOptions {
@@ -176,6 +204,118 @@ interface MalformedApprovalRecoveryOptions {
   readonly requestId: string;
   readonly approvalSha256: string;
   readonly recoveryRequestId: string;
+}
+
+interface RecoveryPolicyIssueOptions {
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+  readonly allowedOperations: readonly ('MIGRATION_APPROVAL' | 'SOURCE_MIGRATION')[];
+  readonly sourceRoot: string;
+  readonly controlScript: string;
+  readonly executable: string;
+  readonly executableArguments: readonly string[];
+  readonly runtimePreflightSha256: string;
+  readonly runtimeLoaderSha256: string;
+  readonly maxOperationCount: number;
+  readonly expiresAt: string;
+  readonly protectedReferenceRoot?: string | undefined;
+}
+
+interface RecoveryPolicyOperationOptions {
+  readonly policyId: string;
+  readonly operation: 'MIGRATION_APPROVAL' | 'SOURCE_MIGRATION';
+  readonly requestId: string;
+  readonly transactionId: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly sourceRoot: string;
+  readonly controlScript: string;
+  readonly executable: string;
+  readonly executableArguments: readonly string[];
+  readonly runtimePreflightSha256: string;
+  readonly runtimeLoaderSha256: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+  readonly protectedReferenceRoot?: string | undefined;
+}
+
+interface RecoveryPolicyLockOptions {
+  readonly lockId: string;
+  readonly pid: number;
+  readonly processStartMarker: string;
+}
+
+function parseRecoveryPolicyIssueOptions(argumentsList: readonly string[]): RecoveryPolicyIssueOptions {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(RECOVERY_POLICY_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => {
+    const value = values.get(name);
+    if (value === undefined) throw new Error(RECOVERY_POLICY_USAGE);
+    return value;
+  };
+  const allowed = new Set(['--source-sha', '--source-tree', '--source-root', '--control-script', '--executable', '--executable-arguments', '--runtime-preflight-sha256', '--runtime-loader-sha256', '--before-metadata-sha256', '--before-plist-sha256', '--allowed-operations', '--max-operations', '--expires-at', '--protected-reference-root']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(RECOVERY_POLICY_USAGE);
+  const maxOperationCount = Number(required('--max-operations'));
+  if (!Number.isInteger(maxOperationCount)) throw new Error(RECOVERY_POLICY_USAGE);
+  return {
+    sourceSha: required('--source-sha'),
+    sourceTree: required('--source-tree'),
+    beforeMetadataSha256: required('--before-metadata-sha256'),
+    beforePlistSha256: required('--before-plist-sha256'),
+    allowedOperations: required('--allowed-operations').split(',').map((value) => value.trim()) as RecoveryPolicyIssueOptions['allowedOperations'],
+    sourceRoot: required('--source-root'),
+    controlScript: required('--control-script'),
+    executable: required('--executable'),
+    executableArguments: JSON.parse(required('--executable-arguments')) as string[],
+    runtimePreflightSha256: required('--runtime-preflight-sha256'),
+    runtimeLoaderSha256: required('--runtime-loader-sha256'),
+    maxOperationCount,
+    expiresAt: required('--expires-at'),
+    ...(values.get('--protected-reference-root') === undefined ? {} : { protectedReferenceRoot: values.get('--protected-reference-root') }),
+  };
+}
+
+function parseRecoveryPolicyOperationOptions(argumentsList: readonly string[]): RecoveryPolicyOperationOptions {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => { const value = values.get(name); if (value === undefined) throw new Error(RECOVERY_POLICY_OPERATION_USAGE); return value; };
+  const allowed = new Set(['--policy-id', '--operation', '--request-id', '--transaction-id', '--source-sha', '--source-tree', '--source-root', '--control-script', '--executable', '--executable-arguments', '--runtime-preflight-sha256', '--runtime-loader-sha256', '--before-metadata-sha256', '--before-plist-sha256', '--protected-reference-root']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
+  const operation = required('--operation');
+  if (operation !== 'MIGRATION_APPROVAL' && operation !== 'SOURCE_MIGRATION') throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
+  return { policyId: required('--policy-id'), operation, requestId: required('--request-id'), transactionId: required('--transaction-id'), sourceSha: required('--source-sha'), sourceTree: required('--source-tree'), sourceRoot: required('--source-root'), controlScript: required('--control-script'), executable: required('--executable'), executableArguments: JSON.parse(required('--executable-arguments')) as string[], runtimePreflightSha256: required('--runtime-preflight-sha256'), runtimeLoaderSha256: required('--runtime-loader-sha256'), beforeMetadataSha256: required('--before-metadata-sha256'), beforePlistSha256: required('--before-plist-sha256'), ...(values.get('--protected-reference-root') === undefined ? {} : { protectedReferenceRoot: values.get('--protected-reference-root') }) };
+}
+
+function parseRecoveryPolicyLockOptions(argumentsList: readonly string[]): RecoveryPolicyLockOptions {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(RECOVERY_POLICY_LOCK_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => {
+    const value = values.get(name);
+    if (value === undefined) throw new Error(RECOVERY_POLICY_LOCK_USAGE);
+    return value;
+  };
+  const allowed = new Set(['--lock-id', '--pid', '--process-start-marker']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(RECOVERY_POLICY_LOCK_USAGE);
+  const pid = Number(required('--pid'));
+  if (!Number.isSafeInteger(pid)) throw new Error(RECOVERY_POLICY_LOCK_USAGE);
+  return { lockId: required('--lock-id'), pid, processStartMarker: required('--process-start-marker') };
 }
 
 const LAUNCHD_INSTALL_USAGE = 'Usage: iris launchd install [--runtime-data-root <external-directory>] [--protected-reference-root <existing-directory>]';
@@ -213,9 +353,10 @@ function parseLaunchdSourceMigrationOptions(argumentsList: readonly string[]): L
     if (value === undefined) throw new Error(LAUNCHD_SOURCE_MIGRATION_USAGE);
     return value;
   };
-  const allowed = new Set(['--source-root', '--control-script', '--executable', '--source-sha', '--source-tree', '--approval-id', '--request-id', '--protected-reference-root']);
+  const allowed = new Set(['--source-root', '--control-script', '--executable', '--source-sha', '--source-tree', '--approval-id', '--request-id', '--protected-reference-root', '--recovery-policy-id']);
   if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_SOURCE_MIGRATION_USAGE);
   const protectedReferenceRoot = values.get('--protected-reference-root');
+  const recoveryPolicyId = values.get('--recovery-policy-id');
   return {
     sourceRoot: required('--source-root'),
     controlScript: required('--control-script'),
@@ -225,6 +366,7 @@ function parseLaunchdSourceMigrationOptions(argumentsList: readonly string[]): L
     approvalId: required('--approval-id'),
     requestId: required('--request-id'),
     ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }),
+    ...(recoveryPolicyId === undefined ? {} : { recoveryPolicyId }),
   };
 }
 
@@ -236,6 +378,7 @@ interface LaunchdSourceApprovalOptions {
   readonly sourceTree: string;
   readonly requestId: string;
   readonly protectedReferenceRoot?: string;
+  readonly recoveryPolicyId?: string;
 }
 
 function parseLaunchdSourceApprovalOptions(argumentsList: readonly string[]): LaunchdSourceApprovalOptions {
@@ -251,9 +394,10 @@ function parseLaunchdSourceApprovalOptions(argumentsList: readonly string[]): La
     if (value === undefined) throw new Error(LAUNCHD_SOURCE_APPROVAL_USAGE);
     return value;
   };
-  const allowed = new Set(['--source-root', '--control-script', '--executable', '--source-sha', '--source-tree', '--request-id', '--protected-reference-root']);
+  const allowed = new Set(['--source-root', '--control-script', '--executable', '--source-sha', '--source-tree', '--request-id', '--protected-reference-root', '--recovery-policy-id']);
   if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_SOURCE_APPROVAL_USAGE);
   const protectedReferenceRoot = values.get('--protected-reference-root');
+  const recoveryPolicyId = values.get('--recovery-policy-id');
   return {
     sourceRoot: required('--source-root'),
     controlScript: required('--control-script'),
@@ -262,6 +406,7 @@ function parseLaunchdSourceApprovalOptions(argumentsList: readonly string[]): La
     sourceTree: required('--source-tree'),
     requestId: required('--request-id'),
     ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }),
+    ...(recoveryPolicyId === undefined ? {} : { recoveryPolicyId }),
   };
 }
 
@@ -310,6 +455,9 @@ const LAUNCHD_SOURCE_MIGRATION_USAGE = 'Usage: iris launchd migrate-source --sou
 const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-migrate-approval --source-sha <commit> --source-tree <tree> --request-id <uuid>';
 const MALFORMED_APPROVAL_RECOVERY_USAGE = 'Usage: iris launchd reconcile-malformed-approval --approval-id <uuid> --request-id <uuid> --approval-sha256 <digest> --recovery-request-id <uuid>';
+const RECOVERY_POLICY_USAGE = 'Usage: iris recovery-policy issue --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> --allowed-operations <comma-separated> --max-operations <count> --expires-at <ISO> [--protected-reference-root <directory>]';
+const RECOVERY_POLICY_OPERATION_USAGE = 'Usage: iris recovery-policy reconcile --policy-id <uuid> --operation <MIGRATION_APPROVAL|SOURCE_MIGRATION> --request-id <uuid> --transaction-id <uuid> --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> [--protected-reference-root <directory>]';
+const RECOVERY_POLICY_LOCK_USAGE = 'Usage: iris recovery-policy reconcile-lock --lock-id <uuid> --pid <pid> --process-start-marker <marker>';
 
 function printStatus(status: Awaited<ReturnType<Awaited<ReturnType<typeof createSupervisor>>['status']>>): void {
   process.stdout.write(`IRIS_STACK=${status.state}\n`);
