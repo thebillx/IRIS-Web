@@ -12,6 +12,7 @@ import {
   launchdPaths,
   migrateLaunchAgentSource,
   renderLaunchAgent,
+  resolveReviewedRuntimeEntrypoints,
   uninstallLaunchAgent,
   type LaunchdDependencies,
 } from './launchd.js';
@@ -213,6 +214,7 @@ async function reviewedSource(subject: Awaited<ReturnType<typeof fixture>>): Pro
   await mkdir(path.dirname(controlScript), { recursive: true, mode: 0o700 });
   await mkdir(tsx, { recursive: true, mode: 0o700 });
   await writeFile(controlScript, 'export {};\n', { mode: 0o600 });
+  await writeFile(path.join(root, '.gitignore'), 'node_modules/\n', { mode: 0o600 });
   await writeFile(path.join(tsx, 'preflight.cjs'), 'module.exports = {};\n', { mode: 0o600 });
   await writeFile(path.join(tsx, 'loader.mjs'), 'export {};\n', { mode: 0o600 });
   await exec('/usr/bin/git', ['init', '-b', 'main'], { cwd: root });
@@ -233,6 +235,68 @@ async function reviewedSource(subject: Awaited<ReturnType<typeof fixture>>): Pro
 }
 
 describe('IRIS LaunchAgent artifact', () => {
+  it('resolves the pnpm tsx link only within the reviewed source dependency tree', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'iris-runtime-entrypoints-')));
+    roots.push(root);
+    const runtime = path.join(root, 'apps', 'runtime');
+    const packageRoot = path.join(root, 'node_modules', '.pnpm', 'tsx@4.23.13', 'node_modules', 'tsx');
+    await mkdir(path.join(runtime, 'node_modules'), { recursive: true, mode: 0o755 });
+    await mkdir(path.join(packageRoot, 'dist'), { recursive: true, mode: 0o755 });
+    await writeFile(path.join(packageRoot, 'dist', 'preflight.cjs'), 'module.exports = {}\n', { mode: 0o755 });
+    await writeFile(path.join(packageRoot, 'dist', 'loader.mjs'), 'export {}\n', { mode: 0o755 });
+    await symlink('../../../node_modules/.pnpm/tsx@4.23.13/node_modules/tsx', path.join(runtime, 'node_modules', 'tsx'));
+
+    const resolved = await resolveReviewedRuntimeEntrypoints(runtime);
+    expect(resolved.preflight).toBe(path.join(packageRoot, 'dist', 'preflight.cjs'));
+    expect(resolved.loader).toBe(path.join(packageRoot, 'dist', 'loader.mjs'));
+  });
+
+  it('rejects a tsx dependency link that escapes the reviewed source', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'iris-runtime-entrypoints-')));
+    roots.push(root);
+    const runtime = path.join(root, 'apps', 'runtime');
+    const outside = path.join(root, 'outside-tsx');
+    await mkdir(path.join(runtime, 'node_modules'), { recursive: true, mode: 0o755 });
+    await mkdir(path.join(outside, 'dist'), { recursive: true, mode: 0o755 });
+    await writeFile(path.join(outside, 'dist', 'preflight.cjs'), 'module.exports = {}\n', { mode: 0o755 });
+    await writeFile(path.join(outside, 'dist', 'loader.mjs'), 'export {}\n', { mode: 0o755 });
+    await symlink(outside, path.join(runtime, 'node_modules', 'tsx'));
+
+    await expect(resolveReviewedRuntimeEntrypoints(runtime)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+  });
+
+  it('rejects an entrypoint file substituted through a symlink', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'iris-runtime-entrypoints-')));
+    roots.push(root);
+    const runtime = path.join(root, 'apps', 'runtime');
+    const packageRoot = path.join(root, 'node_modules', '.pnpm', 'tsx@4.23.13', 'node_modules', 'tsx');
+    const outside = path.join(root, 'outside-entrypoint.cjs');
+    await mkdir(path.join(runtime, 'node_modules'), { recursive: true, mode: 0o755 });
+    await mkdir(path.join(packageRoot, 'dist'), { recursive: true, mode: 0o755 });
+    await writeFile(outside, 'module.exports = {}\n', { mode: 0o755 });
+    await symlink('../../../node_modules/.pnpm/tsx@4.23.13/node_modules/tsx', path.join(runtime, 'node_modules', 'tsx'));
+    await symlink(outside, path.join(packageRoot, 'dist', 'preflight.cjs'));
+    await writeFile(path.join(packageRoot, 'dist', 'loader.mjs'), 'export {}\n', { mode: 0o755 });
+
+    await expect(resolveReviewedRuntimeEntrypoints(runtime)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+  });
+
+  it('rejects writable intermediate pnpm dependency directories', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'iris-runtime-entrypoints-')));
+    roots.push(root);
+    const runtime = path.join(root, 'apps', 'runtime');
+    const pnpmRoot = path.join(root, 'node_modules', '.pnpm');
+    const packageRoot = path.join(pnpmRoot, 'tsx@4.23.13', 'node_modules', 'tsx');
+    await mkdir(path.join(runtime, 'node_modules'), { recursive: true, mode: 0o755 });
+    await mkdir(path.join(packageRoot, 'dist'), { recursive: true, mode: 0o755 });
+    await writeFile(path.join(packageRoot, 'dist', 'preflight.cjs'), 'module.exports = {}\n', { mode: 0o755 });
+    await writeFile(path.join(packageRoot, 'dist', 'loader.mjs'), 'export {}\n', { mode: 0o755 });
+    await symlink('../../../node_modules/.pnpm/tsx@4.23.13/node_modules/tsx', path.join(runtime, 'node_modules', 'tsx'));
+    await chmod(pnpmRoot, 0o777);
+
+    await expect(resolveReviewedRuntimeEntrypoints(runtime)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+  });
+
   it('contains only non-secret process configuration and exact source/data bindings', () => {
     const node = canonicalNodeRuntime();
     const dataRoot = '/Users/example/Library/Application Support/IRIS';
@@ -457,6 +521,84 @@ describe('IRIS LaunchAgent artifact', () => {
     }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
     expect(await readFile(paths.metadata, 'utf8')).toContain('"schemaVersion": 1');
     expect(await readFile(paths.plist, 'utf8')).toContain(subject.dataRoot);
+  });
+
+  it('refuses bootstrap when a committed migration entrypoint changes before install', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    await migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalId: approval.approvalId,
+      requestId,
+    }, subject.fake.dependencies);
+    await writeFile(target.executableArguments[1]!, 'module.exports = { changed: true };\n', { mode: 0o600 });
+    await expect(installLaunchAgent(
+      subject.dataRoot,
+      canonicalNodeRuntime().path,
+      target.controlScript,
+      target.executableArguments,
+      undefined,
+      subject.fake.dependencies,
+    )).rejects.toThrow(/Committed source migration runtime entrypoints changed/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(0);
+  });
+
+  it('refuses bootstrap when the committed source tree changes before install', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    await migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalId: approval.approvalId,
+      requestId,
+    }, subject.fake.dependencies);
+    await writeFile(target.controlScript, 'export const changed = true;\n', { mode: 0o600 });
+    await expect(installLaunchAgent(
+      subject.dataRoot,
+      canonicalNodeRuntime().path,
+      target.controlScript,
+      target.executableArguments,
+      undefined,
+      subject.fake.dependencies,
+    )).rejects.toThrow(/source identity is not exact and clean/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(0);
+  });
+
+  it('rejects entrypoint bytes changed after owner approval', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    await writeFile(target.executableArguments[1]!, 'module.exports = { changed: true };\n', { mode: 0o600 });
+    await expect(migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalId: approval.approvalId,
+      requestId,
+    }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
   });
 
   it('rejects a source migration before publication when the reviewed identity or target entrypoint is wrong', async () => {

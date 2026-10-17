@@ -6,7 +6,7 @@ import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
 import { createSupervisor } from './supervisor.js';
-import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, uninstallLaunchAgent } from './launchd.js';
+import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, resolveReviewedRuntimeEntrypoints, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 
 const command = process.argv[2];
@@ -71,22 +71,22 @@ try {
       process.stdout.write(`${JSON.stringify(await supervisor.rotateTunnelCredential(), null, 2)}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'install') {
       const runtimeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-      const tsxDirectory = path.join(runtimeDirectory, 'node_modules', 'tsx', 'dist');
+      const tsx = await resolveReviewedRuntimeEntrypoints(runtimeDirectory);
       const executable = canonicalNodeRuntime().path;
       const script = path.join(runtimeDirectory, 'src', 'control.ts');
-      const executableArguments = ['--require', path.join(tsxDirectory, 'preflight.cjs'), '--import', pathToFileURL(path.join(tsxDirectory, 'loader.mjs')).href];
+      const executableArguments = ['--require', tsx.preflight, '--import', pathToFileURL(tsx.loader).href];
       const protectedReferenceRoot = launchdInstallOptions?.protectedReferenceRoot ?? process.env.IRIS_PROTECTED_REFERENCE_ROOT?.trim();
       process.stdout.write(`${JSON.stringify(await installLaunchAgent(dataRoot, executable, script, executableArguments, protectedReferenceRoot), null, 2)}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'migrate-source') {
       const migration = parseLaunchdSourceMigrationOptions(process.argv.slice(4));
       const runtimeDirectory = path.join(migration.sourceRoot, 'apps', 'runtime');
-      const tsxDirectory = path.join(runtimeDirectory, 'node_modules', 'tsx', 'dist');
+      const tsx = await resolveReviewedRuntimeEntrypoints(runtimeDirectory);
       process.stdout.write(`${JSON.stringify(await migrateLaunchAgentSource({
         dataRoot,
         sourceRoot: migration.sourceRoot,
         controlScript: migration.controlScript,
         executable: migration.executable,
-        executableArguments: ['--require', path.join(tsxDirectory, 'preflight.cjs'), '--import', pathToFileURL(path.join(tsxDirectory, 'loader.mjs')).href],
+        executableArguments: ['--require', tsx.preflight, '--import', pathToFileURL(tsx.loader).href],
         sourceSha: migration.sourceSha,
         sourceTree: migration.sourceTree,
         approvalId: migration.approvalId,
@@ -96,7 +96,7 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'authorize-migrate-source') {
       const approval = parseLaunchdSourceApprovalOptions(process.argv.slice(4));
       const runtimeDirectory = path.join(approval.sourceRoot, 'apps', 'runtime');
-      const tsxDirectory = path.join(runtimeDirectory, 'node_modules', 'tsx', 'dist');
+      const tsx = await resolveReviewedRuntimeEntrypoints(runtimeDirectory);
       const prompt = createInterface({ input, output });
       try {
         const confirmation = await prompt.question('Type APPROVE IRIS MIGRATION to issue the one-time local authorization: ');
@@ -107,7 +107,7 @@ try {
       const issued = await issueLaunchAgentSourceApproval({
         ...approval,
         dataRoot,
-        executableArguments: ['--require', path.join(tsxDirectory, 'preflight.cjs'), '--import', pathToFileURL(path.join(tsxDirectory, 'loader.mjs')).href],
+        executableArguments: ['--require', tsx.preflight, '--import', pathToFileURL(tsx.loader).href],
       });
       process.stdout.write(`${JSON.stringify({ approvalId: issued.approvalId, requestId: issued.requestId, state: issued.state })}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'uninstall') {
