@@ -27,8 +27,8 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: 46bbbb3ae773a614a678d3412369e672cfc9d9da
-      APPROVED_TARGET_TREE: 93b05e2d87e4edb3111e005e076f8a5344b36d92
+      APPROVED_TARGET_SHA: 1dce8053aa6fcd52b2766b6b96538bea5f202409
+      APPROVED_TARGET_TREE: 6589c0b8d9aac548896e4870e73c95b61b0e7b1a
       BASELINE_SHA: 7df046b2e84028b6a42f9a18ba4521d74b55d554
     steps:
       - name: Validate the approved target
@@ -77,6 +77,7 @@ jobs:
         run: |
           pnpm --filter @iris/runtime exec vitest run \
             src/launchd.test.ts \
+            src/recovery-policy.test.ts \
             src/supervisor-startup.test.ts \
             src/supervisor-daemon-exit.test.ts \
             src/supervisor-failure-stop.test.ts
