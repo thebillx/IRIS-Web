@@ -1,4 +1,6 @@
+import { execFile } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -7,16 +9,19 @@ import {
   LAUNCH_AGENT_LABEL,
   launchAgentStatus,
   launchdPaths,
+  migrateLaunchAgentSource,
   renderLaunchAgent,
   uninstallLaunchAgent,
   type LaunchdDependencies,
 } from './launchd.js';
 import { canonicalNodeRuntime, node24Path } from './node-runtime.js';
+import { promisify } from 'node:util';
 
 const roots: string[] = [];
 const sourceRoot = path.resolve(import.meta.dirname, '../../..');
 const controlScript = path.join(sourceRoot, 'apps/runtime/src/control.ts');
 const uid = process.getuid!();
+const exec = promisify(execFile);
 
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
@@ -179,6 +184,39 @@ async function writeLegacyLaunchAgent(subject: Awaited<ReturnType<typeof fixture
   return { metadata, plist };
 }
 
+async function reviewedSource(subject: Awaited<ReturnType<typeof fixture>>): Promise<{
+  readonly root: string;
+  readonly controlScript: string;
+  readonly executableArguments: readonly string[];
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+}> {
+  const root = path.join(path.dirname(subject.dataRoot), 'reviewed-control-source');
+  const runtime = path.join(root, 'apps', 'runtime');
+  const controlScript = path.join(runtime, 'src', 'control.ts');
+  const tsx = path.join(runtime, 'node_modules', 'tsx', 'dist');
+  await mkdir(path.dirname(controlScript), { recursive: true, mode: 0o700 });
+  await mkdir(tsx, { recursive: true, mode: 0o700 });
+  await writeFile(controlScript, 'export {};\n', { mode: 0o600 });
+  await writeFile(path.join(tsx, 'preflight.cjs'), 'module.exports = {};\n', { mode: 0o600 });
+  await writeFile(path.join(tsx, 'loader.mjs'), 'export {};\n', { mode: 0o600 });
+  await exec('/usr/bin/git', ['init', '-b', 'main'], { cwd: root });
+  await exec('/usr/bin/git', ['config', 'user.email', 'iris-test@example.invalid'], { cwd: root });
+  await exec('/usr/bin/git', ['config', 'user.name', 'IRIS test'], { cwd: root });
+  await exec('/usr/bin/git', ['add', '--', '.'], { cwd: root });
+  await exec('/usr/bin/git', ['commit', '-m', 'reviewed control source'], { cwd: root });
+  const sourceSha = (await exec('/usr/bin/git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim();
+  const sourceTree = (await exec('/usr/bin/git', ['rev-parse', 'HEAD^{tree}'], { cwd: root })).stdout.trim();
+  roots.push(root);
+  return {
+    root,
+    controlScript,
+    executableArguments: ['--require', path.join(tsx, 'preflight.cjs'), '--import', `file://${path.join(tsx, 'loader.mjs')}`],
+    sourceSha,
+    sourceTree,
+  };
+}
+
 describe('IRIS LaunchAgent artifact', () => {
   it('contains only non-secret process configuration and exact source/data bindings', () => {
     const node = canonicalNodeRuntime();
@@ -318,6 +356,118 @@ describe('IRIS LaunchAgent artifact', () => {
     expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
     await uninstallLaunchAgent(subject.dataRoot, subject.fake.dependencies);
     expect(subject.fake.disabled).toBe(true);
+  });
+
+  it('migrates a stopped legacy source binding without bootstrapping and journals exact provenance', async () => {
+    const subject = await fixture();
+    const legacy = await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const result = await migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalFingerprint: 'a'.repeat(64),
+      requestId,
+    }, subject.fake.dependencies);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    expect(result.state).toBe('COMMITTED');
+    expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({
+      schemaVersion: 3,
+      state: 'PREPARED',
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      legacyMigration: { fromSchemaVersion: 1, observedState: 'ABSENT' },
+    });
+    expect(JSON.parse(await readFile(paths.sourceBindingMigration, 'utf8'))).toMatchObject({
+      state: 'COMMITTED',
+      targetSourceSha: target.sourceSha,
+      targetSourceTree: target.sourceTree,
+      legacyMetadataRaw: legacy.metadata,
+    });
+    expect(await readFile(paths.plist, 'utf8')).toContain(target.controlScript);
+    await expect(lstat(paths.registeredPlist)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalFingerprint: 'a'.repeat(64),
+      requestId,
+    }, subject.fake.dependencies)).resolves.toMatchObject({ state: 'COMMITTED', transactionId: result.transactionId });
+    expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
+  });
+
+  it('rejects a source migration before publication when the reviewed identity or target entrypoint is wrong', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    const beforeMetadata = await readFile(paths.metadata, 'utf8');
+    const beforePlist = await readFile(paths.plist, 'utf8');
+    await expect(migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: [...target.executableArguments, path.join(target.root, 'missing-entrypoint.mjs')],
+      sourceSha: '0'.repeat(40),
+      sourceTree: target.sourceTree,
+      approvalFingerprint: 'b'.repeat(64),
+      requestId: randomUUID(),
+    }, subject.fake.dependencies)).rejects.toThrow(/reviewed control source identity|entrypoint/);
+    expect(await readFile(paths.metadata, 'utf8')).toBe(beforeMetadata);
+    expect(await readFile(paths.plist, 'utf8')).toBe(beforePlist);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
+  });
+
+  it('refuses migration when the same-label service is loaded', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    subject.fake.loaded = true;
+    const target = await reviewedSource(subject);
+    await expect(migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalFingerprint: 'c'.repeat(64),
+      requestId: randomUUID(),
+    }, subject.fake.dependencies)).rejects.toThrow(/must be stopped/);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
+  });
+
+  it('refuses concurrent source migration while the lifecycle lock is held', async () => {
+    const subject = await fixture();
+    const legacy = await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    await writeFile(paths.operationLock, `${JSON.stringify({ schemaVersion: 1, label: LAUNCH_AGENT_LABEL, pid: 1234, requestId: randomUUID() })}\n`, { mode: 0o600 });
+    await expect(migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalFingerprint: 'd'.repeat(64),
+      requestId: randomUUID(),
+    }, subject.fake.dependencies)).rejects.toThrow(/lifecycle operation/);
+    expect(await readFile(paths.metadata, 'utf8')).toBe(legacy.metadata);
+    expect(await readFile(paths.plist, 'utf8')).toBe(legacy.plist);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
   });
 
   it('reads schema-1 metadata without mutation and resumes a journaled migration after install rollback', async () => {

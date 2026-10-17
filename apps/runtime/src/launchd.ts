@@ -5,6 +5,7 @@ import { access, link, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { RuntimeError } from '@iris/domain';
 import { RUNTIME_DATA_ENV } from './data-root.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
@@ -22,6 +23,8 @@ export interface LaunchdPaths {
   readonly registeredPlist: string;
   readonly stdout: string;
   readonly stderr: string;
+  readonly sourceBindingMigration: string;
+  readonly operationLock: string;
 }
 
 export interface LaunchdStatus {
@@ -36,6 +39,41 @@ export interface LaunchdDependencies {
   readonly homeDirectory?: string;
   readonly uid?: number;
   readonly launchctl?: (argumentsList: readonly string[]) => Promise<{ readonly stdout: string }>;
+}
+
+export interface LaunchAgentSourceMigrationInput {
+  readonly dataRoot: string;
+  readonly sourceRoot: string;
+  readonly controlScript: string;
+  readonly executable: string;
+  readonly executableArguments: readonly string[];
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly approvalFingerprint: string;
+  readonly requestId: string;
+  readonly protectedReferenceRoot?: string;
+}
+
+export interface LaunchAgentSourceMigrationRecord {
+  readonly schemaVersion: 1;
+  readonly transactionId: string;
+  readonly requestId: string;
+  readonly state: 'PREPARED' | 'APPLYING' | 'COMMITTED' | 'RECONCILIATION_REQUIRED';
+  readonly label: typeof LAUNCH_AGENT_LABEL;
+  readonly domain: string;
+  readonly dataRoot: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+  readonly legacyMetadataRaw: string;
+  readonly targetSourceRoot: string;
+  readonly targetControlScript: string;
+  readonly targetExecutable: string;
+  readonly targetExecutableArguments: readonly string[];
+  readonly targetSourceSha: string;
+  readonly targetSourceTree: string;
+  readonly approvalFingerprint: string;
+  readonly protectedReferenceRoot?: string;
+  readonly failureCode?: string;
 }
 
 interface LegacyLaunchAgentMetadata {
@@ -105,6 +143,8 @@ export function launchdPaths(dataRoot: string, homeDirectory = os.homedir()): La
     registeredPlist: path.join(registrationDirectory, `${LAUNCH_AGENT_LABEL}.plist`),
     stdout: path.join(dataRoot, 'logs', 'supervisor.log'),
     stderr: path.join(dataRoot, 'logs', 'supervisor-error.log'),
+    sourceBindingMigration: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-migration.json`),
+    operationLock: path.join(directory, `${LAUNCH_AGENT_LABEL}.operation.lock`),
   };
 }
 
@@ -148,7 +188,220 @@ export function renderLaunchAgent(
   ].join('\n');
 }
 
+/**
+ * Rebinds a stopped schema-1 LaunchAgent to a reviewed control source without
+ * loading the service. Bootstrap remains an explicit, separate operation.
+ */
+export async function migrateLaunchAgentSource(
+  input: LaunchAgentSourceMigrationInput,
+  dependencies: LaunchdDependencies = {},
+): Promise<LaunchAgentSourceMigrationRecord> {
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, () => migrateLaunchAgentSourceUnlocked(input, dependencies));
+}
+
+async function migrateLaunchAgentSourceUnlocked(
+  input: LaunchAgentSourceMigrationInput,
+  dependencies: LaunchdDependencies,
+): Promise<LaunchAgentSourceMigrationRecord> {
+  assertSupportedNodeVersion();
+  validateMigrationInput(input);
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const canonicalSourceRoot = await requireCanonicalDirectory(input.sourceRoot, 'IRIS control source root', uid, false);
+  const canonicalControlScript = await requireCanonicalFile(input.controlScript, 'IRIS control script', uid);
+  if (sourceRootForControlScript(canonicalControlScript) !== canonicalSourceRoot) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Control script is outside the requested source root');
+  }
+  const executable = await realpath(input.executable).catch((error) => {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Reviewed control executable cannot be resolved', { cause: error });
+  });
+  const expectedExecutable = await realpath(canonicalNodeRuntime().path);
+  if (executable !== expectedExecutable) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Reviewed control executable is not the supported Node runtime');
+  }
+  await requireTargetRuntimeEntries(input.executableArguments, uid);
+  await requireSourceGitIdentity(canonicalSourceRoot, input.sourceSha, input.sourceTree);
+  const canonicalProtectedReferenceRoot = input.protectedReferenceRoot === undefined
+    ? undefined
+    : await requireCanonicalDirectory(input.protectedReferenceRoot, 'IRIS protected reference root', uid, false);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  const domain = launchdDomain(dependencies);
+  const launchctl = dependencies.launchctl ?? systemLaunchctl;
+  await requireGuiDomain(domain, launchctl);
+  const observation = await observeLaunchAgent(dependencies);
+  if (observation.state !== 'ABSENT') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'A loaded LaunchAgent must be stopped before source migration');
+  }
+  const migrationPath = paths.sourceBindingMigration;
+  const existingMigration = await readSourceMigrationRecord(migrationPath, uid);
+  if (existingMigration !== null) {
+    if (existingMigration.state === 'COMMITTED'
+      && existingMigration.requestId === input.requestId
+      && existingMigration.dataRoot === canonicalDataRoot
+      && existingMigration.targetSourceRoot === canonicalSourceRoot
+      && existingMigration.targetControlScript === canonicalControlScript
+      && existingMigration.targetExecutable === executable
+      && existingMigration.targetExecutableArguments.length === input.executableArguments.length
+      && existingMigration.targetExecutableArguments.every((argument, index) => argument === input.executableArguments[index])
+      && existingMigration.targetSourceSha === input.sourceSha
+      && existingMigration.targetSourceTree === input.sourceTree
+      && (existingMigration.protectedReferenceRoot ?? null) === (canonicalProtectedReferenceRoot ?? null)
+      && existingMigration.approvalFingerprint === input.approvalFingerprint) return existingMigration;
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing source migration requires reconciliation before retry');
+  }
+
+  const legacyRecord = await readLaunchAgentMetadata(paths.metadata, uid);
+  if (legacyRecord?.metadata.schemaVersion !== 1) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Source migration requires an exact schema-1 LaunchAgent record');
+  }
+  const legacy = legacyRecord.metadata;
+  const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+  if (privatePlist.state !== 'ok') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy private LaunchAgent plist is unavailable');
+  const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+  if (registeredPlist.state !== 'missing') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'A registered LaunchAgent conflicts with source migration');
+  const legacyPlist = renderLaunchAgent(canonicalDataRoot, legacy.executable, legacy.controlScript, legacy.executableArguments);
+  if (legacy.plist !== paths.plist || privatePlist.content !== legacyPlist) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy LaunchAgent binding does not match its durable metadata');
+  }
+  const disabledBeforeMigration = await launchAgentDisabled(domain, launchctl);
+  const targetPlist = renderLaunchAgent(
+    canonicalDataRoot,
+    executable,
+    canonicalControlScript,
+    input.executableArguments,
+    canonicalProtectedReferenceRoot,
+  );
+  const targetMetadata: LaunchAgentMetadata = {
+    schemaVersion: 3,
+    label: LAUNCH_AGENT_LABEL,
+    domain,
+    dataRoot: canonicalDataRoot,
+    sourceRoot: canonicalSourceRoot,
+    executable,
+    controlScript: canonicalControlScript,
+    executableArguments: [...input.executableArguments],
+    plist: paths.plist,
+    registeredPlist: paths.registeredPlist,
+    plistSha256: sha256(targetPlist),
+    state: 'PREPARED',
+    disabledBeforeInstall: disabledBeforeMigration,
+    unresolvedReason: null,
+    legacyMigration: {
+      fromSchemaVersion: 1,
+      metadataSha256: sha256(legacyRecord.raw),
+      plistSha256: sha256(legacyPlist),
+      executable: legacy.executable,
+      controlScript: legacy.controlScript,
+      executableArguments: [...legacy.executableArguments],
+      plist: legacy.plist,
+      observedState: 'ABSENT',
+      disabledBeforeMigration,
+    },
+  };
+  const transactionId = randomUUID();
+  const baseRecord: LaunchAgentSourceMigrationRecord = {
+    schemaVersion: 1,
+    transactionId,
+    requestId: input.requestId,
+    state: 'PREPARED',
+    label: LAUNCH_AGENT_LABEL,
+    domain,
+    dataRoot: canonicalDataRoot,
+    beforeMetadataSha256: sha256(legacyRecord.raw),
+    beforePlistSha256: sha256(legacyPlist),
+    legacyMetadataRaw: legacyRecord.raw,
+    targetSourceRoot: canonicalSourceRoot,
+    targetControlScript: canonicalControlScript,
+    targetExecutable: executable,
+    targetExecutableArguments: [...input.executableArguments],
+    targetSourceSha: input.sourceSha,
+    targetSourceTree: input.sourceTree,
+    approvalFingerprint: input.approvalFingerprint,
+    ...(canonicalProtectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: canonicalProtectedReferenceRoot }),
+  };
+  const beforePublication = await observeLaunchAgent(dependencies);
+  if (beforePublication.state !== 'ABSENT') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'A same-label LaunchAgent appeared during source migration preflight');
+  }
+  await publishOwnedFile(migrationPath, migrationContent(baseRecord), 'IRIS source migration record', uid);
+  const applying = { ...baseRecord, state: 'APPLYING' as const };
+  await replaceOwnedFile(migrationPath, migrationContent(baseRecord), migrationContent(applying), 'IRIS source migration record', uid);
+  let plistChanged = false;
+  let metadataChanged = false;
+  let rollbackEvidenceUnknown = false;
+  try {
+    try {
+      await replaceOwnedFile(paths.plist, legacyPlist, targetPlist, 'IRIS private LaunchAgent', uid);
+      plistChanged = true;
+    } catch (error) {
+      const state = await exactOwnedContent(paths.plist, targetPlist, uid);
+      if (state === true) plistChanged = true;
+      else if (state === null) rollbackEvidenceUnknown = true;
+      throw error;
+    }
+    try {
+      await replaceOwnedFile(paths.metadata, legacyRecord.raw, metadataContent(targetMetadata), 'IRIS LaunchAgent metadata', uid);
+      metadataChanged = true;
+    } catch (error) {
+      const state = await exactOwnedContent(paths.metadata, metadataContent(targetMetadata), uid);
+      if (state === true) metadataChanged = true;
+      else if (state === null) rollbackEvidenceUnknown = true;
+      throw error;
+    }
+    const committed = { ...applying, state: 'COMMITTED' as const };
+    await replaceOwnedFile(migrationPath, migrationContent(applying), migrationContent(committed), 'IRIS source migration record', uid);
+    return committed;
+  } catch (error) {
+    let rollbackFailed = false;
+    if (metadataChanged) {
+      try { await replaceOwnedFile(paths.metadata, metadataContent(targetMetadata), legacyRecord.raw, 'IRIS LaunchAgent metadata', uid); }
+      catch { rollbackFailed = true; }
+    }
+    if (plistChanged) {
+      try { await replaceOwnedFile(paths.plist, targetPlist, legacyPlist, 'IRIS private LaunchAgent', uid); }
+      catch { rollbackFailed = true; }
+    }
+    const unresolved = {
+      ...applying,
+      state: 'RECONCILIATION_REQUIRED' as const,
+      failureCode: rollbackFailed || rollbackEvidenceUnknown ? 'ROLLBACK_OUTCOME_UNKNOWN' : 'MIGRATION_FAILED',
+    };
+    await replaceOwnedFile(migrationPath, migrationContent(applying), migrationContent(unresolved), 'IRIS source migration record', uid).catch(() => undefined);
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', rollbackFailed
+      ? 'Source migration rollback requires reconciliation'
+      : 'Source migration failed and was rolled back', { cause: error });
+  }
+}
+
+async function exactOwnedContent(filename: string, expected: string, uid: number): Promise<boolean | null> {
+  try {
+    const inspected = await inspectOwnedFile(filename, 'IRIS migration target', uid);
+    if (inspected.state === 'ok') return inspected.content === expected;
+    if (inspected.state === 'missing') return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export async function installLaunchAgent(
+  dataRoot: string,
+  requestedExecutable: string,
+  controlScript: string,
+  executableArguments: readonly string[] = [],
+  protectedReferenceRoot?: string,
+  dependencies: LaunchdDependencies = {},
+): Promise<LaunchdPaths> {
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, () => installLaunchAgentUnlocked(canonicalDataRoot, requestedExecutable, controlScript, executableArguments, protectedReferenceRoot, dependencies));
+}
+
+async function installLaunchAgentUnlocked(
   dataRoot: string,
   requestedExecutable: string,
   controlScript: string,
@@ -297,6 +550,13 @@ export async function uninstallLaunchAgent(dataRoot: string, dependencies: Launc
   const uid = launchdUid(dependencies);
   const canonicalDataRoot = await requireCanonicalDirectory(dataRoot, 'IRIS data root', uid, true);
   const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  await withLaunchAgentLock(paths, uid, () => uninstallLaunchAgentUnlocked(canonicalDataRoot, dependencies));
+}
+
+async function uninstallLaunchAgentUnlocked(dataRoot: string, dependencies: LaunchdDependencies = {}): Promise<void> {
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
   const domain = launchdDomain(dependencies);
   const launchctl = dependencies.launchctl ?? systemLaunchctl;
   await requireGuiDomain(domain, launchctl);
@@ -349,6 +609,50 @@ export async function uninstallLaunchAgent(dataRoot: string, dependencies: Launc
   await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
   await removeOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
   await removeOwnedFile(paths.metadata, 'IRIS LaunchAgent metadata', uid);
+}
+
+async function withLaunchAgentLock<T>(paths: LaunchdPaths, uid: number, operation: () => Promise<T>): Promise<T> {
+  await ensureOwnedDirectory(paths.directory, 'IRIS launchd directory', uid, true);
+  const lockContent = `${JSON.stringify({ schemaVersion: 1, label: LAUNCH_AGENT_LABEL, pid: process.pid, requestId: randomUUID() })}\n`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(paths.operationLock, 'wx', 0o600);
+    await handle.writeFile(lockContent, 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (isAlreadyExists(error)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Another LaunchAgent lifecycle operation is active or requires reconciliation');
+    throw new RuntimeError('PERSISTENCE_FAILURE', 'LaunchAgent lifecycle lock could not be established', { cause: error });
+  }
+  let succeeded = false;
+  let result!: T;
+  let operationError: unknown;
+  try {
+    result = await operation();
+    succeeded = true;
+  } catch (error) {
+    operationError = error;
+  }
+  let lockError: unknown;
+  try {
+    const inspected = await inspectOwnedFile(paths.operationLock, 'IRIS LaunchAgent lifecycle lock', uid);
+    if (inspected.state !== 'ok' || inspected.content !== lockContent) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent lifecycle lock ownership is unresolved');
+    }
+    await rm(paths.operationLock);
+    await syncDirectory(path.dirname(paths.operationLock));
+  } catch (error) {
+    lockError = error;
+  }
+  if (lockError !== undefined) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent lifecycle lock cleanup requires reconciliation', {
+      cause: operationError ?? lockError,
+    });
+  }
+  if (!succeeded) throw operationError;
+  return result;
 }
 
 export async function launchAgentStatus(dataRoot: string, dependencies: LaunchdDependencies = {}): Promise<LaunchdStatus> {
@@ -802,6 +1106,64 @@ async function replaceOwnedFile(filename: string, expected: string, content: str
 
 function metadataContent(metadata: LaunchAgentMetadata): string {
   return `${JSON.stringify(metadata, null, 2)}\n`;
+}
+
+function migrationContent(record: LaunchAgentSourceMigrationRecord): string {
+  return `${JSON.stringify(record, null, 2)}\n`;
+}
+
+async function readSourceMigrationRecord(filename: string, uid: number): Promise<LaunchAgentSourceMigrationRecord | null> {
+  const inspected = await inspectOwnedFile(filename, 'IRIS source migration record', uid);
+  if (inspected.state === 'missing') return null;
+  if (inspected.state === 'invalid') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', inspected.reason);
+  try {
+    const value = JSON.parse(inspected.content) as Partial<LaunchAgentSourceMigrationRecord>;
+    if (value.schemaVersion !== 1 || value.label !== LAUNCH_AGENT_LABEL
+      || !['PREPARED', 'APPLYING', 'COMMITTED', 'RECONCILIATION_REQUIRED'].includes(String(value.state))
+      || typeof value.transactionId !== 'string' || typeof value.requestId !== 'string'
+      || typeof value.targetSourceSha !== 'string' || typeof value.targetSourceTree !== 'string') throw new Error('invalid source migration record');
+    return value as LaunchAgentSourceMigrationRecord;
+  } catch (error) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'IRIS source migration record is invalid', { cause: error });
+  }
+}
+
+function validateMigrationInput(input: LaunchAgentSourceMigrationInput): void {
+  for (const [name, value] of [['sourceSha', input.sourceSha], ['sourceTree', input.sourceTree]] as const) {
+    if (!/^[a-f0-9]{40}$/.test(value)) throw new RuntimeError('INVALID_REQUEST', `${name} must be a lowercase hexadecimal object identifier`);
+  }
+  if (!/^[a-f0-9]{64}$/.test(input.approvalFingerprint)) throw new RuntimeError('INVALID_REQUEST', 'approvalFingerprint must be a 64-character lowercase hexadecimal value');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.requestId)) {
+    throw new RuntimeError('INVALID_REQUEST', 'requestId must be a UUID');
+  }
+  if (input.executableArguments.some((argument) => argument.includes('\0'))) {
+    throw new RuntimeError('INVALID_REQUEST', 'executable arguments cannot contain NUL bytes');
+  }
+}
+
+async function requireSourceGitIdentity(sourceRoot: string, expectedSha: string, expectedTree: string): Promise<void> {
+  try {
+    const [head, tree, status] = await Promise.all([
+      execFileAsync('/usr/bin/git', ['-C', sourceRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 5_000 }),
+      execFileAsync('/usr/bin/git', ['-C', sourceRoot, 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf8', timeout: 5_000 }),
+      execFileAsync('/usr/bin/git', ['-C', sourceRoot, 'status', '--porcelain=v1', '--untracked-files=no'], { encoding: 'utf8', timeout: 5_000 }),
+    ]);
+    if (head.stdout.trim() !== expectedSha || tree.stdout.trim() !== expectedTree || status.stdout.trim().length !== 0) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Reviewed control source identity is not exact and clean');
+    }
+  } catch (error) {
+    if (error instanceof RuntimeError) throw error;
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Reviewed control source Git identity could not be verified', { cause: error });
+  }
+}
+
+async function requireTargetRuntimeEntries(argumentsList: readonly string[], uid: number): Promise<void> {
+  for (const argument of argumentsList) {
+    const candidate = argument.startsWith('file://')
+      ? fileURLToPath(argument)
+      : path.isAbsolute(argument) ? argument : null;
+    if (candidate !== null) await requireCanonicalFile(candidate, 'Reviewed runtime entrypoint', uid);
+  }
 }
 
 function requireMetadataBinding(actual: LaunchAgentMetadata, expected: Omit<LaunchAgentMetadata, 'state' | 'disabledBeforeInstall' | 'unresolvedReason'>): void {
