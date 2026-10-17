@@ -29,6 +29,7 @@ export interface LaunchdPaths {
   readonly sourceBindingMigration: string;
   readonly sourceBindingApproval: string;
   readonly sourceBindingApprovalHistory: string;
+  readonly sourceBindingApprovalRecovery: string;
   readonly operationLock: string;
 }
 
@@ -45,6 +46,7 @@ export interface LaunchdDependencies {
   readonly homeDirectory?: string;
   readonly uid?: number;
   readonly launchctl?: (argumentsList: readonly string[]) => Promise<{ readonly stdout: string }>;
+  readonly syncDirectory?: (directory: string) => Promise<void>;
 }
 
 export interface LaunchAgentSourceApprovalInput {
@@ -64,6 +66,33 @@ export interface LaunchAgentSourceApprovalReconciliationInput {
   readonly requestId: string;
   readonly sourceSha: string;
   readonly sourceTree: string;
+}
+
+export interface MalformedLegacyApprovalReconciliationInput {
+  readonly dataRoot: string;
+  readonly approvalId: string;
+  readonly requestId: string;
+  readonly approvalSha256: string;
+  readonly recoveryRequestId: string;
+}
+
+export interface MalformedLegacyApprovalReconciliationRecord {
+  readonly schemaVersion: 1;
+  readonly transactionId: string;
+  readonly recoveryRequestId: string;
+  readonly approvalId: string;
+  readonly requestId: string;
+  readonly state: 'PREPARED' | 'APPLYING' | 'COMMITTED' | 'RECONCILIATION_REQUIRED' | 'FAILED';
+  readonly label: typeof LAUNCH_AGENT_LABEL;
+  readonly domain: string;
+  readonly dataRoot: string;
+  readonly approvalSha256: string;
+  readonly originalApprovalRaw: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+  readonly finalizedApprovalSha256?: string;
 }
 
 export interface LaunchAgentSourceApprovalRecord extends LaunchAgentSourceApprovalInput {
@@ -190,6 +219,7 @@ export function launchdPaths(dataRoot: string, homeDirectory = os.homedir()): La
     sourceBindingMigration: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-migration.json`),
     sourceBindingApproval: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-approval.json`),
     sourceBindingApprovalHistory: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-approval.history.json`),
+    sourceBindingApprovalRecovery: path.join(directory, `${LAUNCH_AGENT_LABEL}.source-binding-approval-recovery.json`),
     operationLock: path.join(directory, `${LAUNCH_AGENT_LABEL}.operation.lock`),
   };
 }
@@ -321,6 +351,121 @@ export async function reconcileLaunchAgentSourceApproval(
       : reconciled;
     await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(approval), approvalContent(signedReconciled), 'IRIS source migration approval', uid);
     return signedReconciled;
+  });
+}
+
+/** Retires one authenticated malformed schema-1 approval without granting migration authority. */
+export async function reconcileMalformedLegacyApproval(
+  input: MalformedLegacyApprovalReconciliationInput,
+  dependencies: LaunchdDependencies = {},
+): Promise<MalformedLegacyApprovalReconciliationRecord> {
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, async () => {
+    validateMalformedLegacyApprovalInput(input);
+    const inspectedApproval = await inspectOwnedFile(paths.sourceBindingApproval, 'IRIS source migration approval', uid);
+    if (inspectedApproval.state !== 'ok') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', inspectedApproval.state === 'invalid' ? inspectedApproval.reason : 'No migration approval exists to reconcile');
+    const approval = parseSourceApproval(inspectedApproval.content);
+    if (approval.schemaVersion !== 1 || approval.approvalId !== input.approvalId || approval.requestId !== input.requestId) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'The malformed approval is not an issued schema-1 record for this request');
+    }
+    const existing = await readMalformedApprovalRecoveryRecord(paths.sourceBindingApprovalRecovery, uid);
+    const sync = dependencies.syncDirectory ?? syncDirectory;
+    const approvalSha256 = sha256(inspectedApproval.content);
+    if (!/^[a-f0-9]{41}$/.test(approval.sourceSha)) {
+      throw new RuntimeError('INVALID_REQUEST', 'The approval is not the expected malformed 41-character legacy record');
+    }
+    const secret = await readOwnerAccessSecret(canonicalDataRoot);
+    if (secret === null || !verifySourceApproval(approval, secret)) throw new RuntimeError('CONTROL_DENIED', 'The malformed migration approval failed authentication');
+    const sameTransaction = existing !== null
+      && existing.recoveryRequestId === input.recoveryRequestId
+      && existing.approvalSha256 === input.approvalSha256
+      && existing.approvalId === approval.approvalId;
+    const replay = sameTransaction && existing.state === 'COMMITTED';
+    const expectedOriginalRaw = existing?.originalApprovalRaw ?? inspectedApproval.content;
+    const expectedOriginalSha256 = existing?.approvalSha256 ?? input.approvalSha256;
+    if (sha256(expectedOriginalRaw) !== expectedOriginalSha256 || expectedOriginalSha256 !== input.approvalSha256) {
+      throw new RuntimeError('CONTROL_DENIED', 'The malformed approval recovery digest is inconsistent');
+    }
+    const originalApproval = parseSourceApproval(expectedOriginalRaw);
+    if (originalApproval.schemaVersion !== 1 || originalApproval.approvalId !== approval.approvalId || originalApproval.requestId !== approval.requestId || !verifySourceApproval(originalApproval, secret)) {
+      throw new RuntimeError('CONTROL_DENIED', 'The historical malformed approval failed authentication');
+    }
+    const expectedReconciled = approvalContent({ ...originalApproval, state: 'RECONCILIATION_REQUIRED' });
+    const currentIsOriginal = inspectedApproval.content === expectedOriginalRaw;
+    const currentIsReconciled = inspectedApproval.content === expectedReconciled;
+    if (!replay && !currentIsOriginal && !currentIsReconciled) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'The malformed approval bytes have an unknown state and require reconciliation');
+    }
+    if (!replay && currentIsOriginal && approvalSha256 !== input.approvalSha256) throw new RuntimeError('CONTROL_DENIED', 'The malformed approval bytes changed before reconciliation');
+    if (currentIsReconciled && !verifySourceApproval(approval, secret)) throw new RuntimeError('CONTROL_DENIED', 'The reconciled approval failed authentication');
+    const metadata = await inspectOwnedFile(paths.metadata, 'IRIS LaunchAgent metadata', uid);
+    const plist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+    if (metadata.state !== 'ok' || plist.state !== 'ok' || sha256(metadata.content) !== approval.beforeMetadataSha256 || sha256(plist.content) !== approval.beforePlistSha256) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Protected before-images changed; malformed approval reconciliation is blocked');
+    }
+    const migration = await readSourceMigrationRecord(paths.sourceBindingMigration, uid);
+    if (migration !== null) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing source migration requires reconciliation before approval recovery');
+    if (replay) {
+      if (!currentIsReconciled || existing.finalizedApprovalSha256 !== approvalSha256) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'The malformed approval recovery readback is inconsistent');
+      await sync(path.dirname(paths.sourceBindingApproval));
+      const readback = await inspectOwnedFile(paths.sourceBindingApproval, 'IRIS source migration approval', uid);
+      if (readback.state !== 'ok' || readback.content !== inspectedApproval.content) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'The malformed approval recovery readback is not durable');
+      return existing;
+    }
+    if (existing !== null && (existing.state !== 'PREPARED' && existing.state !== 'APPLYING')) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing malformed approval recovery requires reconciliation before retry');
+    }
+    if (existing !== null && (existing.recoveryRequestId !== input.recoveryRequestId || existing.approvalSha256 !== input.approvalSha256 || existing.approvalId !== approval.approvalId)) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing malformed approval recovery belongs to a different request');
+    }
+    if (existing?.state === 'APPLYING' && currentIsReconciled) {
+      const committed = { ...existing, state: 'COMMITTED' as const, finalizedApprovalSha256: approvalSha256 };
+      if (!await persistMalformedApprovalRecovery(paths, existing, committed, uid, sync)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Malformed approval recovery commit durability is unknown');
+      return committed;
+    }
+    if (!currentIsOriginal || approval.state !== 'ISSUED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `Malformed migration approval is ${approval.state.toLowerCase()} and cannot be reconciled`);
+    const prepared: MalformedLegacyApprovalReconciliationRecord = existing ?? {
+      schemaVersion: 1,
+      transactionId: randomUUID(),
+      recoveryRequestId: input.recoveryRequestId,
+      approvalId: approval.approvalId,
+      requestId: approval.requestId,
+      state: 'PREPARED',
+      label: LAUNCH_AGENT_LABEL,
+      domain: approval.domain,
+      dataRoot: canonicalDataRoot,
+      approvalSha256,
+      originalApprovalRaw: inspectedApproval.content,
+      sourceSha: approval.sourceSha,
+      sourceTree: approval.sourceTree,
+      beforeMetadataSha256: approval.beforeMetadataSha256,
+      beforePlistSha256: approval.beforePlistSha256,
+    };
+    if (existing === null) await publishOwnedFile(paths.sourceBindingApprovalRecovery, malformedApprovalRecoveryContent(prepared), 'IRIS malformed approval recovery', uid, sync);
+    const applying = prepared.state === 'APPLYING' ? prepared : { ...prepared, state: 'APPLYING' as const };
+    if (prepared.state !== 'APPLYING') await replaceOwnedFile(paths.sourceBindingApprovalRecovery, malformedApprovalRecoveryContent(prepared), malformedApprovalRecoveryContent(applying), 'IRIS malformed approval recovery', uid, sync);
+    const reconciled = { ...originalApproval, state: 'RECONCILIATION_REQUIRED' as const };
+    const reconciledContent = approvalContent(reconciled);
+    try {
+      await replaceOwnedFile(paths.sourceBindingApproval, inspectedApproval.content, reconciledContent, 'IRIS source migration approval', uid, sync);
+    } catch (error) {
+      const readback = await inspectOwnedFile(paths.sourceBindingApproval, 'IRIS source migration approval', uid);
+      const recoveryState = readback.state === 'ok' && readback.content === inspectedApproval.content
+        ? 'FAILED' as const
+        : readback.state === 'ok' && readback.content === reconciledContent
+          ? 'COMMITTED' as const
+          : 'RECONCILIATION_REQUIRED' as const;
+      try { await sync(path.dirname(paths.sourceBindingApproval)); } catch { throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Malformed approval retirement durability is unknown', { cause: error }); }
+      const recovered = { ...applying, state: recoveryState, ...(recoveryState === 'COMMITTED' ? { finalizedApprovalSha256: sha256(reconciledContent) } : {}) };
+      if (!await persistMalformedApprovalRecovery(paths, applying, recovered, uid, sync)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Malformed approval recovery durability is unknown', { cause: error });
+      if (recoveryState === 'COMMITTED') return recovered;
+      throw error;
+    }
+    const committed = { ...applying, state: 'COMMITTED' as const, finalizedApprovalSha256: sha256(reconciledContent) };
+    if (!await persistMalformedApprovalRecovery(paths, applying, committed, uid, sync)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Malformed approval recovery commit durability is unknown');
+    return committed;
   });
 }
 
@@ -1333,7 +1478,7 @@ async function inspectOwnedFile(filename: string, label: string, uid: number): P
   finally { await handle.close().catch(() => undefined); }
 }
 
-async function publishOwnedFile(filename: string, content: string, label: string, uid: number): Promise<void> {
+async function publishOwnedFile(filename: string, content: string, label: string, uid: number, syncDirectoryFn = syncDirectory): Promise<void> {
   const existing = await inspectOwnedFile(filename, label, uid);
   if (existing.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', existing.reason);
   if (existing.state === 'ok') {
@@ -1349,7 +1494,7 @@ async function publishOwnedFile(filename: string, content: string, label: string
     await handle.close();
     handle = undefined;
     await link(temporary, filename);
-    await syncDirectory(path.dirname(filename));
+    await syncDirectoryFn(path.dirname(filename));
   } catch (error) {
     if (!isAlreadyExists(error)) throw new RuntimeError('PERSISTENCE_FAILURE', `${label} publication failed`, { cause: error });
     const concurrent = await inspectOwnedFile(filename, label, uid);
@@ -1390,7 +1535,7 @@ async function writeLaunchAgentMetadata(filename: string, metadata: LaunchAgentM
   }
 }
 
-async function replaceOwnedFile(filename: string, expected: string, content: string, label: string, uid: number): Promise<void> {
+async function replaceOwnedFile(filename: string, expected: string, content: string, label: string, uid: number, syncDirectoryFn = syncDirectory): Promise<void> {
   const inspected = await inspectOwnedFile(filename, label, uid);
   if (inspected.state !== 'ok' || inspected.content !== expected) {
     throw new RuntimeError('PERSISTENCE_FAILURE', `${label} changed before its authorized replacement`);
@@ -1408,7 +1553,7 @@ async function replaceOwnedFile(filename: string, expected: string, content: str
       throw new RuntimeError('PERSISTENCE_FAILURE', `${label} changed during its authorized replacement`);
     }
     await rename(temporary, filename);
-    await syncDirectory(path.dirname(filename));
+    await syncDirectoryFn(path.dirname(filename));
   } catch (error) {
     if (error instanceof RuntimeError) throw error;
     throw new RuntimeError('PERSISTENCE_FAILURE', `${label} replacement failed`, { cause: error });
@@ -1452,6 +1597,27 @@ function metadataContent(metadata: LaunchAgentMetadata): string {
 
 function migrationContent(record: LaunchAgentSourceMigrationRecord): string {
   return `${JSON.stringify(record, null, 2)}\n`;
+}
+
+function malformedApprovalRecoveryContent(record: MalformedLegacyApprovalReconciliationRecord): string {
+  return `${JSON.stringify(record, null, 2)}\n`;
+}
+
+async function persistMalformedApprovalRecovery(
+  paths: LaunchdPaths,
+  expected: MalformedLegacyApprovalReconciliationRecord,
+  next: MalformedLegacyApprovalReconciliationRecord,
+  uid: number,
+  syncDirectoryFn: (directory: string) => Promise<void>,
+): Promise<boolean> {
+  const content = malformedApprovalRecoveryContent(next);
+  try { await replaceOwnedFile(paths.sourceBindingApprovalRecovery, malformedApprovalRecoveryContent(expected), content, 'IRIS malformed approval recovery', uid, syncDirectoryFn); }
+  catch { /* readback below distinguishes a durable rename from an unknown outcome */ }
+  try {
+    await syncDirectoryFn(path.dirname(paths.sourceBindingApprovalRecovery));
+    const readback = await inspectOwnedFile(paths.sourceBindingApprovalRecovery, 'IRIS malformed approval recovery', uid);
+    return readback.state === 'ok' && readback.content === content;
+  } catch { return false; }
 }
 
 async function readSourceMigrationRecord(filename: string, uid: number): Promise<LaunchAgentSourceMigrationRecord | null> {
@@ -1593,8 +1759,12 @@ async function readSourceApprovalRecord(filename: string, uid: number): Promise<
   const inspected = await inspectOwnedFile(filename, 'IRIS source migration approval', uid);
   if (inspected.state === 'missing') return null;
   if (inspected.state === 'invalid') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', inspected.reason);
+  return parseSourceApproval(inspected.content);
+}
+
+function parseSourceApproval(content: string): LaunchAgentSourceApprovalRecord {
   try {
-    const value = JSON.parse(inspected.content) as Partial<LaunchAgentSourceApprovalRecord>;
+    const value = JSON.parse(content) as Partial<LaunchAgentSourceApprovalRecord>;
     if (![1, 2].includes(Number(value.schemaVersion)) || value.label !== LAUNCH_AGENT_LABEL || typeof value.approvalId !== 'string'
       || !['ISSUED', 'CONSUMED', 'RECONCILIATION_REQUIRED'].includes(String(value.state))
       || typeof value.signature !== 'string' || typeof value.requestId !== 'string'
@@ -1604,6 +1774,22 @@ async function readSourceApprovalRecord(filename: string, uid: number): Promise<
     return value as LaunchAgentSourceApprovalRecord;
   } catch (error) {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'IRIS source migration approval is invalid', { cause: error });
+  }
+}
+
+async function readMalformedApprovalRecoveryRecord(filename: string, uid: number): Promise<MalformedLegacyApprovalReconciliationRecord | null> {
+  const inspected = await inspectOwnedFile(filename, 'IRIS malformed approval recovery', uid);
+  if (inspected.state === 'missing') return null;
+  if (inspected.state === 'invalid') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', inspected.reason);
+  try {
+    const value = JSON.parse(inspected.content) as Partial<MalformedLegacyApprovalReconciliationRecord>;
+    if (value.schemaVersion !== 1 || value.label !== LAUNCH_AGENT_LABEL || typeof value.transactionId !== 'string'
+      || typeof value.recoveryRequestId !== 'string' || typeof value.approvalId !== 'string' || typeof value.requestId !== 'string'
+      || !['PREPARED', 'APPLYING', 'COMMITTED', 'RECONCILIATION_REQUIRED', 'FAILED'].includes(String(value.state))
+      || !/^[a-f0-9]{64}$/.test(String(value.approvalSha256)) || typeof value.originalApprovalRaw !== 'string') throw new Error('invalid malformed approval recovery record');
+    return value as MalformedLegacyApprovalReconciliationRecord;
+  } catch (error) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'IRIS malformed approval recovery is invalid', { cause: error });
   }
 }
 
@@ -1629,6 +1815,13 @@ function validateApprovalReconciliationInput(input: LaunchAgentSourceApprovalRec
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.requestId)) {
     throw new RuntimeError('INVALID_REQUEST', 'requestId must be a UUID');
   }
+}
+
+function validateMalformedLegacyApprovalInput(input: MalformedLegacyApprovalReconciliationInput): void {
+  for (const [name, value] of [['approvalId', input.approvalId], ['requestId', input.requestId], ['recoveryRequestId', input.recoveryRequestId]] as const) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) throw new RuntimeError('INVALID_REQUEST', `${name} must be a UUID`);
+  }
+  if (!/^[a-f0-9]{64}$/.test(input.approvalSha256)) throw new RuntimeError('INVALID_REQUEST', 'approvalSha256 must be a lowercase SHA-256 digest');
 }
 
 async function requireSourceGitIdentity(sourceRoot: string, expectedSha: string, expectedTree: string): Promise<void> {

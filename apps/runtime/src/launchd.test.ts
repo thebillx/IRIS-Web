@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { createHmac, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -11,6 +11,7 @@ import {
   launchAgentStatus,
   launchdPaths,
   migrateLaunchAgentSource,
+  reconcileMalformedLegacyApproval,
   reconcileLaunchAgentSourceApproval,
   renderLaunchAgent,
   resolveReviewedRuntimeEntrypoints,
@@ -631,6 +632,151 @@ describe('IRIS LaunchAgent artifact', () => {
     const signedLegacy = { ...legacy, signature: createHmac('sha256', 'A'.repeat(43)).update(legacyPayload).digest('hex') };
     await writeFile(paths.sourceBindingApproval, `${JSON.stringify(signedLegacy)}\n`, { mode: 0o600 });
     await expect(approve(subject, target, approval.requestId)).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+  });
+
+  it('retires an authenticated malformed schema-1 approval without granting migration authority', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    const legacy = { ...approval, schemaVersion: 1 as const, sourceSha: `${approval.sourceSha}3`, signature: '' };
+    const legacyPayload = JSON.stringify({
+      schemaVersion: legacy.schemaVersion,
+      approvalId: legacy.approvalId,
+      dataRoot: legacy.dataRoot,
+      sourceRoot: legacy.sourceRoot,
+      controlScript: legacy.controlScript,
+      executable: legacy.executable,
+      executableArguments: legacy.executableArguments,
+      sourceSha: legacy.sourceSha,
+      sourceTree: legacy.sourceTree,
+      requestId: legacy.requestId,
+      protectedReferenceRoot: legacy.protectedReferenceRoot ?? null,
+      label: legacy.label,
+      domain: legacy.domain,
+      beforeMetadataSha256: legacy.beforeMetadataSha256,
+      beforePlistSha256: legacy.beforePlistSha256,
+      runtimePreflightSha256: legacy.runtimePreflightSha256,
+      runtimeLoaderSha256: legacy.runtimeLoaderSha256,
+    });
+    const signedLegacy = { ...legacy, signature: createHmac('sha256', 'A'.repeat(43)).update(legacyPayload).digest('hex') };
+    const raw = `${JSON.stringify(signedLegacy)}\n`;
+    await writeFile(paths.sourceBindingApproval, raw, { mode: 0o600 });
+    expect(JSON.parse(raw)).toMatchObject({ schemaVersion: 1, state: 'ISSUED', approvalId: approval.approvalId, requestId });
+    const recoveryRequestId = randomUUID();
+    const originalApprovalSha256 = createHash('sha256').update(raw).digest('hex');
+    const syncCalls = { count: 0 };
+    const dependencies = {
+      ...subject.fake.dependencies,
+      syncDirectory: async () => {
+        syncCalls.count += 1;
+        if (syncCalls.count === 3) throw new Error('directory sync lost after approval rename');
+      },
+    };
+    const recovered = await reconcileMalformedLegacyApproval({
+      dataRoot: subject.dataRoot,
+      approvalId: approval.approvalId,
+      requestId,
+      approvalSha256: originalApprovalSha256,
+      recoveryRequestId,
+    }, dependencies);
+    expect(recovered).toMatchObject({ state: 'COMMITTED', approvalId: approval.approvalId, recoveryRequestId });
+    expect(JSON.parse(await readFile(paths.sourceBindingApproval, 'utf8'))).toMatchObject({ state: 'RECONCILIATION_REQUIRED', sourceSha: legacy.sourceSha });
+    expect(JSON.parse(await readFile(paths.sourceBindingApprovalRecovery, 'utf8'))).toMatchObject({ state: 'COMMITTED', originalApprovalRaw: raw });
+    const replay = await reconcileMalformedLegacyApproval({
+      dataRoot: subject.dataRoot,
+      approvalId: approval.approvalId,
+      requestId,
+      approvalSha256: originalApprovalSha256,
+      recoveryRequestId,
+    }, dependencies);
+    expect(replay.transactionId).toBe(recovered.transactionId);
+    const interrupted = JSON.parse(await readFile(paths.sourceBindingApprovalRecovery, 'utf8')) as Record<string, unknown>;
+    interrupted.state = 'APPLYING';
+    await writeFile(paths.sourceBindingApprovalRecovery, `${JSON.stringify(interrupted, null, 2)}\n`, { mode: 0o600 });
+    const resumed = await reconcileMalformedLegacyApproval({
+      dataRoot: subject.dataRoot,
+      approvalId: approval.approvalId,
+      requestId,
+      approvalSha256: originalApprovalSha256,
+      recoveryRequestId,
+    }, dependencies);
+    expect(resumed).toMatchObject({ state: 'COMMITTED', transactionId: recovered.transactionId });
+  });
+
+  it('rejects malformed approval recovery when bytes or authentication do not match', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    const legacy = { ...approval, schemaVersion: 1 as const, sourceSha: `${approval.sourceSha}3`, signature: '0'.repeat(64) };
+    const raw = `${JSON.stringify(legacy)}\n`;
+    await writeFile(paths.sourceBindingApproval, raw, { mode: 0o600 });
+    await expect(reconcileMalformedLegacyApproval({
+      dataRoot: subject.dataRoot,
+      approvalId: approval.approvalId,
+      requestId,
+      approvalSha256: createHash('sha256').update(raw).digest('hex'),
+      recoveryRequestId: randomUUID(),
+    }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect(await readFile(paths.sourceBindingApproval, 'utf8')).toBe(raw);
+  });
+
+  it('preserves an unknown approval-byte outcome instead of claiming reconciliation', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    const legacy = { ...approval, schemaVersion: 1 as const, sourceSha: `${approval.sourceSha}3`, signature: '' };
+    const legacyPayload = JSON.stringify({
+      schemaVersion: legacy.schemaVersion,
+      approvalId: legacy.approvalId,
+      dataRoot: legacy.dataRoot,
+      sourceRoot: legacy.sourceRoot,
+      controlScript: legacy.controlScript,
+      executable: legacy.executable,
+      executableArguments: legacy.executableArguments,
+      sourceSha: legacy.sourceSha,
+      sourceTree: legacy.sourceTree,
+      requestId: legacy.requestId,
+      protectedReferenceRoot: legacy.protectedReferenceRoot ?? null,
+      label: legacy.label,
+      domain: legacy.domain,
+      beforeMetadataSha256: legacy.beforeMetadataSha256,
+      beforePlistSha256: legacy.beforePlistSha256,
+      runtimePreflightSha256: legacy.runtimePreflightSha256,
+      runtimeLoaderSha256: legacy.runtimeLoaderSha256,
+    });
+    const raw = `${JSON.stringify({ ...legacy, signature: createHmac('sha256', 'A'.repeat(43)).update(legacyPayload).digest('hex') })}\n`;
+    await writeFile(paths.sourceBindingApproval, raw, { mode: 0o600 });
+    const originalApprovalSha256 = createHash('sha256').update(raw).digest('hex');
+    const recoveryRequestId = randomUUID();
+    const syncCalls = { count: 0 };
+    const dependencies = {
+      ...subject.fake.dependencies,
+      syncDirectory: async () => {
+        syncCalls.count += 1;
+        if (syncCalls.count === 3) {
+          await writeFile(paths.sourceBindingApproval, '{"unknown":true}\n', { mode: 0o600 });
+          throw new Error('approval rename outcome is unknown');
+        }
+      },
+    };
+    await expect(reconcileMalformedLegacyApproval({
+      dataRoot: subject.dataRoot,
+      approvalId: approval.approvalId,
+      requestId,
+      approvalSha256: originalApprovalSha256,
+      recoveryRequestId,
+    }, dependencies)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    expect(await readFile(paths.sourceBindingApproval, 'utf8')).toBe('{"unknown":true}\n');
+    expect(JSON.parse(await readFile(paths.sourceBindingApprovalRecovery, 'utf8'))).toMatchObject({ state: 'RECONCILIATION_REQUIRED' });
   });
 
   it('refuses bootstrap when a committed migration entrypoint changes before install', async () => {

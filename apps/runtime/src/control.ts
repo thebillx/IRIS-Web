@@ -6,7 +6,7 @@ import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
 import { createSupervisor } from './supervisor.js';
-import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, resolveReviewedRuntimeEntrypoints, uninstallLaunchAgent } from './launchd.js';
+import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, resolveReviewedRuntimeEntrypoints, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 
 const command = process.argv[2];
@@ -121,6 +121,17 @@ try {
       }
       const reconciled = await reconcileLaunchAgentSourceApproval({ ...reconciliation, dataRoot });
       process.stdout.write(`${JSON.stringify({ approvalId: reconciled.approvalId, requestId: reconciled.requestId, sourceSha: reconciled.sourceSha, sourceTree: reconciled.sourceTree, state: reconciled.state })}\n`);
+    } else if (command === 'launchd' && process.argv[3] === 'reconcile-malformed-approval') {
+      const recovery = parseMalformedApprovalRecoveryOptions(process.argv.slice(4));
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type RECONCILE MALFORMED IRIS APPROVAL to retire the malformed legacy authorization: ');
+        if (confirmation.trim() !== 'RECONCILE MALFORMED IRIS APPROVAL') throw new Error('Malformed approval reconciliation was not confirmed');
+      } finally {
+        prompt.close();
+      }
+      const reconciled = await reconcileMalformedLegacyApproval({ ...recovery, dataRoot }, {});
+      process.stdout.write(`${JSON.stringify({ transactionId: reconciled.transactionId, recoveryRequestId: reconciled.recoveryRequestId, approvalId: reconciled.approvalId, requestId: reconciled.requestId, state: reconciled.state })}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'uninstall') {
       await uninstallLaunchAgent(dataRoot);
       process.stdout.write('IRIS_LAUNCHD=UNINSTALLED\n');
@@ -158,6 +169,13 @@ interface LaunchdSourceApprovalReconciliationOptions {
   readonly sourceSha: string;
   readonly sourceTree: string;
   readonly requestId: string;
+}
+
+interface MalformedApprovalRecoveryOptions {
+  readonly approvalId: string;
+  readonly requestId: string;
+  readonly approvalSha256: string;
+  readonly recoveryRequestId: string;
 }
 
 const LAUNCHD_INSTALL_USAGE = 'Usage: iris launchd install [--runtime-data-root <external-directory>] [--protected-reference-root <existing-directory>]';
@@ -265,9 +283,33 @@ function parseLaunchdSourceApprovalReconciliationOptions(argumentsList: readonly
   return { sourceSha: required('--source-sha'), sourceTree: required('--source-tree'), requestId: required('--request-id') };
 }
 
+function parseMalformedApprovalRecoveryOptions(argumentsList: readonly string[]): MalformedApprovalRecoveryOptions {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(MALFORMED_APPROVAL_RECOVERY_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => {
+    const value = values.get(name);
+    if (value === undefined) throw new Error(MALFORMED_APPROVAL_RECOVERY_USAGE);
+    return value;
+  };
+  const allowed = new Set(['--approval-id', '--request-id', '--approval-sha256', '--recovery-request-id']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(MALFORMED_APPROVAL_RECOVERY_USAGE);
+  return {
+    approvalId: required('--approval-id'),
+    requestId: required('--request-id'),
+    approvalSha256: required('--approval-sha256'),
+    recoveryRequestId: required('--recovery-request-id'),
+  };
+}
+
 const LAUNCHD_SOURCE_MIGRATION_USAGE = 'Usage: iris launchd migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --approval-id <uuid> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-migrate-approval --source-sha <commit> --source-tree <tree> --request-id <uuid>';
+const MALFORMED_APPROVAL_RECOVERY_USAGE = 'Usage: iris launchd reconcile-malformed-approval --approval-id <uuid> --request-id <uuid> --approval-sha256 <digest> --recovery-request-id <uuid>';
 
 function printStatus(status: Awaited<ReturnType<Awaited<ReturnType<typeof createSupervisor>>['status']>>): void {
   process.stdout.write(`IRIS_STACK=${status.state}\n`);
