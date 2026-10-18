@@ -42,8 +42,11 @@ try {
       process.stdout.write(`RECOVERY_POLICY_SCOPE=${JSON.stringify(effectiveScope)}\n`);
       const prompt = createInterface({ input, output });
       try {
-        const confirmation = await prompt.question('Type AUTHORIZE IRIS RECOVERY POLICY to enroll the bounded recovery policy: ');
-        if (confirmation.trim() !== 'AUTHORIZE IRIS RECOVERY POLICY') throw new Error('Owner recovery policy authorization was not confirmed');
+        const confirmationPhrase = policy.supersedesPolicyId === undefined
+          ? 'AUTHORIZE IRIS RECOVERY POLICY'
+          : 'AUTHORIZE IRIS RECOVERY POLICY ROLLOVER';
+        const confirmation = await prompt.question(`Type ${confirmationPhrase} to enroll the bounded recovery policy: `);
+        if (confirmation.trim() !== confirmationPhrase) throw new Error('Owner recovery policy authorization was not confirmed');
       } finally { prompt.close(); }
       process.stdout.write(`${JSON.stringify(await issueRecoveryAuthorizationPolicy({ ...policy, sourceBindings: [{ sourceSha: policy.sourceSha, sourceTree: policy.sourceTree, sourceRoot: policy.sourceRoot, controlScript: policy.controlScript, executable: policy.executable, ...(policy.executableSha256 === undefined ? {} : { executableSha256: policy.executableSha256 }), executableArguments: policy.executableArguments, runtimePreflightSha256: policy.runtimePreflightSha256, runtimeLoaderSha256: policy.runtimeLoaderSha256 }], dataRoot, ...(machineId === null ? {} : { machineId }) }), null, 2)}\n`);
     } else if (command === 'recovery-policy' && process.argv[3] === 'status') {
@@ -236,6 +239,7 @@ interface RecoveryPolicyIssueOptions {
   readonly maxOperationCount: number;
   readonly expiresAt: string;
   readonly protectedReferenceRoot?: string | undefined;
+  readonly supersedesPolicyId?: string | undefined;
 }
 
 interface RecoveryPolicyOperationOptions {
@@ -277,7 +281,7 @@ function parseRecoveryPolicyIssueOptions(argumentsList: readonly string[]): Reco
     if (value === undefined) throw new Error(RECOVERY_POLICY_USAGE);
     return value;
   };
-  const allowed = new Set(['--source-sha', '--source-tree', '--source-root', '--control-script', '--executable', '--executable-sha256', '--executable-arguments', '--runtime-preflight-sha256', '--runtime-loader-sha256', '--before-metadata-sha256', '--before-plist-sha256', '--allowed-operations', '--max-operations', '--expires-at', '--protected-reference-root']);
+  const allowed = new Set(['--source-sha', '--source-tree', '--source-root', '--control-script', '--executable', '--executable-sha256', '--executable-arguments', '--runtime-preflight-sha256', '--runtime-loader-sha256', '--before-metadata-sha256', '--before-plist-sha256', '--allowed-operations', '--max-operations', '--expires-at', '--protected-reference-root', '--supersedes-policy-id']);
   if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(RECOVERY_POLICY_USAGE);
   const maxOperationCount = Number(required('--max-operations'));
   if (!Number.isInteger(maxOperationCount)) throw new Error(RECOVERY_POLICY_USAGE);
@@ -297,6 +301,7 @@ function parseRecoveryPolicyIssueOptions(argumentsList: readonly string[]): Reco
     maxOperationCount,
     expiresAt: required('--expires-at'),
     ...(values.get('--protected-reference-root') === undefined ? {} : { protectedReferenceRoot: values.get('--protected-reference-root') }),
+    ...(values.get('--supersedes-policy-id') === undefined ? {} : { supersedesPolicyId: values.get('--supersedes-policy-id') }),
   };
 }
 
@@ -489,7 +494,7 @@ const LAUNCHD_SOURCE_MIGRATION_USAGE = 'Usage: iris launchd migrate-source --sou
 const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-migrate-approval --source-sha <commit> --source-tree <tree> --request-id <uuid>';
 const MALFORMED_APPROVAL_RECOVERY_USAGE = 'Usage: iris launchd reconcile-malformed-approval --approval-id <uuid> --request-id <uuid> --approval-sha256 <digest> --recovery-request-id <uuid>';
-const RECOVERY_POLICY_USAGE = 'Usage: iris recovery-policy issue --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> [--executable-sha256 <digest>] --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> --allowed-operations <comma-separated> --max-operations <count> --expires-at <ISO> [--protected-reference-root <directory>]';
+const RECOVERY_POLICY_USAGE = 'Usage: iris recovery-policy issue --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> [--executable-sha256 <digest>] --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> --allowed-operations <comma-separated> --max-operations <count> --expires-at <ISO> [--protected-reference-root <directory>] [--supersedes-policy-id <uuid>]';
 const RECOVERY_POLICY_OPERATION_USAGE = 'Usage: iris recovery-policy reconcile --policy-id <uuid> --operation <MIGRATION_APPROVAL|SOURCE_MIGRATION|SUPERVISOR_BOOTSTRAP> --request-id <uuid> --transaction-id <uuid> --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> [--executable-sha256 <digest>] --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> [--protected-reference-root <directory>] [--machine-id <uuid>]';
 const RECOVERY_POLICY_LOCK_USAGE = 'Usage: iris recovery-policy reconcile-lock --lock-id <uuid> --pid <pid> --process-start-marker <marker>';
 

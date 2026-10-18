@@ -46,6 +46,20 @@ async function fixture() {
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
 describe('recovery authorization policy', () => {
+  it('requires a real terminal predecessor for explicit rollover', async () => {
+    const dataRoot = await fixture();
+    await expect(issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [sourceBinding],
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      allowedOperations: ['SOURCE_MIGRATION'],
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      supersedesPolicyId: crypto.randomUUID(),
+    })).rejects.toThrow('predecessor does not exist');
+  });
+
   it('enrolls one bounded policy and journals dependent operations', async () => {
     const dataRoot = await fixture();
     const policy = await issueRecoveryAuthorizationPolicy({
@@ -209,6 +223,94 @@ describe('recovery authorization policy', () => {
       beforePlistSha256: plistSha,
       machineId: revokedMachineId,
     })).rejects.toThrow('expired or revoked');
+  });
+
+  it('supports explicit rollover while preserving signed history and replay tombstones', async () => {
+    const dataRoot = await fixture();
+    const policyA = await issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [sourceBinding],
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      allowedOperations: ['SOURCE_MIGRATION'],
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const requestId = crypto.randomUUID();
+    const reserved = await reserveRecoveryPolicyOperation({ dataRoot, policyId: policyA.policyId, operation: 'SOURCE_MIGRATION', requestId, ...sourceBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha });
+    await finalizeRecoveryPolicyOperation({ dataRoot, policyId: policyA.policyId, operation: 'SOURCE_MIGRATION', requestId, transactionId: reserved.transactionId, state: 'COMMITTED', ...sourceBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha });
+    await revokeRecoveryAuthorizationPolicy(dataRoot);
+
+    await expect(issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [{ ...sourceBinding, sourceRoot: '/tmp/source-b' }],
+      beforeMetadataSha256: 'e'.repeat(64),
+      beforePlistSha256: 'f'.repeat(64),
+      allowedOperations: ['SOURCE_MIGRATION'],
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    })).rejects.toThrow('requires explicit reconciliation');
+
+    const policyB = await issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [{ ...sourceBinding, sourceRoot: '/tmp/source-b' }],
+      beforeMetadataSha256: 'e'.repeat(64),
+      beforePlistSha256: 'f'.repeat(64),
+      allowedOperations: ['SOURCE_MIGRATION'],
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      supersedesPolicyId: policyA.policyId,
+    });
+    expect(policyB.policyId).not.toBe(policyA.policyId);
+    expect(policyB.supersedesPolicyId).toBe(policyA.policyId);
+    expect(policyB.retiredPolicies).toHaveLength(1);
+    expect(policyB.retiredPolicies?.[0]).toMatchObject({ policyId: policyA.policyId, state: 'REVOKED' });
+    expect(policyB.retiredPolicies?.[0]).not.toHaveProperty('signature');
+    expect(policyB.retiredPolicies?.[0]?.operations[0]?.requestId).toBe(requestId);
+    const persisted = JSON.parse(await readFile(recoveryPolicyPath(dataRoot), 'utf8')) as { retiredPolicies?: Array<{ signature?: string }> };
+    expect(persisted.retiredPolicies?.[0]?.signature).toMatch(/^[a-f0-9]{64}$/);
+    await expect(reserveRecoveryPolicyOperation({ dataRoot, policyId: policyB.policyId, operation: 'SOURCE_MIGRATION', requestId, ...sourceBinding, sourceRoot: '/tmp/source-b', beforeMetadataSha256: 'e'.repeat(64), beforePlistSha256: 'f'.repeat(64) })).rejects.toThrow('retired policy history');
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({ policyId: policyB.policyId, supersedesPolicyId: policyA.policyId });
+
+    const tampered = JSON.parse(await readFile(recoveryPolicyPath(dataRoot), 'utf8')) as { retiredPolicies: Array<{ signature: string }> };
+    tampered.retiredPolicies[0]!.signature = `${tampered.retiredPolicies[0]!.signature.slice(0, 63)}0`;
+    await writeFile(recoveryPolicyPath(dataRoot), `${JSON.stringify(tampered, null, 2)}\n`);
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toThrow('authentication');
+  });
+
+  it('refuses rollover while the predecessor has unresolved work', async () => {
+    const dataRoot = await fixture();
+    const policyA = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    const requestId = crypto.randomUUID();
+    const reserved = await reserveRecoveryPolicyOperation({ dataRoot, policyId: policyA.policyId, operation: 'SOURCE_MIGRATION', requestId, ...sourceBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha });
+    await finalizeRecoveryPolicyOperation({ dataRoot, policyId: policyA.policyId, operation: 'SOURCE_MIGRATION', requestId, transactionId: reserved.transactionId, state: 'RECONCILIATION_REQUIRED', ...sourceBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha });
+    await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [{ ...sourceBinding, sourceRoot: '/tmp/source-b' }], beforeMetadataSha256: 'e'.repeat(64), beforePlistSha256: 'f'.repeat(64), allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(), supersedesPolicyId: policyA.policyId })).rejects.toThrow('unresolved operations');
+  });
+
+  it('preserves an expired predecessor as expired while validating its original signature', async () => {
+    const dataRoot = await fixture();
+    const policyA = await issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [sourceBinding],
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      allowedOperations: ['SOURCE_MIGRATION'],
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 1_500).toISOString(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    const policyB = await issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [{ ...sourceBinding, sourceRoot: '/tmp/source-b' }],
+      beforeMetadataSha256: 'e'.repeat(64),
+      beforePlistSha256: 'f'.repeat(64),
+      allowedOperations: ['SOURCE_MIGRATION'],
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      supersedesPolicyId: policyA.policyId,
+    });
+    expect(policyB.retiredPolicies?.[0]).toMatchObject({ policyId: policyA.policyId, state: 'EXPIRED' });
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({ policyId: policyB.policyId });
   });
 
   it('reconciles only an exact lock owned by a dead or reused process', async () => {

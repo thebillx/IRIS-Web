@@ -21,6 +21,7 @@ const HASH40 = /^[a-f0-9]{40}$/;
 const HASH64 = /^[a-f0-9]{64}$/;
 const MAX_OPERATIONS = 16;
 const MAX_ENTRIES = 32;
+const MAX_RETIRED_POLICIES = 8;
 const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP"];
 
 interface RecoveryPolicyLockRecord {
@@ -52,6 +53,8 @@ export interface RecoveryPolicyIssueInput {
   readonly allowedOperations: readonly RecoveryPolicyOperation[];
   readonly maxOperationCount: number;
   readonly expiresAt: string;
+  /** Explicit owner-authorized rollover of the exact terminal predecessor. */
+  readonly supersedesPolicyId?: string | undefined;
 }
 
 export interface RecoveryPolicyOperationInput {
@@ -90,6 +93,12 @@ export interface RecoveryPolicyPublicRecord {
   readonly issuedAt: string;
   readonly operations: readonly RecoveryPolicyOperationJournal[];
   readonly audit: readonly RecoveryPolicyAudit[];
+  readonly supersedesPolicyId?: string | null;
+  readonly retiredPolicies?: readonly RecoveryPolicyHistoricalRecord[];
+}
+
+export interface RecoveryPolicyHistoricalRecord extends RecoveryPolicyPublicRecord {
+  readonly signature: string;
 }
 
 export interface RecoveryPolicyOperationJournal {
@@ -179,12 +188,50 @@ async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIss
     if (
       existing.state === "ISSUED" &&
       existing.expiresAt > now &&
+      input.supersedesPolicyId === undefined &&
       sameIssue(existing, input, dataRoot)
     )
       return publicRecord(existing);
+    if (
+      input.supersedesPolicyId !== undefined &&
+      allPolicyOperations(existing).some((entry) => entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED")
+    )
+      throw new RuntimeError(
+        "SUPERVISOR_NOT_RUNNING",
+        "Recovery policy has unresolved operations",
+      );
+    if (existing.state === "ISSUED" && existing.expiresAt > now)
+      throw new RuntimeError(
+        "CONTROL_DENIED",
+        "An active recovery authorization policy cannot be superseded and requires explicit reconciliation",
+      );
+    if (
+      input.supersedesPolicyId === undefined ||
+      input.supersedesPolicyId !== existing.policyId
+    )
+      throw new RuntimeError(
+        "CONTROL_DENIED",
+        "A recovery authorization policy already exists and requires explicit reconciliation",
+      );
+    if (existing.state !== "REVOKED" && existing.state !== "EXPIRED")
+      throw new RuntimeError(
+        "CONTROL_DENIED",
+        "Only a revoked or expired recovery policy may be superseded",
+      );
+    if (allPolicyOperations(existing).some((entry) => entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED"))
+      throw new RuntimeError(
+        "SUPERVISOR_NOT_RUNNING",
+        "Recovery policy has unresolved operations",
+      );
+    if ((existing.retiredPolicies?.length ?? 0) >= MAX_RETIRED_POLICIES)
+      throw new RuntimeError(
+        "PERSISTENCE_FAILURE",
+        "Recovery policy retirement history is full",
+      );
+  } else if (input.supersedesPolicyId !== undefined) {
     throw new RuntimeError(
       "CONTROL_DENIED",
-      "A recovery authorization policy already exists and requires explicit reconciliation",
+      "Recovery policy predecessor does not exist",
     );
   }
   const record: RecoveryPolicyPublicRecord = {
@@ -203,9 +250,17 @@ async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIss
     issuedAt: now,
     operations: [],
     audit: [{ event: "ISSUED", at: now }],
+    ...(input.supersedesPolicyId === undefined ? {} : { supersedesPolicyId: input.supersedesPolicyId }),
+    ...(existing === null ? {} : {
+      retiredPolicies: [
+        ...(existing.retiredPolicies ?? []),
+        existing,
+      ],
+    }),
   };
-  await writeSigned(filename, sign(record, secret));
-  return record;
+  const signed = sign(record, secret);
+  await writeSigned(filename, signed);
+  return publicRecord(signed);
 }
 
 export async function readRecoveryAuthorizationPolicy(
@@ -320,8 +375,13 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       );
     return { transactionId: existing.transactionId, state: "RESERVED" };
   }
+  if (retiredPolicyOperations(current).some((entry) => entry.requestId === input.requestId))
+    throw new RuntimeError(
+      "CONTROL_DENIED",
+      "Recovery request identity is already present in retired policy history",
+    );
   if (
-    current.operations.some(
+    allPolicyOperations(current).some(
       (entry) =>
         entry.state === "RECONCILIATION_REQUIRED" || entry.state === "RESERVED",
     )
@@ -490,7 +550,7 @@ async function revokeRecoveryAuthorizationPolicyUnlocked(dataRootInput: string):
   const filename = recoveryPolicyPath(dataRoot);
   const current = await requirePolicy(filename, secret);
   if (
-    current.operations.some(
+    allPolicyOperations(current).some(
       (entry) =>
         entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED",
     )
@@ -694,6 +754,7 @@ async function readSigned(
       "CONTROL_DENIED",
       "Recovery authorization policy authentication failed",
     );
+  verifyRetiredPolicySignatures(parsed, secret);
   if (parsed.expiresAt <= new Date().toISOString() && parsed.state === "ISSUED")
     return { ...parsed, state: "EXPIRED" };
   return parsed;
@@ -773,6 +834,12 @@ function publicRecord(
 ): RecoveryPolicyPublicRecord {
   const publicValue = { ...record } as Record<string, unknown>;
   delete publicValue.signature;
+  if (Array.isArray(record.retiredPolicies)) {
+    publicValue.retiredPolicies = record.retiredPolicies.map((retired) => {
+      const historical = publicRecord(retired);
+      return historical;
+    });
+  }
   return publicValue as unknown as RecoveryPolicyPublicRecord;
 }
 
@@ -843,6 +910,8 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
     );
   if (input.machineId !== undefined && !isUuid(input.machineId))
     throw new RuntimeError("INVALID_REQUEST", "Recovery policy machine identity is invalid");
+  if (input.supersedesPolicyId !== undefined && !isUuid(input.supersedesPolicyId))
+    throw new RuntimeError("INVALID_REQUEST", "Recovery policy predecessor identity is invalid");
   if (input.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") && input.machineId === undefined)
     throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap policy requires a machine identity");
   if (input.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") && input.sourceBindings.some((binding) => binding.executableSha256 === undefined || !HASH64.test(binding.executableSha256)))
@@ -879,7 +948,7 @@ function validateOperation(input: RecoveryPolicyOperationInput): void {
     throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap operation requires an executable digest");
 }
 
-function isSignedPolicy(value: unknown): value is SignedRecoveryPolicy {
+function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolicy {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Partial<SignedRecoveryPolicy>;
   return record.schemaVersion === 1
@@ -907,7 +976,31 @@ function isSignedPolicy(value: unknown): value is SignedRecoveryPolicy {
     && typeof record.expiresAt === "string"
     && typeof record.issuedAt === "string"
     && typeof record.signature === "string"
-    && /^[a-f0-9]{64}$/.test(record.signature);
+    && /^[a-f0-9]{64}$/.test(record.signature)
+    && (record.supersedesPolicyId === undefined || record.supersedesPolicyId === null || isUuid(record.supersedesPolicyId))
+    && (record.retiredPolicies === undefined || (depth < MAX_RETIRED_POLICIES && Array.isArray(record.retiredPolicies) && record.retiredPolicies.length <= MAX_RETIRED_POLICIES && record.retiredPolicies.every((entry) => isSignedPolicy(entry, depth + 1))));
+}
+
+function allPolicyOperations(record: RecoveryPolicyPublicRecord): readonly RecoveryPolicyOperationJournal[] {
+  return [
+    ...record.operations,
+    ...(record.retiredPolicies ?? []).flatMap((retired) => allPolicyOperations(retired)),
+  ];
+}
+
+function retiredPolicyOperations(record: RecoveryPolicyPublicRecord): readonly RecoveryPolicyOperationJournal[] {
+  return (record.retiredPolicies ?? []).flatMap((retired) => allPolicyOperations(retired));
+}
+
+function verifyRetiredPolicySignatures(record: SignedRecoveryPolicy, secret: string): void {
+  for (const retired of record.retiredPolicies ?? []) {
+    const actual = Buffer.from(retired.signature, "hex");
+    const signedPayload = retired.state === "EXPIRED" ? { ...retired, state: "ISSUED" as const } : retired;
+    const expected = Buffer.from(signPayload(signedPayload, secret), "hex");
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected))
+      throw new RuntimeError("CONTROL_DENIED", "Recovery policy retirement history authentication failed");
+    verifyRetiredPolicySignatures(retired, secret);
+  }
 }
 
 function isRecoveryPolicyBinding(value: unknown): value is RecoveryPolicyBinding {
