@@ -39,6 +39,18 @@ export function observeProcessStart(pid: number): ProcessStartObservation {
   return { state: 'indeterminate' };
 }
 
+export function observeProcessExecutable(pid: number): string | null {
+  const result = spawnSync(PYTHON, ['-I', '-S', HELPER, 'process-executable', String(pid)], {
+    encoding: 'utf8',
+    timeout: 2_000,
+    maxBuffer: 16 * 1024,
+    env: { PATH: '/usr/bin:/bin' },
+  });
+  if (result.status !== 0) return null;
+  const executable = result.stdout.trim();
+  return executable.length > 0 && path.isAbsolute(executable) ? executable : null;
+}
+
 export async function secureProjectFileRead(projectRoot: string, targetPath: string): Promise<string> {
   const parsed = await runJsonHelper(['read-file', projectRoot, targetPath]);
   if (!isRecord(parsed) || typeof parsed.content !== 'string' || Object.keys(parsed).length !== 1) {

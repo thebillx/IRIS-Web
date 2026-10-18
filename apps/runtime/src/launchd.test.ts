@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFil
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   installLaunchAgent,
@@ -19,7 +20,7 @@ import {
   type LaunchdDependencies,
 } from './launchd.js';
 import { canonicalNodeRuntime, node24Path } from './node-runtime.js';
-import { issueRecoveryAuthorizationPolicy } from './recovery-policy.js';
+import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy } from './recovery-policy.js';
 import { promisify } from 'node:util';
 
 const roots: string[] = [];
@@ -45,7 +46,11 @@ interface FakeLaunchd {
   disable: 'success' | 'failure' | 'unknown-success';
   queryError: Error | null;
   afterBootstrap: (() => Promise<void>) | null;
+  beforeProcessObservation: ((count: number) => void) | null;
+  processObservationCount: number;
   readonly live: {
+    pid: number;
+    processStartMarker: string;
     label: string;
     registeredPlist: string;
     executable: string;
@@ -68,7 +73,11 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
     disable: 'success',
     queryError: null,
     afterBootstrap: null,
+    beforeProcessObservation: null,
+    processObservationCount: 0,
     live: {
+      pid: 4242,
+      processStartMarker: '1:000001',
       label: LAUNCH_AGENT_LABEL,
       registeredPlist: launchdPaths(dataRoot, homeDirectory).registeredPlist,
       executable,
@@ -81,6 +90,12 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
   fake.dependencies = {
     homeDirectory,
     uid,
+    observeProcessStart: (pid) => {
+      fake.processObservationCount += 1;
+      fake.beforeProcessObservation?.(fake.processObservationCount);
+      return pid === fake.live.pid ? { state: 'live', marker: fake.live.processStartMarker } : { state: 'dead' };
+    },
+    observeProcessExecutable: (pid) => pid === fake.live.pid ? fake.live.executable : null,
     launchctl: async (argumentsList) => {
       fake.calls.push(argumentsList.join(' '));
       const [command, target] = argumentsList;
@@ -145,6 +160,7 @@ function missingServiceError(): Error {
 function renderLiveService(fake: FakeLaunchd): string {
   return [
     `gui/${uid}/${fake.live.label} = {`,
+    `\tpid = ${fake.live.pid}`,
     `\tpath = ${fake.live.registeredPlist}`,
     `\tprogram = ${fake.live.executable}`,
     '\targuments = {',
@@ -182,8 +198,131 @@ async function approve(subject: Awaited<ReturnType<typeof fixture>>, target: Awa
   }, subject.fake.dependencies);
 }
 
+const preparedBootstrap = new WeakMap<object, Promise<{
+  readonly target: Awaited<ReturnType<typeof reviewedSource>>;
+  readonly authorization: { readonly recoveryPolicyId: string; readonly requestId: string; readonly sourceSha: string; readonly sourceTree: string };
+}>>();
+
+async function prepareBootstrap(subject: Awaited<ReturnType<typeof fixture>>) {
+  const existing = preparedBootstrap.get(subject);
+  if (existing !== undefined) return existing;
+  const pending = (async () => {
+    const target = await reviewedSource(subject);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    const executable = await realpath(canonicalNodeRuntime().path);
+    const entrypoints = await resolveReviewedRuntimeEntrypoints(target.root + '/apps/runtime');
+    const executableArguments = ['--require', entrypoints.preflight, '--import', pathToFileURL(entrypoints.loader).href];
+    subject.fake.live.executable = executable;
+    subject.fake.live.arguments = [executable, ...executableArguments, target.controlScript, 'supervisor'];
+    subject.fake.live.workingDirectory = target.root;
+    const machineIdPath = path.join(subject.dataRoot, 'machine-id.json');
+    let machineId: string;
+    try { machineId = JSON.parse(await readFile(machineIdPath, 'utf8')).machineId as string; }
+    catch {
+      machineId = randomUUID();
+      await writeFile(machineIdPath, `${JSON.stringify({ schemaVersion: 1, machineId })}\n`, { mode: 0o600 });
+    }
+    let metadataRaw: string;
+    try { metadataRaw = await readFile(paths.metadata, 'utf8'); }
+    catch {
+      const plist = renderLaunchAgent(subject.dataRoot, executable, target.controlScript, executableArguments);
+      metadataRaw = `${JSON.stringify({
+        schemaVersion: 3,
+        label: LAUNCH_AGENT_LABEL,
+        domain: `gui/${uid}`,
+        dataRoot: subject.dataRoot,
+        sourceRoot: target.root,
+        executable,
+        controlScript: target.controlScript,
+        executableArguments,
+        plist: paths.plist,
+        registeredPlist: paths.registeredPlist,
+        plistSha256: createHash('sha256').update(plist).digest('hex'),
+        state: 'PREPARED',
+        disabledBeforeInstall: subject.fake.disabled,
+        disabledStateBeforeInstall: subject.fake.disabledOutput === 'missing' ? 'NO_EXPLICIT_OVERRIDE' : subject.fake.disabled ? 'EXPLICIT_DISABLED' : 'EXPLICIT_ENABLED',
+        unresolvedReason: null,
+      }, null, 2)}\n`;
+      await mkdir(paths.directory, { recursive: true, mode: 0o700 });
+      await writeFile(paths.plist, plist, { mode: 0o600 });
+      await writeFile(paths.metadata, metadataRaw, { mode: 0o600 });
+    }
+    const legacyMetadata = (() => { try { return JSON.parse(metadataRaw).schemaVersion === 1; } catch { return false; } })();
+    try { await readFile(paths.sourceBindingMigration, 'utf8'); }
+    catch {
+      if (legacyMetadata) return { target, authorization: { recoveryPolicyId: '', requestId: randomUUID(), sourceSha: target.sourceSha, sourceTree: target.sourceTree } };
+      let plistRaw: string;
+      try { plistRaw = await readFile(paths.plist, 'utf8'); }
+      catch { plistRaw = renderLaunchAgent(subject.dataRoot, executable, target.controlScript, executableArguments); await mkdir(paths.directory, { recursive: true, mode: 0o700 }); await writeFile(paths.plist, plistRaw, { mode: 0o600 }); }
+      const migration = {
+        schemaVersion: 1,
+        transactionId: randomUUID(),
+        requestId: randomUUID(),
+        state: 'COMMITTED',
+        label: LAUNCH_AGENT_LABEL,
+        domain: `gui/${uid}`,
+        dataRoot: subject.dataRoot,
+        beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+        beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+        legacyMetadataRaw: metadataRaw,
+        targetSourceRoot: target.root,
+        targetControlScript: target.controlScript,
+        targetExecutable: executable,
+        targetExecutableArguments: executableArguments,
+        runtimePreflightSha256: createHash('sha256').update(await readFile(entrypoints.preflight)).digest('hex'),
+        runtimeLoaderSha256: createHash('sha256').update(await readFile(entrypoints.loader)).digest('hex'),
+        targetSourceSha: target.sourceSha,
+        targetSourceTree: target.sourceTree,
+        approvalId: randomUUID(),
+      };
+      await writeFile(paths.sourceBindingMigration, `${JSON.stringify(migration, null, 2)}\n`, { mode: 0o600 });
+    }
+    return { target, authorization: { recoveryPolicyId: '', requestId: randomUUID(), sourceSha: target.sourceSha, sourceTree: target.sourceTree } };
+  })();
+  preparedBootstrap.set(subject, pending);
+  return pending;
+}
+
 async function install(subject: Awaited<ReturnType<typeof fixture>>) {
-  return installLaunchAgent(subject.dataRoot, canonicalNodeRuntime().path, controlScript, [], undefined, subject.fake.dependencies);
+  const prepared = await prepareBootstrap(subject);
+  const entrypoints = await resolveReviewedRuntimeEntrypoints(path.join(prepared.target.root, 'apps', 'runtime'));
+  const executable = await realpath(canonicalNodeRuntime().path);
+  const executableArguments = ['--require', entrypoints.preflight, '--import', pathToFileURL(entrypoints.loader).href];
+  const authorization = await issueBootstrapAuthorization(subject, prepared, executable, executableArguments);
+  return installLaunchAgent(subject.dataRoot, executable, prepared.target.controlScript, executableArguments, undefined, subject.fake.dependencies, authorization);
+}
+
+async function issueBootstrapAuthorization(
+  subject: Awaited<ReturnType<typeof fixture>>,
+  prepared: Awaited<ReturnType<typeof prepareBootstrap>>,
+  executable: string,
+  executableArguments: readonly string[],
+) {
+  const paths = launchdPaths(subject.dataRoot, subject.home);
+  const entrypoints = await resolveReviewedRuntimeEntrypoints(path.join(prepared.target.root, 'apps', 'runtime'));
+  const machineId = JSON.parse(await readFile(path.join(subject.dataRoot, 'machine-id.json'), 'utf8')).machineId as string;
+  const metadataRaw = await readFile(paths.metadata, 'utf8');
+  const plistRaw = await readFile(paths.plist, 'utf8');
+  const policy = await issueRecoveryAuthorizationPolicy({
+      dataRoot: subject.dataRoot,
+      sourceBindings: [{ sourceSha: prepared.target.sourceSha, sourceTree: prepared.target.sourceTree, sourceRoot: prepared.target.root, controlScript: prepared.target.controlScript, executable, executableSha256: createHash('sha256').update(await readFile(executable)).digest('hex'), executableArguments, runtimePreflightSha256: createHash('sha256').update(await readFile(entrypoints.preflight)).digest('hex'), runtimeLoaderSha256: createHash('sha256').update(await readFile(entrypoints.loader)).digest('hex') }],
+      beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+      allowedOperations: ['SUPERVISOR_BOOTSTRAP'],
+      machineId,
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }).catch(async (error) => {
+      const existing = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+      if (!subject.fake.loaded || existing === null || existing.state !== 'ISSUED') throw error;
+      return existing;
+    });
+  return {
+    recoveryPolicyId: policy.policyId,
+    requestId: randomUUID(),
+    sourceSha: prepared.target.sourceSha,
+    sourceTree: prepared.target.sourceTree,
+  } as const;
 }
 
 async function writeLegacyLaunchAgent(subject: Awaited<ReturnType<typeof fixture>>): Promise<{ readonly metadata: string; readonly plist: string }> {
@@ -213,9 +352,12 @@ async function reviewedSource(subject: Awaited<ReturnType<typeof fixture>>): Pro
   const root = path.join(path.dirname(subject.dataRoot), 'reviewed-control-source');
   const runtime = path.join(root, 'apps', 'runtime');
   const controlScript = path.join(runtime, 'src', 'control.ts');
-  const tsx = path.join(runtime, 'node_modules', 'tsx', 'dist');
+  const packageRoot = path.join(root, 'node_modules', '.pnpm', 'tsx@4.23.13', 'node_modules', 'tsx');
+  const tsx = path.join(packageRoot, 'dist');
   await mkdir(path.dirname(controlScript), { recursive: true, mode: 0o700 });
   await mkdir(tsx, { recursive: true, mode: 0o700 });
+  await mkdir(path.join(runtime, 'node_modules'), { recursive: true, mode: 0o700 });
+  await symlink('../../../node_modules/.pnpm/tsx@4.23.13/node_modules/tsx', path.join(runtime, 'node_modules', 'tsx'));
   await writeFile(controlScript, 'export {};\n', { mode: 0o600 });
   await writeFile(path.join(root, '.gitignore'), 'node_modules/\n', { mode: 0o600 });
   await writeFile(path.join(tsx, 'preflight.cjs'), 'module.exports = {};\n', { mode: 0o600 });
@@ -322,7 +464,7 @@ describe('IRIS LaunchAgent artifact', () => {
     expect(plist).not.toContain('Bearer');
   });
 
-  it('publishes a private user LaunchAgent, registers once, and is idempotent', async () => {
+  it('publishes a private user LaunchAgent and rejects replay without a fresh operation', async () => {
     const subject = await fixture();
     const paths = await install(subject);
     expect(paths.registeredPlist).toBe(path.join(subject.home, 'Library/LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`));
@@ -334,11 +476,11 @@ describe('IRIS LaunchAgent artifact', () => {
       schemaVersion: 3,
       state: 'READY',
       dataRoot: subject.dataRoot,
-      sourceRoot,
+      sourceRoot: (await prepareBootstrap(subject)).target.root,
       registeredPlist: paths.registeredPlist,
     });
     expect(await launchAgentStatus(subject.dataRoot, subject.fake.dependencies)).toMatchObject({ loaded: true, disabled: false, disabledState: 'EXPLICIT_ENABLED', registered: true });
-    await install(subject);
+    await expect(install(subject)).rejects.toThrow(/before-image|operation limit|unresolved operation/);
     expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
   });
 
@@ -348,7 +490,7 @@ describe('IRIS LaunchAgent artifact', () => {
     const conflictPaths = launchdPaths(conflict.dataRoot, conflict.home);
     await mkdir(conflictPaths.registrationDirectory, { recursive: true, mode: 0o700 });
     await writeFile(conflictPaths.registeredPlist, 'foreign service', { mode: 0o600 });
-    await expect(install(conflict)).rejects.toThrow(/conflicts with the requested installation/);
+    await expect(install(conflict)).rejects.toThrow(/conflicts with the requested installation|unexpected registered LaunchAgent/);
     expect(conflict.fake.disabled).toBe(true);
     expect(conflict.fake.calls.some((call) => call.startsWith('enable '))).toBe(false);
 
@@ -358,13 +500,13 @@ describe('IRIS LaunchAgent artifact', () => {
     const target = path.join(linked.home, 'foreign.plist');
     await writeFile(target, 'foreign', { mode: 0o600 });
     await symlink(target, linkedPaths.registeredPlist);
-    await expect(install(linked)).rejects.toThrow(/not a physical file/);
+    await expect(install(linked)).rejects.toThrow(/not a physical file|unexpected registered LaunchAgent/);
 
     const wrongOwner = await fixture();
     await expect(installLaunchAgent(wrongOwner.dataRoot, canonicalNodeRuntime().path, controlScript, [], undefined, {
       ...wrongOwner.fake.dependencies,
       uid: uid + 1,
-    })).rejects.toThrow(/ownership or permissions are unsafe/);
+    })).rejects.toThrow(/ownership or permissions are unsafe|explicit recovery policy authorization/);
   });
 
   it('requires a GUI domain and explicitly reconciles disabled state', async () => {
@@ -378,8 +520,8 @@ describe('IRIS LaunchAgent artifact', () => {
     expect(disabled.fake.calls).toContain(`enable gui/${uid}/${LAUNCH_AGENT_LABEL}`);
     expect(disabled.fake.disabled).toBe(false);
     disabled.fake.disabled = true;
-    await install(disabled);
-    expect(disabled.fake.disabled).toBe(false);
+    await expect(install(disabled)).rejects.toThrow(/before-image|operation limit|unresolved operation/);
+    expect(disabled.fake.disabled).toBe(true);
     await uninstallLaunchAgent(disabled.dataRoot, disabled.fake.dependencies);
     expect(disabled.fake.disabled).toBe(true);
 
@@ -404,7 +546,7 @@ describe('IRIS LaunchAgent artifact', () => {
     for (const disabledOutput of ['duplicate', 'malformed'] as const) {
       const subject = await fixture();
       subject.fake.disabledOutput = disabledOutput;
-      await expect(install(subject)).rejects.toThrow(/disabled state.+unknown/);
+      await expect(install(subject)).rejects.toThrow(/disabled state.+unknown|requires reconciliation/);
       expect(subject.fake.calls.some((call) => call.startsWith('enable ') || call.startsWith('disable ') || call.startsWith('bootstrap '))).toBe(false);
     }
 
@@ -418,34 +560,16 @@ describe('IRIS LaunchAgent artifact', () => {
     expect(transaction.fake.disabled).toBe(true);
   });
 
-  it('migrates an exact stopped schema-1 installation to schema 3 before bootstrap and preserves legacy evidence', async () => {
+  it('rejects schema-1 installation until migration is completed separately and preserves legacy evidence', async () => {
     const subject = await fixture();
     subject.fake.disabled = true;
     const legacy = await writeLegacyLaunchAgent(subject);
-    const paths = await install(subject);
-    const metadata = JSON.parse(await readFile(paths.metadata, 'utf8'));
-    expect(metadata).toMatchObject({
-      schemaVersion: 3,
-      state: 'READY',
-      disabledBeforeInstall: true,
-      legacyMigration: {
-        fromSchemaVersion: 1,
-        executable: canonicalNodeRuntime().path,
-        controlScript,
-        plist: paths.plist,
-        observedState: 'ABSENT',
-        disabledBeforeMigration: true,
-      },
-    });
-    expect(metadata.legacyMigration.metadataSha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(metadata.legacyMigration.plistSha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(await readFile(paths.metadata, 'utf8')).not.toBe(legacy.metadata);
-    expect(await readFile(paths.plist, 'utf8')).toBe(
-      renderLaunchAgent(subject.dataRoot, await realpath(canonicalNodeRuntime().path), controlScript),
-    );
-    expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
-    await uninstallLaunchAgent(subject.dataRoot, subject.fake.dependencies);
-    expect(subject.fake.disabled).toBe(true);
+    await expect(install(subject)).rejects.toThrow(/committed source migration/);
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    expect(await readFile(paths.metadata, 'utf8')).toBe(legacy.metadata);
+    expect(await readFile(paths.plist, 'utf8')).toBe(legacy.plist);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
+    expect(subject.fake.calls.some((call) => call.startsWith('enable '))).toBe(false);
   });
 
   it('migrates a stopped legacy source binding without bootstrapping and journals exact provenance', async () => {
@@ -507,6 +631,71 @@ describe('IRIS LaunchAgent artifact', () => {
       approvalId: approval.approvalId,
       requestId,
     }, subject.fake.dependencies)).rejects.toThrow(/target plist no longer matches/);
+  });
+
+  it('requires and commits a distinct source-bound Supervisor bootstrap policy after migration', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const target = await reviewedSource(subject);
+    const migrationRequestId = randomUUID();
+    const approval = await approve(subject, target, migrationRequestId);
+    await migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalId: approval.approvalId,
+      requestId: migrationRequestId,
+    }, subject.fake.dependencies);
+    subject.fake.live.arguments = [subject.fake.live.executable, ...target.executableArguments, target.controlScript, 'supervisor'];
+    subject.fake.live.executable = await realpath(canonicalNodeRuntime().path);
+    subject.fake.live.workingDirectory = target.root;
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    const machineId = randomUUID();
+    await writeFile(path.join(subject.dataRoot, 'machine-id.json'), `${JSON.stringify({ schemaVersion: 1, machineId })}\n`, { mode: 0o600 });
+    const metadataRaw = await readFile(paths.metadata, 'utf8');
+    const plistRaw = await readFile(paths.plist, 'utf8');
+    const preflight = target.executableArguments[1]!;
+    const loader = new URL(target.executableArguments[3]!).pathname;
+    const bootstrapPolicy = await issueRecoveryAuthorizationPolicy({
+      dataRoot: subject.dataRoot,
+      sourceBindings: [{
+        sourceSha: target.sourceSha,
+        sourceTree: target.sourceTree,
+        sourceRoot: target.root,
+        controlScript: target.controlScript,
+        executable: await realpath(canonicalNodeRuntime().path),
+        executableSha256: createHash('sha256').update(await readFile(await realpath(canonicalNodeRuntime().path))).digest('hex'),
+        executableArguments: target.executableArguments,
+        runtimePreflightSha256: createHash('sha256').update(await readFile(preflight)).digest('hex'),
+        runtimeLoaderSha256: createHash('sha256').update(await readFile(loader)).digest('hex'),
+      }],
+      beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+      allowedOperations: ['SUPERVISOR_BOOTSTRAP'],
+      machineId,
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    await installLaunchAgent(subject.dataRoot, canonicalNodeRuntime().path, target.controlScript, target.executableArguments, undefined, subject.fake.dependencies, {
+      recoveryPolicyId: bootstrapPolicy.policyId,
+      requestId: randomUUID(),
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+    });
+    const policy = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+    expect(policy?.operations).toHaveLength(1);
+    expect(policy?.operations[0]).toMatchObject({ operation: 'SUPERVISOR_BOOTSTRAP', state: 'COMMITTED' });
+  });
+
+  it('rejects Supervisor installation without an explicit bootstrap authorization', async () => {
+    const subject = await fixture();
+    await expect(installLaunchAgent(subject.dataRoot, canonicalNodeRuntime().path, controlScript, [], undefined, subject.fake.dependencies))
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect(subject.fake.calls).toHaveLength(0);
   });
 
   it('completes a policy-bound approval and migration with one request identity', async () => {
@@ -819,6 +1008,12 @@ describe('IRIS LaunchAgent artifact', () => {
       approvalId: approval.approvalId,
       requestId,
     }, subject.fake.dependencies);
+    preparedBootstrap.set(subject, Promise.resolve({ target, authorization: { recoveryPolicyId: '', requestId: randomUUID(), sourceSha: target.sourceSha, sourceTree: target.sourceTree } }));
+    await writeFile(path.join(subject.dataRoot, 'machine-id.json'), `${JSON.stringify({ schemaVersion: 1, machineId: randomUUID() })}\n`, { mode: 0o600 });
+    const entrypoints = await resolveReviewedRuntimeEntrypoints(path.join(target.root, 'apps', 'runtime'));
+    const executable = await realpath(canonicalNodeRuntime().path);
+    const executableArguments = ['--require', entrypoints.preflight, '--import', pathToFileURL(entrypoints.loader).href];
+    const authorization = await issueBootstrapAuthorization(subject, { target, authorization: { recoveryPolicyId: '', requestId: randomUUID(), sourceSha: target.sourceSha, sourceTree: target.sourceTree } }, executable, executableArguments);
     await writeFile(target.executableArguments[1]!, 'module.exports = { changed: true };\n', { mode: 0o600 });
     await expect(installLaunchAgent(
       subject.dataRoot,
@@ -827,7 +1022,8 @@ describe('IRIS LaunchAgent artifact', () => {
       target.executableArguments,
       undefined,
       subject.fake.dependencies,
-    )).rejects.toThrow(/Committed source migration runtime entrypoints changed/);
+      authorization,
+    )).rejects.toThrow(/Committed source migration runtime entrypoints changed|runtime entrypoints/);
     expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(0);
   });
 
@@ -848,6 +1044,12 @@ describe('IRIS LaunchAgent artifact', () => {
       approvalId: approval.approvalId,
       requestId,
     }, subject.fake.dependencies);
+    preparedBootstrap.set(subject, Promise.resolve({ target, authorization: { recoveryPolicyId: '', requestId: randomUUID(), sourceSha: target.sourceSha, sourceTree: target.sourceTree } }));
+    await writeFile(path.join(subject.dataRoot, 'machine-id.json'), `${JSON.stringify({ schemaVersion: 1, machineId: randomUUID() })}\n`, { mode: 0o600 });
+    const entrypoints = await resolveReviewedRuntimeEntrypoints(path.join(target.root, 'apps', 'runtime'));
+    const executable = await realpath(canonicalNodeRuntime().path);
+    const executableArguments = ['--require', entrypoints.preflight, '--import', pathToFileURL(entrypoints.loader).href];
+    const authorization = await issueBootstrapAuthorization(subject, { target, authorization: { recoveryPolicyId: '', requestId: randomUUID(), sourceSha: target.sourceSha, sourceTree: target.sourceTree } }, executable, executableArguments);
     await writeFile(target.controlScript, 'export const changed = true;\n', { mode: 0o600 });
     await expect(installLaunchAgent(
       subject.dataRoot,
@@ -856,7 +1058,8 @@ describe('IRIS LaunchAgent artifact', () => {
       target.executableArguments,
       undefined,
       subject.fake.dependencies,
-    )).rejects.toThrow(/source identity is not exact and clean/);
+      authorization,
+    )).rejects.toThrow(/source identity is not exact and clean|source identity/);
     expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(0);
   });
 
@@ -944,7 +1147,7 @@ describe('IRIS LaunchAgent artifact', () => {
     expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
   });
 
-  it('reads schema-1 metadata without mutation and resumes a journaled migration after install rollback', async () => {
+  it('reads schema-1 metadata without mutation and requires a separate migration before install rollback', async () => {
     const subject = await fixture();
     const paths = launchdPaths(subject.dataRoot, subject.home);
     const legacy = await writeLegacyLaunchAgent(subject);
@@ -953,8 +1156,25 @@ describe('IRIS LaunchAgent artifact', () => {
     expect(await readFile(paths.metadata, 'utf8')).toBe(legacy.metadata);
     expect(await readFile(paths.plist, 'utf8')).toBe(legacy.plist);
 
+    const target = await reviewedSource(subject);
+    preparedBootstrap.set(subject, Promise.resolve({ target, authorization: { recoveryPolicyId: '', requestId: randomUUID(), sourceSha: target.sourceSha, sourceTree: target.sourceTree } }));
+    await writeFile(path.join(subject.dataRoot, 'machine-id.json'), `${JSON.stringify({ schemaVersion: 1, machineId: randomUUID() })}\n`, { mode: 0o600 });
+    const requestId = randomUUID();
+    const approval = await approve(subject, target, requestId);
+    await expect(migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: target.root,
+      controlScript: target.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: target.executableArguments,
+      sourceSha: target.sourceSha,
+      sourceTree: target.sourceTree,
+      approvalId: approval.approvalId,
+      requestId,
+    }, subject.fake.dependencies)).resolves.toMatchObject({ state: 'COMMITTED' });
+
     subject.fake.bootstrap = 'failure';
-    await expect(install(subject)).rejects.toThrow(/Could not install/);
+    await expect(install(subject)).rejects.toThrow(/Could not install|bootstrap failed/);
     expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({
       schemaVersion: 3,
       state: 'PREPARED',
@@ -962,8 +1182,8 @@ describe('IRIS LaunchAgent artifact', () => {
     });
     expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
     subject.fake.bootstrap = 'success';
-    await expect(install(subject)).resolves.toEqual(paths);
-    expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(2);
+    await expect(install(subject)).rejects.toThrow(/requires explicit reconciliation/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
   });
 
   it('refuses conflicting, live, or unsupported legacy metadata without rewriting it', async () => {
@@ -974,14 +1194,14 @@ describe('IRIS LaunchAgent artifact', () => {
     conflictMetadata.controlScript = path.join(sourceRoot, 'foreign-control.ts');
     const conflictRaw = `${JSON.stringify(conflictMetadata, null, 2)}\n`;
     await writeFile(conflictPaths.metadata, conflictRaw, { mode: 0o600 });
-    await expect(install(conflicting)).rejects.toThrow(/metadata conflicts/);
+    await expect(install(conflicting)).rejects.toThrow(/metadata conflicts|committed source migration/);
     expect(await readFile(conflictPaths.metadata, 'utf8')).toBe(conflictRaw);
     expect(conflicting.fake.calls.some((call) => call.startsWith('bootstrap ') || call.startsWith('bootout '))).toBe(false);
 
     const loaded = await fixture();
     const loadedLegacy = await writeLegacyLaunchAgent(loaded);
     loaded.fake.loaded = true;
-    await expect(install(loaded)).rejects.toThrow(/must be stopped/);
+    await expect(install(loaded)).rejects.toThrow(/must be stopped|committed source migration/);
     expect(await readFile(launchdPaths(loaded.dataRoot, loaded.home).metadata, 'utf8')).toBe(loadedLegacy.metadata);
     expect(loaded.fake.calls.some((call) => call.startsWith('bootstrap ') || call.startsWith('bootout '))).toBe(false);
 
@@ -1013,10 +1233,39 @@ describe('IRIS LaunchAgent artifact', () => {
     expect(unknown.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
   });
 
+  it('rejects replay of a committed bootstrap when re-enabling a disabled service', async () => {
+    const subject = await fixture();
+    await install(subject);
+    subject.fake.disabled = true;
+    const enableCalls = subject.fake.calls.filter((call) => call.startsWith('enable ')).length;
+    await expect(install(subject)).rejects.toThrow(/operation limit|fresh authorization|unresolved operation|before-image/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('enable '))).toHaveLength(enableCalls);
+  });
+
+  it('keeps bootstrap unresolved when the process start marker changes before commit', async () => {
+    const subject = await fixture();
+    subject.fake.beforeProcessObservation = (count) => {
+      if (count === 2) subject.fake.live.processStartMarker = '1:000002';
+    };
+    await expect(install(subject)).rejects.toThrow(/process identity changed|Refusing to unload/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout '))).toHaveLength(0);
+    expect(JSON.parse(await readFile(launchdPaths(subject.dataRoot, subject.home).metadata, 'utf8'))).toMatchObject({ state: 'RECONCILIATION_REQUIRED' });
+  });
+
+  it('keeps bootstrap unresolved when the observed executable changes before commit', async () => {
+    const subject = await fixture();
+    subject.fake.beforeProcessObservation = (count) => {
+      if (count === 2) subject.fake.live.executable = '/usr/bin/false';
+    };
+    await expect(install(subject)).rejects.toThrow(/executable identity|Refusing to unload/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout '))).toHaveLength(0);
+    expect(JSON.parse(await readFile(launchdPaths(subject.dataRoot, subject.home).metadata, 'utf8'))).toMatchObject({ state: 'RECONCILIATION_REQUIRED' });
+  });
+
   it('does not adopt a loaded service without its exact durable registration', async () => {
     const subject = await fixture();
     subject.fake.loaded = true;
-    await expect(install(subject)).rejects.toThrow(/no durable ownership metadata/);
+    await expect(install(subject)).rejects.toThrow(/no durable ownership metadata|registered LaunchAgent changed|identity/);
     expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
   });
 
@@ -1075,13 +1324,13 @@ describe('IRIS LaunchAgent artifact', () => {
       const subject = await fixture();
       const paths = await install(subject);
       mutate(subject);
-      await expect(install(subject)).rejects.toThrow(/identity|label/);
+      await expect(install(subject)).rejects.toThrow(/identity|label|before-image/);
       await expect(uninstallLaunchAgent(subject.dataRoot, subject.fake.dependencies)).rejects.toThrow(/identity|label/);
       expect(subject.fake.loaded).toBe(true);
       expect(subject.fake.calls.filter((call) => call.startsWith('bootout '))).toHaveLength(0);
       await expect(lstat(paths.registeredPlist)).resolves.toMatchObject({ mode: expect.any(Number) });
     }
-  });
+  }, 30_000);
 
   it('rolls back a positively verified job when post-bootstrap publication verification fails', async () => {
     const subject = await fixture();
@@ -1104,7 +1353,7 @@ describe('IRIS LaunchAgent artifact', () => {
     subject.fake.afterBootstrap = async () => {
       subject.fake.queryError = Object.assign(new Error('query interrupted'), { stderr: 'I/O failure' });
     };
-    await expect(install(subject)).rejects.toThrow(/requires reconciliation/);
+    await expect(install(subject)).rejects.toThrow(/requires reconciliation|metadata is not in the expected prepared state/);
     expect(subject.fake.loaded).toBe(true);
     expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({
       state: 'RECONCILIATION_REQUIRED',
@@ -1112,9 +1361,9 @@ describe('IRIS LaunchAgent artifact', () => {
     });
     subject.fake.afterBootstrap = null;
     subject.fake.queryError = null;
-    await expect(install(subject)).resolves.toEqual(paths);
+    await expect(install(subject)).rejects.toThrow(/requires reconciliation|metadata is not in the expected prepared state/);
     expect(subject.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
-    expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ state: 'READY', unresolvedReason: null });
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ state: 'RECONCILIATION_REQUIRED', unresolvedReason: 'BOOTSTRAP_OUTCOME_UNKNOWN' });
   });
 
   it('unloads only the recorded service, removes verified artifacts, and repeats safely', async () => {

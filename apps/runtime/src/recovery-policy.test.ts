@@ -99,6 +99,118 @@ describe('recovery authorization policy', () => {
     await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toThrow('authentication');
   });
 
+  it('requires an explicit Supervisor bootstrap operation and preserves its journal boundary', async () => {
+    const dataRoot = await fixture();
+    const machineId = crypto.randomUUID();
+    const bootstrapBinding = { ...sourceBinding, executableSha256: 'e'.repeat(64) };
+    const policy = await issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [bootstrapBinding],
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      allowedOperations: ['SUPERVISOR_BOOTSTRAP'],
+      machineId,
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const requestId = crypto.randomUUID();
+    await expect(reserveRecoveryPolicyOperation({
+      dataRoot,
+      policyId: policy.policyId,
+      operation: 'SOURCE_MIGRATION',
+      requestId,
+      ...bootstrapBinding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      machineId,
+    })).rejects.toThrow('does not authorize this operation');
+    const reserved = await reserveRecoveryPolicyOperation({
+      dataRoot,
+      policyId: policy.policyId,
+      operation: 'SUPERVISOR_BOOTSTRAP',
+      requestId,
+      ...bootstrapBinding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      machineId,
+    });
+    const committed = await finalizeRecoveryPolicyOperation({
+      dataRoot,
+      policyId: policy.policyId,
+      operation: 'SUPERVISOR_BOOTSTRAP',
+      requestId,
+      transactionId: reserved.transactionId,
+      state: 'COMMITTED',
+      ...bootstrapBinding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      machineId,
+    });
+    expect(committed.operations).toHaveLength(1);
+    expect(committed.operations[0]).toMatchObject({ operation: 'SUPERVISOR_BOOTSTRAP', state: 'COMMITTED', requestId });
+    await expect(reserveRecoveryPolicyOperation({
+      dataRoot,
+      policyId: policy.policyId,
+      operation: 'SUPERVISOR_BOOTSTRAP',
+      requestId: crypto.randomUUID(),
+      ...bootstrapBinding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      machineId,
+    })).rejects.toThrow('operation limit');
+  });
+
+  it('rejects expired and revoked bootstrap authority before any transaction is reserved', async () => {
+    const expiredRoot = await fixture();
+    const expiredMachineId = crypto.randomUUID();
+    const bootstrapBinding = { ...sourceBinding, executableSha256: 'e'.repeat(64) };
+    const expired = await issueRecoveryAuthorizationPolicy({
+      dataRoot: expiredRoot,
+      sourceBindings: [bootstrapBinding],
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      allowedOperations: ['SUPERVISOR_BOOTSTRAP'],
+      machineId: expiredMachineId,
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 300).toISOString(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    await expect(reserveRecoveryPolicyOperation({
+      dataRoot: expiredRoot,
+      policyId: expired.policyId,
+      operation: 'SUPERVISOR_BOOTSTRAP',
+      requestId: crypto.randomUUID(),
+      ...bootstrapBinding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      machineId: expiredMachineId,
+    })).rejects.toThrow('expired or revoked');
+
+    const revokedRoot = await fixture();
+    const revokedMachineId = crypto.randomUUID();
+    const revoked = await issueRecoveryAuthorizationPolicy({
+      dataRoot: revokedRoot,
+      sourceBindings: [bootstrapBinding],
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      allowedOperations: ['SUPERVISOR_BOOTSTRAP'],
+      machineId: revokedMachineId,
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    await revokeRecoveryAuthorizationPolicy(revokedRoot);
+    await expect(reserveRecoveryPolicyOperation({
+      dataRoot: revokedRoot,
+      policyId: revoked.policyId,
+      operation: 'SUPERVISOR_BOOTSTRAP',
+      requestId: crypto.randomUUID(),
+      ...bootstrapBinding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      machineId: revokedMachineId,
+    })).rejects.toThrow('expired or revoked');
+  });
+
   it('reconciles only an exact lock owned by a dead or reused process', async () => {
     const dataRoot = await fixture();
     const lockId = crypto.randomUUID();

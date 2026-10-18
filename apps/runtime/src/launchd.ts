@@ -12,6 +12,8 @@ import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './
 import { inspectRegistrationRoot } from './project-path.js';
 import { PROTECTED_REFERENCE_ROOT_ENV } from './permissions.js';
 import { readOwnerAccessSecret } from './persistence.js';
+import { readMachineId } from './machine-identity.js';
+import { observeProcessExecutable, observeProcessStart, type ProcessStartObservation } from './macos-safety.js';
 import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, reserveRecoveryPolicyOperation } from './recovery-policy.js';
 
 const execFileAsync = promisify(execFile);
@@ -49,6 +51,15 @@ export interface LaunchdDependencies {
   readonly uid?: number;
   readonly launchctl?: (argumentsList: readonly string[]) => Promise<{ readonly stdout: string }>;
   readonly syncDirectory?: (directory: string) => Promise<void>;
+  readonly observeProcessStart?: (pid: number) => ProcessStartObservation;
+  readonly observeProcessExecutable?: (pid: number) => string | null;
+}
+
+export interface LaunchAgentBootstrapAuthorization {
+  readonly recoveryPolicyId: string;
+  readonly requestId: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
 }
 
 export interface LaunchAgentSourceApprovalInput {
@@ -192,6 +203,8 @@ interface LaunchAgentMetadata {
   readonly disabledBeforeInstall: boolean;
   readonly disabledStateBeforeInstall?: DisabledState;
   readonly unresolvedReason: 'BOOTSTRAP_OUTCOME_UNKNOWN' | 'LIVE_IDENTITY_UNVERIFIED' | 'PUBLISHED_STATE_CHANGED' | 'DISABLED_STATE_UNKNOWN' | 'BOOTOUT_OUTCOME_UNKNOWN' | null;
+  readonly processId?: number;
+  readonly processStartMarker?: string;
   readonly legacyMigration?: LegacyMigrationEvidence;
 }
 
@@ -205,11 +218,18 @@ type LaunchAgentObservation =
   | { readonly state: 'LOADED'; readonly stdout: string };
 
 interface LiveLaunchAgentIdentity {
+  readonly pid: number;
   readonly registeredPlist: string;
   readonly executable: string;
   readonly arguments: readonly string[];
   readonly workingDirectory: string;
   readonly dataRoot: string;
+}
+
+interface LiveProcessIdentity {
+  readonly pid: number;
+  readonly processStartMarker: string;
+  readonly executable: string;
 }
 
 export function launchdPaths(dataRoot: string, homeDirectory = os.homedir()): LaunchdPaths {
@@ -794,9 +814,11 @@ async function verifyCommittedMigration(paths: LaunchdPaths, record: LaunchAgent
   const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
   if (privatePlist.state !== 'ok' || privatePlist.content !== targetPlist) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration target plist no longer matches');
   const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
-  if (registeredPlist.state !== 'missing') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration has an unexpected registered LaunchAgent');
+  if (registeredPlist.state === 'invalid' || registeredPlist.state === 'ok' && registeredPlist.content !== targetPlist) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration has an unexpected registered LaunchAgent');
+  }
   const metadata = await readLaunchAgentMetadata(paths.metadata, uid);
-  if (metadata?.metadata.schemaVersion !== 3 || metadata.metadata.state !== 'PREPARED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration metadata is not in the expected prepared state');
+  if (metadata?.metadata.schemaVersion !== 3 || metadata.metadata.state !== 'PREPARED' && metadata.metadata.state !== 'READY') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration metadata is not in the expected prepared state');
   requireMetadataBinding(metadata.metadata, {
     schemaVersion: 3,
     label: LAUNCH_AGENT_LABEL,
@@ -819,11 +841,13 @@ export async function installLaunchAgent(
   executableArguments: readonly string[] = [],
   protectedReferenceRoot?: string,
   dependencies: LaunchdDependencies = {},
+  bootstrapAuthorization?: LaunchAgentBootstrapAuthorization,
 ): Promise<LaunchdPaths> {
+  if (bootstrapAuthorization === undefined) throw new RuntimeError('CONTROL_DENIED', 'Supervisor bootstrap requires an explicit recovery policy authorization');
   const uid = launchdUid(dependencies);
   const canonicalDataRoot = await requireCanonicalDirectory(dataRoot, 'IRIS data root', uid, true);
   const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
-  return withLaunchAgentLock(paths, uid, () => installLaunchAgentUnlocked(canonicalDataRoot, requestedExecutable, controlScript, executableArguments, protectedReferenceRoot, dependencies));
+  return withLaunchAgentLock(paths, uid, () => installLaunchAgentUnlocked(canonicalDataRoot, requestedExecutable, controlScript, executableArguments, protectedReferenceRoot, dependencies, bootstrapAuthorization));
 }
 
 async function installLaunchAgentUnlocked(
@@ -833,7 +857,9 @@ async function installLaunchAgentUnlocked(
   executableArguments: readonly string[] = [],
   protectedReferenceRoot?: string,
   dependencies: LaunchdDependencies = {},
+  bootstrapAuthorization?: LaunchAgentBootstrapAuthorization,
 ): Promise<LaunchdPaths> {
+  if (bootstrapAuthorization === undefined) throw new RuntimeError('CONTROL_DENIED', 'Supervisor bootstrap requires an explicit recovery policy authorization');
   assertSupportedNodeVersion();
   const uid = launchdUid(dependencies);
   const canonicalDataRoot = await requireCanonicalDirectory(dataRoot, 'IRIS data root', uid, true);
@@ -841,6 +867,11 @@ async function installLaunchAgentUnlocked(
   const sourceRoot = await requireCanonicalDirectory(sourceRootForControlScript(canonicalControlScript), 'IRIS source root', uid, false);
   const executable = await realpath(canonicalNodeRuntime().path);
   await access(canonicalControlScript).catch(() => { throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Build IRIS before installing its LaunchAgent'); });
+  const runtimeEntrypoints = await requireTargetRuntimeEntries(executableArguments, uid);
+  const executableSha256 = await hashCanonicalFile(executable, 'Reviewed control executable', uid);
+  await requireSourceGitIdentity(sourceRoot, bootstrapAuthorization.sourceSha, bootstrapAuthorization.sourceTree);
+  const machineId = await readMachineId(canonicalDataRoot);
+  if (machineId === null) throw new RuntimeError('CONTROL_DENIED', 'Supervisor bootstrap requires an existing protected machine identity');
 
   let canonicalProtectedReferenceRoot: string | undefined;
   if (protectedReferenceRoot !== undefined && protectedReferenceRoot.trim().length > 0) {
@@ -858,6 +889,9 @@ async function installLaunchAgentUnlocked(
   await requireGuiDomain(domain, launchctl);
 
   const committedMigration = await readSourceMigrationRecord(paths.sourceBindingMigration, uid);
+  if (committedMigration === null) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap requires a committed source migration');
+  }
   if (committedMigration !== null) {
     if (committedMigration.state !== 'COMMITTED') {
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An incomplete source migration requires reconciliation before installation');
@@ -873,13 +907,92 @@ async function installLaunchAgentUnlocked(
       || (committedMigration.protectedReferenceRoot ?? null) !== (canonicalProtectedReferenceRoot ?? null)) {
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration does not authorize the requested LaunchAgent binding');
     }
+    if (committedMigration.targetSourceSha !== bootstrapAuthorization.sourceSha || committedMigration.targetSourceTree !== bootstrapAuthorization.sourceTree) {
+      throw new RuntimeError('CONTROL_DENIED', 'Supervisor bootstrap source identity does not match the committed migration');
+    }
     await requireSourceGitIdentity(committedMigration.targetSourceRoot, committedMigration.targetSourceSha, committedMigration.targetSourceTree);
     await verifyCommittedMigration(paths, committedMigration, uid);
   }
 
   const plist = renderLaunchAgent(canonicalDataRoot, executable, canonicalControlScript, executableArguments, canonicalProtectedReferenceRoot);
   const existingRecord = await readLaunchAgentMetadata(paths.metadata, uid);
+  if (existingRecord === null || existingRecord.metadata.schemaVersion !== 3) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap requires a committed schema-3 source binding');
+  }
+  if (existingRecord.metadata.state === 'UNINSTALLING' || existingRecord.metadata.state === 'INSTALLING' || existingRecord.metadata.state === 'RECONCILIATION_REQUIRED') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An interrupted LaunchAgent operation requires reconciliation');
+  }
+  const existingPlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+  if (existingPlist.state !== 'ok') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap requires an exact protected LaunchAgent before-image');
+  }
+  const beforeMetadataSha256 = sha256(existingRecord.raw);
+  const beforePlistSha256 = sha256(existingPlist.content);
   const observationBefore = await observeLaunchAgent(dependencies);
+  const bootstrapPolicyInput = {
+    dataRoot: canonicalDataRoot,
+    policyId: bootstrapAuthorization.recoveryPolicyId,
+    operation: 'SUPERVISOR_BOOTSTRAP' as const,
+    requestId: bootstrapAuthorization.requestId,
+    sourceSha: bootstrapAuthorization.sourceSha,
+    sourceTree: bootstrapAuthorization.sourceTree,
+    beforeMetadataSha256,
+    beforePlistSha256,
+    protectedReferenceRoot: canonicalProtectedReferenceRoot,
+    machineId,
+    sourceRoot,
+    controlScript: canonicalControlScript,
+    executable,
+    executableSha256,
+    executableArguments,
+    runtimePreflightSha256: runtimeEntrypoints.runtimePreflightSha256,
+    runtimeLoaderSha256: runtimeEntrypoints.runtimeLoaderSha256,
+  };
+  const bootstrapReservation = await reserveRecoveryPolicyOperation(bootstrapPolicyInput);
+  const finalizeBootstrap = async (state: 'COMMITTED' | 'RECONCILIATION_REQUIRED'): Promise<void> => {
+    if (bootstrapReservation === null) return;
+    await finalizeRecoveryPolicyOperation({ ...bootstrapPolicyInput, transactionId: bootstrapReservation.transactionId, state });
+  };
+  const reverifyBootstrapTarget = async (): Promise<void> => {
+    await requireSourceGitIdentity(sourceRoot, bootstrapAuthorization.sourceSha, bootstrapAuthorization.sourceTree);
+    const currentExecutableSha256 = await hashCanonicalFile(executable, 'Reviewed control executable', uid);
+    if (currentExecutableSha256 !== executableSha256) throw new RuntimeError('CONTROL_DENIED', 'Reviewed control executable changed after authorization');
+    const currentEntrypoints = await requireTargetRuntimeEntries(executableArguments, uid);
+    if (currentEntrypoints.runtimePreflightSha256 !== runtimeEntrypoints.runtimePreflightSha256 || currentEntrypoints.runtimeLoaderSha256 !== runtimeEntrypoints.runtimeLoaderSha256) {
+      throw new RuntimeError('CONTROL_DENIED', 'Reviewed runtime entrypoints changed after authorization');
+    }
+    const currentMachineId = await readMachineId(canonicalDataRoot);
+    if (currentMachineId !== machineId) throw new RuntimeError('CONTROL_DENIED', 'Protected machine identity changed after authorization');
+  };
+  const rollbackBootstrapAndReconcile = async (
+    metadata: LaunchAgentMetadata,
+    reason: NonNullable<LaunchAgentMetadata['unresolvedReason']>,
+    cause: unknown,
+    verifiedProcess?: LiveProcessIdentity,
+  ): Promise<never> => {
+    let rollbackError: unknown;
+    try {
+      await rollbackFailedInstall(paths, metadata, plist, reason, uid, dependencies, cause, verifiedProcess);
+    } catch (error) {
+      rollbackError = error;
+    }
+    let journalError: unknown;
+    try {
+      await finalizeBootstrap('RECONCILIATION_REQUIRED');
+    } catch (error) {
+      journalError = error;
+    }
+    if (rollbackError !== undefined && journalError !== undefined) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap rollback and durable reconciliation both require reconciliation', {
+        cause: new AggregateError([rollbackError, journalError], 'Supervisor bootstrap rollback and journal finalization failed'),
+      });
+    }
+    if (rollbackError !== undefined) throw rollbackError;
+    if (journalError !== undefined) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap rollback completed but durable reconciliation failed', { cause: journalError });
+    }
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap failed and requires reconciliation', { cause });
+  };
   const desiredBinding: Omit<LaunchAgentMetadata, 'state' | 'disabledBeforeInstall' | 'unresolvedReason'> = {
     schemaVersion: 3,
     label: LAUNCH_AGENT_LABEL,
@@ -893,20 +1006,7 @@ async function installLaunchAgentUnlocked(
     registeredPlist: paths.registeredPlist,
     plistSha256: sha256(plist),
   };
-  const existingMetadata = existingRecord?.metadata.schemaVersion === 1
-    ? await migrateLegacyLaunchAgent({
-      record: { metadata: existingRecord.metadata, raw: existingRecord.raw },
-      observation: observationBefore,
-      desiredBinding,
-      desiredPlist: plist,
-      requestedExecutable,
-      ...(canonicalProtectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: canonicalProtectedReferenceRoot }),
-      paths,
-      domain,
-      launchctl,
-      uid,
-    })
-    : existingRecord?.metadata ?? null;
+  const existingMetadata = existingRecord.metadata;
 
   if (existingMetadata?.legacyMigration !== undefined) {
     await completeLegacyPlistTransition(paths.plist, plist, existingMetadata.legacyMigration.plistSha256, uid);
@@ -920,20 +1020,36 @@ async function installLaunchAgentUnlocked(
     await requirePublishedContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
     await requirePublishedContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
     requireLiveLaunchAgentIdentity(observationBefore.stdout, existingMetadata);
+    const liveProcess = await requireLiveProcessIdentity(observationBefore.stdout, existingMetadata, dependencies);
     try {
-      await ensureEnabledState(domain, serviceTarget, launchctl);
-      await writeLaunchAgentMetadata(paths.metadata, { ...existingMetadata, state: 'READY', unresolvedReason: null }, uid);
+      const disabledState = await observeDisabledState(domain, launchctl);
+      if (disabledState === 'UNKNOWN') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'The disabled state of the loaded LaunchAgent is unknown');
+      if (disabledState === 'EXPLICIT_DISABLED' && bootstrapReservation === null) {
+        throw new RuntimeError('CONTROL_DENIED', 'Re-enabling a committed Supervisor bootstrap requires a fresh authorization');
+      }
+      if (bootstrapReservation !== null) await ensureEnabledState(domain, serviceTarget, launchctl);
+      await reverifyBootstrapTarget();
+      const stableObservation = await observeLaunchAgent(dependencies);
+      if (stableObservation.state !== 'LOADED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor process exited during bootstrap verification');
+      requireLiveLaunchAgentIdentity(stableObservation.stdout, existingMetadata);
+      const stableProcess = await requireLiveProcessIdentity(stableObservation.stdout, existingMetadata, dependencies);
+      if (!sameLiveProcessIdentity(liveProcess, stableProcess)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor process identity changed during bootstrap verification');
+      await writeLaunchAgentMetadata(paths.metadata, { ...existingMetadata, state: 'READY', unresolvedReason: null, processId: stableProcess.pid, processStartMarker: stableProcess.processStartMarker }, uid);
     } catch (error) {
+      await finalizeBootstrap('RECONCILIATION_REQUIRED');
       await recordUnresolved(paths.metadata, existingMetadata, 'DISABLED_STATE_UNKNOWN', uid);
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Loaded LaunchAgent persistence could not be verified', { cause: error });
+    }
+    try {
+      await finalizeBootstrap('COMMITTED');
+    } catch (error) {
+      await recordUnresolved(paths.metadata, existingMetadata, 'PUBLISHED_STATE_CHANGED', uid).catch(() => undefined);
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Loaded LaunchAgent bootstrap authorization could not be finalized', { cause: error });
     }
     return paths;
   }
 
-  if (existingMetadata?.state === 'UNINSTALLING') {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An interrupted LaunchAgent uninstall requires reconciliation');
-  }
-  if (existingMetadata !== null) requireMetadataBinding(existingMetadata, desiredBinding);
+  requireMetadataBinding(existingMetadata, desiredBinding);
 
   await ensureOwnedDirectory(paths.directory, 'IRIS launchd directory', uid, true);
   await ensureOwnedDirectory(path.dirname(paths.stdout), 'IRIS log directory', uid, true);
@@ -941,7 +1057,7 @@ async function installLaunchAgentUnlocked(
   await requireCompatibleContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
   await requireCompatibleContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
 
-  const disabledStateBeforeInstall = existingMetadata?.disabledStateBeforeInstall ?? await observeDisabledState(domain, launchctl);
+  const disabledStateBeforeInstall = existingMetadata.disabledStateBeforeInstall ?? await observeDisabledState(domain, launchctl);
   if (disabledStateBeforeInstall === 'UNKNOWN') {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${domain} is unknown`);
   }
@@ -951,11 +1067,10 @@ async function installLaunchAgentUnlocked(
     disabledBeforeInstall: disabledStateBeforeInstall === 'EXPLICIT_DISABLED',
     disabledStateBeforeInstall,
     unresolvedReason: null,
-    ...(existingMetadata?.legacyMigration === undefined ? {} : { legacyMigration: existingMetadata.legacyMigration }),
+    ...(existingMetadata.legacyMigration === undefined ? {} : { legacyMigration: existingMetadata.legacyMigration }),
   };
   await publishOwnedFile(paths.plist, plist, 'IRIS private LaunchAgent', uid);
-  if (existingMetadata === null) await publishOwnedFile(paths.metadata, metadataContent(preparedMetadata), 'IRIS LaunchAgent metadata', uid);
-  else await writeLaunchAgentMetadata(paths.metadata, preparedMetadata, uid);
+  await writeLaunchAgentMetadata(paths.metadata, preparedMetadata, uid);
   await publishOwnedFile(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
   await requirePublishedContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
   await requirePublishedContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
@@ -964,36 +1079,56 @@ async function installLaunchAgentUnlocked(
 
   try {
     await ensureEnabledState(domain, serviceTarget, launchctl);
+    await requirePublishedContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
+    await requirePublishedContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
+    await reverifyBootstrapTarget();
   } catch (error) {
-    await rollbackFailedInstall(paths, installingMetadata, plist, 'DISABLED_STATE_UNKNOWN', uid, dependencies, error);
+    await rollbackBootstrapAndReconcile(installingMetadata, 'DISABLED_STATE_UNKNOWN', error);
   }
 
   let bootstrapError: unknown;
+  let verifiedProcess: LiveProcessIdentity | undefined;
   try { await launchctl(['bootstrap', domain, paths.registeredPlist]); } catch (error) { bootstrapError = error; }
   let observationAfter: LaunchAgentObservation;
   try { observationAfter = await observeLaunchAgent(dependencies); }
   catch (error) {
+    await finalizeBootstrap('RECONCILIATION_REQUIRED');
     await recordUnresolved(paths.metadata, installingMetadata, 'BOOTSTRAP_OUTCOME_UNKNOWN', uid);
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent bootstrap outcome requires reconciliation', { cause: error });
   }
   if (observationAfter.state === 'ABSENT') {
-    return rollbackFailedInstall(paths, installingMetadata, plist, 'BOOTSTRAP_OUTCOME_UNKNOWN', uid, dependencies, bootstrapError);
+    return rollbackBootstrapAndReconcile(installingMetadata, 'BOOTSTRAP_OUTCOME_UNKNOWN', bootstrapError);
   }
   try { requireLiveLaunchAgentIdentity(observationAfter.stdout, installingMetadata); }
   catch (error) {
+    await finalizeBootstrap('RECONCILIATION_REQUIRED');
     await recordUnresolved(paths.metadata, installingMetadata, 'LIVE_IDENTITY_UNVERIFIED', uid);
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Loaded LaunchAgent identity is not the requested installation', { cause: error });
   }
   try {
+    const liveProcess = await requireLiveProcessIdentity(observationAfter.stdout, installingMetadata, dependencies);
+    verifiedProcess = liveProcess;
     await requirePublishedContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
     await requirePublishedContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
     const installedDisabledState = await observeDisabledState(domain, launchctl);
     if (installedDisabledState === 'UNKNOWN' || installedDisabledState === 'EXPLICIT_DISABLED') {
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'The installed LaunchAgent is disabled or its state is unknown');
     }
-    await writeLaunchAgentMetadata(paths.metadata, { ...installingMetadata, state: 'READY', unresolvedReason: null }, uid);
+    await reverifyBootstrapTarget();
+    await writeLaunchAgentMetadata(paths.metadata, { ...installingMetadata, state: 'READY', unresolvedReason: null, processId: liveProcess.pid, processStartMarker: liveProcess.processStartMarker }, uid);
   } catch (error) {
-    await rollbackFailedInstall(paths, installingMetadata, plist, 'PUBLISHED_STATE_CHANGED', uid, dependencies, error);
+    await rollbackBootstrapAndReconcile(installingMetadata, 'PUBLISHED_STATE_CHANGED', error, verifiedProcess);
+  }
+  try {
+    await reverifyBootstrapTarget();
+    const finalObservation = await observeLaunchAgent(dependencies);
+    if (finalObservation.state !== 'LOADED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor process exited before bootstrap commit');
+    requireLiveLaunchAgentIdentity(finalObservation.stdout, installingMetadata);
+    const finalProcess = await requireLiveProcessIdentity(finalObservation.stdout, installingMetadata, dependencies);
+    if (verifiedProcess === undefined || !sameLiveProcessIdentity(verifiedProcess, finalProcess)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor process identity changed before bootstrap commit');
+    await finalizeBootstrap('COMMITTED');
+  } catch (error) {
+    await rollbackBootstrapAndReconcile(installingMetadata, 'PUBLISHED_STATE_CHANGED', error, verifiedProcess);
   }
   return paths;
 }
@@ -1161,6 +1296,7 @@ async function rollbackFailedInstall(
   uid: number,
   dependencies: LaunchdDependencies,
   cause: unknown,
+  verifiedProcess?: LiveProcessIdentity,
 ): Promise<never> {
   const domain = metadata.domain;
   const launchctl = dependencies.launchctl ?? systemLaunchctl;
@@ -1171,7 +1307,13 @@ async function rollbackFailedInstall(
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent install outcome requires reconciliation', { cause: error });
   }
   if (observation.state === 'LOADED') {
-    try { requireLiveLaunchAgentIdentity(observation.stdout, metadata); }
+    try {
+      requireLiveLaunchAgentIdentity(observation.stdout, metadata);
+      const currentProcess = await requireLiveProcessIdentity(observation.stdout, metadata, dependencies);
+      if (verifiedProcess !== undefined && !sameLiveProcessIdentity(verifiedProcess, currentProcess)) {
+        throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Refusing to unload a LaunchAgent whose process identity changed');
+      }
+    }
     catch (error) {
       await recordUnresolved(paths.metadata, metadata, 'LIVE_IDENTITY_UNVERIFIED', uid);
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Refusing to unload a LaunchAgent whose live identity is unverified', { cause: error });
@@ -1204,77 +1346,6 @@ async function rollbackFailedInstall(
   throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Could not install the IRIS LaunchAgent', { cause });
 }
 
-interface LegacyMigrationInput {
-  readonly record: LaunchAgentMetadataRecord & { readonly metadata: LegacyLaunchAgentMetadata };
-  readonly observation: LaunchAgentObservation;
-  readonly desiredBinding: Omit<LaunchAgentMetadata, 'state' | 'disabledBeforeInstall' | 'unresolvedReason'>;
-  readonly desiredPlist: string;
-  readonly requestedExecutable: string;
-  readonly protectedReferenceRoot?: string;
-  readonly paths: LaunchdPaths;
-  readonly domain: string;
-  readonly launchctl: NonNullable<LaunchdDependencies['launchctl']>;
-  readonly uid: number;
-}
-
-async function migrateLegacyLaunchAgent(input: LegacyMigrationInput): Promise<LaunchAgentMetadata> {
-  const legacy = input.record.metadata;
-  if (input.observation.state !== 'ABSENT') {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'A loaded legacy LaunchAgent must be stopped before authorized metadata migration');
-  }
-  const requestedExecutable = path.resolve(input.requestedExecutable);
-  const legacyExecutable = await realpath(legacy.executable).catch((error) => {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy LaunchAgent executable cannot be verified', { cause: error });
-  });
-  if (legacy.label !== LAUNCH_AGENT_LABEL
-    || legacy.executable !== requestedExecutable
-    || legacyExecutable !== input.desiredBinding.executable
-    || legacy.controlScript !== input.desiredBinding.controlScript
-    || legacy.plist !== input.paths.plist
-    || legacy.executableArguments.length !== input.desiredBinding.executableArguments.length
-    || legacy.executableArguments.some((argument, index) => argument !== input.desiredBinding.executableArguments[index])) {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy LaunchAgent ownership metadata conflicts with the requested installation');
-  }
-  const legacyPlist = renderLaunchAgent(
-    input.desiredBinding.dataRoot,
-    legacy.executable,
-    legacy.controlScript,
-    legacy.executableArguments,
-    input.protectedReferenceRoot,
-  );
-  await requirePublishedContent(input.paths.plist, legacyPlist, 'legacy IRIS LaunchAgent', input.uid);
-  const registered = await inspectOwnedFile(input.paths.registeredPlist, 'IRIS registered LaunchAgent', input.uid);
-  if (registered.state !== 'missing') {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy LaunchAgent registration conflicts with the schema migration');
-  }
-  const disabledStateBeforeMigration = await observeDisabledState(input.domain, input.launchctl);
-  if (disabledStateBeforeMigration === 'UNKNOWN') {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${input.domain} is unknown`);
-  }
-  const migrated: LaunchAgentMetadata = {
-    ...input.desiredBinding,
-    state: 'PREPARED',
-    disabledBeforeInstall: disabledStateBeforeMigration === 'EXPLICIT_DISABLED',
-    disabledStateBeforeInstall: disabledStateBeforeMigration,
-    unresolvedReason: null,
-    legacyMigration: {
-      fromSchemaVersion: 1,
-      metadataSha256: sha256(input.record.raw),
-      plistSha256: sha256(legacyPlist),
-      executable: legacy.executable,
-      controlScript: legacy.controlScript,
-      executableArguments: [...legacy.executableArguments],
-      plist: legacy.plist,
-      observedState: 'ABSENT',
-      disabledBeforeMigration: disabledStateBeforeMigration === 'EXPLICIT_DISABLED',
-      disabledStateBeforeMigration,
-    },
-  };
-  await replaceOwnedFile(input.paths.metadata, input.record.raw, metadataContent(migrated), 'IRIS LaunchAgent metadata', input.uid);
-  await completeLegacyPlistTransition(input.paths.plist, input.desiredPlist, migrated.legacyMigration!.plistSha256, input.uid);
-  return migrated;
-}
-
 async function completeLegacyPlistTransition(filename: string, desired: string, legacySha256: string, uid: number): Promise<void> {
   const inspected = await inspectOwnedFile(filename, 'IRIS private LaunchAgent', uid);
   if (inspected.state !== 'ok') {
@@ -1303,17 +1374,35 @@ function requireLiveLaunchAgentIdentity(stdout: string, metadata: LaunchAgentMet
   }
 }
 
+async function requireLiveProcessIdentity(stdout: string, metadata: LaunchAgentMetadata, dependencies: LaunchdDependencies): Promise<LiveProcessIdentity> {
+  const live = parseLiveLaunchAgentIdentity(stdout);
+  const startObservation = (dependencies.observeProcessStart ?? observeProcessStart)(live.pid);
+  if (startObservation.state !== 'live') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor process start identity could not be verified');
+  }
+  const executable = (dependencies.observeProcessExecutable ?? observeProcessExecutable)(live.pid);
+  if (executable !== metadata.executable) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor process executable identity conflicts with durable ownership metadata');
+  }
+  return { pid: live.pid, processStartMarker: startObservation.marker, executable };
+}
+
+function sameLiveProcessIdentity(left: LiveProcessIdentity, right: LiveProcessIdentity): boolean {
+  return left.pid === right.pid && left.processStartMarker === right.processStartMarker && left.executable === right.executable;
+}
+
 function parseLiveLaunchAgentIdentity(stdout: string): LiveLaunchAgentIdentity {
   const lines = stdout.split(/\r?\n/);
+  const pidText = launchctlScalar(lines, 'pid');
   const registeredPlist = launchctlScalar(lines, 'path');
   const executable = launchctlScalar(lines, 'program');
   const workingDirectory = launchctlScalar(lines, 'working directory');
   const dataRoot = launchctlMapping(lines, 'environment', RUNTIME_DATA_ENV);
   const argumentsList = launchctlList(lines, 'arguments');
-  if (registeredPlist === null || executable === null || workingDirectory === null || dataRoot === null || argumentsList === null) {
+  if (pidText === null || !/^\d+$/.test(pidText) || Number(pidText) <= 0 || registeredPlist === null || executable === null || workingDirectory === null || dataRoot === null || argumentsList === null) {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Live LaunchAgent identity output is incomplete');
   }
-  return { registeredPlist, executable, arguments: argumentsList, workingDirectory, dataRoot };
+  return { pid: Number(pidText), registeredPlist, executable, arguments: argumentsList, workingDirectory, dataRoot };
 }
 
 function launchctlScalar(lines: readonly string[], key: string): string | null {

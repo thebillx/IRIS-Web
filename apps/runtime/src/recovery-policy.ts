@@ -11,7 +11,7 @@ import {
 import { readOwnerAccessSecret } from "./persistence.js";
 import { observeProcessStart } from "./macos-safety.js";
 
-export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION";
+export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP";
 export type RecoveryPolicyState = "ISSUED" | "REVOKED" | "EXPIRED";
 export type RecoveryPolicyOperationState =
   "RESERVED" | "COMMITTED" | "RECONCILIATION_REQUIRED";
@@ -21,7 +21,7 @@ const HASH40 = /^[a-f0-9]{40}$/;
 const HASH64 = /^[a-f0-9]{64}$/;
 const MAX_OPERATIONS = 16;
 const MAX_ENTRIES = 32;
-const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION"];
+const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP"];
 
 interface RecoveryPolicyLockRecord {
   readonly schemaVersion: 1;
@@ -36,6 +36,7 @@ export interface RecoveryPolicyBinding {
   readonly sourceRoot: string;
   readonly controlScript: string;
   readonly executable: string;
+  readonly executableSha256?: string | undefined;
   readonly executableArguments: readonly string[];
   readonly runtimePreflightSha256: string;
   readonly runtimeLoaderSha256: string;
@@ -45,6 +46,7 @@ export interface RecoveryPolicyIssueInput {
   readonly dataRoot: string;
   readonly sourceBindings: readonly RecoveryPolicyBinding[];
   readonly protectedReferenceRoot?: string | undefined;
+  readonly machineId?: string | undefined;
   readonly beforeMetadataSha256: string;
   readonly beforePlistSha256: string;
   readonly allowedOperations: readonly RecoveryPolicyOperation[];
@@ -62,9 +64,11 @@ export interface RecoveryPolicyOperationInput {
   readonly beforeMetadataSha256: string;
   readonly beforePlistSha256: string;
   readonly protectedReferenceRoot?: string | undefined;
+  readonly machineId?: string | undefined;
   readonly sourceRoot: string;
   readonly controlScript: string;
   readonly executable: string;
+  readonly executableSha256?: string | undefined;
   readonly executableArguments: readonly string[];
   readonly runtimePreflightSha256: string;
   readonly runtimeLoaderSha256: string;
@@ -77,6 +81,7 @@ export interface RecoveryPolicyPublicRecord {
   readonly dataRoot: string;
   readonly sourceBindings: readonly RecoveryPolicyBinding[];
   readonly protectedReferenceRoot: string | null;
+  readonly machineId?: string | null;
   readonly beforeMetadataSha256: string;
   readonly beforePlistSha256: string;
   readonly allowedOperations: readonly RecoveryPolicyOperation[];
@@ -96,12 +101,14 @@ export interface RecoveryPolicyOperationJournal {
   readonly sourceRoot: string;
   readonly controlScript: string;
   readonly executable: string;
+  readonly executableSha256?: string | null;
   readonly executableArguments: readonly string[];
   readonly runtimePreflightSha256: string;
   readonly runtimeLoaderSha256: string;
   readonly beforeMetadataSha256: string;
   readonly beforePlistSha256: string;
   readonly protectedReferenceRoot: string | null;
+  readonly machineId?: string | null;
   readonly state: RecoveryPolicyOperationState;
   readonly createdAt: string;
   readonly finalizedAt?: string;
@@ -187,6 +194,7 @@ async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIss
     dataRoot,
     sourceBindings: input.sourceBindings.map((binding) => ({ ...binding })),
     protectedReferenceRoot: input.protectedReferenceRoot ?? null,
+    ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
     beforeMetadataSha256: input.beforeMetadataSha256,
     beforePlistSha256: input.beforePlistSha256,
     allowedOperations: [...new Set(input.allowedOperations)],
@@ -247,6 +255,14 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       "Recovery policy does not authorize this operation",
     );
   if (
+    input.operation === "SUPERVISOR_BOOTSTRAP" &&
+    (current.machineId === undefined || current.machineId === null || current.machineId !== input.machineId)
+  )
+    throw new RuntimeError(
+      "CONTROL_DENIED",
+      "Recovery policy machine identity does not match",
+    );
+  if (
     !current.sourceBindings.some(
       (binding) =>
         binding.sourceSha === input.sourceSha &&
@@ -254,6 +270,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
         binding.sourceRoot === input.sourceRoot &&
         binding.controlScript === input.controlScript &&
         binding.executable === input.executable &&
+        (input.operation !== "SUPERVISOR_BOOTSTRAP" || binding.executableSha256 === input.executableSha256) &&
         JSON.stringify(binding.executableArguments) === JSON.stringify(input.executableArguments) &&
         binding.runtimePreflightSha256 === input.runtimePreflightSha256 &&
         binding.runtimeLoaderSha256 === input.runtimeLoaderSha256,
@@ -283,12 +300,14 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       existing.sourceRoot !== input.sourceRoot ||
       existing.controlScript !== input.controlScript ||
       existing.executable !== input.executable ||
+      (existing.executableSha256 ?? null) !== (input.executableSha256 ?? null) ||
       JSON.stringify(existing.executableArguments) !== JSON.stringify(input.executableArguments) ||
       existing.runtimePreflightSha256 !== input.runtimePreflightSha256 ||
       existing.runtimeLoaderSha256 !== input.runtimeLoaderSha256 ||
       existing.beforeMetadataSha256 !== input.beforeMetadataSha256 ||
       existing.beforePlistSha256 !== input.beforePlistSha256 ||
-      existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null)
+      existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) ||
+      (existing.machineId ?? null) !== (input.machineId ?? null)
     )
       throw new RuntimeError(
         "CONTROL_DENIED",
@@ -334,12 +353,14 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
     sourceRoot: input.sourceRoot,
     controlScript: input.controlScript,
     executable: input.executable,
+    ...(input.executableSha256 === undefined ? {} : { executableSha256: input.executableSha256 }),
     executableArguments: [...input.executableArguments],
     runtimePreflightSha256: input.runtimePreflightSha256,
     runtimeLoaderSha256: input.runtimeLoaderSha256,
     beforeMetadataSha256: input.beforeMetadataSha256,
     beforePlistSha256: input.beforePlistSha256,
     protectedReferenceRoot: input.protectedReferenceRoot ?? null,
+    ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
     state: "RESERVED",
     createdAt: now.toISOString(),
   };
@@ -380,7 +401,7 @@ export async function assertRecoveryPolicyOperationCommitted(input: RecoveryPoli
       "Recovery policy identity does not match",
     );
   const entry = current.operations.find((candidate) => candidate.transactionId === input.transactionId && candidate.requestId === input.requestId && candidate.operation === input.operation);
-  if (entry === undefined || entry.state !== "COMMITTED" || entry.sourceSha !== input.sourceSha || entry.sourceTree !== input.sourceTree || entry.sourceRoot !== input.sourceRoot || entry.controlScript !== input.controlScript || entry.executable !== input.executable || JSON.stringify(entry.executableArguments) !== JSON.stringify(input.executableArguments) || entry.runtimePreflightSha256 !== input.runtimePreflightSha256 || entry.runtimeLoaderSha256 !== input.runtimeLoaderSha256 || entry.beforeMetadataSha256 !== input.beforeMetadataSha256 || entry.beforePlistSha256 !== input.beforePlistSha256 || entry.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null)) throw new RuntimeError("CONTROL_DENIED", "Recovery policy operation is not durably committed");
+  if (entry === undefined || entry.state !== "COMMITTED" || entry.sourceSha !== input.sourceSha || entry.sourceTree !== input.sourceTree || entry.sourceRoot !== input.sourceRoot || entry.controlScript !== input.controlScript || entry.executable !== input.executable || (entry.executableSha256 ?? null) !== (input.executableSha256 ?? null) || JSON.stringify(entry.executableArguments) !== JSON.stringify(input.executableArguments) || entry.runtimePreflightSha256 !== input.runtimePreflightSha256 || entry.runtimeLoaderSha256 !== input.runtimeLoaderSha256 || entry.beforeMetadataSha256 !== input.beforeMetadataSha256 || entry.beforePlistSha256 !== input.beforePlistSha256 || entry.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) || (entry.machineId ?? null) !== (input.machineId ?? null)) throw new RuntimeError("CONTROL_DENIED", "Recovery policy operation is not durably committed");
 }
 
 async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOperationInput & { readonly transactionId: string; readonly state: Exclude<RecoveryPolicyOperationState, "RESERVED"> }): Promise<RecoveryPolicyPublicRecord> {
@@ -417,12 +438,14 @@ async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOper
     existing.sourceRoot !== input.sourceRoot ||
     existing.controlScript !== input.controlScript ||
     existing.executable !== input.executable ||
+    (existing.executableSha256 ?? null) !== (input.executableSha256 ?? null) ||
     JSON.stringify(existing.executableArguments) !== JSON.stringify(input.executableArguments) ||
     existing.runtimePreflightSha256 !== input.runtimePreflightSha256 ||
     existing.runtimeLoaderSha256 !== input.runtimeLoaderSha256 ||
     existing.beforeMetadataSha256 !== input.beforeMetadataSha256 ||
     existing.beforePlistSha256 !== input.beforePlistSha256 ||
-    existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null)
+    existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) ||
+    (existing.machineId ?? null) !== (input.machineId ?? null)
   )
     throw new RuntimeError(
       "CONTROL_DENIED",
@@ -762,6 +785,7 @@ function sameIssue(
     existing.dataRoot === dataRoot &&
     existing.protectedReferenceRoot ===
       (input.protectedReferenceRoot ?? null) &&
+    (existing.machineId ?? null) === (input.machineId ?? null) &&
     existing.beforeMetadataSha256 === input.beforeMetadataSha256 &&
     existing.beforePlistSha256 === input.beforePlistSha256 &&
     existing.maxOperationCount === input.maxOperationCount &&
@@ -817,6 +841,12 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
       "INVALID_REQUEST",
       "Recovery policy operations are invalid",
     );
+  if (input.machineId !== undefined && !isUuid(input.machineId))
+    throw new RuntimeError("INVALID_REQUEST", "Recovery policy machine identity is invalid");
+  if (input.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") && input.machineId === undefined)
+    throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap policy requires a machine identity");
+  if (input.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") && input.sourceBindings.some((binding) => binding.executableSha256 === undefined || !HASH64.test(binding.executableSha256)))
+    throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap policy requires executable digests");
   const expiry = Date.parse(input.expiresAt);
   if (!Number.isFinite(expiry) || expiry <= Date.now())
     throw new RuntimeError(
@@ -841,6 +871,12 @@ function validateOperation(input: RecoveryPolicyOperationInput): void {
       "INVALID_REQUEST",
       "Recovery policy operation identity is invalid",
     );
+  if (input.machineId !== undefined && !isUuid(input.machineId))
+    throw new RuntimeError("INVALID_REQUEST", "Recovery policy operation machine identity is invalid");
+  if (input.operation === "SUPERVISOR_BOOTSTRAP" && input.machineId === undefined)
+    throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap operation requires a machine identity");
+  if (input.operation === "SUPERVISOR_BOOTSTRAP" && (input.executableSha256 === undefined || !HASH64.test(input.executableSha256)))
+    throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap operation requires an executable digest");
 }
 
 function isSignedPolicy(value: unknown): value is SignedRecoveryPolicy {
@@ -855,15 +891,18 @@ function isSignedPolicy(value: unknown): value is SignedRecoveryPolicy {
     && record.sourceBindings.length <= MAX_ENTRIES
     && record.sourceBindings.every((binding) => isRecoveryPolicyBinding(binding))
     && (typeof record.protectedReferenceRoot === "string" || record.protectedReferenceRoot === null)
+    && (record.machineId === undefined || record.machineId === null || isUuid(record.machineId))
     && HASH64.test(record.beforeMetadataSha256 ?? "")
     && HASH64.test(record.beforePlistSha256 ?? "")
     && typeof record.maxOperationCount === "number"
     && Array.isArray(record.allowedOperations)
     && record.allowedOperations.length > 0
     && record.allowedOperations.every((operation) => POLICY_OPERATIONS.includes(operation as RecoveryPolicyOperation))
+    && (!record.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") || (record.machineId !== undefined && record.machineId !== null))
+    && (!record.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") || record.sourceBindings.every((binding) => binding.executableSha256 !== undefined))
     && Array.isArray(record.operations)
     && record.operations.length <= MAX_ENTRIES
-    && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforeMetadataSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforePlistSha256) && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
+    && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforeMetadataSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforePlistSha256) && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && ((entry as RecoveryPolicyOperationJournal).operation !== "SUPERVISOR_BOOTSTRAP" || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
     && Array.isArray(record.audit)
     && typeof record.expiresAt === "string"
     && typeof record.issuedAt === "string"
@@ -882,6 +921,7 @@ function isRecoveryPolicyBinding(value: unknown): value is RecoveryPolicyBinding
     && binding.controlScript.length > 0
     && typeof binding.executable === "string"
     && binding.executable.length > 0
+    && (binding.executableSha256 === undefined || HASH64.test(binding.executableSha256))
     && Array.isArray(binding.executableArguments)
     && binding.executableArguments.every((argument) => typeof argument === "string" && !argument.includes("\0"))
     && HASH64.test(binding.runtimePreflightSha256)
