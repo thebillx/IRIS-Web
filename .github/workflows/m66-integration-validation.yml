@@ -1,0 +1,54 @@
+name: M66 isolated integration validation
+on:
+  push:
+    branches: [codex/m66-isolated-validation]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: validator
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 4a19dd3ada2980ccceedc414b392bdc5be9549e6
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore the exact merged revision from the reviewed bundle
+        env:
+          TARGET_SHA: ad205edad936fb8592cfc681f41905e2a1f7456b
+          TARGET_TREE: 10591c2f714f19adbfefe21f74379ce7d63a6428
+        run: |
+          set -euo pipefail
+          echo '7eed78b1c501076ebd287af2ed6fd7ead8ef3eafec193f5b6a59760e04e5b627  validator/.github/scripts/m66/integration.bundle' | shasum -a 256 -c -
+          git -C source bundle verify ../validator/.github/scripts/m66/integration.bundle
+          git -C source fetch ../validator/.github/scripts/m66/integration.bundle refs/heads/codex/m66-governed-integration
+          git -C source checkout --detach "$TARGET_SHA"
+          test "$(git -C source rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(git -C source rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.20.0
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10.15.0
+          package_json_file: source/package.json
+      - name: Prove environment and validate exact integrated revision
+        env:
+          TARGET_SHA: ad205edad936fb8592cfc681f41905e2a1f7456b
+          TARGET_TREE: 10591c2f714f19adbfefe21f74379ce7d63a6428
+          VALIDATION_ROLE: integration
+        run: node validator/.github/scripts/m66/validate.mjs
+      - name: Preserve bounded validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: m66-integration
+          path: ${{ runner.temp }}/m66-evidence-integration/
+          if-no-files-found: error
+          retention-days: 30
