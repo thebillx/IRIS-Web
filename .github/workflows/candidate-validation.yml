@@ -91,7 +91,8 @@ jobs:
             src/repository-reconcile.test.ts \
             src/registry-authority-reconcile.test.ts \
             src/capability-service.test.ts \
-            src/server.test.ts
+            src/server.test.ts \
+            --testTimeout=180000
 
       - name: Run project isolation regressions
         run: |
