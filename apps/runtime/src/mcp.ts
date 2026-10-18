@@ -299,6 +299,30 @@ async function executeTool(
   const identity = resolveSessionIdentity(args, request, state);
   const requiredClient = identity.clientId;
   const requiredSession = identity.sessionId;
+  if (name === 'mission_delegation_issue') {
+    if (principal !== 'owner') throw new RuntimeError('CONTROL_DENIED', 'Only the authenticated owner MCP principal can issue a mission delegation');
+    const missionId = requiredString(args, 'missionId');
+    await assertChatGptOperationalMission(state, missionId, requiredClient, requiredSession);
+    const workspaceIds = optionalStringArray(args, 'workspaceIds');
+    return capabilities.issueMissionDelegation({
+      requestId: requiredBoundedString(args, 'requestId', 100),
+      missionId,
+      ownerClientId: requiredClient,
+      ownerSessionId: requiredSession,
+      trustedAgentIds: requiredStringArray(args, 'trustedAgentIds'),
+      allowedCapabilities: requiredStringArray(args, 'allowedCapabilities'),
+      projectIds: requiredStringArray(args, 'projectIds'),
+      ...(workspaceIds === undefined ? {} : { workspaceIds }),
+      sourceSha: optionalNullableString(args, 'sourceSha'),
+      sourceTree: optionalNullableString(args, 'sourceTree'),
+      expiresAt: requiredBoundedString(args, 'expiresAt', 80),
+      maxExecutions: requiredPositiveInteger(args, 'maxExecutions'),
+    });
+  }
+  if (name === 'mission_delegation_revoke') {
+    if (principal !== 'owner') throw new RuntimeError('CONTROL_DENIED', 'Only the authenticated owner MCP principal can revoke a mission delegation');
+    return capabilities.revokeMissionDelegation(requiredBoundedString(args, 'delegationId', 100), requiredClient, requiredSession);
+  }
   if (name === 'mission_create') return capabilities.execute({
     capabilityId: 'mission.create', clientId: requiredClient, sessionId: requiredSession,
     title: requiredString(args, 'title'), orchestratorMode: optionalOrchestratorMode(args, 'orchestratorMode') ?? 'HERMES',
@@ -431,6 +455,8 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'mission_directive', description: 'Submit one versioned supervisor directive to the durable mission broker. A directive is orchestration input only and never satisfies IRIS permission approval.', inputSchema: { type: 'object', required: ['missionId','expectedVersion','directiveId','directiveSequence','decision','instruction','authorizedScope','doNot','successCriteria'], properties: { missionId: { type: 'string' }, expectedVersion: { type: 'integer', minimum: 1 }, directiveId: { type: 'string' }, directiveSequence: { type: 'integer', minimum: 1 }, decision: { enum: ['CONTINUE','REVISE','PAUSE','COMPLETE'] }, instruction: { type: 'string', maxLength: 4000 }, authorizedScope: { type: 'array', items: { type: 'string' }, maxItems: 24 }, doNot: { type: 'array', items: { type: 'string' }, maxItems: 24 }, successCriteria: { type: 'array', items: { type: 'string' }, maxItems: 24 } }, additionalProperties: false } },
     { name: 'mission_orchestrator_handoff', description: 'Perform one versioned safe operational-orchestrator handoff. This changes orchestration ownership only and never grants local execution permission.', inputSchema: { type: 'object', required: ['missionId','targetMode','expectedVersion','handoffId'], properties: { missionId: { type: 'string' }, targetMode: { enum: ['HERMES','CHATGPT'] }, expectedVersion: { type: 'integer', minimum: 1 }, handoffId: { type: 'string' } }, additionalProperties: false } },
     { name: 'mission_create', description: 'Register mission identity for the live client/session. New missions default to HERMES unless CHATGPT direct orchestration is explicitly selected.', inputSchema: { type: 'object', required: ['title'], properties: { ...sessionProperty, title: { type: 'string', maxLength: 240 }, orchestratorMode: { enum: ['HERMES','CHATGPT'] } }, additionalProperties: false } },
+    { name: 'mission_delegation_issue', description: 'Issue one signed, bounded mission delegation from an authenticated Owner session. It covers only the listed agents, capabilities, projects and execution count.', inputSchema: { type: 'object', required: ['requestId','missionId','trustedAgentIds','allowedCapabilities','projectIds','expiresAt','maxExecutions'], properties: { requestId: { type: 'string', minLength: 36, maxLength: 36 }, missionId: { type: 'string' }, trustedAgentIds: { type: 'array', minItems: 1, maxItems: 16, items: { type: 'string', minLength: 1, maxLength: 200 } }, allowedCapabilities: { type: 'array', minItems: 1, maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 100 } }, projectIds: { type: 'array', minItems: 1, maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 100 } }, workspaceIds: { type: 'array', maxItems: 64, items: { type: 'string', minLength: 1, maxLength: 100 } }, sourceSha: { type: ['string','null'], pattern: '^[0-9a-f]{40}$' }, sourceTree: { type: ['string','null'], pattern: '^[0-9a-f]{40}$' }, expiresAt: { type: 'string', minLength: 1, maxLength: 80 }, maxExecutions: { type: 'integer', minimum: 1, maximum: 1000 } }, additionalProperties: false } },
+    { name: 'mission_delegation_revoke', description: 'Revoke one previously issued mission delegation. Revocation is durable and fail-closed.', inputSchema: { type: 'object', required: ['delegationId'], properties: { delegationId: { type: 'string', minLength: 1, maxLength: 100 } }, additionalProperties: false } },
     { name: 'mission_state_set', description: 'Record orchestration-owned mission state; this does not grant execution authority.', inputSchema: { type: 'object', required: ['missionId', 'state'], properties: { ...sessionProperty, missionId: { type: 'string' }, state: { enum: ['PLANNED','RUNNING','WAITING_APPROVAL','WAITING_SUPERVISOR','PAUSED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
     { name: 'mission_task_create', description: 'Register a task identity inside a mission.', inputSchema: { type: 'object', required: ['missionId','title'], properties: { ...sessionProperty, missionId: { type: 'string' }, title: { type: 'string', maxLength: 240 } }, additionalProperties: false } },
     { name: 'mission_task_state_set', description: 'Record orchestration-owned task state.', inputSchema: { type: 'object', required: ['missionId','taskId','state'], properties: { ...sessionProperty, missionId: { type: 'string' }, taskId: { type: 'string' }, state: { enum: ['PENDING','RUNNING','BLOCKED','COMPLETED','FAILED','CANCELLED'] } }, additionalProperties: false } },
@@ -564,6 +590,13 @@ function requiredStringArray(record: Record<string, unknown>, name: string): rea
     if (typeof item !== 'string' || item.trim().length === 0 || item.length > 1000 || item.includes('\0')) throw new Error(`${name}[${index}] must be a bounded string`);
     return item.trim();
   });
+}
+
+function optionalStringArray(record: Record<string, unknown>, name: string): readonly string[] | undefined {
+  const value = record[name];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string' && entry.length > 0 && entry.length <= 100)) throw new Error(`${name} must be a string array`);
+  return value;
 }
 
 function supervisorDecision(record: Record<string, unknown>, name: string): SupervisorDecision {

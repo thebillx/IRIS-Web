@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { IdentityCoherenceState, TunnelBindingDiagnostic } from '@iris/domain';
 
-export const MCP_CATALOG_VERSION = '2.7.0' as const;
+export const MCP_CATALOG_VERSION = '2.8.0' as const;
 export const MCP_SCHEMA_VERSION = '2026-07-28' as const;
-export type McpCatalogVersion = '2.3.0' | '2.4.0' | '2.5.0' | '2.6.0' | typeof MCP_CATALOG_VERSION;
-export const MCP_SUPPORTED_CATALOG_VERSIONS = ['2.3.0', '2.4.0', '2.5.0', '2.6.0', MCP_CATALOG_VERSION] as const satisfies readonly McpCatalogVersion[];
+export type McpCatalogVersion = '2.3.0' | '2.4.0' | '2.5.0' | '2.6.0' | '2.7.0' | typeof MCP_CATALOG_VERSION;
+export const MCP_SUPPORTED_CATALOG_VERSIONS = ['2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', MCP_CATALOG_VERSION] as const satisfies readonly McpCatalogVersion[];
 
 export type McpCatalogProfile = 'FULL' | 'PRO';
 export type McpMutationClass = 'READ_ONLY' | 'ORCHESTRATION' | 'PROJECT_MUTATION' | 'OWNER_MUTATION';
@@ -68,6 +68,8 @@ const FULL_CATALOG = [
   entry('mission_task_create', 'ORCHESTRATION', 'mission.task.create', '2.0.0'),
   entry('mission_task_state_set', 'ORCHESTRATION', 'mission.task.state.set', '2.0.0'),
   entry('mission_action_prepare', 'ORCHESTRATION', 'mission.action.prepare', '2.0.0'),
+  entry('mission_delegation_issue', 'OWNER_MUTATION', null, '2.8.0'),
+  entry('mission_delegation_revoke', 'OWNER_MUTATION', null, '2.8.0'),
   entry('owner_approval_resolve', 'OWNER_MUTATION', null, '2.3.0'),
   entry('mission_supervisor_gate_set', 'ORCHESTRATION', 'mission.supervisor_gate.set', '2.1.0'),
   entry('project_test_run', 'PROJECT_MUTATION', 'project.test.run', '2.0.0'),

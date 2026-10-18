@@ -8,9 +8,10 @@ import { PermissionAuditStore } from '../audit.js';
 import { CapabilityService } from '../capability-service.js';
 import { PermissionSettingsStore } from '../permission-store.js';
 import { PermissionPolicyEngine } from '../permissions.js';
-import { FoundationStateStore } from '../persistence.js';
+import { FoundationStateStore, loadOrCreateOwnerAccessSecret } from '../persistence.js';
 import { VNextResourceRegistry } from '../resource-registry.js';
 import { RuntimeState } from '../state.js';
+import { MissionDelegationStore } from '../mission-delegation.js';
 import { MultiWorkerRoutingService } from './service.js';
 import { MultiWorkerStore } from './store.js';
 
@@ -86,7 +87,7 @@ async function fixture() {
     approvalPolicy: 'INHERIT_MISSION',
     resourceBudget: { maxRuntimeMs: 60_000, maxJobs: 0, maxArtifacts: 0, maxOutputBytes: 1_048_576 },
     concurrencyPolicy: { maxParallelCapabilities: 2, mutablePathOwnership: 'READ_ONLY', allowParallelReads: true },
-    expiresAt: '2026-09-20T04:00:00.000Z',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
   const assignment = await multiWorker.assignTask({
     expectedGeneration: 3,
@@ -109,12 +110,27 @@ async function fixture() {
     assignmentId: assignment.id,
     workerId: worker.id,
     authorityDigest: assignment.authorityDigest,
+    operationId: randomUUID(),
   };
 
+  await loadOrCreateOwnerAccessSecret(dataRoot);
+  const delegations = new MissionDelegationStore(dataRoot);
+  const delegation = await delegations.issue({
+    requestId: randomUUID(),
+    missionId: mission.id,
+    ownerClientId: session.clientId,
+    ownerSessionId: session.id,
+    trustedAgentIds: [worker.id],
+    allowedCapabilities: ['fs.read', 'fs.find', 'project.search'],
+    projectIds: [project.id],
+    workspaceIds: [workspace.workspaceId],
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    maxExecutions: 64,
+  });
   const settings = new PermissionSettingsStore(dataRoot);
   await settings.initialize();
   await settings.setMode('FULL_LOCAL_OWNER');
-  const policy = new PermissionPolicyEngine(state, settings, sourceRoot, dataRoot);
+  const policy = new PermissionPolicyEngine(state, settings, sourceRoot, dataRoot, undefined, delegations);
   const audit = new PermissionAuditStore(dataRoot);
 
   const health = (profile: 'FULL' | 'PRO' = 'FULL', deploymentEpoch = 11): RuntimeHealth => ({
@@ -146,7 +162,7 @@ async function fixture() {
     }],
   });
 
-  const createCapabilities = (healthValue: RuntimeHealth = health()) => new CapabilityService(
+  const createCapabilities = (healthValue: RuntimeHealth = health(), workerService = multiWorker) => new CapabilityService(
     state,
     policy,
     audit,
@@ -154,12 +170,14 @@ async function fixture() {
     undefined,
     resources,
     undefined,
-    multiWorker,
+    workerService,
+    undefined,
+    delegations,
   );
 
   return {
     sourceRoot, dataRoot, projectRoot, state, project, session, mission, resources, workspace,
-    multiWorker, run, worker, task, assignment, association, audit, health, createCapabilities,
+    multiWorker, run, worker, task, assignment, association, delegation, delegations, audit, health, createCapabilities,
   };
 }
 
@@ -190,12 +208,41 @@ describe('IRIS multi-worker M11 CapabilityService audit and security acceptance'
       workerId: f.worker.id,
       assignmentId: f.assignment.id,
       authorityDigest: f.assignment.authorityDigest,
+      reason: expect.stringContaining(f.delegation.delegationId),
     });
+  });
+
+  it('preserves durable worker authority across reload and rejects replay, revocation and closed owner sessions', async () => {
+    const f = await fixture();
+    const reloaded = new MultiWorkerStore(f.dataRoot);
+    const durable = await reloaded.read();
+    expect(durable.assignments.find((assignment) => assignment.id === f.assignment.id)?.authorityDigest).toBe(f.assignment.authorityDigest);
+    const workerService = new MultiWorkerRoutingService(f.state, f.resources, reloaded, undefined, () => '2026-09-20T03:00:00.000Z');
+    const capabilities = f.createCapabilities(f.health(), workerService);
+    const operation = { capabilityId: 'fs.read' as const, clientId: f.session.clientId, sessionId: f.session.id, projectId: f.project.id, workspaceId: f.workspace.workspaceId, path: 'apps/runtime/visible.txt', mode: 'TEXT' as const, encoding: 'utf-8' as const, worker: f.association };
+    await expect(capabilities.execute(operation)).resolves.toMatchObject({ status: 'executed' });
+    await expect(capabilities.execute(operation)).resolves.toMatchObject({ status: 'denied', reason: expect.stringContaining('replay') });
+    await f.delegations.revoke(f.delegation.delegationId, f.session.clientId, f.session.id);
+    await expect(capabilities.execute({ ...operation, worker: { ...f.association, operationId: randomUUID() } })).resolves.toMatchObject({ status: 'denied', reason: expect.stringContaining('revoked') });
+    f.state.deleteSession(f.session.id, f.session.clientId);
+    await expect(capabilities.execute({ ...operation, worker: { ...f.association, operationId: randomUUID() } })).rejects.toMatchObject({ code: 'SESSION_NOT_FOUND' });
   });
 
   it('denies cross-path, forged digest, foreign workspace, and broad project search before execution', async () => {
     const f = await fixture();
     const capabilities = f.createCapabilities();
+
+    await expect(capabilities.execute({
+      capabilityId: 'fs.read',
+      clientId: f.session.clientId,
+      sessionId: f.session.id,
+      projectId: f.project.id,
+      workspaceId: f.workspace.workspaceId,
+      path: 'apps/runtime/visible.txt',
+      mode: 'TEXT',
+      encoding: 'utf-8',
+      worker: { ...f.association, operationId: 'malformed-operation-id' },
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
 
     await expect(capabilities.execute({
       capabilityId: 'fs.read',

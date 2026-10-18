@@ -29,13 +29,14 @@ import { discoverDeclaredProjectValidation, ProjectValidationJobManager } from '
 import { ValidationCompatibilityAdapter } from './validation-compatibility.js';
 import { assertExpectedEffects, deriveCapabilityEffects } from './capability-effects.js';
 import { WorkspaceFilesystemEngine, type FsFindMode, type FsIgnoreMode, type FsReadMode, type FsWriteMode } from './filesystem-engine.js';
-import { VNextResourceRegistry } from './resource-registry.js';
+import { VNextResourceRegistry, type RepositoryReconciliationInput } from './resource-registry.js';
 import { DurableJobManager } from './durable-job-manager.js';
 import { CodeReviewManager } from './code-review-manager.js';
 import { GovernedGitEngine, type GitCompatibilityOperation, type Phase4GitOperationName, type Phase4GitRequest } from './governed-git-engine.js';
 import type { RuntimeState } from './state.js';
 import type { MultiWorkerRoutingService } from './multi-worker/service.js';
 import type { AdoRequirementContextService } from './ado/runtime-context.js';
+import type { MissionDelegationStore, MissionDelegationSpec } from './mission-delegation.js';
 
 type Phase4GitCapabilityId = Exclude<Extract<CapabilityId, `git.${string}`>, 'git.local'>;
 type Phase4GitOperationCore = Phase4GitRequest & {
@@ -47,8 +48,10 @@ type Phase4GitOperationCore = Phase4GitRequest & {
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_PENDING_APPROVALS = 100;
 const APPROVAL_TTL_MS = 15 * 60_000;
+const WORKER_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 type CapabilityOperationCore =
+  | (RepositoryReconciliationInput & { readonly capabilityId: 'repository.reconcile'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined })
   | { readonly capabilityId: 'runtime.status'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'project.info'; readonly clientId: string; readonly sessionId?: string | undefined; readonly projectId: string }
@@ -160,6 +163,7 @@ export class CapabilityService {
     jobs?: DurableJobManager,
     multiWorker?: MultiWorkerRoutingService,
     adoContext?: AdoRequirementContextService,
+    private readonly delegations?: MissionDelegationStore,
   ) {
     this.resources = resources;
     this.jobs = jobs;
@@ -173,6 +177,22 @@ export class CapabilityService {
 
   public recentAudit(limit?: number) {
     return this.audit.recent(limit);
+  }
+
+  public async issueMissionDelegation(input: MissionDelegationSpec): Promise<unknown> {
+    if (this.delegations === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Mission delegation is unavailable');
+    const session = this.state.getSessionForClient(input.ownerSessionId, input.ownerClientId);
+    if (session.agentRole !== 'owner') throw new RuntimeError('CONTROL_DENIED', 'Only an authenticated owner session may issue a delegation');
+    const mission = await this.state.getMission(input.missionId);
+    if (mission.clientId !== input.ownerClientId || mission.sessionId !== input.ownerSessionId || mission.orchestratorMode !== 'CHATGPT') {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Delegation owner does not control the mission');
+    }
+    return this.delegations.issue(input);
+  }
+
+  public revokeMissionDelegation(delegationId: string, ownerClientId: string, ownerSessionId: string): Promise<void> {
+    if (this.delegations === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Mission delegation is unavailable');
+    return this.delegations.revoke(delegationId, ownerClientId, ownerSessionId);
   }
 
   public listPendingApprovals(): readonly PendingApprovalView[] {
@@ -361,6 +381,9 @@ export class CapabilityService {
 
   private async authorizeWorkerOperation(operation: CapabilityOperation): Promise<void> {
     if (operation.worker === undefined) return;
+    if (!WORKER_OPERATION_ID_PATTERN.test(operation.worker.operationId)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker capability requires a valid operation identity');
+    }
     if (this.multiWorker === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Multi-worker execution authority is not available in this runtime');
     if (!workerExecutableCapability(operation.capabilityId)) {
       throw new RuntimeError('CAPABILITY_DENIED', 'Worker capability is not enabled for native multi-worker execution');
@@ -414,6 +437,21 @@ export class CapabilityService {
   private async evaluateOperation(operation: CapabilityOperation): Promise<PermissionDecisionRecord> {
     await this.authorizeWorkerOperation(operation);
     const request = requestForOperation(operation);
+    if (operation.capabilityId === 'repository.reconcile') {
+      if (operation.worker !== undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Repository reconciliation is owner-only');
+      const plan = await this.gitEngine().reconcileRepository(operation);
+      const effects = deriveCapabilityEffects(operation.capabilityId)!;
+      const assertion = assertExpectedEffects(effects, operation.expectedEffects);
+      const decision = await this.policy.evaluate({ ...request, effectiveEffects: effects });
+      const worktreeBindings = operation.expectedWorktrees
+        .map((entry) => `${entry.workspaceId}@${entry.head}:${entry.tree}:${entry.ref}`).join(',');
+      const registryBinding = operation.registryTransaction === undefined ? ''
+        : `; registry request ${operation.registryTransaction.requestId}; before ${operation.registryTransaction.expectedBeforeSha256}; stale ${operation.registryTransaction.staleWorkspaceIds.join(',')}; worktreeManifestSha256 ${createHash('sha256').update(JSON.stringify(operation.registryTransaction.existingWorktrees)).digest('hex')}`;
+      return { ...decision, workspaceId: plan.workspaceIds[0]!, resourceId: plan.fingerprint,
+        reason: `${decision.reason}; repository ${operation.previousRepositoryId} -> ${operation.expectedRepositoryId}; previous device ${operation.previousDevice}; source ${operation.expectedHead}:${operation.expectedTree}; worktrees ${worktreeBindings}${registryBinding}`,
+        target: plan.commonGitDir, effectiveEffects: effects,
+        ...(!assertion.valid ? { decision: 'DENY' as const, reason: assertion.reason } : {}) };
+    }
     if (isPhase4GitOperation(operation)) {
       if (operation.capabilityId !== phase4GitCapabilityId(operation.operation)) {
         const base = await this.policy.evaluate(request);
@@ -568,6 +606,10 @@ export class CapabilityService {
   }
 
   private async executeAuthorized(operation: CapabilityOperation, decision: PermissionDecisionRecord): Promise<unknown> {
+    if (operation.capabilityId === 'repository.reconcile') {
+      if (decision.decision !== 'ALLOW_ONCE' || decision.resourceId == null) throw new RuntimeError('CAPABILITY_DENIED', 'Exact owner approval is required');
+      return this.gitEngine().reconcileRepository(operation, decision.resourceId);
+    }
     if (isPhase4GitOperation(operation)) {
       await this.authorizedProject(operation);
       return this.gitEngine().execute(operation, operation.mission?.actionId ?? null);
@@ -1053,6 +1095,8 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId };
   } else if (operation.capabilityId === 'mission.state.set' || operation.capabilityId === 'mission.task.create' || operation.capabilityId === 'mission.task.state.set' || operation.capabilityId === 'mission.action.prepare' || operation.capabilityId === 'mission.supervisor_gate.set') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, missionId: operation.missionId, ...('taskId' in operation ? { taskId: operation.taskId } : {}) };
+  } else if (operation.capabilityId === 'repository.reconcile') {
+    request = { capabilityId: operation.capabilityId, projectId: operation.projectId, clientId: operation.clientId, sessionId: operation.sessionId };
   } else if (operation.capabilityId === 'project.register') {
     request = { capabilityId: operation.capabilityId, clientId: operation.clientId, sessionId: operation.sessionId, targetPath: operation.rootPath };
   } else if (operation.capabilityId === 'project.default.set') {
@@ -1072,10 +1116,25 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
   }
   const missionBound = operation.mission === undefined
     ? request
-    : { ...request, missionId: operation.mission.missionId, taskId: operation.mission.taskId, actionId: operation.mission.actionId };
+    : {
+      ...request,
+      missionId: operation.mission.missionId,
+      taskId: operation.mission.taskId,
+      actionId: operation.mission.actionId,
+      ...('workspaceId' in operation && typeof operation.workspaceId === 'string' ? { workspaceId: operation.workspaceId } : {}),
+      ...('sourceSha' in operation && typeof operation.sourceSha === 'string' ? { sourceSha: operation.sourceSha } : {}),
+      ...('sourceTree' in operation && typeof operation.sourceTree === 'string' ? { sourceTree: operation.sourceTree } : {}),
+    };
+  const scoped = {
+    ...('workspaceId' in operation && typeof operation.workspaceId === 'string' ? { workspaceId: operation.workspaceId } : {}),
+    ...('sourceSha' in operation && typeof operation.sourceSha === 'string' ? { sourceSha: operation.sourceSha } : {}),
+    ...('sourceTree' in operation && typeof operation.sourceTree === 'string' ? { sourceTree: operation.sourceTree } : {}),
+  };
   return operation.worker === undefined ? missionBound : {
     ...missionBound,
+    ...scoped,
     missionId: operation.worker.missionId,
+    actionId: operation.worker.operationId,
     orchestrationRunId: operation.worker.orchestrationRunId,
     workerTaskId: operation.worker.workerTaskId,
     workerId: operation.worker.workerId,
@@ -1083,6 +1142,7 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
     authorityDigest: operation.worker.authorityDigest,
   };
 }
+
 
 function workerExecutableCapability(capabilityId: CapabilityId): boolean {
   return capabilityId === 'project.search'
@@ -1164,6 +1224,7 @@ function describeOperation(operation: CapabilityOperation): string {
   }
   if (operation.capabilityId === 'runtime.status' || operation.capabilityId === 'project.list' || operation.capabilityId === 'mission.list') return operation.capabilityId;
   if (operation.capabilityId === 'project.info') return `project.info projectId=${operation.projectId}`;
+  if (operation.capabilityId === 'repository.reconcile') return `repository.reconcile projectId=${operation.projectId} previousRepositoryId=${operation.previousRepositoryId} previousDevice=${operation.previousDevice} expectedRepositoryId=${operation.expectedRepositoryId} expectedHead=${operation.expectedHead} expectedTree=${operation.expectedTree} expectedWorktrees=${JSON.stringify(operation.expectedWorktrees)} registryTransaction=${JSON.stringify(operation.registryTransaction ?? null)}`;
   if (operation.capabilityId === 'project.git_status') return `project.git_status projectId=${operation.projectId}`;
   if (operation.capabilityId === 'project.search') return `project.search projectId=${operation.projectId} queryLength=${operation.query.length}`;
   if (operation.capabilityId === 'ado.discovery') return `ado.discovery projectId=${operation.projectId} requestId=${operation.requestId}`;
