@@ -1,0 +1,10 @@
+[
+  "isolates admin/workload tunnel digests and recycles only the admin child",
+  "forces an identity-bound same-source activation to replace the workload and advance deployment epoch",
+  "keeps the outer control plane alive during a concurrent cross-catalog handoff",
+  "recycles an owned tunnel when readiness fails without touching other owned components",
+  "automatically replaces a crashed owned runtime before restoring both connector profiles",
+  "does not kill a PID reused by a foreign process",
+  "replaces an owned runtime on restart with a new process and instance identity",
+  "serializes concurrent up operations without starting a duplicate runtime"
+]
