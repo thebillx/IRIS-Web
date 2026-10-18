@@ -100,6 +100,7 @@ try {
     const report=path.join(evidence,index+'.json');
     if (command.includes('vitest run')) command=command.replace('vitest run',`vitest run --maxWorkers=1 --reporter=verbose --reporter=json --outputFile='${report}'`);
     await run(item.name,command,index);
+    if (item.name.startsWith('Provision canonical') && results.at(-1).code === 0) await save('pnpm-provision.json', JSON.parse(await fs.readFile(path.join(tmp, 'm66-pnpm-provision.json'))));
     if (command.includes('vitest run')) {
       try { results.at(-1).coverage=checkReport(JSON.parse(await fs.readFile(report)),item.name === 'Historical eight'?'historical':item.name.startsWith('Run all Supervisor')?'supervisor':'all'); }
       catch(error) { results.at(-1).coverageError=String(error); }

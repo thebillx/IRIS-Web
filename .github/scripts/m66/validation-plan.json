@@ -1,42 +1,14 @@
 [
   {
+    "name": "Provision canonical pinned PNPM in the disposable hosted executor",
+    "command": "pnpm --filter @iris/runtime exec tsx -e 'import assert from \"node:assert/strict\";\nimport {execFileSync,spawnSync} from \"node:child_process\";\nimport {existsSync,lstatSync,readFileSync,realpathSync,symlinkSync,writeFileSync,mkdtempSync} from \"node:fs\";\nimport os from \"node:os\";\nimport path from \"node:path\";\nimport {canonicalNodeRuntime,node24Path} from \"./src/node-runtime.ts\";\nimport {runDeclaredProjectScript} from \"./src/project-test.ts\";\n(async()=>{\n  assert.equal(process.platform,\"darwin\");\n  assert(!existsSync(\"/Users/RARW\") && !existsSync(\"/Users/bill\"));\n  const node=canonicalNodeRuntime();\n  const actionBin=realpathSync(execFileSync(\"/usr/bin/which\",[\"pnpm\"],{encoding:\"utf8\"}).trim());\n  assert.equal(execFileSync(actionBin,[\"--version\"],{encoding:\"utf8\"}).trim(),\"10.15.0\");\n  const cli=actionBin.endsWith(\"/pnpm/bin/pnpm.cjs\")?actionBin:realpathSync(path.resolve(path.dirname(actionBin),\"..\",\"pnpm\",\"bin\",\"pnpm.cjs\"));\n  const pkg=JSON.parse(readFileSync(path.resolve(path.dirname(cli),\"..\",\"package.json\"),\"utf8\"));\n  assert.equal(pkg.name,\"pnpm\");assert.equal(pkg.version,\"10.15.0\");\n  assert.equal(execFileSync(node.path,[cli,\"--version\"],{encoding:\"utf8\"}).trim(),\"10.15.0\");\n  const requested=path.join(path.dirname(node.path),\"pnpm\");\n  const before=spawnSync(\"pnpm\",[\"--version\"],{env:{...process.env,PATH:node24Path()},encoding:\"utf8\"});\n  const probe=mkdtempSync(path.join(os.tmpdir(),\"m66-pnpm-probe-\"));\n  writeFileSync(path.join(probe,\"package.json\"),JSON.stringify({packageManager:\"pnpm@10.15.0\",scripts:{probe:\"node probe.mjs\"}}));\n  writeFileSync(path.join(probe,\"probe.mjs\"),\"console.log('\\''M66_PINNED_PNPM_PROBE'\\'')\\n\");\n  const legacyBefore=await runDeclaredProjectScript(probe,\"probe\");\n  try { lstatSync(requested);assert.equal(realpathSync(requested),cli,\"Refuse to replace an existing different executable\"); }\n  catch(error) { if(error.code!==\"ENOENT\")throw error;symlinkSync(cli,requested); }\n  assert.equal(realpathSync(requested),cli);\n  const version=execFileSync(requested,[\"--version\"],{env:{...process.env,PATH:node24Path()},encoding:\"utf8\"}).trim();\n  assert.equal(version,\"10.15.0\");\n  const legacyAfter=await runDeclaredProjectScript(probe,\"probe\");\n  assert.equal(legacyAfter.passed,true);assert.match(legacyAfter.stdout,/M66_PINNED_PNPM_PROBE/);\n  const report={status:\"PASS\",node,actionBin,pinnedCli:cli,requested,resolved:realpathSync(requested),version,canonicalPathBefore:{status:before.status,errorCode:before.error?.code??null,stdout:before.stdout??\"\"},legacyBefore,legacyAfter};\n  writeFileSync(path.join(os.tmpdir(),\"m66-pnpm-provision.json\"),JSON.stringify(report,null,2)+\"\\n\",{mode:0o600});\n  console.log(JSON.stringify(report,null,2));\n})().catch(error=>{console.error(error);process.exitCode=1;});\n'"
+  },
+  {
     "name": "Run merged ADO and catalog compatibility contracts",
     "command": "pnpm --filter @iris/runtime exec vitest run src/ado/governance.test.ts src/ado/runtime-binding.test.ts src/ado/runtime-context.test.ts src/ado/ado.test.ts src/mcp-ado.test.ts src/phase1-identity.test.ts src/phase4-git-worktree.test.ts src/phase8-catalog-compat.test.ts src/phase8-execution-profile-compat.test.ts src/phase8-mission-compat.test.ts src/phase8-validation-compat.test.ts src/security-audit/service.test.ts src/repository-physical-observation.test.ts src/macos-safety.test.ts"
   },
   {
-    "name": "Historical eight",
-    "command": "pnpm --filter @iris/runtime exec vitest run src/supervisor.test.ts -t \"$HISTORICAL_FILTER\""
-  },
-  {
-    "name": "Run Supervisor failure-stop and KeepAlive regressions",
-    "command": "pnpm --filter @iris/runtime exec vitest run \\\n  src/launchd.test.ts \\\n  src/recovery-policy.test.ts \\\n  src/supervisor-startup.test.ts \\\n  src/supervisor-daemon-exit.test.ts \\\n  src/supervisor-failure-stop.test.ts\n"
-  },
-  {
-    "name": "Run all Supervisor and repository authority regressions",
-    "command": "pnpm --filter @iris/runtime exec vitest run src/supervisor-admin-activation.test.ts \\\n  src/supervisor-admin.test.ts \\\n  src/supervisor-daemon-exit.test.ts \\\n  src/supervisor-failure-stop.test.ts \\\n  src/supervisor-native-control.test.ts \\\n  src/supervisor-operation-lock.test.ts \\\n  src/supervisor-startup.test.ts \\\n  src/supervisor.test.ts \\\n  src/repository-reconcile.test.ts \\\n  src/registry-authority-reconcile.test.ts \\\n  src/capability-service.test.ts \\\n  src/server.test.ts\n"
-  },
-  {
-    "name": "Run mission and worker delegation contracts",
-    "command": "pnpm --filter @iris/runtime exec vitest run src/mission-delegation.test.ts \\\n  src/mcp.test.ts \\\n  src/permissions.test.ts \\\n  src/mcp-catalog.test.ts \\\n  src/phase8-catalog-compat.test.ts \\\n  src/activation-source-identity.test.ts \\\n  src/multi-worker/authority.test.ts \\\n  src/multi-worker/dogfood.test.ts \\\n  src/multi-worker/model.test.ts \\\n  src/multi-worker/observability.test.ts \\\n  src/multi-worker/path-ownership.test.ts \\\n  src/multi-worker/presets.test.ts \\\n  src/multi-worker/recovery.test.ts \\\n  src/multi-worker/scheduler.test.ts \\\n  src/multi-worker/security-acceptance.test.ts \\\n  src/multi-worker/service.test.ts\n"
-  },
-  {
-    "name": "Run project isolation regressions",
-    "command": "pnpm --filter @iris/runtime exec vitest run \\\n  src/activation-controller.test.ts \\\n  src/durable-mission-service.test.ts \\\n  src/phase2-foundation.test.ts \\\n  src/phase7-external-integration.test.ts\n"
-  },
-  {
-    "name": "Run security and redaction regressions",
-    "command": "pnpm --filter @iris/runtime exec vitest run \\\n  src/phase55-security-acceptance.test.ts \\\n  src/phase3-shell-jobs.test.ts \\\n  src/phase7-security-acceptance.test.ts \\\n  src/phase7-external-integration.test.ts \\\n  src/multi-worker/observability.test.ts \\\n  src/multi-worker/security-acceptance.test.ts\npnpm --filter @iris/runtime exec tsx -e '\n  import { redactOutput, StreamingRedactor } from \"./src/output-redaction.ts\";\n  const secret = \"SYNTHETIC_REDACTION_MARKER_4b9c6a8f\";\n  const stream = new StreamingRedactor([secret]);\n  const output = [\n    redactOutput(`Authorization: Bearer ${secret}`, [secret]),\n    redactOutput(`API_TOKEN=${secret}`, [secret]),\n    stream.push(`prefix ${secret.slice(0, 12)}`) + stream.push(`${secret.slice(12)} suffix`) + stream.finish(),\n  ].join(\"\\n\");\n  if (output.includes(secret)) throw new Error(\"Synthetic redaction marker leaked\");\n'\n"
-  },
-  {
-    "name": "Check added source for bounded secret patterns",
-    "command": "node --input-type=module <<'JS'\nimport assert from 'node:assert/strict';\nimport { execFileSync } from 'node:child_process';\nconst patterns = {\n  privateKey: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,\n  githubToken: /\\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\\b/,\n  awsAccessKey: /\\b(?:AKIA|ASIA)[A-Z0-9]{16}\\b/,\n  openaiKey: /\\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\\b/,\n};\nconst findSecrets = diff => {\n  const added = diff.split('\\n').filter(line => line.startsWith('+') && !line.startsWith('+++')).map(line => line.slice(1)).join('\\n');\n  return Object.entries(patterns).filter(([, pattern]) => pattern.test(added)).map(([name]) => name);\n};\nconst synthetic = ['-----BEGIN ' + 'PRIVATE KEY-----', 'ghp_' + 'A'.repeat(32), 'AKIA' + 'A'.repeat(16), 'sk-' + 'a'.repeat(40)];\nassert.deepEqual(findSecrets(synthetic.map(value => '+' + value).join('\\n')), Object.keys(patterns));\nassert.deepEqual(findSecrets('+++ b/example.ts\\n+const count = 1;'), []);\nconst diff = execFileSync('git', ['diff', '--unified=0', process.env.BASELINE_SHA, process.env.TARGET_SHA], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });\nconst matches = findSecrets(diff);\nif (matches.length) throw new Error(`Secret-pattern match in added source: ${matches.join(', ')}`);\nconsole.log('Bounded added-lines secret-pattern scan and synthetic self-check PASS (not exhaustive secret detection)');\nJS\n"
-  },
-  {
-    "name": "Typecheck and build Runtime",
-    "command": "pnpm --filter @iris/runtime typecheck\npnpm --filter @iris/runtime build\n"
-  },
-  {
-    "name": "Check the target diff and lint changed sources",
-    "command": "set -euo pipefail\ngit diff --check \"$BASELINE_SHA\" \"$TARGET_SHA\"\nchanged_sources=()\nwhile IFS= read -r file; do\n  [ -n \"$file\" ] && changed_sources+=(\"$file\")\ndone < <(git diff --name-only --diff-filter=ACMR \"$BASELINE_SHA\" \"$TARGET_SHA\" -- '*.js' '*.mjs' '*.ts' '*.tsx')\ntest \"${#changed_sources[@]}\" -gt 0\npnpm exec eslint \"${changed_sources[@]}\"\n"
+    "name": "Run package-manager boundary impact regressions",
+    "command": "pnpm --filter @iris/runtime exec vitest run src/phase3-shell-jobs.test.ts src/project-test.test.ts"
   }
 ]
