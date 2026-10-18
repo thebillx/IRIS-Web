@@ -1,7 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadOrCreateOwnerAccessSecret, FoundationStateStore } from './persistence.js';
 import { MissionDelegationStore, readVerifiedSourceIdentity } from './mission-delegation.js';
 import { PermissionSettingsStore } from './permission-store.js';
@@ -9,7 +10,7 @@ import { PermissionPolicyEngine } from './permissions.js';
 import { RuntimeState } from './state.js';
 
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('mission-scoped owner delegation', () => {
   it('authorizes one bounded operation, rejects replay and preserves an authenticated audit document', async () => {
@@ -73,6 +74,30 @@ describe('mission-scoped owner delegation', () => {
     const original = await readFile(filename, 'utf8');
     await writeFile(filename, original.replace('"mac":', '"mac":"tampered", "ignored":'));
     await expect(store.authorize({ missionId: spec.missionId, clientId: spec.ownerClientId, sessionId: spec.ownerSessionId, agentId: 'agent', capabilityId: 'file.read', operationId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', riskClass: 'LOW' })).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+  });
+
+  it('rejects an expired grant without consuming authority', async () => {
+    const root = await temp('iris-delegation-expiry-');
+    await loadOrCreateOwnerAccessSecret(root);
+    const store = new MissionDelegationStore(root);
+    const now = Date.now();
+    const grant = await store.issue({ requestId: randomUUID(), missionId: randomUUID(), ownerClientId: 'owner', ownerSessionId: randomUUID(), trustedAgentIds: ['agent'], allowedCapabilities: ['file.read'], projectIds: ['project-a'], expiresAt: new Date(now + 60_000).toISOString(), maxExecutions: 1 });
+    const before = await readFile(path.join(root, 'mission-delegations.json'), 'utf8');
+    vi.spyOn(Date, 'now').mockReturnValue(now + 60_001);
+    await expect(store.authorize({ missionId: grant.missionId, clientId: grant.ownerClientId, sessionId: grant.ownerSessionId, agentId: 'agent', capabilityId: 'file.read', projectId: 'project-a', operationId: randomUUID(), riskClass: 'LOW' })).resolves.toMatchObject({ status: 'blocked', reason: expect.stringContaining('expired') });
+    await expect(readFile(path.join(root, 'mission-delegations.json'), 'utf8')).resolves.toBe(before);
+  });
+
+  it('rejects foreign project, workspace, agent and owner identities without consuming a valid grant', async () => {
+    const root = await temp('iris-delegation-scopes-');
+    await loadOrCreateOwnerAccessSecret(root);
+    const store = new MissionDelegationStore(root);
+    const grant = await store.issue({ requestId: randomUUID(), missionId: randomUUID(), ownerClientId: 'owner', ownerSessionId: randomUUID(), trustedAgentIds: ['agent'], allowedCapabilities: ['fs.read'], projectIds: ['project-a'], workspaceIds: ['workspace-a'], expiresAt: new Date(Date.now() + 60_000).toISOString(), maxExecutions: 1 });
+    const input = { missionId: grant.missionId, clientId: grant.ownerClientId, sessionId: grant.ownerSessionId, agentId: 'agent', capabilityId: 'fs.read', projectId: 'project-a', workspaceId: 'workspace-a', operationId: randomUUID(), riskClass: 'LOW' as const };
+    for (const mismatch of [{ projectId: 'foreign' }, { workspaceId: 'foreign' }, { agentId: 'foreign' }, { sessionId: randomUUID() }, { clientId: 'foreign' }]) {
+      await expect(store.authorize({ ...input, ...mismatch })).resolves.toMatchObject({ status: 'blocked' });
+    }
+    await expect(store.authorize(input)).resolves.toMatchObject({ status: 'allowed' });
   });
 
   it('requires an exact source pair when a delegation is source-bound', async () => {

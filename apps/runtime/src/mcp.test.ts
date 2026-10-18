@@ -33,6 +33,54 @@ describe('local MCP transport and permission boundary', () => {
     expect(await issued.json()).toMatchObject({ result: { isError: false, structuredContent: { delegationId: expect.any(String), digest: expect.any(String) } } });
   });
 
+  it('executes ChatGPT follow-up corrections under one delegation and stops on revocation or session closure', async () => {
+    const fixture = await serviceFixture();
+    const owner = fixture.state.createSession('owner-client', 'chatgpt', 'owner');
+    await fixture.state.setSessionCurrentProject(owner.id, owner.clientId, fixture.project.id);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const response = await handleMcpRequest(rpc('tools/call', 92, { name, arguments: args }, true, name, owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+      return response.json();
+    };
+    const mission = await fixture.state.createMission(owner.clientId, owner.id, 'Follow-up contract', 'CHATGPT');
+    const task = (await fixture.state.createMissionTask(mission.id, owner.clientId, owner.id, 'Correct one file')).tasks[0]!;
+    const issued = await call('mission_delegation_issue', {
+      requestId: randomUUID(), missionId: mission.id, trustedAgentIds: [owner.agentId],
+      allowedCapabilities: ['file.write'], projectIds: [fixture.project.id],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), maxExecutions: 4,
+    });
+    expect(issued).toMatchObject({ result: { isError: false } });
+    const targetPath = path.join(fixture.projectRoot, 'delegated.txt');
+    for (const content of ['first draft', 'reviewed correction']) {
+      const prepared = await call('mission_action_prepare', { missionId: mission.id, taskId: task.id, capabilityId: 'file.write', summary: content });
+      expect(prepared).toMatchObject({ result: { isError: false, structuredContent: { tasks: expect.any(Array) } } });
+      const actions = prepared.result.structuredContent.tasks[0].actions as { id: string }[];
+      const result = await call('file_write', { missionId: mission.id, taskId: task.id, actionId: actions.at(-1)!.id, projectId: fixture.project.id, targetPath, content });
+      expect(result).toMatchObject({ result: { isError: false } });
+      await expect(readFile(targetPath, 'utf8')).resolves.toBe(content);
+    }
+    expect(fixture.service.listPendingApprovals()).toHaveLength(0);
+    const evidence = (await fixture.audit.recent(30)).filter((entry) => entry.capabilityId === 'file.write' && entry.result === 'SUCCESS');
+    expect(evidence).toHaveLength(2);
+    expect(evidence.every((entry) => entry.decision === 'ALLOW_AUTO' && entry.reason.includes(issued.result.structuredContent.delegationId))).toBe(true);
+    const pending = await call('mission_action_prepare', { missionId: mission.id, taskId: task.id, capabilityId: 'file.write', summary: 'Must stop after revocation' });
+    const pendingActions = pending.result.structuredContent.tasks[0].actions as { id: string }[];
+    await call('mission_delegation_revoke', { delegationId: issued.result.structuredContent.delegationId });
+    const stopped = await call('file_write', { missionId: mission.id, taskId: task.id, actionId: pendingActions.at(-1)!.id, targetPath, content: 'forbidden' });
+    expect(stopped).toMatchObject({ result: { isError: true, structuredContent: { code: 'CAPABILITY_DENIED', message: expect.stringContaining('revoked') } } });
+    const active = await call('mission_delegation_issue', {
+      requestId: randomUUID(), missionId: mission.id, trustedAgentIds: [owner.agentId],
+      allowedCapabilities: ['file.write'], projectIds: [fixture.project.id],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), maxExecutions: 1,
+    });
+    expect(active).toMatchObject({ result: { isError: false } });
+    const afterClose = await call('mission_action_prepare', { missionId: mission.id, taskId: task.id, capabilityId: 'file.write', summary: 'Must stop after session close' });
+    const afterCloseActions = afterClose.result.structuredContent.tasks[0].actions as { id: string }[];
+    await call('session_close', {});
+    expect(await call('file_write', { missionId: mission.id, taskId: task.id, actionId: afterCloseActions.at(-1)!.id, targetPath, content: 'forbidden after close' })).toMatchObject({ result: { isError: true, structuredContent: { code: 'SESSION_NOT_FOUND' } } });
+    expect(await call('mission_delegation_issue', { requestId: randomUUID(), missionId: mission.id })).toMatchObject({ result: { isError: true, structuredContent: { code: 'SESSION_NOT_FOUND' } } });
+    await expect(readFile(targetPath, 'utf8')).resolves.toBe('reviewed correction');
+  });
+
   it('accepts the tunnel-client v0.0.12 Streamable HTTP initialize contract', async () => {
     const initialize = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
       method: 'POST',

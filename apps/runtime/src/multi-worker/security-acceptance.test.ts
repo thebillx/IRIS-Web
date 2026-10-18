@@ -162,7 +162,7 @@ async function fixture() {
     }],
   });
 
-  const createCapabilities = (healthValue: RuntimeHealth = health()) => new CapabilityService(
+  const createCapabilities = (healthValue: RuntimeHealth = health(), workerService = multiWorker) => new CapabilityService(
     state,
     policy,
     audit,
@@ -170,14 +170,14 @@ async function fixture() {
     undefined,
     resources,
     undefined,
-    multiWorker,
+    workerService,
     undefined,
     delegations,
   );
 
   return {
     sourceRoot, dataRoot, projectRoot, state, project, session, mission, resources, workspace,
-    multiWorker, run, worker, task, assignment, association, delegation, audit, health, createCapabilities,
+    multiWorker, run, worker, task, assignment, association, delegation, delegations, audit, health, createCapabilities,
   };
 }
 
@@ -210,6 +210,22 @@ describe('IRIS multi-worker M11 CapabilityService audit and security acceptance'
       authorityDigest: f.assignment.authorityDigest,
       reason: expect.stringContaining(f.delegation.delegationId),
     });
+  });
+
+  it('preserves durable worker authority across reload and rejects replay, revocation and closed owner sessions', async () => {
+    const f = await fixture();
+    const reloaded = new MultiWorkerStore(f.dataRoot);
+    const durable = await reloaded.read();
+    expect(durable.assignments.find((assignment) => assignment.id === f.assignment.id)?.authorityDigest).toBe(f.assignment.authorityDigest);
+    const workerService = new MultiWorkerRoutingService(f.state, f.resources, reloaded, undefined, () => '2026-09-20T03:00:00.000Z');
+    const capabilities = f.createCapabilities(f.health(), workerService);
+    const operation = { capabilityId: 'fs.read' as const, clientId: f.session.clientId, sessionId: f.session.id, projectId: f.project.id, workspaceId: f.workspace.workspaceId, path: 'apps/runtime/visible.txt', mode: 'TEXT' as const, encoding: 'utf-8' as const, worker: f.association };
+    await expect(capabilities.execute(operation)).resolves.toMatchObject({ status: 'executed' });
+    await expect(capabilities.execute(operation)).resolves.toMatchObject({ status: 'denied', reason: expect.stringContaining('replay') });
+    await f.delegations.revoke(f.delegation.delegationId, f.session.clientId, f.session.id);
+    await expect(capabilities.execute({ ...operation, worker: { ...f.association, operationId: randomUUID() } })).resolves.toMatchObject({ status: 'denied', reason: expect.stringContaining('revoked') });
+    f.state.deleteSession(f.session.id, f.session.clientId);
+    await expect(capabilities.execute({ ...operation, worker: { ...f.association, operationId: randomUUID() } })).rejects.toMatchObject({ code: 'SESSION_NOT_FOUND' });
   });
 
   it('denies cross-path, forged digest, foreign workspace, and broad project search before execution', async () => {

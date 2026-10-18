@@ -111,7 +111,7 @@ export class PermissionPolicyEngine {
       return record(input, definition.riskClass, 'DENY', 'Capability is not implemented in the local registry', scope.projectId, scope.target);
     }
 
-    if (this.delegations !== undefined && input.missionId !== null && input.missionId !== undefined) {
+    if (definition.requiredScope === 'PROJECT' && this.delegations !== undefined && input.missionId !== null && input.missionId !== undefined) {
       const delegation = await this.delegations.authorize({
         missionId: input.missionId,
         clientId: input.clientId,
