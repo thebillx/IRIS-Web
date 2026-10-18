@@ -342,14 +342,14 @@ async function writeLegacyLaunchAgent(subject: Awaited<ReturnType<typeof fixture
   return { metadata, plist };
 }
 
-async function reviewedSource(subject: Awaited<ReturnType<typeof fixture>>): Promise<{
+async function reviewedSource(subject: Awaited<ReturnType<typeof fixture>>, name = 'reviewed-control-source'): Promise<{
   readonly root: string;
   readonly controlScript: string;
   readonly executableArguments: readonly string[];
   readonly sourceSha: string;
   readonly sourceTree: string;
 }> {
-  const root = path.join(path.dirname(subject.dataRoot), 'reviewed-control-source');
+  const root = path.join(path.dirname(subject.dataRoot), name);
   const runtime = path.join(root, 'apps', 'runtime');
   const controlScript = path.join(runtime, 'src', 'control.ts');
   const packageRoot = path.join(root, 'node_modules', '.pnpm', 'tsx@4.23.13', 'node_modules', 'tsx');
@@ -631,6 +631,32 @@ describe('IRIS LaunchAgent artifact', () => {
       approvalId: approval.approvalId,
       requestId,
     }, subject.fake.dependencies)).rejects.toThrow(/target plist no longer matches/);
+  });
+
+  it('supersedes a committed schema-3 source binding without losing migration history', async () => {
+    const subject = await fixture();
+    await prepareBootstrap(subject);
+    const next = await reviewedSource(subject, 'next-reviewed-control-source');
+    const paths = launchdPaths(subject.dataRoot, subject.home);
+    const previousMigration = await readFile(paths.sourceBindingMigration, 'utf8');
+    const requestId = randomUUID();
+    const approval = await approve(subject, next, requestId);
+    const result = await migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: next.root,
+      controlScript: next.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: next.executableArguments,
+      sourceSha: next.sourceSha,
+      sourceTree: next.sourceTree,
+      approvalId: approval.approvalId,
+      requestId,
+    }, subject.fake.dependencies);
+    expect(result.state).toBe('COMMITTED');
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ schemaVersion: 3, sourceRoot: next.root, controlScript: next.controlScript });
+    expect(JSON.parse(await readFile(paths.sourceBindingMigration, 'utf8'))).toMatchObject({ state: 'COMMITTED', targetSourceSha: next.sourceSha, targetSourceTree: next.sourceTree });
+    expect((JSON.parse(await readFile(paths.sourceBindingMigrationHistory, 'utf8')) as Array<{ raw: string }>).some((entry) => entry.raw === previousMigration)).toBe(true);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootstrap '))).toBe(false);
   });
 
   it('requires and commits a distinct source-bound Supervisor bootstrap policy after migration', async () => {
