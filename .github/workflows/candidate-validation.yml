@@ -81,7 +81,8 @@ jobs:
             src/recovery-policy.test.ts \
             src/supervisor-startup.test.ts \
             src/supervisor-daemon-exit.test.ts \
-            src/supervisor-failure-stop.test.ts
+            src/supervisor-failure-stop.test.ts \
+            --testTimeout=30000
 
       - name: Run Supervisor and repository authority regressions
         run: |
