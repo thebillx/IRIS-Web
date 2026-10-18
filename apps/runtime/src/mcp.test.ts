@@ -12,7 +12,8 @@ import { handleMcpProRequest, handleMcpRequest, MCP_PROTOCOL_VERSION, TUNNEL_CLI
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
-import { FoundationStateStore } from './persistence.js';
+import { MissionDelegationStore } from './mission-delegation.js';
+import { FoundationStateStore, loadOrCreateOwnerAccessSecret } from './persistence.js';
 import { ProjectValidationJobManager } from './project-test.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { RuntimeState } from './state.js';
@@ -22,6 +23,16 @@ const execFileAsync = promisify(execFile);
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('local MCP transport and permission boundary', () => {
+  it('issues one owner-bound delegation through authenticated MCP without treating chat text as authority', async () => {
+    const fixture = await serviceFixture();
+    const owner = fixture.state.createSession('owner-client', 'chatgpt', 'owner');
+    await fixture.state.setSessionCurrentProject(owner.id, owner.clientId, fixture.project.id);
+    const created = await handleMcpRequest(rpc('tools/call', 90, { name: 'mission_create', arguments: { title: 'Delegated mission', orchestratorMode: 'CHATGPT' } }, true, 'mission_create', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    const mission = (await created.json()) as { result: { structuredContent: { id: string } } };
+    const issued = await handleMcpRequest(rpc('tools/call', 91, { name: 'mission_delegation_issue', arguments: { requestId: '15151515-1515-4151-8151-151515151515', missionId: mission.result.structuredContent.id, trustedAgentIds: ['codex-executor'], allowedCapabilities: ['file.write'], projectIds: [fixture.project.id], expiresAt: new Date(Date.now() + 60_000).toISOString(), maxExecutions: 2 } }, true, 'mission_delegation_issue', owner.clientId, owner.id), fixture.service, fixture.state, fixture.broker);
+    expect(await issued.json()).toMatchObject({ result: { isError: false, structuredContent: { delegationId: expect.any(String), digest: expect.any(String) } } });
+  });
+
   it('accepts the tunnel-client v0.0.12 Streamable HTTP initialize contract', async () => {
     const initialize = await handleMcpRequest(new Request('http://127.0.0.1/mcp', {
       method: 'POST',
@@ -105,7 +116,7 @@ describe('local MCP transport and permission boundary', () => {
     for (const name of [
       'runtime_status', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select',
       'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive',
-      'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create',
+      'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_delegation_issue', 'mission_delegation_revoke',
       'mission_task_state_set', 'mission_action_prepare', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run',
       'project_validation_run', 'git_local', 'remote_publish', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete',
     ]) {
@@ -130,7 +141,7 @@ describe('local MCP transport and permission boundary', () => {
     const listed = await handleMcpRequest(rpc('tools/list', 2), fixture.service);
     const listedBody = await listed.json() as { result: { tools: Array<{ name: string; inputSchema: { required?: string[] } }> } };
     expect(listedBody.result.tools.map((tool) => tool.name)).toEqual([
-      'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete', 'catalog_identity',
+      'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_delegation_issue', 'mission_delegation_revoke', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete', 'catalog_identity',
     ]);
     expect(listedBody.result.tools.find((tool) => tool.name === 'session_open')?.inputSchema.required).toBeUndefined();
 
@@ -513,6 +524,7 @@ function rpc(
 async function serviceFixture() {
   const sourceRoot = await realpath(await temp('iris-mcp-source-'));
   const dataRoot = await realpath(await temp('iris-mcp-data-'));
+  await loadOrCreateOwnerAccessSecret(dataRoot);
   const legacyRoot = await realpath(await temp('iris-mcp-legacy-'));
   const projectRoot = path.join(sourceRoot, 'project');
   await mkdir(projectRoot);
@@ -522,7 +534,8 @@ async function serviceFixture() {
   await state.setSessionCurrentProject(session.id, session.clientId, project.id);
   const settings = new PermissionSettingsStore(dataRoot);
   await settings.initialize();
-  const policy = new PermissionPolicyEngine(state, settings, sourceRoot, dataRoot, legacyRoot);
+  const delegations = new MissionDelegationStore(dataRoot);
+  const policy = new PermissionPolicyEngine(state, settings, sourceRoot, dataRoot, legacyRoot, delegations);
   const audit = new PermissionAuditStore(dataRoot);
   const broker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
   const resources = new VNextResourceRegistry(state, dataRoot);
@@ -532,8 +545,8 @@ async function serviceFixture() {
     uptimeMs: 1, authority: 'owned', connectedClients: state.listClients().length, connectedSessions: state.listSessions().length,
     agentExecutorType: 'local-development-executor', productionModelConnected: false,
     apiUrl: 'http://127.0.0.1:43110', mcpUrl: 'http://127.0.0.1:43110/mcp',
-  }), new ProjectValidationJobManager(dataRoot), resources, jobs);
-  return { sourceRoot, dataRoot, legacyRoot, projectRoot, state, project, session, settings, policy, audit, broker, service };
+  }), new ProjectValidationJobManager(dataRoot), resources, jobs, undefined, undefined, delegations);
+  return { sourceRoot, dataRoot, legacyRoot, projectRoot, state, project, session, settings, policy, audit, broker, service, delegations };
 }
 
 async function temp(prefix: string): Promise<string> {

@@ -216,6 +216,7 @@ describe('IRIS multi-worker M13 read-only dogfood', () => {
         assignmentId: assignment.id,
         workerId: worker.id,
         authorityDigest: assignment.authorityDigest,
+        operationId: randomUUID(),
       });
     }
 

@@ -11,6 +11,7 @@ import { capabilityDefinition, listCapabilities } from './capability-registry.js
 import { PermissionSettingsStore } from './permission-store.js';
 import { inspectProjectTarget, inspectRegistrationRoot, pathIsWithin, type ProjectTargetKind } from './project-path.js';
 import type { RuntimeState } from './state.js';
+import type { MissionDelegationStore } from './mission-delegation.js';
 
 export const LEGACY_REFERENCE_ROOT = '/Users/bill/iris-native-runtime' as const;
 export const PROTECTED_REFERENCE_ROOT_ENV = 'IRIS_PROTECTED_REFERENCE_ROOT' as const;
@@ -28,6 +29,9 @@ export interface PolicyRequest {
   readonly workerId?: string | null | undefined;
   readonly assignmentId?: string | null | undefined;
   readonly authorityDigest?: string | null | undefined;
+  readonly workspaceId?: string | null | undefined;
+  readonly sourceSha?: string | null | undefined;
+  readonly sourceTree?: string | null | undefined;
   readonly projectId?: string | null | undefined;
   readonly targetPath?: string | null | undefined;
   readonly effectiveEffects?: readonly CapabilityEffect[] | undefined;
@@ -55,6 +59,7 @@ export class PermissionPolicyEngine {
     private readonly sourceRoot: string,
     private readonly dataRoot: string,
     private readonly legacyReferenceRoot: string = LEGACY_REFERENCE_ROOT,
+    private readonly delegations?: MissionDelegationStore,
   ) {}
 
   public async snapshot(): Promise<PermissionSnapshot> {
@@ -76,7 +81,7 @@ export class PermissionPolicyEngine {
   }
 
   public async evaluate(input: PolicyRequest): Promise<PermissionDecisionRecord> {
-    input = { ...input, agentId: this.effectiveAgentId(input) };
+    input = { ...input, agentId: input.workerId?.trim() || this.effectiveAgentId(input) };
     const definition = capabilityDefinition(input.capabilityId);
     if (definition === null) return record(input, 'HIGH', 'DENY', 'Unknown capability fails closed', null, null);
 
@@ -104,6 +109,26 @@ export class PermissionPolicyEngine {
     }
     if (!definition.implemented) {
       return record(input, definition.riskClass, 'DENY', 'Capability is not implemented in the local registry', scope.projectId, scope.target);
+    }
+
+    if (this.delegations !== undefined && input.missionId !== null && input.missionId !== undefined) {
+      const delegation = await this.delegations.authorize({
+        missionId: input.missionId,
+        clientId: input.clientId,
+        sessionId: input.sessionId,
+        agentId: input.agentId,
+        capabilityId: definition.id,
+        projectId: scope.projectId,
+        workspaceId: input.workspaceId,
+        sourceSha: input.sourceSha,
+        sourceTree: input.sourceTree,
+        operationId: input.actionId,
+        riskClass: definition.riskClass,
+      });
+      if (delegation.status === 'blocked') return record(input, definition.riskClass, 'DENY', delegation.reason, scope.projectId, scope.target);
+      if (delegation.status === 'allowed') {
+        return record({ ...input, authorityDigest: input.authorityDigest ?? delegation.record.digest }, definition.riskClass, 'ALLOW_AUTO', delegation.reason, scope.projectId, scope.target);
+      }
     }
 
     if (definition.id === 'project.register' && scope.target !== null && !pathIsWithin(this.sourceRoot, scope.target)) {

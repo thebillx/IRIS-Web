@@ -159,6 +159,7 @@ export interface WorkerExecutionAssociation {
   readonly assignmentId: string;
   readonly workerId: string;
   readonly authorityDigest: string;
+  readonly operationId: string;
 }
 
 export interface MissionOrchestratorHandoff {

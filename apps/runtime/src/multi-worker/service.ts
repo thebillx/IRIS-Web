@@ -33,6 +33,8 @@ import type { MultiWorkerDocument } from './model.js';
 import { projectMultiWorkerObservability, type MultiWorkerObservabilityTree } from './observability.js';
 import { assertMutablePathOwnershipAvailable } from './path-ownership.js';
 import { MultiWorkerStore } from './store.js';
+
+const WORKER_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 import { validateMultiWorkerDocument, validateWorkerResult, validateWorkerReview, validateWorkerTaskAuthority } from './validation.js';
 
 export interface CreateOrchestrationRunInput {
@@ -209,6 +211,9 @@ export class MultiWorkerRoutingService {
   }
 
   public async authorizeExecution(input: AuthorizeWorkerExecutionInput): Promise<WorkerExecutionEnvelope> {
+    if (!WORKER_OPERATION_ID_PATTERN.test(input.association.operationId)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker capability requires a valid operation identity');
+    }
     const document = await this.store.read();
     const task = requiredTask(document, input.association.workerTaskId);
     const run = requiredRun(document, task.orchestrationRunId);

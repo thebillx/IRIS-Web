@@ -36,6 +36,7 @@ import { GovernedGitEngine, type GitCompatibilityOperation, type Phase4GitOperat
 import type { RuntimeState } from './state.js';
 import type { MultiWorkerRoutingService } from './multi-worker/service.js';
 import type { AdoRequirementContextService } from './ado/runtime-context.js';
+import type { MissionDelegationStore, MissionDelegationSpec } from './mission-delegation.js';
 
 type Phase4GitCapabilityId = Exclude<Extract<CapabilityId, `git.${string}`>, 'git.local'>;
 type Phase4GitOperationCore = Phase4GitRequest & {
@@ -47,6 +48,7 @@ type Phase4GitOperationCore = Phase4GitRequest & {
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_PENDING_APPROVALS = 100;
 const APPROVAL_TTL_MS = 15 * 60_000;
+const WORKER_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 type CapabilityOperationCore =
   | (RepositoryReconciliationInput & { readonly capabilityId: 'repository.reconcile'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined })
@@ -161,6 +163,7 @@ export class CapabilityService {
     jobs?: DurableJobManager,
     multiWorker?: MultiWorkerRoutingService,
     adoContext?: AdoRequirementContextService,
+    private readonly delegations?: MissionDelegationStore,
   ) {
     this.resources = resources;
     this.jobs = jobs;
@@ -174,6 +177,22 @@ export class CapabilityService {
 
   public recentAudit(limit?: number) {
     return this.audit.recent(limit);
+  }
+
+  public async issueMissionDelegation(input: MissionDelegationSpec): Promise<unknown> {
+    if (this.delegations === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Mission delegation is unavailable');
+    const session = this.state.getSessionForClient(input.ownerSessionId, input.ownerClientId);
+    if (session.agentRole !== 'owner') throw new RuntimeError('CONTROL_DENIED', 'Only an authenticated owner session may issue a delegation');
+    const mission = await this.state.getMission(input.missionId);
+    if (mission.clientId !== input.ownerClientId || mission.sessionId !== input.ownerSessionId || mission.orchestratorMode !== 'CHATGPT') {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Delegation owner does not control the mission');
+    }
+    return this.delegations.issue(input);
+  }
+
+  public revokeMissionDelegation(delegationId: string, ownerClientId: string, ownerSessionId: string): Promise<void> {
+    if (this.delegations === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Mission delegation is unavailable');
+    return this.delegations.revoke(delegationId, ownerClientId, ownerSessionId);
   }
 
   public listPendingApprovals(): readonly PendingApprovalView[] {
@@ -362,6 +381,9 @@ export class CapabilityService {
 
   private async authorizeWorkerOperation(operation: CapabilityOperation): Promise<void> {
     if (operation.worker === undefined) return;
+    if (!WORKER_OPERATION_ID_PATTERN.test(operation.worker.operationId)) {
+      throw new RuntimeError('CAPABILITY_DENIED', 'Worker capability requires a valid operation identity');
+    }
     if (this.multiWorker === undefined) throw new RuntimeError('CAPABILITY_DENIED', 'Multi-worker execution authority is not available in this runtime');
     if (!workerExecutableCapability(operation.capabilityId)) {
       throw new RuntimeError('CAPABILITY_DENIED', 'Worker capability is not enabled for native multi-worker execution');
@@ -1094,10 +1116,25 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
   }
   const missionBound = operation.mission === undefined
     ? request
-    : { ...request, missionId: operation.mission.missionId, taskId: operation.mission.taskId, actionId: operation.mission.actionId };
+    : {
+      ...request,
+      missionId: operation.mission.missionId,
+      taskId: operation.mission.taskId,
+      actionId: operation.mission.actionId,
+      ...('workspaceId' in operation && typeof operation.workspaceId === 'string' ? { workspaceId: operation.workspaceId } : {}),
+      ...('sourceSha' in operation && typeof operation.sourceSha === 'string' ? { sourceSha: operation.sourceSha } : {}),
+      ...('sourceTree' in operation && typeof operation.sourceTree === 'string' ? { sourceTree: operation.sourceTree } : {}),
+    };
+  const scoped = {
+    ...('workspaceId' in operation && typeof operation.workspaceId === 'string' ? { workspaceId: operation.workspaceId } : {}),
+    ...('sourceSha' in operation && typeof operation.sourceSha === 'string' ? { sourceSha: operation.sourceSha } : {}),
+    ...('sourceTree' in operation && typeof operation.sourceTree === 'string' ? { sourceTree: operation.sourceTree } : {}),
+  };
   return operation.worker === undefined ? missionBound : {
     ...missionBound,
+    ...scoped,
     missionId: operation.worker.missionId,
+    actionId: operation.worker.operationId,
     orchestrationRunId: operation.worker.orchestrationRunId,
     workerTaskId: operation.worker.workerTaskId,
     workerId: operation.worker.workerId,
@@ -1105,6 +1142,7 @@ function requestForOperation(operation: CapabilityOperation): PolicyRequest {
     authorityDigest: operation.worker.authorityDigest,
   };
 }
+
 
 function workerExecutableCapability(capabilityId: CapabilityId): boolean {
   return capabilityId === 'project.search'
