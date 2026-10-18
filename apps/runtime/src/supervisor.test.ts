@@ -51,6 +51,21 @@ afterEach(async () => {
 });
 
 describe('IRIS supervisor', () => {
+  it('reads registered project metadata for control-only Mode A without mutating the registry', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-mode-a-projects-'));
+    roots.push(dataRoot);
+    const project = { id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' };
+    const registryPath = path.join(dataRoot, 'state.json');
+    await writeFile(registryPath, JSON.stringify({ schemaVersion: 1, projects: [project], defaultProjectId: null }) + '\n', { mode: 0o600 });
+    const before = await readFile(registryPath, 'utf8');
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot: '/Users/example/iris' });
+
+    await expect(supervisor.listProjects()).resolves.toEqual({ projects: [project], defaultProjectId: null });
+    await expect(supervisor.projectInfo(project.id)).resolves.toEqual(project);
+    await expect(supervisor.projectInfo('22222222-2222-4222-8222-222222222222')).rejects.toMatchObject({ code: 'PROJECT_NOT_FOUND' });
+    await expect(readFile(registryPath, 'utf8')).resolves.toBe(before);
+  });
+
   it('reports missing migration state without creating files during status', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-status-'));
     roots.push(dataRoot);

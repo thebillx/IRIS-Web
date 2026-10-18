@@ -16,7 +16,7 @@ import { catalogIdentity, catalogIdentityAtVersion, catalogToolNames, isSupporte
 import { observeProcessStart } from './macos-safety.js';
 import { MCP_PROTOCOL_VERSION, proMcpToolDefinitions } from './mcp.js';
 import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
-import { loadOrCreateRuntimeId, readEndpoint, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
+import { FoundationStateStore, loadOrCreateRuntimeId, readEndpoint, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
 import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
 import { readMachineId } from './machine-identity.js';
@@ -591,6 +591,18 @@ export class Supervisor {
     return this.statusFrom(state, registry, credentials);
   }
 
+  public async listProjects(): Promise<Record<string, unknown>> {
+    const registry = await new FoundationStateStore(this.dataRoot).read();
+    return { projects: registry.projects, defaultProjectId: registry.defaultProjectId };
+  }
+
+  public async projectInfo(projectId: string): Promise<Record<string, unknown>> {
+    const registry = await new FoundationStateStore(this.dataRoot).read();
+    const project = registry.projects.find((candidate) => candidate.id === projectId);
+    if (project === undefined) throw new RuntimeError('PROJECT_NOT_FOUND', 'Registered project was not found');
+    return { ...project };
+  }
+
   public async doctor(): Promise<Record<string, unknown>> {
     const status = await this.status();
     const failedLayer = status.localRuntime.state !== 'READY'
@@ -760,6 +772,8 @@ export class Supervisor {
     try {
       nativeControl = await startSupervisorNativeControlServer(this.dataRoot, this.supervisorControlPort, {
       supervisorStatus: () => this.supervisorNativeStatus(),
+      listProjects: () => this.listProjects(),
+      projectInfo: (projectId) => this.projectInfo(projectId),
       adminStatus: () => this.adminNativeStatus(),
       runtimeReconcile: () => this.runtimeReconcile(),
       adminRecycle: (input) => this.adminRecycle(input),

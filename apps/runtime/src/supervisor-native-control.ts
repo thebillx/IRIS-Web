@@ -36,6 +36,8 @@ export interface AdminTunnelRecycleInput {
 
 export interface SupervisorNativeOperations {
   supervisorStatus(): Promise<unknown>;
+  readonly listProjects?: () => Promise<unknown>;
+  readonly projectInfo?: (projectId: string) => Promise<unknown>;
   adminStatus(): Promise<unknown>;
   runtimeReconcile(): Promise<unknown>;
   adminRecycle(input: AdminRecycleInput): Promise<unknown>;
@@ -84,6 +86,11 @@ async function handleRequest(
   secret: string,
   operations: SupervisorNativeOperations,
 ): Promise<void> {
+  if (request.method === 'GET' && isUnsupportedOAuthMetadataPath(request.url)) {
+    // Static bearer authentication is supplied by the managed tunnel profile; advertise no OAuth contract.
+    writeJson(response, 404, { error: 'not_found' });
+    return;
+  }
   if (request.headers.authorization !== `Bearer ${secret}`) {
     writeJson(response, 401, { error: 'unauthorized' });
     return;
@@ -174,6 +181,17 @@ async function handleRequest(
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.supervisorStatus()));
       return;
     }
+    if (name === 'list_projects') {
+      requireNoArguments(args);
+      if (operations.listProjects === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Project registry read is unavailable');
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.listProjects()));
+      return;
+    }
+    if (name === 'project_info') {
+      if (operations.projectInfo === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Project registry read is unavailable');
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.projectInfo(requiredProjectId(args))));
+      return;
+    }
     if (name === 'admin_status') {
       requireNoArguments(args);
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.adminStatus()));
@@ -208,6 +226,10 @@ async function handleRequest(
   writeJsonRpcError(response, rpc.id ?? null, -32601, 'Unknown supervisor tool');
 }
 
+function isUnsupportedOAuthMetadataPath(url: string | undefined): boolean {
+  return url === '/.well-known/oauth-protected-resource/mcp' || url === '/.well-known/oauth-authorization-server';
+}
+
 export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
   const noArgs = { type: 'object', properties: {}, additionalProperties: false };
   const activation = adminToolDefinitions().filter((tool) => typeof tool.name === 'string' && ACTIVATION_NAMES.has(tool.name));
@@ -216,6 +238,23 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
       name: 'supervisor_status',
       description: 'Read bounded identity, readiness, tunnel identity, and profile digest state owned by the outer supervisor daemon.',
       inputSchema: noArgs,
+      annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'list_projects',
+      description: 'List the persisted project registry without selecting a workspace or changing authority.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'project_info',
+      description: 'Read bounded metadata for one explicitly registered project; this does not grant workspace or filesystem authority.',
+      inputSchema: {
+        type: 'object',
+        properties: { projectId: { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' } },
+        required: ['projectId'],
+        additionalProperties: false,
+      },
       annotations: { readOnlyHint: true },
     },
     {
@@ -288,6 +327,15 @@ function adminTunnelRecycleArguments(args: Record<string, unknown>): AdminTunnel
 
 function requireNoArguments(args: Record<string, unknown>): void {
   assertAllowedKeys(args, []);
+}
+
+function requiredProjectId(args: Record<string, unknown>): string {
+  assertAllowedKeys(args, ['projectId']);
+  const projectId = args.projectId;
+  if (typeof projectId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(projectId)) {
+    throw new RuntimeError('INVALID_REQUEST', 'projectId must be a registered project UUID');
+  }
+  return projectId;
 }
 
 function assertAllowedKeys(args: Record<string, unknown>, allowed: readonly string[]): void {

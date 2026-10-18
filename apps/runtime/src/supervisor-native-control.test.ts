@@ -49,7 +49,7 @@ describe('outer supervisor native control', () => {
         'Mcp-Method': 'tools/list',
       });
       expect(toolNames(listed)).toEqual([
-        'supervisor_status', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
+        'supervisor_status', 'list_projects', 'project_info', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
         'activation_status', 'activation_prepare', 'activation_apply', 'activation_confirm', 'activation_rollback',
       ]);
       expect(catalogToolNames('FULL')).not.toContain('admin_tunnel_recycle');
@@ -88,10 +88,14 @@ describe('outer supervisor native control', () => {
       const health = await fetch(harness.server.healthUrl, { headers: { authorization: `Bearer ${harness.secret}` } });
       expect(health.status).toBe(200);
       await expect(health.json()).resolves.toMatchObject({ ok: true, owner: 'OUTER_SUPERVISOR_DAEMON' });
+      expect((await fetch(`${harness.server.mcpUrl.replace('/mcp', '')}/.well-known/oauth-protected-resource/mcp`)).status).toBe(404);
+      expect((await fetch(`${harness.server.mcpUrl.replace('/mcp', '')}/.well-known/oauth-authorization-server`)).status).toBe(404);
 
       const listed = await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
       expect(toolNames(listed)).toEqual([
         'supervisor_status',
+        'list_projects',
+        'project_info',
         'admin_status',
         'runtime_reconcile',
         'admin_recycle',
@@ -111,6 +115,9 @@ describe('outer supervisor native control', () => {
       }
       expect(adminToolDefinitions().map((tool) => tool.name)).toContain('admin_status');
       expect(structured(await rpcTool(harness, 'supervisor_status', {}))).toMatchObject({ supervisor: 'outer', workloadRuntimeId: 'runtime-a' });
+      expect(structured(await rpcTool(harness, 'list_projects', {}))).toMatchObject({ defaultProjectId: null, projects: [{ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' }] });
+      expect(structured(await rpcTool(harness, 'project_info', { projectId: '11111111-1111-4111-8111-111111111111' }))).toEqual({ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' });
+      expect(toolError(await rpcTool(harness, 'project_info', { projectId: '../escape' }))).toMatchObject({ code: 'INVALID_REQUEST' });
       expect(structured(await rpcTool(harness, 'admin_status', {}))).toMatchObject({ adminIdentity: 'admin-a' });
       expect(structured(await rpcTool(harness, 'runtime_reconcile', {}))).toMatchObject({ readiness: 'READY', workloadAnchorsPreserved: true });
       expect(structured(await rpcTool(harness, 'activation_status', {}))).toMatchObject({ proxied: 'activation_status' });
@@ -167,6 +174,22 @@ describe('outer supervisor native control', () => {
       await harness.server.close();
     }
   });
+
+  it('supports an authenticated MCP reconnect after the native transport is replaced', async () => {
+    const harness = await startHarness();
+    let replacement: Awaited<ReturnType<typeof startSupervisorNativeControlServer>> | null = null;
+    try {
+      expect(toolNames(await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }))).toContain('project_info');
+      const port = harness.server.port;
+      replacement = await harness.restart();
+      expect(replacement.port).toBe(port);
+      expect((await fetch(replacement.healthUrl, { headers: { authorization: `Bearer ${harness.secret}` } })).status).toBe(200);
+      const reconnected = { ...harness, server: replacement };
+      expect(structured(await rpcTool(reconnected, 'project_info', { projectId: '11111111-1111-4111-8111-111111111111' }))).toMatchObject({ id: '11111111-1111-4111-8111-111111111111' });
+    } finally {
+      await (replacement ?? harness.server).close();
+    }
+  });
 });
 
 async function startHarness() {
@@ -177,6 +200,11 @@ async function startHarness() {
   const harness = { workloadRuntimeId: 'runtime-a' };
   const operations: SupervisorNativeOperations = {
     supervisorStatus: async () => ({ supervisor: 'outer', workloadRuntimeId: harness.workloadRuntimeId }),
+    listProjects: async () => ({ defaultProjectId: null, projects: [{ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' }] }),
+    projectInfo: async (projectId) => {
+      if (projectId !== '11111111-1111-4111-8111-111111111111') throw new Error('Registered project was not found');
+      return { id: projectId, name: 'Project', rootPath: '/tmp/project-a' };
+    },
     adminStatus: async () => ({ adminIdentity: recycleInputs.length === 0 ? 'admin-a' : 'admin-b' }),
     runtimeReconcile: async () => ({ readiness: 'READY', workloadAnchorsPreserved: true }),
     adminRecycle: async (input) => {
@@ -187,7 +215,20 @@ async function startHarness() {
     adminToolCall: async (name): Promise<SupervisorAdminToolCallResult> => ({ structuredContent: { proxied: name }, isError: false }),
   };
   const server = await startSupervisorNativeControlServer(dataRoot, await freePort(), operations);
-  return { ...harness, dataRoot, secret, recycleInputs, server, get workloadRuntimeId() { return harness.workloadRuntimeId; }, set workloadRuntimeId(value: string) { harness.workloadRuntimeId = value; } };
+  return {
+    ...harness,
+    dataRoot,
+    secret,
+    recycleInputs,
+    server,
+    restart: async () => {
+      const port = server.port;
+      await server.close();
+      return startSupervisorNativeControlServer(dataRoot, port, operations);
+    },
+    get workloadRuntimeId() { return harness.workloadRuntimeId; },
+    set workloadRuntimeId(value: string) { harness.workloadRuntimeId = value; },
+  };
 }
 
 async function rpcTool(harness: Awaited<ReturnType<typeof startHarness>>, name: string, args: object): Promise<Record<string, unknown>> {
