@@ -16,6 +16,7 @@ import {
   reconcileLaunchAgentSourceApproval,
   renderLaunchAgent,
   resolveReviewedRuntimeEntrypoints,
+  stopLaunchAgentForMigration,
   uninstallLaunchAgent,
   type LaunchdDependencies,
 } from './launchd.js';
@@ -1402,6 +1403,77 @@ describe('IRIS LaunchAgent artifact', () => {
     await expect(lstat(paths.metadata)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(uninstallLaunchAgent(subject.dataRoot, subject.fake.dependencies)).resolves.toBeUndefined();
     expect(subject.fake.calls.filter((call) => call.startsWith('bootout '))).toHaveLength(1);
+  });
+
+  it('stops only a verified Supervisor for source migration and preserves Schema-3 artifacts', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const metadataRaw = await readFile(paths.metadata, 'utf8');
+    const plistRaw = await readFile(paths.plist, 'utf8');
+    const migrationRaw = await readFile(paths.sourceBindingMigration, 'utf8');
+    const metadata = JSON.parse(metadataRaw) as { sourceRoot: string };
+    await expect(stopLaunchAgentForMigration({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).resolves.toMatchObject({ state: 'STOPPED', processId: subject.fake.live.pid });
+    expect(subject.fake.loaded).toBe(false);
+    await expect(lstat(paths.registeredPlist)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(paths.metadata, 'utf8')).toBe(metadataRaw);
+    expect(await readFile(paths.plist, 'utf8')).toBe(plistRaw);
+    expect(await readFile(paths.sourceBindingMigration, 'utf8')).toBe(migrationRaw);
+  });
+
+  it('fails closed without unloading when Supervisor identity or before-images conflict', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const metadataRaw = await readFile(paths.metadata, 'utf8');
+    const plistRaw = await readFile(paths.plist, 'utf8');
+    const metadata = JSON.parse(metadataRaw) as { sourceRoot: string };
+    await expect(stopLaunchAgentForMigration({
+      dataRoot: subject.dataRoot,
+      sourceRoot: path.join(metadata.sourceRoot, 'foreign'),
+      beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).rejects.toThrow(/source root|identity/);
+    expect(subject.fake.loaded).toBe(true);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('records an unresolved stop when bootout outcome is unknown', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const metadataRaw = await readFile(paths.metadata, 'utf8');
+    const plistRaw = await readFile(paths.plist, 'utf8');
+    const metadata = JSON.parse(metadataRaw) as { sourceRoot: string };
+    subject.fake.bootout = 'unknown-success';
+    await expect(stopLaunchAgentForMigration({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).resolves.toMatchObject({ state: 'STOPPED', processId: subject.fake.live.pid });
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ schemaVersion: 3, state: 'READY' });
+    expect(subject.fake.loaded).toBe(false);
+  });
+
+  it('preserves the binding when identity-verified bootout fails', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const metadataRaw = await readFile(paths.metadata, 'utf8');
+    const plistRaw = await readFile(paths.plist, 'utf8');
+    const metadata = JSON.parse(metadataRaw) as { sourceRoot: string };
+    subject.fake.bootout = 'failure';
+    await expect(stopLaunchAgentForMigration({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).rejects.toThrow(/verified Supervisor|reconciliation/);
+    expect(subject.fake.loaded).toBe(true);
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ state: 'RECONCILIATION_REQUIRED', unresolvedReason: 'BOOTOUT_OUTCOME_UNKNOWN' });
+    await expect(lstat(paths.registeredPlist)).resolves.toMatchObject({ mode: expect.any(Number) });
   });
 
   it('preserves a loaded service when its registered plist changed', async () => {
