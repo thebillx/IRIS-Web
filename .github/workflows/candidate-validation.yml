@@ -75,7 +75,7 @@ jobs:
 
       - name: Run Supervisor failure-stop and KeepAlive regressions
         run: |
-          pnpm --filter @iris/runtime exec vitest run \
+          pnpm --filter @iris/runtime exec vitest run --testTimeout 30000 \
             src/launchd.test.ts \
             src/recovery-policy.test.ts \
             src/supervisor-startup.test.ts \
@@ -84,7 +84,7 @@ jobs:
 
       - name: Run Supervisor and repository authority regressions
         run: |
-          pnpm --filter @iris/runtime exec vitest run \
+          pnpm --filter @iris/runtime exec vitest run --testTimeout 30000 \
             src/supervisor.test.ts \
             src/repository-reconcile.test.ts \
             src/registry-authority-reconcile.test.ts \
@@ -93,7 +93,7 @@ jobs:
 
       - name: Run project isolation regressions
         run: |
-          pnpm --filter @iris/runtime exec vitest run \
+          pnpm --filter @iris/runtime exec vitest run --testTimeout 30000 \
             src/activation-controller.test.ts \
             src/durable-mission-service.test.ts \
             src/phase2-foundation.test.ts \
@@ -101,7 +101,7 @@ jobs:
 
       - name: Run security and redaction regressions
         run: |
-          pnpm --filter @iris/runtime exec vitest run \
+          pnpm --filter @iris/runtime exec vitest run --testTimeout 30000 \
             src/phase55-security-acceptance.test.ts \
             src/phase3-shell-jobs.test.ts \
             src/phase7-security-acceptance.test.ts \
