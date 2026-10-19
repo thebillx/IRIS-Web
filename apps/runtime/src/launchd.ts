@@ -598,7 +598,7 @@ async function stopLaunchAgentForMigrationUnlocked(
   let bootoutError: unknown;
   try { await launchctl(['bootout', `${domain}/${LAUNCH_AGENT_LABEL}`]); } catch (error) { bootoutError = error; }
   let afterBootout: LaunchAgentObservation;
-  try { afterBootout = await observeLaunchAgent(dependencies); }
+  try { afterBootout = await observeLaunchAgentAfterBootout(dependencies); }
   catch (error) {
     await recordUnresolved(paths.metadata, metadata, 'BOOTOUT_OUTCOME_UNKNOWN', uid);
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor source stop outcome requires reconciliation', { cause: error });
@@ -609,6 +609,15 @@ async function stopLaunchAgentForMigrationUnlocked(
   }
   if (registeredPlist.state === 'ok') await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
   return { state: 'STOPPED', processId: liveProcess.pid };
+}
+
+async function observeLaunchAgentAfterBootout(dependencies: LaunchdDependencies): Promise<LaunchAgentObservation> {
+  let observation: LaunchAgentObservation = await observeLaunchAgent(dependencies);
+  for (let attempt = 0; attempt < 10 && observation.state !== 'ABSENT'; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    observation = await observeLaunchAgent(dependencies);
+  }
+  return observation;
 }
 
 async function migrateLaunchAgentSourceUnlocked(

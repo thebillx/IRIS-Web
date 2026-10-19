@@ -42,7 +42,8 @@ interface FakeLaunchd {
   disabledOutput: 'normal' | 'missing' | 'duplicate' | 'malformed';
   guiAvailable: boolean;
   bootstrap: 'success' | 'failure' | 'unknown-success';
-  bootout: 'success' | 'failure' | 'unknown-success';
+  bootout: 'success' | 'failure' | 'unknown-success' | 'delayed-success';
+  bootoutDelay: number;
   enable: 'success' | 'failure' | 'unknown-success';
   disable: 'success' | 'failure' | 'unknown-success';
   queryError: Error | null;
@@ -70,6 +71,7 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
     guiAvailable: true,
     bootstrap: 'success',
     bootout: 'success',
+    bootoutDelay: 0,
     enable: 'success',
     disable: 'success',
     queryError: null,
@@ -106,6 +108,10 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
       }
       if (command === 'print' && target === `gui/${uid}/${LAUNCH_AGENT_LABEL}`) {
         if (fake.queryError !== null) throw fake.queryError;
+        if (fake.bootout === 'delayed-success' && fake.bootoutDelay > 0) {
+          fake.bootoutDelay -= 1;
+          return { stdout: renderLiveService(fake) };
+        }
         if (!fake.loaded) throw missingServiceError();
         return { stdout: renderLiveService(fake) };
       }
@@ -140,6 +146,7 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
       }
       if (command === 'bootout') {
         if (fake.bootout === 'failure') throw new Error('bootout failed');
+        if (fake.bootout === 'delayed-success') fake.bootoutDelay = 2;
         fake.loaded = false;
         if (fake.bootout === 'unknown-success') throw new Error('bootout response lost');
         return { stdout: '' };
@@ -1455,6 +1462,23 @@ describe('IRIS LaunchAgent artifact', () => {
       beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
     }, subject.fake.dependencies)).resolves.toMatchObject({ state: 'STOPPED', processId: subject.fake.live.pid });
     expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ schemaVersion: 3, state: 'READY' });
+    expect(subject.fake.loaded).toBe(false);
+  });
+
+  it('waits for asynchronous launchd teardown before committing the stop', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const metadataRaw = await readFile(paths.metadata, 'utf8');
+    const plistRaw = await readFile(paths.plist, 'utf8');
+    const metadata = JSON.parse(metadataRaw) as { sourceRoot: string };
+    subject.fake.bootout = 'delayed-success';
+    await expect(stopLaunchAgentForMigration({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).resolves.toMatchObject({ state: 'STOPPED', processId: subject.fake.live.pid });
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ state: 'READY' });
     expect(subject.fake.loaded).toBe(false);
   });
 
