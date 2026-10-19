@@ -23,7 +23,7 @@ import { readMachineId } from './machine-identity.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput } from './supervisor-native-control.js';
-import { finalizeRecoveryPolicyOperation, reserveRecoveryPolicyOperation } from './recovery-policy.js';
+import { finalizeRecoveryPolicyOperation, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
 import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
 
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
@@ -258,6 +258,26 @@ export class Supervisor {
     return this.withOperationLock('admin-tunnel-start-control-only', () => this.startControlOnlyAdminTunnelUnlocked(input));
   }
 
+  /** Close one failed ADMIN tunnel reservation only after durable absence is reverified. */
+  public async reconcileFailedControlOnlyAdminTunnel(input: RecoveryPolicyOperationInput & { readonly transactionId: string; readonly startupTransactionId: string }): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('admin-tunnel-start-reconcile-failed', async () => {
+      if (input.operation !== 'ADMIN_TUNNEL_START') throw new RuntimeError('INVALID_REQUEST', 'Only an ADMIN_TUNNEL_START may be reconciled as failed');
+      const state = await this.readState();
+      if (state.adminTunnel !== null) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'ADMIN tunnel ownership is still present');
+      const operation = state.startupOperations.find((candidate) => candidate.transactionId === input.startupTransactionId && candidate.component === 'tunnel-admin' && candidate.state === 'STOPPED' && candidate.sourceRoot === input.sourceRoot && candidate.dataRoot === this.dataRoot);
+      if (operation === undefined || operation.ownedProcess === undefined) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'No stopped ADMIN tunnel startup evidence matches the failed policy operation');
+      const ownedProcess = operation.ownedProcess as OwnedProcess;
+      const inspected = await inspectProcess(ownedProcess);
+      if (inspected !== 'stopped') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Failed ADMIN tunnel process identity is not definitively absent');
+      for (const port of ownedProcess.listenerPorts ?? [this.adminTunnelHealthPort]) {
+        if (!await listenerReleased(port)) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Failed ADMIN tunnel listener ownership is not definitively absent');
+      }
+      const record = await resolveFailedAdminTunnelStart(input);
+      return { state: 'FAILED', transactionId: input.transactionId, policyState: record.state, workloadProcessesStarted: false };
+    });
+  }
+
   private async startControlOnlyAdminTunnelUnlocked(input: {
     readonly recoveryPolicyId: string;
     readonly requestId: string;
@@ -325,7 +345,7 @@ export class Supervisor {
       machineId,
     };
     const reservation = await reserveRecoveryPolicyOperation(policyInput);
-    this.startupTransactionId = randomUUID();
+    this.startupTransactionId = reservation.transactionId;
     this.startupRecords.clear();
     try {
       state = await this.migrateHistoricalOwnership();
@@ -2101,7 +2121,7 @@ export class Supervisor {
     // Retain the probe root until separate evidence cleanup; never erase uncertain authority.
   }
 
-  private startupTransactionId = randomUUID();
+  private startupTransactionId: string = randomUUID();
   private readonly startupRecords = new Map<string, OwnedProcess>();
 
   public async reconcileStartup(): Promise<void> {

@@ -13,6 +13,7 @@ import {
   readRecoveryAuthorizationPolicy,
   reserveRecoveryPolicyOperation,
   reconcileRecoveryPolicyLock,
+  resolveFailedAdminTunnelStart,
   revokeRecoveryAuthorizationPolicy,
   recoveryPolicyPath,
 } from './recovery-policy.js';
@@ -335,6 +336,28 @@ describe('recovery authorization policy', () => {
     const reserved = await reserveRecoveryPolicyOperation({ dataRoot, policyId: policyA.policyId, operation: 'SOURCE_MIGRATION', requestId, ...sourceBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha });
     await finalizeRecoveryPolicyOperation({ dataRoot, policyId: policyA.policyId, operation: 'SOURCE_MIGRATION', requestId, transactionId: reserved.transactionId, state: 'RECONCILIATION_REQUIRED', ...sourceBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha });
     await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [{ ...sourceBinding, sourceRoot: '/tmp/source-b' }], beforeMetadataSha256: 'e'.repeat(64), beforePlistSha256: 'f'.repeat(64), allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(), supersedesPolicyId: policyA.policyId })).rejects.toThrow('unresolved operations');
+  });
+
+  it('terminally records a verified failed ADMIN tunnel start without committing it', async () => {
+    const dataRoot = await fixture();
+    const policy = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [{ ...sourceBinding, executableSha256: 'e'.repeat(64) }], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['ADMIN_TUNNEL_START'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(), machineId: crypto.randomUUID() });
+    const requestId = crypto.randomUUID();
+    const operation = { dataRoot, policyId: policy.policyId, operation: 'ADMIN_TUNNEL_START' as const, requestId, transactionId: crypto.randomUUID(), ...sourceBinding, executableSha256: 'e'.repeat(64), beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, machineId: policy.machineId! };
+    const reserved = await reserveRecoveryPolicyOperation(operation);
+    await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reserved.transactionId, state: 'RECONCILIATION_REQUIRED' });
+    const failed = await resolveFailedAdminTunnelStart({ ...operation, transactionId: reserved.transactionId });
+    expect(failed.operations[0]).toMatchObject({ operation: 'ADMIN_TUNNEL_START', state: 'FAILED', transactionId: reserved.transactionId });
+    expect(failed.operations[0]?.state).not.toBe('COMMITTED');
+    await expect(revokeRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({ state: 'REVOKED' });
+  });
+
+  it('does not resolve a reserved ADMIN tunnel start directly as failed', async () => {
+    const dataRoot = await fixture();
+    const policy = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [{ ...sourceBinding, executableSha256: 'e'.repeat(64) }], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['ADMIN_TUNNEL_START'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(), machineId: crypto.randomUUID() });
+    const requestId = crypto.randomUUID();
+    const operation = { dataRoot, policyId: policy.policyId, operation: 'ADMIN_TUNNEL_START' as const, requestId, transactionId: crypto.randomUUID(), ...sourceBinding, executableSha256: 'e'.repeat(64), beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, machineId: policy.machineId! };
+    const reserved = await reserveRecoveryPolicyOperation(operation);
+    await expect(resolveFailedAdminTunnelStart({ ...operation, transactionId: reserved.transactionId })).rejects.toThrow('reconciliation-required');
   });
 
   it('preserves an expired predecessor as expired while validating its original signature', async () => {

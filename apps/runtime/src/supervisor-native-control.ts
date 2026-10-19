@@ -88,7 +88,7 @@ async function handleRequest(
 ): Promise<void> {
   if (request.method === 'GET' && isUnsupportedOAuthMetadataPath(request.url)) {
     // Static bearer authentication is supplied by the managed tunnel profile; advertise no OAuth contract.
-    writeJson(response, 404, { error: 'not_found' });
+    writeEmptyNotFound(response);
     return;
   }
   if (request.headers.authorization !== `Bearer ${secret}`) {
@@ -406,6 +406,14 @@ function writeJson(response: ServerResponse, status: number, value: unknown): vo
     'x-content-type-options': 'nosniff',
   });
   response.end(JSON.stringify(value));
+}
+
+function writeEmptyNotFound(response: ServerResponse): void {
+  response.writeHead(404, {
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  });
+  response.end();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

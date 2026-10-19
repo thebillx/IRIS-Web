@@ -14,7 +14,7 @@ import { observeProcessStart } from "./macos-safety.js";
 export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP" | "ADMIN_TUNNEL_START";
 export type RecoveryPolicyState = "ISSUED" | "REVOKED" | "EXPIRED";
 export type RecoveryPolicyOperationState =
-  "RESERVED" | "COMMITTED" | "RECONCILIATION_REQUIRED";
+  "RESERVED" | "COMMITTED" | "FAILED" | "RECONCILIATION_REQUIRED";
 
 const POLICY_FILE = "com.iris.supervisor.recovery-policy.json";
 const HASH40 = /^[a-f0-9]{40}$/;
@@ -452,6 +452,13 @@ export async function reconcileRecoveryPolicyOperation(input: RecoveryPolicyOper
   return finalizeRecoveryPolicyOperation({ ...input, state: "RECONCILIATION_REQUIRED" });
 }
 
+/** Terminally records a verified failed ADMIN tunnel start without implying success. */
+export async function resolveFailedAdminTunnelStart(input: RecoveryPolicyOperationInput & { readonly transactionId: string }): Promise<RecoveryPolicyPublicRecord> {
+  if (input.operation !== "ADMIN_TUNNEL_START")
+    throw new RuntimeError("INVALID_REQUEST", "Only an ADMIN_TUNNEL_START may be resolved as failed");
+  return finalizeRecoveryPolicyOperation({ ...input, state: "FAILED" });
+}
+
 export async function assertRecoveryPolicyOperationCommitted(input: RecoveryPolicyOperationInput & { readonly transactionId: string }): Promise<void> {
   validateOperation(input);
   if (!isUuid(input.transactionId)) throw new RuntimeError("INVALID_REQUEST", "Recovery transaction ID is invalid");
@@ -513,7 +520,10 @@ async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOper
       "CONTROL_DENIED",
       "Recovery transaction source binding changed",
     );
-  if (existing.state !== "RESERVED") {
+  if (input.state === "FAILED" && (existing.state !== "RECONCILIATION_REQUIRED" || existing.operation !== "ADMIN_TUNNEL_START"))
+    throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Only a reconciliation-required ADMIN tunnel start may be resolved as failed");
+  const resolvingFailedAdminTunnel = input.state === "FAILED" && existing.state === "RECONCILIATION_REQUIRED" && existing.operation === "ADMIN_TUNNEL_START";
+  if (existing.state !== "RESERVED" && !resolvingFailedAdminTunnel) {
     if (existing.state === input.state) return current;
     throw new RuntimeError(
       "SUPERVISOR_NOT_RUNNING",
@@ -973,7 +983,7 @@ function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolic
     && (!record.allowedOperations.some(requiresHostBinding) || record.sourceBindings.every((binding) => binding.executableSha256 !== undefined))
     && Array.isArray(record.operations)
     && record.operations.length <= MAX_ENTRIES
-    && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforeMetadataSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforePlistSha256) && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && (!requiresHostBinding((entry as RecoveryPolicyOperationJournal).operation) || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
+    && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforeMetadataSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforePlistSha256) && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && (!requiresHostBinding((entry as RecoveryPolicyOperationJournal).operation) || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "FAILED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
     && Array.isArray(record.audit)
     && typeof record.expiresAt === "string"
     && typeof record.issuedAt === "string"

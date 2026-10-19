@@ -12,6 +12,7 @@ import {
   launchAgentStatus,
   launchdPaths,
   migrateLaunchAgentSource,
+  reconcileStoppedLaunchAgent,
   reconcileMalformedLegacyApproval,
   reconcileLaunchAgentSourceApproval,
   renderLaunchAgent,
@@ -1547,6 +1548,56 @@ describe('IRIS LaunchAgent artifact', () => {
     }, subject.fake.dependencies)).resolves.toMatchObject({ state: 'STOPPED' });
     expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ state: 'READY', unresolvedReason: null });
     await expect(lstat(paths.registeredPlist)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('reconciles a verified-absent stop without issuing bootout', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const initialMetadataRaw = await readFile(paths.metadata, 'utf8');
+    const plistRaw = await readFile(paths.plist, 'utf8');
+    const metadata = JSON.parse(initialMetadataRaw) as { sourceRoot: string };
+    subject.fake.bootout = 'failure';
+    await expect(stopLaunchAgentForMigration({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(initialMetadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).rejects.toThrow(/verified Supervisor|reconciliation/);
+    subject.fake.loaded = false;
+    subject.fake.live.pid = 9999;
+    const reconciliationMetadataRaw = await readFile(paths.metadata, 'utf8');
+    await expect(reconcileStoppedLaunchAgent({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(reconciliationMetadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).resolves.toEqual({ state: 'READY' });
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout '))).toHaveLength(1);
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ state: 'READY', unresolvedReason: null });
+    await expect(lstat(paths.registeredPlist)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('fails closed without bootout when reconciliation observes a loaded Supervisor', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const initialMetadataRaw = await readFile(paths.metadata, 'utf8');
+    const plistRaw = await readFile(paths.plist, 'utf8');
+    const metadata = JSON.parse(initialMetadataRaw) as { sourceRoot: string };
+    subject.fake.bootout = 'failure';
+    await expect(stopLaunchAgentForMigration({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(initialMetadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).rejects.toThrow();
+    const reconciliationMetadataRaw = await readFile(paths.metadata, 'utf8');
+    await expect(reconcileStoppedLaunchAgent({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(reconciliationMetadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).rejects.toThrow(/still loaded/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout '))).toHaveLength(1);
   });
 
   it('preserves a loaded service when its registered plist changed', async () => {

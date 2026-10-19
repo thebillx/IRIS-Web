@@ -6,7 +6,7 @@ import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
 import { createSupervisor } from './supervisor.js';
-import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, resolveReviewedRuntimeEntrypoints, stopLaunchAgentForMigration, uninstallLaunchAgent } from './launchd.js';
+import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, reconcileStoppedLaunchAgent, resolveReviewedRuntimeEntrypoints, stopLaunchAgentForMigration, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, reconcileRecoveryPolicyLock, reconcileRecoveryPolicyOperation, revokeRecoveryAuthorizationPolicy } from './recovery-policy.js';
 import { readMachineId } from './machine-identity.js';
@@ -54,6 +54,15 @@ try {
     } else if (command === 'recovery-policy' && process.argv[3] === 'reconcile') {
       const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
       process.stdout.write(`${JSON.stringify(await reconcileRecoveryPolicyOperation({ ...recovery, dataRoot }), null, 2)}\n`);
+    } else if (command === 'recovery-policy' && process.argv[3] === 'resolve-failed-admin-tunnel') {
+      const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type RECONCILE FAILED IRIS ADMIN TUNNEL START to close the verified failed operation: ');
+        if (confirmation.trim() !== 'RECONCILE FAILED IRIS ADMIN TUNNEL START') throw new Error('Owner failed-operation reconciliation was not confirmed');
+      } finally { prompt.close(); }
+      if (recovery.startupTransactionId === undefined) throw new Error('Usage: recovery-policy resolve-failed-admin-tunnel requires --startup-transaction-id');
+      process.stdout.write(`${JSON.stringify(await supervisor.reconcileFailedControlOnlyAdminTunnel({ ...recovery, startupTransactionId: recovery.startupTransactionId, dataRoot }), null, 2)}\n`);
     } else if (command === 'recovery-policy' && process.argv[3] === 'reconcile-lock') {
       const lock = parseRecoveryPolicyLockOptions(process.argv.slice(4));
       await reconcileRecoveryPolicyLock(dataRoot, lock.lockId, lock.pid, lock.processStartMarker);
@@ -142,6 +151,16 @@ try {
         prompt.close();
       }
       process.stdout.write(`${JSON.stringify(await stopLaunchAgentForMigration({ ...stop, dataRoot }, {}), null, 2)}\n`);
+    } else if (command === 'launchd' && process.argv[3] === 'reconcile-stop') {
+      const reconciliation = parseLaunchdStopReconciliationOptions(process.argv.slice(4));
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type RECONCILE IRIS SUPERVISOR STOP to finalize the verified-absent stop: ');
+        if (confirmation.trim() !== 'RECONCILE IRIS SUPERVISOR STOP') throw new Error('Owner Supervisor stop reconciliation was not confirmed');
+      } finally {
+        prompt.close();
+      }
+      process.stdout.write(`${JSON.stringify(await reconcileStoppedLaunchAgent({ ...reconciliation, dataRoot }, {}), null, 2)}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'start-admin-tunnel') {
       const start = parseLaunchdAdminTunnelStartOptions(process.argv.slice(4));
       process.stdout.write(`${JSON.stringify(await supervisor.startControlOnlyAdminTunnel(start), null, 2)}\n`);
@@ -260,6 +279,7 @@ interface RecoveryPolicyOperationOptions {
   readonly operation: 'MIGRATION_APPROVAL' | 'SOURCE_MIGRATION' | 'SUPERVISOR_BOOTSTRAP' | 'ADMIN_TUNNEL_START';
   readonly requestId: string;
   readonly transactionId: string;
+  readonly startupTransactionId: string | undefined;
   readonly sourceSha: string;
   readonly sourceTree: string;
   readonly sourceRoot: string;
@@ -327,14 +347,14 @@ function parseRecoveryPolicyOperationOptions(argumentsList: readonly string[]): 
     values.set(name, value);
   }
   const required = (name: string): string => { const value = values.get(name); if (value === undefined) throw new Error(RECOVERY_POLICY_OPERATION_USAGE); return value; };
-  const allowed = new Set(['--policy-id', '--operation', '--request-id', '--transaction-id', '--source-sha', '--source-tree', '--source-root', '--control-script', '--executable', '--executable-sha256', '--executable-arguments', '--runtime-preflight-sha256', '--runtime-loader-sha256', '--before-metadata-sha256', '--before-plist-sha256', '--protected-reference-root', '--machine-id']);
+  const allowed = new Set(['--policy-id', '--operation', '--request-id', '--transaction-id', '--startup-transaction-id', '--source-sha', '--source-tree', '--source-root', '--control-script', '--executable', '--executable-sha256', '--executable-arguments', '--runtime-preflight-sha256', '--runtime-loader-sha256', '--before-metadata-sha256', '--before-plist-sha256', '--protected-reference-root', '--machine-id']);
   if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
   const operation = required('--operation');
   if (operation !== 'MIGRATION_APPROVAL' && operation !== 'SOURCE_MIGRATION' && operation !== 'SUPERVISOR_BOOTSTRAP' && operation !== 'ADMIN_TUNNEL_START') throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
   const executableSha256 = values.get('--executable-sha256');
   const machineId = values.get('--machine-id');
   if ((operation === 'SUPERVISOR_BOOTSTRAP' || operation === 'ADMIN_TUNNEL_START') && (executableSha256 === undefined || machineId === undefined)) throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
-  return { policyId: required('--policy-id'), operation, requestId: required('--request-id'), transactionId: required('--transaction-id'), sourceSha: required('--source-sha'), sourceTree: required('--source-tree'), sourceRoot: required('--source-root'), controlScript: required('--control-script'), executable: required('--executable'), ...(executableSha256 === undefined ? {} : { executableSha256 }), executableArguments: JSON.parse(required('--executable-arguments')) as string[], runtimePreflightSha256: required('--runtime-preflight-sha256'), runtimeLoaderSha256: required('--runtime-loader-sha256'), beforeMetadataSha256: required('--before-metadata-sha256'), beforePlistSha256: required('--before-plist-sha256'), ...(values.get('--protected-reference-root') === undefined ? {} : { protectedReferenceRoot: values.get('--protected-reference-root') }), ...(machineId === undefined ? {} : { machineId }) };
+  return { policyId: required('--policy-id'), operation, requestId: required('--request-id'), transactionId: required('--transaction-id'), startupTransactionId: values.get('--startup-transaction-id'), sourceSha: required('--source-sha'), sourceTree: required('--source-tree'), sourceRoot: required('--source-root'), controlScript: required('--control-script'), executable: required('--executable'), ...(executableSha256 === undefined ? {} : { executableSha256 }), executableArguments: JSON.parse(required('--executable-arguments')) as string[], runtimePreflightSha256: required('--runtime-preflight-sha256'), runtimeLoaderSha256: required('--runtime-loader-sha256'), beforeMetadataSha256: required('--before-metadata-sha256'), beforePlistSha256: required('--before-plist-sha256'), ...(values.get('--protected-reference-root') === undefined ? {} : { protectedReferenceRoot: values.get('--protected-reference-root') }), ...(machineId === undefined ? {} : { machineId }) };
 }
 
 function parseRecoveryPolicyLockOptions(argumentsList: readonly string[]): RecoveryPolicyLockOptions {
@@ -505,6 +525,7 @@ function parseMalformedApprovalRecoveryOptions(argumentsList: readonly string[])
 
 const LAUNCHD_SOURCE_MIGRATION_USAGE = 'Usage: iris launchd migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --approval-id <uuid> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_STOP_USAGE = 'Usage: iris launchd stop-for-migration --source-root <directory> --before-metadata-sha256 <digest> --before-plist-sha256 <digest>';
+const LAUNCHD_SOURCE_STOP_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-stop --source-root <directory> --before-metadata-sha256 <digest> --before-plist-sha256 <digest>';
 const LAUNCHD_ADMIN_TUNNEL_START_USAGE = 'Usage: iris launchd start-admin-tunnel --recovery-policy-id <uuid> --request-id <uuid> --source-sha <commit> --source-tree <tree> --before-metadata-sha256 <digest> --before-plist-sha256 <digest>';
 const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-migrate-approval --source-sha <commit> --source-tree <tree> --request-id <uuid>';
@@ -528,6 +549,24 @@ function parseLaunchdStopForMigrationOptions(argumentsList: readonly string[]): 
   };
   const allowed = new Set(['--source-root', '--before-metadata-sha256', '--before-plist-sha256']);
   if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_SOURCE_STOP_USAGE);
+  return { sourceRoot: required('--source-root'), beforeMetadataSha256: required('--before-metadata-sha256'), beforePlistSha256: required('--before-plist-sha256') };
+}
+
+function parseLaunchdStopReconciliationOptions(argumentsList: readonly string[]): { readonly sourceRoot: string; readonly beforeMetadataSha256: string; readonly beforePlistSha256: string } {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(LAUNCHD_SOURCE_STOP_RECONCILIATION_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => {
+    const value = values.get(name);
+    if (value === undefined) throw new Error(LAUNCHD_SOURCE_STOP_RECONCILIATION_USAGE);
+    return value;
+  };
+  const allowed = new Set(['--source-root', '--before-metadata-sha256', '--before-plist-sha256']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_SOURCE_STOP_RECONCILIATION_USAGE);
   return { sourceRoot: required('--source-root'), beforeMetadataSha256: required('--before-metadata-sha256'), beforePlistSha256: required('--before-plist-sha256') };
 }
 

@@ -90,6 +90,13 @@ export interface LaunchAgentStopForMigrationInput {
   readonly beforePlistSha256: string;
 }
 
+export interface LaunchAgentStopReconciliationInput {
+  readonly dataRoot: string;
+  readonly sourceRoot: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+}
+
 export interface MalformedLegacyApprovalReconciliationInput {
   readonly dataRoot: string;
   readonly approvalId: string;
@@ -567,6 +574,59 @@ export async function stopLaunchAgentForMigration(
   const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
   const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
   return withLaunchAgentLock(paths, uid, () => stopLaunchAgentForMigrationUnlocked({ ...input, dataRoot: canonicalDataRoot }, dependencies));
+}
+
+/** Reconciles a verified-absent Supervisor without issuing another bootout. */
+export async function reconcileStoppedLaunchAgent(
+  input: LaunchAgentStopReconciliationInput,
+  dependencies: LaunchdDependencies = {},
+): Promise<{ readonly state: 'READY' }> {
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, () => reconcileStoppedLaunchAgentUnlocked({ ...input, dataRoot: canonicalDataRoot }, dependencies));
+}
+
+async function reconcileStoppedLaunchAgentUnlocked(
+  input: LaunchAgentStopReconciliationInput,
+  dependencies: LaunchdDependencies,
+): Promise<{ readonly state: 'READY' }> {
+  const uid = launchdUid(dependencies);
+  const domain = launchdDomain(dependencies);
+  const launchctl = dependencies.launchctl ?? systemLaunchctl;
+  await requireGuiDomain(domain, launchctl);
+  const paths = launchdPaths(input.dataRoot, dependencies.homeDirectory ?? os.homedir());
+  const metadataRecord = await readLaunchAgentMetadata(paths.metadata, uid);
+  if (metadataRecord === null || metadataRecord.metadata.schemaVersion !== 3 || metadataRecord.metadata.state !== 'RECONCILIATION_REQUIRED' || metadataRecord.metadata.unresolvedReason !== 'BOOTOUT_OUTCOME_UNKNOWN') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor stop reconciliation requires a BOOTOUT_OUTCOME_UNKNOWN Schema-3 record');
+  }
+  const metadata = metadataRecord.metadata;
+  const canonicalSourceRoot = await requireCanonicalDirectory(input.sourceRoot, 'IRIS current control source root', uid, false);
+  if (metadata.sourceRoot !== canonicalSourceRoot || sha256(metadataRecord.raw) !== input.beforeMetadataSha256) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor stop reconciliation metadata identity does not match the authorized before-image');
+  }
+  const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+  if (privatePlist.state !== 'ok' || sha256(privatePlist.content) !== input.beforePlistSha256 || metadata.plistSha256 !== sha256(privatePlist.content)) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor stop reconciliation plist identity does not match the authorized before-image');
+  }
+  const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+  if (registeredPlist.state === 'invalid' || registeredPlist.state === 'ok' && registeredPlist.content !== privatePlist.content) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Registered LaunchAgent plist conflicts with the private binding');
+  }
+  const observation = await observeLaunchAgent(dependencies);
+  if (observation.state !== 'ABSENT') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor is still loaded; stop reconciliation will not issue bootout');
+  }
+  if (metadata.processId === undefined || metadata.processStartMarker === undefined) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Unresolved Supervisor stop has no durable process identity');
+  }
+  const processObservation = (dependencies.observeProcessStart ?? observeProcessStart)(metadata.processId);
+  if (processObservation.state === 'indeterminate' || processObservation.state === 'live' && processObservation.marker === metadata.processStartMarker) {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Original Supervisor process identity remains ambiguous');
+  }
+  await writeLaunchAgentMetadata(paths.metadata, { ...metadata, state: 'READY', unresolvedReason: null }, uid);
+  if (registeredPlist.state === 'ok') await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+  return { state: 'READY' };
 }
 
 async function stopLaunchAgentForMigrationUnlocked(

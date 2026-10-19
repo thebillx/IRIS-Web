@@ -88,8 +88,12 @@ describe('outer supervisor native control', () => {
       const health = await fetch(harness.server.healthUrl, { headers: { authorization: `Bearer ${harness.secret}` } });
       expect(health.status).toBe(200);
       await expect(health.json()).resolves.toMatchObject({ ok: true, owner: 'OUTER_SUPERVISOR_DAEMON' });
-      expect((await fetch(`${harness.server.mcpUrl.replace('/mcp', '')}/.well-known/oauth-protected-resource/mcp`)).status).toBe(404);
-      expect((await fetch(`${harness.server.mcpUrl.replace('/mcp', '')}/.well-known/oauth-authorization-server`)).status).toBe(404);
+      const protectedResourceMetadata = await fetch(`${harness.server.mcpUrl.replace('/mcp', '')}/.well-known/oauth-protected-resource/mcp`);
+      const authorizationMetadata = await fetch(`${harness.server.mcpUrl.replace('/mcp', '')}/.well-known/oauth-authorization-server`);
+      expect(protectedResourceMetadata.status).toBe(404);
+      expect(authorizationMetadata.status).toBe(404);
+      await expect(protectedResourceMetadata.text()).resolves.toBe('');
+      await expect(authorizationMetadata.text()).resolves.toBe('');
 
       const listed = await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
       expect(toolNames(listed)).toEqual([
