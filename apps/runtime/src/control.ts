@@ -142,6 +142,9 @@ try {
         prompt.close();
       }
       process.stdout.write(`${JSON.stringify(await stopLaunchAgentForMigration({ ...stop, dataRoot }, {}), null, 2)}\n`);
+    } else if (command === 'launchd' && process.argv[3] === 'start-admin-tunnel') {
+      const start = parseLaunchdAdminTunnelStartOptions(process.argv.slice(4));
+      process.stdout.write(`${JSON.stringify(await supervisor.startControlOnlyAdminTunnel(start), null, 2)}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'authorize-migrate-source') {
       const approval = parseLaunchdSourceApprovalOptions(process.argv.slice(4));
       const runtimeDirectory = path.join(approval.sourceRoot, 'apps', 'runtime');
@@ -502,6 +505,7 @@ function parseMalformedApprovalRecoveryOptions(argumentsList: readonly string[])
 
 const LAUNCHD_SOURCE_MIGRATION_USAGE = 'Usage: iris launchd migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --approval-id <uuid> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_STOP_USAGE = 'Usage: iris launchd stop-for-migration --source-root <directory> --before-metadata-sha256 <digest> --before-plist-sha256 <digest>';
+const LAUNCHD_ADMIN_TUNNEL_START_USAGE = 'Usage: iris launchd start-admin-tunnel --recovery-policy-id <uuid> --request-id <uuid> --source-sha <commit> --source-tree <tree> --before-metadata-sha256 <digest> --before-plist-sha256 <digest>';
 const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-migrate-approval --source-sha <commit> --source-tree <tree> --request-id <uuid>';
 const MALFORMED_APPROVAL_RECOVERY_USAGE = 'Usage: iris launchd reconcile-malformed-approval --approval-id <uuid> --request-id <uuid> --approval-sha256 <digest> --recovery-request-id <uuid>';
@@ -525,6 +529,38 @@ function parseLaunchdStopForMigrationOptions(argumentsList: readonly string[]): 
   const allowed = new Set(['--source-root', '--before-metadata-sha256', '--before-plist-sha256']);
   if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_SOURCE_STOP_USAGE);
   return { sourceRoot: required('--source-root'), beforeMetadataSha256: required('--before-metadata-sha256'), beforePlistSha256: required('--before-plist-sha256') };
+}
+
+function parseLaunchdAdminTunnelStartOptions(argumentsList: readonly string[]): {
+  readonly recoveryPolicyId: string;
+  readonly requestId: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+} {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(LAUNCHD_ADMIN_TUNNEL_START_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => {
+    const value = values.get(name);
+    if (value === undefined) throw new Error(LAUNCHD_ADMIN_TUNNEL_START_USAGE);
+    return value;
+  };
+  const allowed = new Set(['--recovery-policy-id', '--request-id', '--source-sha', '--source-tree', '--before-metadata-sha256', '--before-plist-sha256']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_ADMIN_TUNNEL_START_USAGE);
+  return {
+    recoveryPolicyId: required('--recovery-policy-id'),
+    requestId: required('--request-id'),
+    sourceSha: required('--source-sha'),
+    sourceTree: required('--source-tree'),
+    beforeMetadataSha256: required('--before-metadata-sha256'),
+    beforePlistSha256: required('--before-plist-sha256'),
+  };
 }
 
 function printStatus(status: Awaited<ReturnType<Awaited<ReturnType<typeof createSupervisor>>['status']>>): void {

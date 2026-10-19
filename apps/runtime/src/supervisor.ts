@@ -23,6 +23,8 @@ import { readMachineId } from './machine-identity.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput } from './supervisor-native-control.js';
+import { finalizeRecoveryPolicyOperation, reserveRecoveryPolicyOperation } from './recovery-policy.js';
+import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
 
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
 import { readSupervisorStateFile, writeSupervisorStateFile, unresolvedStartup, validStartupOperations, type StartupOperation, type StartupState } from './supervisor-startup.js';
@@ -241,6 +243,105 @@ export class Supervisor {
   public async up(): Promise<SupervisorStackStatus> {
     await this.prepareDirectories();
     return this.withOperationLock('up', () => this.upUnlocked());
+  }
+
+  /** Start only the authenticated ADMIN transport for an already-running native Supervisor. */
+  public async startControlOnlyAdminTunnel(input: {
+    readonly recoveryPolicyId: string;
+    readonly requestId: string;
+    readonly sourceSha: string;
+    readonly sourceTree: string;
+    readonly beforeMetadataSha256: string;
+    readonly beforePlistSha256: string;
+  }): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('admin-tunnel-start-control-only', () => this.startControlOnlyAdminTunnelUnlocked(input));
+  }
+
+  private async startControlOnlyAdminTunnelUnlocked(input: {
+    readonly recoveryPolicyId: string;
+    readonly requestId: string;
+    readonly sourceSha: string;
+    readonly sourceTree: string;
+    readonly beforeMetadataSha256: string;
+    readonly beforePlistSha256: string;
+  }): Promise<Record<string, unknown>> {
+    let state = await this.readState();
+    const nativeControl = await this.probeNativeControl();
+    if (nativeControl.state !== 'READY') throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'Control-only ADMIN start requires the authenticated native Supervisor control endpoint');
+    const records = [state.runtime, state.web, state.admin, state.tunnels.full, state.tunnels.pro];
+    for (const record of records) {
+      if (record === null) continue;
+      const inspected = await inspectProcess(record);
+      if (inspected === 'ambiguous') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Control-only ADMIN start found ambiguous workload ownership');
+      if (inspected === 'running') throw new RuntimeError('PRECONDITION_FAILED', 'Control-only ADMIN start requires all workload processes to remain stopped');
+    }
+    const registry = await readConnectorRegistry(this.dataRoot);
+    const binding = registry?.admin;
+    if (registry === null || binding === null || binding === undefined) throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Dedicated ADMIN connector binding is required for control-only transport');
+    const profile = await readFile(binding.managedProfilePath, 'utf8').catch(() => null);
+    const credentials = credentialPaths(this.dataRoot);
+    const expectedProfile = managedAdminProfile(binding, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), this.adminTunnelHealthPort, `http://127.0.0.1:${this.supervisorControlPort}/mcp`);
+    if (profile !== expectedProfile) throw new RuntimeError('CONTROL_DENIED', 'Managed ADMIN profile is not the authenticated native-control profile');
+    const sourceRoot = this.sourceRoot;
+    const controlScript = path.join(sourceRoot, 'apps/runtime/src/control.ts');
+    const [headResult, treeResult, statusResult] = await Promise.all([
+      execFileAsync('git', ['-C', sourceRoot, 'rev-parse', 'HEAD']),
+      execFileAsync('git', ['-C', sourceRoot, 'rev-parse', 'HEAD^{tree}']),
+      execFileAsync('git', ['-C', sourceRoot, 'status', '--porcelain', '--untracked-files=all']),
+    ]);
+    if (headResult.stdout.trim() !== input.sourceSha || treeResult.stdout.trim() !== input.sourceTree || statusResult.stdout.trim() !== '') {
+      throw new RuntimeError('CONTROL_DENIED', 'Control-only ADMIN source identity is not the exact clean reviewed checkout');
+    }
+    const executable = canonicalNodeRuntime().path;
+    const runtimeEntrypoints = await resolveReviewedRuntimeEntrypoints(path.join(sourceRoot, 'apps/runtime'));
+    const executableArguments = ['--require', runtimeEntrypoints.preflight, '--import', pathToFileURL(runtimeEntrypoints.loader).href];
+    const runtimePreflightSha256 = await fileSha256(runtimeEntrypoints.preflight);
+    const runtimeLoaderSha256 = await fileSha256(runtimeEntrypoints.loader);
+    const executableSha256 = await fileSha256(executable);
+    const machineId = await readMachineId(this.dataRoot);
+    if (machineId === null) throw new RuntimeError('CONTROL_DENIED', 'Control-only ADMIN start requires a protected machine identity');
+    const metadataPath = path.join(this.dataRoot, 'launchd/com.iris.supervisor.plist.metadata.json');
+    const plistPath = path.join(this.dataRoot, 'launchd/com.iris.supervisor.plist');
+    const beforeMetadataSha256 = await fileSha256(metadataPath);
+    const beforePlistSha256 = await fileSha256(plistPath);
+    if (beforeMetadataSha256 !== input.beforeMetadataSha256 || beforePlistSha256 !== input.beforePlistSha256) throw new RuntimeError('CONTROL_DENIED', 'Protected LaunchAgent before-image changed');
+    const policyInput = {
+      dataRoot: this.dataRoot,
+      policyId: input.recoveryPolicyId,
+      operation: 'SUPERVISOR_BOOTSTRAP' as const,
+      requestId: input.requestId,
+      sourceSha: input.sourceSha,
+      sourceTree: input.sourceTree,
+      sourceRoot,
+      controlScript,
+      executable,
+      executableSha256,
+      executableArguments,
+      runtimePreflightSha256,
+      runtimeLoaderSha256,
+      beforeMetadataSha256,
+      beforePlistSha256,
+      machineId,
+    };
+    const reservation = await reserveRecoveryPolicyOperation(policyInput);
+    this.startupTransactionId = randomUUID();
+    this.startupRecords.clear();
+    try {
+      state = { ...state, schemaVersion: 4, startupOperations: state.startupOperations ?? [] };
+      await this.writeState(state, true);
+      state = await this.ensureAdminTunnel(state, registry, binding.managedProfilePath, []);
+      const record = state.adminTunnel;
+      if (record === null) throw new RuntimeError('TUNNEL_NOT_RUNNING', 'Control-only ADMIN tunnel did not publish ownership');
+      const readiness = await this.probeAdminTunnel(state, record, true);
+      if (readiness.status.state !== 'READY') throw new RuntimeError('TUNNEL_NOT_RUNNING', readiness.status.detail);
+      await finalizeRecoveryPolicyOperation({ ...policyInput, transactionId: reservation.transactionId, state: 'COMMITTED' });
+      return { state: 'READY', transactionId: reservation.transactionId, adminTunnelPid: record.pid, adminTunnelIdentity: ownedProcessIdentity(record), tunnelId: record.tunnelId, target: `http://127.0.0.1:${this.supervisorControlPort}/mcp`, workloadProcessesStarted: false };
+    } catch (error) {
+      try { await this.rollbackStarted(); } catch { /* preserve durable startup evidence */ }
+      await finalizeRecoveryPolicyOperation({ ...policyInput, transactionId: reservation.transactionId, state: 'RECONCILIATION_REQUIRED' }).catch(() => undefined);
+      throw error;
+    }
   }
 
   private async upUnlocked(expectedSourceIdentity?: ActivationSourceIdentity): Promise<SupervisorStackStatus> {

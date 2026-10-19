@@ -51,6 +51,21 @@ afterEach(async () => {
 });
 
 describe('IRIS supervisor', () => {
+  it('fails closed before control-only ADMIN start when native control is unavailable', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-control-only-binding-'));
+    roots.push(dataRoot);
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot });
+
+    await expect(supervisor.startControlOnlyAdminTunnel({
+      recoveryPolicyId: randomUUID(),
+      requestId: randomUUID(),
+      sourceSha: 'a'.repeat(40),
+      sourceTree: 'b'.repeat(40),
+      beforeMetadataSha256: 'c'.repeat(64),
+      beforePlistSha256: 'd'.repeat(64),
+    })).rejects.toMatchObject({ code: 'CONTROL_PLANE_UNREACHABLE' });
+  });
+
   it('reads registered project metadata for control-only Mode A without mutating the registry', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-mode-a-projects-'));
     roots.push(dataRoot);
