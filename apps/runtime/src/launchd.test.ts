@@ -836,6 +836,30 @@ describe('IRIS LaunchAgent artifact', () => {
     await expect(reconcileLaunchAgentSourceApproval({ dataRoot: subject.dataRoot, requestId, sourceSha: target.sourceSha, sourceTree: target.sourceTree }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
   });
 
+  it('supersedes a consumed approval only after matching committed migration proof', async () => {
+    const subject = await fixture();
+    await writeLegacyLaunchAgent(subject);
+    const firstTarget = await reviewedSource(subject);
+    const firstRequestId = randomUUID();
+    const first = await approve(subject, firstTarget, firstRequestId);
+    await migrateLaunchAgentSource({
+      dataRoot: subject.dataRoot,
+      sourceRoot: firstTarget.root,
+      controlScript: firstTarget.controlScript,
+      executable: canonicalNodeRuntime().path,
+      executableArguments: firstTarget.executableArguments,
+      sourceSha: firstTarget.sourceSha,
+      sourceTree: firstTarget.sourceTree,
+      approvalId: first.approvalId,
+      requestId: firstRequestId,
+    }, subject.fake.dependencies);
+    const nextTarget = await reviewedSource(subject, 'next-consumed-approval-source');
+    const second = await approve(subject, nextTarget, randomUUID());
+    expect(second).toMatchObject({ state: 'ISSUED', sourceSha: nextTarget.sourceSha, sourceTree: nextTarget.sourceTree });
+    const history = JSON.parse(await readFile(launchdPaths(subject.dataRoot, subject.home).sourceBindingApprovalHistory, 'utf8')) as Array<{ record: { readonly approvalId: string; readonly state: string } }>;
+    expect(history.some((entry) => entry.record.approvalId === first.approvalId && entry.record.state === 'CONSUMED')).toBe(true);
+  });
+
   it('fails closed when approval history contains a conflicting same-id entry', async () => {
     const subject = await fixture();
     await writeLegacyLaunchAgent(subject);

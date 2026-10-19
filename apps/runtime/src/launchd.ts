@@ -316,7 +316,7 @@ export async function issueLaunchAgentSourceApproval(
     const secret = await readOwnerAccessSecret(canonicalDataRoot);
     if (secret === null) throw new RuntimeError('CONTROL_DENIED', 'Owner access approval is not initialized');
     const existing = await readSourceApprovalRecord(paths.sourceBindingApproval, uid);
-    const supersedingReconciledApproval = existing?.state === 'RECONCILIATION_REQUIRED';
+    let supersededExistingApproval = existing?.state === 'RECONCILIATION_REQUIRED';
     if (existing !== null && existing.state === 'RECONCILIATION_REQUIRED') {
       if (!verifySourceApproval(existing, secret)) {
         throw new RuntimeError('CONTROL_DENIED', 'The existing migration approval cannot be authenticated for supersession');
@@ -324,7 +324,17 @@ export async function issueLaunchAgentSourceApproval(
       await archiveSourceApproval(paths, existing, uid);
     } else if (existing !== null) {
       if (existing.schemaVersion === 2 && existing.state === 'ISSUED' && approvalMatches(existing, preflight, input) && verifySourceApproval(existing, secret)) return existing;
-      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing migration approval requires reconciliation before retry');
+      const committedMigration = existing.schemaVersion === 2 && existing.state === 'CONSUMED' && verifySourceApproval(existing, secret)
+        ? await readSourceMigrationRecord(paths.sourceBindingMigration, uid)
+        : null;
+      if (committedMigration?.state === 'COMMITTED'
+        && committedMigration.approvalId === existing.approvalId
+        && committedMigration.requestId === existing.requestId) {
+        await archiveSourceApproval(paths, existing, uid);
+        supersededExistingApproval = true;
+      } else {
+        throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An existing migration approval requires reconciliation before retry');
+      }
     }
     let policyTransactionId: string | undefined;
     if (input.recoveryPolicyId !== undefined) {
@@ -370,7 +380,7 @@ export async function issueLaunchAgentSourceApproval(
     };
     const signed = { ...record, signature: signSourceApproval(record, secret) };
     try {
-      if (supersedingReconciledApproval && existing !== null) {
+      if (supersededExistingApproval && existing !== null) {
       await replaceOwnedFile(paths.sourceBindingApproval, approvalContent(existing), approvalContent(signed), 'IRIS source migration approval', uid);
       } else {
         await publishOwnedFile(paths.sourceBindingApproval, approvalContent(signed), 'IRIS source migration approval', uid);
