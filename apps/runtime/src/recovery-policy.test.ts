@@ -174,6 +174,56 @@ describe('recovery authorization policy', () => {
     })).rejects.toThrow('operation limit');
   });
 
+  it('uses a distinct bounded operation for the dedicated ADMIN tunnel', async () => {
+    const dataRoot = await fixture();
+    const machineId = crypto.randomUUID();
+    const binding = { ...sourceBinding, executableSha256: 'f'.repeat(64) };
+    const policy = await issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [binding],
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      allowedOperations: ['ADMIN_TUNNEL_START'],
+      machineId,
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const requestId = crypto.randomUUID();
+    const reserved = await reserveRecoveryPolicyOperation({
+      dataRoot,
+      policyId: policy.policyId,
+      operation: 'ADMIN_TUNNEL_START',
+      requestId,
+      ...binding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      machineId,
+    });
+    const committed = await finalizeRecoveryPolicyOperation({
+      dataRoot,
+      policyId: policy.policyId,
+      operation: 'ADMIN_TUNNEL_START',
+      requestId,
+      transactionId: reserved.transactionId,
+      state: 'COMMITTED',
+      ...binding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      machineId,
+    });
+    expect(committed.operations[0]).toMatchObject({ operation: 'ADMIN_TUNNEL_START', state: 'COMMITTED' });
+    await expect(reserveRecoveryPolicyOperation({
+      dataRoot,
+      policyId: policy.policyId,
+      operation: 'SUPERVISOR_BOOTSTRAP',
+      requestId: crypto.randomUUID(),
+      ...binding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      machineId,
+    })).rejects.toThrow('does not authorize this operation');
+  });
+
   it('rejects expired and revoked bootstrap authority before any transaction is reserved', async () => {
     const expiredRoot = await fixture();
     const expiredMachineId = crypto.randomUUID();

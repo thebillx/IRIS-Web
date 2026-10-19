@@ -36,8 +36,8 @@ try {
     const supervisor = await createSupervisor({ dataRoot });
     if (command === 'recovery-policy' && process.argv[3] === 'issue') {
       const policy = parseRecoveryPolicyIssueOptions(process.argv.slice(4));
-      const machineId = policy.allowedOperations.includes('SUPERVISOR_BOOTSTRAP') ? await readMachineId(dataRoot) : null;
-      if (policy.allowedOperations.includes('SUPERVISOR_BOOTSTRAP') && machineId === null) throw new Error('Supervisor bootstrap policy requires an existing protected machine identity');
+      const machineId = policy.allowedOperations.some((operation) => operation === 'SUPERVISOR_BOOTSTRAP' || operation === 'ADMIN_TUNNEL_START') ? await readMachineId(dataRoot) : null;
+      if (policy.allowedOperations.some((operation) => operation === 'SUPERVISOR_BOOTSTRAP' || operation === 'ADMIN_TUNNEL_START') && machineId === null) throw new Error('Supervisor bootstrap policy requires an existing protected machine identity');
       const effectiveScope = { ...policy, dataRoot, ...(machineId === null ? {} : { machineId }) };
       process.stdout.write(`RECOVERY_POLICY_SCOPE=${JSON.stringify(effectiveScope)}\n`);
       const prompt = createInterface({ input, output });
@@ -241,7 +241,7 @@ interface RecoveryPolicyIssueOptions {
   readonly sourceTree: string;
   readonly beforeMetadataSha256: string;
   readonly beforePlistSha256: string;
-  readonly allowedOperations: readonly ('MIGRATION_APPROVAL' | 'SOURCE_MIGRATION' | 'SUPERVISOR_BOOTSTRAP')[];
+  readonly allowedOperations: readonly ('MIGRATION_APPROVAL' | 'SOURCE_MIGRATION' | 'SUPERVISOR_BOOTSTRAP' | 'ADMIN_TUNNEL_START')[];
   readonly sourceRoot: string;
   readonly controlScript: string;
   readonly executable: string;
@@ -257,7 +257,7 @@ interface RecoveryPolicyIssueOptions {
 
 interface RecoveryPolicyOperationOptions {
   readonly policyId: string;
-  readonly operation: 'MIGRATION_APPROVAL' | 'SOURCE_MIGRATION' | 'SUPERVISOR_BOOTSTRAP';
+  readonly operation: 'MIGRATION_APPROVAL' | 'SOURCE_MIGRATION' | 'SUPERVISOR_BOOTSTRAP' | 'ADMIN_TUNNEL_START';
   readonly requestId: string;
   readonly transactionId: string;
   readonly sourceSha: string;
@@ -330,10 +330,10 @@ function parseRecoveryPolicyOperationOptions(argumentsList: readonly string[]): 
   const allowed = new Set(['--policy-id', '--operation', '--request-id', '--transaction-id', '--source-sha', '--source-tree', '--source-root', '--control-script', '--executable', '--executable-sha256', '--executable-arguments', '--runtime-preflight-sha256', '--runtime-loader-sha256', '--before-metadata-sha256', '--before-plist-sha256', '--protected-reference-root', '--machine-id']);
   if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
   const operation = required('--operation');
-  if (operation !== 'MIGRATION_APPROVAL' && operation !== 'SOURCE_MIGRATION' && operation !== 'SUPERVISOR_BOOTSTRAP') throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
+  if (operation !== 'MIGRATION_APPROVAL' && operation !== 'SOURCE_MIGRATION' && operation !== 'SUPERVISOR_BOOTSTRAP' && operation !== 'ADMIN_TUNNEL_START') throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
   const executableSha256 = values.get('--executable-sha256');
   const machineId = values.get('--machine-id');
-  if (operation === 'SUPERVISOR_BOOTSTRAP' && (executableSha256 === undefined || machineId === undefined)) throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
+  if ((operation === 'SUPERVISOR_BOOTSTRAP' || operation === 'ADMIN_TUNNEL_START') && (executableSha256 === undefined || machineId === undefined)) throw new Error(RECOVERY_POLICY_OPERATION_USAGE);
   return { policyId: required('--policy-id'), operation, requestId: required('--request-id'), transactionId: required('--transaction-id'), sourceSha: required('--source-sha'), sourceTree: required('--source-tree'), sourceRoot: required('--source-root'), controlScript: required('--control-script'), executable: required('--executable'), ...(executableSha256 === undefined ? {} : { executableSha256 }), executableArguments: JSON.parse(required('--executable-arguments')) as string[], runtimePreflightSha256: required('--runtime-preflight-sha256'), runtimeLoaderSha256: required('--runtime-loader-sha256'), beforeMetadataSha256: required('--before-metadata-sha256'), beforePlistSha256: required('--before-plist-sha256'), ...(values.get('--protected-reference-root') === undefined ? {} : { protectedReferenceRoot: values.get('--protected-reference-root') }), ...(machineId === undefined ? {} : { machineId }) };
 }
 
@@ -510,7 +510,7 @@ const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-sou
 const LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-migrate-approval --source-sha <commit> --source-tree <tree> --request-id <uuid>';
 const MALFORMED_APPROVAL_RECOVERY_USAGE = 'Usage: iris launchd reconcile-malformed-approval --approval-id <uuid> --request-id <uuid> --approval-sha256 <digest> --recovery-request-id <uuid>';
 const RECOVERY_POLICY_USAGE = 'Usage: iris recovery-policy issue --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> [--executable-sha256 <digest>] --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> --allowed-operations <comma-separated> --max-operations <count> --expires-at <ISO> [--protected-reference-root <directory>] [--supersedes-policy-id <uuid>]';
-const RECOVERY_POLICY_OPERATION_USAGE = 'Usage: iris recovery-policy reconcile --policy-id <uuid> --operation <MIGRATION_APPROVAL|SOURCE_MIGRATION|SUPERVISOR_BOOTSTRAP> --request-id <uuid> --transaction-id <uuid> --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> [--executable-sha256 <digest>] --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> [--protected-reference-root <directory>] [--machine-id <uuid>]';
+const RECOVERY_POLICY_OPERATION_USAGE = 'Usage: iris recovery-policy reconcile --policy-id <uuid> --operation <MIGRATION_APPROVAL|SOURCE_MIGRATION|SUPERVISOR_BOOTSTRAP|ADMIN_TUNNEL_START> --request-id <uuid> --transaction-id <uuid> --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> [--executable-sha256 <digest>] --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> [--protected-reference-root <directory>] [--machine-id <uuid>]';
 const RECOVERY_POLICY_LOCK_USAGE = 'Usage: iris recovery-policy reconcile-lock --lock-id <uuid> --pid <pid> --process-start-marker <marker>';
 
 function parseLaunchdStopForMigrationOptions(argumentsList: readonly string[]): { readonly sourceRoot: string; readonly beforeMetadataSha256: string; readonly beforePlistSha256: string } {

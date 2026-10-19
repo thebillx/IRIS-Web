@@ -309,7 +309,7 @@ export class Supervisor {
     const policyInput = {
       dataRoot: this.dataRoot,
       policyId: input.recoveryPolicyId,
-      operation: 'SUPERVISOR_BOOTSTRAP' as const,
+      operation: 'ADMIN_TUNNEL_START' as const,
       requestId: input.requestId,
       sourceSha: input.sourceSha,
       sourceTree: input.sourceTree,
@@ -328,7 +328,7 @@ export class Supervisor {
     this.startupTransactionId = randomUUID();
     this.startupRecords.clear();
     try {
-      state = { ...state, schemaVersion: 4, startupOperations: state.startupOperations ?? [] };
+      state = await this.migrateHistoricalOwnership();
       await this.writeState(state, true);
       state = await this.ensureAdminTunnel(state, registry, binding.managedProfilePath, []);
       const record = state.adminTunnel;

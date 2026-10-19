@@ -11,7 +11,7 @@ import {
 import { readOwnerAccessSecret } from "./persistence.js";
 import { observeProcessStart } from "./macos-safety.js";
 
-export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP";
+export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP" | "ADMIN_TUNNEL_START";
 export type RecoveryPolicyState = "ISSUED" | "REVOKED" | "EXPIRED";
 export type RecoveryPolicyOperationState =
   "RESERVED" | "COMMITTED" | "RECONCILIATION_REQUIRED";
@@ -22,7 +22,9 @@ const HASH64 = /^[a-f0-9]{64}$/;
 const MAX_OPERATIONS = 16;
 const MAX_ENTRIES = 32;
 const MAX_RETIRED_POLICIES = 8;
-const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP"];
+const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START"];
+const HOST_BOUND_OPERATIONS: readonly RecoveryPolicyOperation[] = ["SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START"];
+const requiresHostBinding = (operation: RecoveryPolicyOperation): boolean => HOST_BOUND_OPERATIONS.includes(operation);
 
 interface RecoveryPolicyLockRecord {
   readonly schemaVersion: 1;
@@ -310,7 +312,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       "Recovery policy does not authorize this operation",
     );
   if (
-    input.operation === "SUPERVISOR_BOOTSTRAP" &&
+    requiresHostBinding(input.operation) &&
     (current.machineId === undefined || current.machineId === null || current.machineId !== input.machineId)
   )
     throw new RuntimeError(
@@ -325,7 +327,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
         binding.sourceRoot === input.sourceRoot &&
         binding.controlScript === input.controlScript &&
         binding.executable === input.executable &&
-        (input.operation !== "SUPERVISOR_BOOTSTRAP" || binding.executableSha256 === input.executableSha256) &&
+        (!requiresHostBinding(input.operation) || binding.executableSha256 === input.executableSha256) &&
         JSON.stringify(binding.executableArguments) === JSON.stringify(input.executableArguments) &&
         binding.runtimePreflightSha256 === input.runtimePreflightSha256 &&
         binding.runtimeLoaderSha256 === input.runtimeLoaderSha256,
@@ -912,10 +914,10 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
     throw new RuntimeError("INVALID_REQUEST", "Recovery policy machine identity is invalid");
   if (input.supersedesPolicyId !== undefined && !isUuid(input.supersedesPolicyId))
     throw new RuntimeError("INVALID_REQUEST", "Recovery policy predecessor identity is invalid");
-  if (input.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") && input.machineId === undefined)
-    throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap policy requires a machine identity");
-  if (input.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") && input.sourceBindings.some((binding) => binding.executableSha256 === undefined || !HASH64.test(binding.executableSha256)))
-    throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap policy requires executable digests");
+  if (input.allowedOperations.some(requiresHostBinding) && input.machineId === undefined)
+    throw new RuntimeError("INVALID_REQUEST", "Protected control policy requires a machine identity");
+  if (input.allowedOperations.some(requiresHostBinding) && input.sourceBindings.some((binding) => binding.executableSha256 === undefined || !HASH64.test(binding.executableSha256)))
+    throw new RuntimeError("INVALID_REQUEST", "Protected control policy requires executable digests");
   const expiry = Date.parse(input.expiresAt);
   if (!Number.isFinite(expiry) || expiry <= Date.now())
     throw new RuntimeError(
@@ -942,9 +944,9 @@ function validateOperation(input: RecoveryPolicyOperationInput): void {
     );
   if (input.machineId !== undefined && !isUuid(input.machineId))
     throw new RuntimeError("INVALID_REQUEST", "Recovery policy operation machine identity is invalid");
-  if (input.operation === "SUPERVISOR_BOOTSTRAP" && input.machineId === undefined)
+  if (requiresHostBinding(input.operation) && input.machineId === undefined)
     throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap operation requires a machine identity");
-  if (input.operation === "SUPERVISOR_BOOTSTRAP" && (input.executableSha256 === undefined || !HASH64.test(input.executableSha256)))
+  if (requiresHostBinding(input.operation) && (input.executableSha256 === undefined || !HASH64.test(input.executableSha256)))
     throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap operation requires an executable digest");
 }
 
@@ -967,11 +969,11 @@ function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolic
     && Array.isArray(record.allowedOperations)
     && record.allowedOperations.length > 0
     && record.allowedOperations.every((operation) => POLICY_OPERATIONS.includes(operation as RecoveryPolicyOperation))
-    && (!record.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") || (record.machineId !== undefined && record.machineId !== null))
-    && (!record.allowedOperations.includes("SUPERVISOR_BOOTSTRAP") || record.sourceBindings.every((binding) => binding.executableSha256 !== undefined))
+    && (!record.allowedOperations.some(requiresHostBinding) || (record.machineId !== undefined && record.machineId !== null))
+    && (!record.allowedOperations.some(requiresHostBinding) || record.sourceBindings.every((binding) => binding.executableSha256 !== undefined))
     && Array.isArray(record.operations)
     && record.operations.length <= MAX_ENTRIES
-    && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforeMetadataSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforePlistSha256) && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && ((entry as RecoveryPolicyOperationJournal).operation !== "SUPERVISOR_BOOTSTRAP" || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
+    && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforeMetadataSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforePlistSha256) && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && (!requiresHostBinding((entry as RecoveryPolicyOperationJournal).operation) || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
     && Array.isArray(record.audit)
     && typeof record.expiresAt === "string"
     && typeof record.issuedAt === "string"
