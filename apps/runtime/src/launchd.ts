@@ -569,12 +569,15 @@ async function stopLaunchAgentForMigrationUnlocked(
   await requireGuiDomain(domain, launchctl);
   const paths = launchdPaths(input.dataRoot, dependencies.homeDirectory ?? os.homedir());
   const metadataRecord = await readLaunchAgentMetadata(paths.metadata, uid);
-  if (metadataRecord === null || metadataRecord.metadata.schemaVersion !== 3 || metadataRecord.metadata.state !== 'READY') {
+  const pendingStop = metadataRecord?.metadata.schemaVersion === 3
+    && metadataRecord.metadata.state === 'RECONCILIATION_REQUIRED'
+    && metadataRecord.metadata.unresolvedReason === 'BOOTOUT_OUTCOME_UNKNOWN';
+  if (metadataRecord === null || metadataRecord.metadata.schemaVersion !== 3 || metadataRecord.metadata.state !== 'READY' && !pendingStop) {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor source stop requires Schema-3 metadata');
   }
   const metadata = metadataRecord.metadata;
   const canonicalSourceRoot = await requireCanonicalDirectory(input.sourceRoot, 'IRIS current control source root', uid, false);
-  if (metadata.sourceRoot !== canonicalSourceRoot || sha256(metadataRecord.raw) !== input.beforeMetadataSha256) {
+  if (metadata.sourceRoot !== canonicalSourceRoot || !pendingStop && sha256(metadataRecord.raw) !== input.beforeMetadataSha256) {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor source stop metadata identity does not match the authorized before-image');
   }
   const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
@@ -587,6 +590,16 @@ async function stopLaunchAgentForMigrationUnlocked(
   }
   const observation = await observeLaunchAgent(dependencies);
   if (observation.state === 'ABSENT') {
+    if (pendingStop) {
+      if (metadata.processId === undefined || metadata.processStartMarker === undefined) {
+        throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Unresolved Supervisor stop has no durable process identity');
+      }
+      const processObservation = (dependencies.observeProcessStart ?? observeProcessStart)(metadata.processId);
+      if (processObservation.state === 'indeterminate' || processObservation.state === 'live' && processObservation.marker === metadata.processStartMarker) {
+        throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Unresolved Supervisor stop still has ambiguous process ownership');
+      }
+      await writeLaunchAgentMetadata(paths.metadata, { ...metadata, state: 'READY', unresolvedReason: null }, uid);
+    }
     if (registeredPlist.state === 'ok') await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
     return { state: 'STOPPED' };
   }

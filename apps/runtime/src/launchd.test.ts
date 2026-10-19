@@ -1500,6 +1500,31 @@ describe('IRIS LaunchAgent artifact', () => {
     await expect(lstat(paths.registeredPlist)).resolves.toMatchObject({ mode: expect.any(Number) });
   });
 
+  it('reconciles a verified absent Supervisor after an unresolved stop', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const metadataRaw = await readFile(paths.metadata, 'utf8');
+    const plistRaw = await readFile(paths.plist, 'utf8');
+    const metadata = JSON.parse(metadataRaw) as { sourceRoot: string };
+    subject.fake.bootout = 'failure';
+    await expect(stopLaunchAgentForMigration({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).rejects.toThrow(/verified Supervisor|reconciliation/);
+    subject.fake.loaded = false;
+    subject.fake.live.pid = 9999;
+    await expect(stopLaunchAgentForMigration({
+      dataRoot: subject.dataRoot,
+      sourceRoot: metadata.sourceRoot,
+      beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    }, subject.fake.dependencies)).resolves.toMatchObject({ state: 'STOPPED' });
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8'))).toMatchObject({ state: 'READY', unresolvedReason: null });
+    await expect(lstat(paths.registeredPlist)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('preserves a loaded service when its registered plist changed', async () => {
     const subject = await fixture();
     const paths = await install(subject);
