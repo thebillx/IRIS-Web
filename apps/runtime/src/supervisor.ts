@@ -1764,7 +1764,7 @@ export class Supervisor {
     await this.writeState(next);
     started.push('admin-tunnel');
     await waitForTunnel(executable, this.adminTunnelHealthPort, current === null ? 15_000 : 2_000);
-    return next;
+    return this.readState();
   }
 
   private async ensureWeb(
