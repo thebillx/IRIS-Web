@@ -351,6 +351,7 @@ export class Supervisor {
       state = await this.migrateHistoricalOwnership();
       await this.writeState(state, true);
       state = await this.ensureAdminTunnel(state, registry, binding.managedProfilePath, []);
+      state = await this.readState();
       const record = state.adminTunnel;
       if (record === null) throw new RuntimeError('TUNNEL_NOT_RUNNING', 'Control-only ADMIN tunnel did not publish ownership');
       const readiness = await this.probeAdminTunnel(state, record, true);
@@ -1764,7 +1765,7 @@ export class Supervisor {
     await this.writeState(next);
     started.push('admin-tunnel');
     await waitForTunnel(executable, this.adminTunnelHealthPort, current === null ? 15_000 : 2_000);
-    return this.readState();
+    return next;
   }
 
   private async ensureWeb(
