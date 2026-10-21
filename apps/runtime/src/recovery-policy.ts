@@ -344,12 +344,15 @@ async function archiveRecoveryPolicyHistoryUnlocked(input: RecoveryPolicyArchive
   let metadata: unknown;
   try { metadata = JSON.parse(metadataContent); } catch (error) { throw new RuntimeError("PERSISTENCE_FAILURE", "IRIS LaunchAgent metadata is invalid JSON", { cause: error }); }
   if (typeof metadata !== "object" || metadata === null || (metadata as { sourceRoot?: unknown }).sourceRoot !== canonicalSourceRoot || (metadata as { schemaVersion?: unknown }).schemaVersion !== 3) throw new RuntimeError("CONTROL_DENIED", "Protected LaunchAgent source binding does not match");
+  let migration: unknown;
+  try { migration = JSON.parse(await readPrivateContent(path.join(dataRoot, "launchd", "com.iris.supervisor.source-binding-migration.json"), "IRIS source migration record")); } catch (error) { throw new RuntimeError("PERSISTENCE_FAILURE", "IRIS source migration record is invalid", { cause: error }); }
+  if (typeof migration !== "object" || migration === null || (migration as { schemaVersion?: unknown }).schemaVersion !== 1 || (migration as { state?: unknown }).state !== "COMMITTED" || (migration as { targetSourceRoot?: unknown }).targetSourceRoot !== canonicalSourceRoot || (migration as { targetSourceSha?: unknown }).targetSourceSha !== input.sourceSha || (migration as { targetSourceTree?: unknown }).targetSourceTree !== input.sourceTree) throw new RuntimeError("CONTROL_DENIED", "Protected source migration evidence does not match");
   if (allPolicyOperations(current).some((entry) => entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED")) throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Recovery policy has unresolved operations");
   if (current.retiredPoliciesArchive !== undefined) {
     await readPolicyArchive(dataRoot, current.retiredPoliciesArchive, secret);
     if ((current.retiredPolicies?.length ?? 0) === 0) return publicRecord(current);
   }
-  const archiveRecords = uniquePolicies([...(current as SignedRecoveryPolicyWithArchive)[ARCHIVED_POLICIES] ?? [], current, ...(current.retiredPolicies ?? [])]);
+  const archiveRecords = uniquePolicies([current, ...(current.retiredPolicies ?? []), ...(current as SignedRecoveryPolicyWithArchive)[ARCHIVED_POLICIES] ?? []]);
   const beforePolicySha256 = sha256(await readPrivateContent(filename, "Recovery authorization policy"));
   const existingArchive = await findMatchingArchive(dataRoot, current.policyId, beforePolicySha256, secret);
   const archive = existingArchive ?? await createPolicyArchive(dataRoot, current, archiveRecords, beforePolicySha256, secret, input);

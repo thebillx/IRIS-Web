@@ -350,8 +350,10 @@ describe('recovery authorization policy', () => {
     const source = await sourceFixture();
     const metadata = JSON.stringify({ schemaVersion: 3, sourceRoot: source.root });
     const plist = '<plist>fixture</plist>\n';
+    const migration = JSON.stringify({ schemaVersion: 1, state: 'COMMITTED', targetSourceRoot: source.root, targetSourceSha: source.sourceSha, targetSourceTree: source.sourceTree });
     await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.plist.metadata.json'), metadata, { mode: 0o600 });
     await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.plist'), plist, { mode: 0o600 });
+    await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.source-binding-migration.json'), migration, { mode: 0o600 });
     const currentMetadataSha = createHash('sha256').update(metadata).digest('hex');
     const currentPlistSha = createHash('sha256').update(plist).digest('hex');
     const binding = { ...sourceBinding, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root };
@@ -376,7 +378,11 @@ describe('recovery authorization policy', () => {
     const afterSecondRollover = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [binding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(), supersedesPolicyId: next.policyId });
     expect(afterSecondRollover.retiredPolicies).toHaveLength(1);
     await expect(reserveRecoveryPolicyOperation({ dataRoot, policyId: afterSecondRollover.policyId, operation: 'SOURCE_MIGRATION', requestId, ...binding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha })).rejects.toThrow('retired policy history');
-    const archiveFilename = path.join(dataRoot, 'launchd', archived.retiredPoliciesArchive!.filename);
+    await revokeRecoveryAuthorizationPolicy(dataRoot);
+    const rearchived = await archiveRecoveryPolicyHistory({ dataRoot, policyId: afterSecondRollover.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha });
+    expect(rearchived.retiredPoliciesArchive?.policyIds[0]).toBe(afterSecondRollover.policyId);
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({ policyId: afterSecondRollover.policyId });
+    const archiveFilename = path.join(dataRoot, 'launchd', rearchived.retiredPoliciesArchive!.filename);
     const archiveContent = await readFile(archiveFilename, 'utf8');
     await rm(archiveFilename);
     await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toThrow();

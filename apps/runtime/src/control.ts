@@ -60,6 +60,8 @@ try {
         const confirmation = await prompt.question('Type ARCHIVE IRIS RECOVERY POLICY HISTORY to archive terminal policy history: ');
         if (confirmation.trim() !== 'ARCHIVE IRIS RECOVERY POLICY HISTORY') throw new Error('Owner recovery policy archival was not confirmed');
       } finally { prompt.close(); }
+      const confirmedLaunchdState = await launchAgentStatus(dataRoot);
+      if (confirmedLaunchdState.loaded || confirmedLaunchdState.registered) throw new Error('Recovery policy archival requires the Supervisor LaunchAgent to remain absent');
       process.stdout.write(`${JSON.stringify(await archiveRecoveryPolicyHistory({ ...archive, dataRoot }), null, 2)}\n`);
     } else if (command === 'recovery-policy' && process.argv[3] === 'reconcile') {
       const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
