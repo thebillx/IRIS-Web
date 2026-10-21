@@ -367,6 +367,11 @@ describe('recovery authorization policy', () => {
     }
     await revokeRecoveryAuthorizationPolicy(dataRoot);
     expect(policy.retiredPolicies).toHaveLength(8);
+    await expect(archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha.slice(0, 39) + '0', sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha })).rejects.toThrow('exact clean checkout');
+    await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.source-binding-migration.json'), migration.replace(source.sourceSha, source.sourceSha.slice(0, 39) + '0'), { mode: 0o600 });
+    await expect(archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha })).rejects.toThrow('source migration evidence');
+    await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.source-binding-migration.json'), migration, { mode: 0o600 });
+    const policyBeforeArchive = await readFile(recoveryPolicyPath(dataRoot), 'utf8');
     const archived = await archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha });
     expect(archived.retiredPolicies).toEqual([]);
     expect(archived.retiredPoliciesArchive?.policyIds).toHaveLength(9);
@@ -382,7 +387,17 @@ describe('recovery authorization policy', () => {
     const rearchived = await archiveRecoveryPolicyHistory({ dataRoot, policyId: afterSecondRollover.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha });
     expect(rearchived.retiredPoliciesArchive?.policyIds[0]).toBe(afterSecondRollover.policyId);
     await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({ policyId: afterSecondRollover.policyId });
-    const archiveFilename = path.join(dataRoot, 'launchd', rearchived.retiredPoliciesArchive!.filename);
+    await writeFile(recoveryPolicyPath(dataRoot), policyBeforeArchive, { mode: 0o600 });
+    const orphanArchive = path.join(dataRoot, 'launchd', archived.retiredPoliciesArchive!.filename);
+    const orphanContent = await readFile(orphanArchive, 'utf8');
+    await rm(orphanArchive);
+    await chmod(path.join(dataRoot, 'launchd'), 0o500);
+    try {
+      await expect(archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha })).rejects.toThrow(/already active|publication failed/);
+    } finally { await chmod(path.join(dataRoot, 'launchd'), 0o700); }
+    await writeFile(orphanArchive, orphanContent, { mode: 0o600 });
+    await expect(archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha })).resolves.toMatchObject({ retiredPoliciesArchive: archived.retiredPoliciesArchive });
+    const archiveFilename = path.join(dataRoot, 'launchd', archived.retiredPoliciesArchive!.filename);
     const archiveContent = await readFile(archiveFilename, 'utf8');
     await rm(archiveFilename);
     await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toThrow();
@@ -391,7 +406,7 @@ describe('recovery authorization policy', () => {
     tampered.signature = `${tampered.signature[0] === '0' ? '1' : '0'}${tampered.signature.slice(1)}`;
     await writeFile(archiveFilename, `${JSON.stringify(tampered, null, 2)}\n`, { mode: 0o600 });
     await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toThrow(/integrity|authentication/);
-  });
+  }, 20_000);
 
   it('refuses rollover while the predecessor has unresolved work', async () => {
     const dataRoot = await fixture();
