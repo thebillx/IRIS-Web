@@ -164,6 +164,16 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'start-admin-tunnel') {
       const start = parseLaunchdAdminTunnelStartOptions(process.argv.slice(4));
       process.stdout.write(`${JSON.stringify(await supervisor.startControlOnlyAdminTunnel(start), null, 2)}\n`);
+    } else if (command === 'launchd' && process.argv[3] === 'reconcile-admin-tunnel') {
+      const reconciliation = parseLaunchdAdminTunnelReconciliationOptions(process.argv.slice(4));
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type RECONCILE IRIS ADMIN TUNNEL START to finalize the verified running tunnel: ');
+        if (confirmation.trim() !== 'RECONCILE IRIS ADMIN TUNNEL START') throw new Error('Owner ADMIN tunnel reconciliation was not confirmed');
+      } finally {
+        prompt.close();
+      }
+      process.stdout.write(`${JSON.stringify(await supervisor.reconcileControlOnlyAdminTunnel(reconciliation), null, 2)}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'authorize-migrate-source') {
       const approval = parseLaunchdSourceApprovalOptions(process.argv.slice(4));
       const runtimeDirectory = path.join(approval.sourceRoot, 'apps', 'runtime');
@@ -527,6 +537,7 @@ const LAUNCHD_SOURCE_MIGRATION_USAGE = 'Usage: iris launchd migrate-source --sou
 const LAUNCHD_SOURCE_STOP_USAGE = 'Usage: iris launchd stop-for-migration --source-root <directory> --before-metadata-sha256 <digest> --before-plist-sha256 <digest>';
 const LAUNCHD_SOURCE_STOP_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-stop --source-root <directory> --before-metadata-sha256 <digest> --before-plist-sha256 <digest>';
 const LAUNCHD_ADMIN_TUNNEL_START_USAGE = 'Usage: iris launchd start-admin-tunnel --recovery-policy-id <uuid> --request-id <uuid> --source-sha <commit> --source-tree <tree> --before-metadata-sha256 <digest> --before-plist-sha256 <digest>';
+const LAUNCHD_ADMIN_TUNNEL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-admin-tunnel --recovery-policy-id <uuid> --request-id <uuid> --transaction-id <uuid> --source-sha <commit> --source-tree <tree> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> --pid <pid> --process-start-marker <marker> --tunnel-id <id> --profile-digest <digest>';
 const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-migrate-approval --source-sha <commit> --source-tree <tree> --request-id <uuid>';
 const MALFORMED_APPROVAL_RECOVERY_USAGE = 'Usage: iris launchd reconcile-malformed-approval --approval-id <uuid> --request-id <uuid> --approval-sha256 <digest> --recovery-request-id <uuid>';
@@ -599,6 +610,50 @@ function parseLaunchdAdminTunnelStartOptions(argumentsList: readonly string[]): 
     sourceTree: required('--source-tree'),
     beforeMetadataSha256: required('--before-metadata-sha256'),
     beforePlistSha256: required('--before-plist-sha256'),
+  };
+}
+
+function parseLaunchdAdminTunnelReconciliationOptions(argumentsList: readonly string[]): {
+  readonly recoveryPolicyId: string;
+  readonly requestId: string;
+  readonly transactionId: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+  readonly pid: number;
+  readonly processStartMarker: string;
+  readonly tunnelId: string;
+  readonly profileDigest: string;
+} {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(LAUNCHD_ADMIN_TUNNEL_RECONCILIATION_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => {
+    const value = values.get(name);
+    if (value === undefined) throw new Error(LAUNCHD_ADMIN_TUNNEL_RECONCILIATION_USAGE);
+    return value;
+  };
+  const allowed = new Set(['--recovery-policy-id', '--request-id', '--transaction-id', '--source-sha', '--source-tree', '--before-metadata-sha256', '--before-plist-sha256', '--pid', '--process-start-marker', '--tunnel-id', '--profile-digest']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(LAUNCHD_ADMIN_TUNNEL_RECONCILIATION_USAGE);
+  const pid = Number(required('--pid'));
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(LAUNCHD_ADMIN_TUNNEL_RECONCILIATION_USAGE);
+  return {
+    recoveryPolicyId: required('--recovery-policy-id'),
+    requestId: required('--request-id'),
+    transactionId: required('--transaction-id'),
+    sourceSha: required('--source-sha'),
+    sourceTree: required('--source-tree'),
+    beforeMetadataSha256: required('--before-metadata-sha256'),
+    beforePlistSha256: required('--before-plist-sha256'),
+    pid,
+    processStartMarker: required('--process-start-marker'),
+    tunnelId: required('--tunnel-id'),
+    profileDigest: required('--profile-digest'),
   };
 }
 

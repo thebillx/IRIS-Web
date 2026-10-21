@@ -102,7 +102,7 @@ async function fixture(): Promise<Fixture> {
   const f = { root, ports, supervisor, internal: supervisor as unknown as Internals, backups: [] };
   fixtures.push(f); return f;
 }
-async function child(f: Fixture, component: 'web' | 'admin' = 'web'): Promise<ChildRecord> {
+async function child(f: Fixture, component: 'web' | 'admin' | 'tunnel-admin' = 'web'): Promise<ChildRecord> {
   const record = await f.internal.spawnManaged(component, canonicalNodeRuntime().path,
     ['-e', 'setTimeout(()=>process.exit(0),4000);setInterval(()=>{},1000)', 'failure-stop-test-child'], sourceRoot, {}, null, path.join(f.root, 'logs'), 'failure-stop-test-child');
   const op = (await f.internal.readState()).startupOperations.find((op) => op.pid === record.pid)!;
@@ -122,6 +122,16 @@ async function gone(pid: number): Promise<void> {
 
 // Scenario IDs correspond to the Owner's original 16-scenario matrix.
 describe('Supervisor production failure boundaries', () => {
+  it('finalizes a verified control-only tunnel startup before reporting success', async () => {
+    const f = await fixture();
+    const record = await child(f, 'tunnel-admin');
+    const state = await f.internal.readState();
+    const operation = state.startupOperations.find((candidate) => candidate.pid === record.pid)!;
+    await f.internal.writeState({ ...state, adminTunnel: record, startupOperations: [{ ...operation, state: 'OWNERSHIP_VERIFIED' }] }, true);
+    await f.internal.finishStartupTransaction();
+    expect((await f.internal.readState()).startupOperations.find((candidate) => candidate.id === operation.id)?.state).toBe('RUNNING');
+  });
+
   it('S01 proves a real OS pre-PID rejection is SPAWN_FAILED, not an unknown child', async () => {
     const f = await fixture(); const filename = path.join(f.root, 'not-executable');
     await writeFile(filename, '#!/bin/sh\nexit 0\n', { mode: 0o600 });

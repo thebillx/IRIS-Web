@@ -23,7 +23,7 @@ import { readMachineId } from './machine-identity.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput } from './supervisor-native-control.js';
-import { finalizeRecoveryPolicyOperation, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
+import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, readRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
 import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
 
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
@@ -278,6 +278,78 @@ export class Supervisor {
     });
   }
 
+  /** Finalize one already-running ADMIN tunnel whose startup journal stopped at ownership verification. */
+  public async reconcileControlOnlyAdminTunnel(input: {
+    readonly recoveryPolicyId: string;
+    readonly requestId: string;
+    readonly transactionId: string;
+    readonly sourceSha: string;
+    readonly sourceTree: string;
+    readonly beforeMetadataSha256: string;
+    readonly beforePlistSha256: string;
+    readonly pid: number;
+    readonly processStartMarker: string;
+    readonly tunnelId: string;
+    readonly profileDigest: string;
+  }): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('admin-tunnel-start-reconcile-running', () => this.reconcileControlOnlyAdminTunnelUnlocked(input));
+  }
+
+  private async reconcileControlOnlyAdminTunnelUnlocked(input: {
+    readonly recoveryPolicyId: string;
+    readonly requestId: string;
+    readonly transactionId: string;
+    readonly sourceSha: string;
+    readonly sourceTree: string;
+    readonly beforeMetadataSha256: string;
+    readonly beforePlistSha256: string;
+    readonly pid: number;
+    readonly processStartMarker: string;
+    readonly tunnelId: string;
+    readonly profileDigest: string;
+  }): Promise<Record<string, unknown>> {
+    const state = await this.readState();
+    const candidates = state.startupOperations.filter((operation) => operation.transactionId === input.transactionId && operation.component === 'tunnel-admin' && operation.state === 'OWNERSHIP_VERIFIED');
+    if (candidates.length !== 1) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Exactly one ownership-verified ADMIN tunnel startup record is required');
+    const operation = candidates[0]!;
+    const record = state.adminTunnel;
+    if (record === null || record.pid !== input.pid || record.tunnelId !== input.tunnelId || record.profileDigest !== input.profileDigest || operation.pid !== input.pid || operation.processStartMarker !== input.processStartMarker || record.processStartMarker !== input.processStartMarker) {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'ADMIN tunnel identity changed before journal reconciliation');
+    }
+    if (operation.sourceRoot !== this.sourceRoot || operation.dataRoot !== this.dataRoot || record.workingDirectory !== this.sourceRoot
+      || !sameExecutablePath(operation.executable, record.executable) || operation.profilePath !== record.profilePath
+      || operation.processExecutable === null || operation.expectedProcessExecutable !== operation.processExecutable
+      || operation.configurationDigest !== record.environmentDigest || await executableForPid(record.pid) !== operation.processExecutable
+      || await inspectProcess(record) !== 'running') {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'ADMIN tunnel source or process identity is not verified');
+    }
+    if (!isOwnedProcess(operation.ownedProcess) || !sameOwnedProcessAuthority(operation.ownedProcess, record) || !await ownedProcessOwnsRecordedListeners(record, [this.adminTunnelHealthPort])) {
+      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'ADMIN tunnel durable ownership or listener identity is not verified');
+    }
+    const unrelated = state.startupOperations.filter((candidate) => unresolvedStartup(candidate) && candidate.transactionId !== input.transactionId);
+    if (unrelated.length > 0) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Unrelated unresolved startup operations prevent reconciliation');
+    const policy = await readRecoveryAuthorizationPolicy(this.dataRoot);
+    const journal = policy?.operations.find((entry) => entry.transactionId === input.transactionId && entry.requestId === input.requestId && entry.operation === 'ADMIN_TUNNEL_START');
+    if (policy === null || journal === undefined || journal.state !== 'COMMITTED' || policy.policyId !== input.recoveryPolicyId || journal.sourceSha !== input.sourceSha || journal.sourceTree !== input.sourceTree || journal.sourceRoot !== operation.sourceRoot || journal.beforeMetadataSha256 !== input.beforeMetadataSha256 || journal.beforePlistSha256 !== input.beforePlistSha256) {
+      throw new RuntimeError('CONTROL_DENIED', 'Committed ADMIN tunnel policy binding is unavailable');
+    }
+    await assertRecoveryPolicyOperationCommitted({
+      ...journal,
+      dataRoot: this.dataRoot,
+      policyId: policy.policyId,
+      operation: 'ADMIN_TUNNEL_START',
+      requestId: journal.requestId,
+      transactionId: journal.transactionId,
+      protectedReferenceRoot: journal.protectedReferenceRoot ?? undefined,
+      machineId: journal.machineId ?? undefined,
+      executableSha256: journal.executableSha256 ?? undefined,
+    });
+    const next = { ...state, startupOperations: state.startupOperations.map((candidate) => candidate.id === operation.id ? { ...candidate, state: 'RUNNING' as const } : candidate) };
+    await this.writeState(next, true);
+    return { state: 'READY', transactionId: input.transactionId, adminTunnelPid: record.pid, adminTunnelIdentity: ownedProcessIdentity(record), tunnelId: record.tunnelId, workloadProcessesStarted: false };
+  }
+
   private async startControlOnlyAdminTunnelUnlocked(input: {
     readonly recoveryPolicyId: string;
     readonly requestId: string;
@@ -356,6 +428,7 @@ export class Supervisor {
       if (record === null) throw new RuntimeError('TUNNEL_NOT_RUNNING', 'Control-only ADMIN tunnel did not publish ownership');
       const readiness = await this.probeAdminTunnel(state, record, true);
       if (readiness.status.state !== 'READY') throw new RuntimeError('TUNNEL_NOT_RUNNING', readiness.status.detail);
+      await this.finishStartupTransaction();
       await finalizeRecoveryPolicyOperation({ ...policyInput, transactionId: reservation.transactionId, state: 'COMMITTED' });
       return { state: 'READY', transactionId: reservation.transactionId, adminTunnelPid: record.pid, adminTunnelIdentity: ownedProcessIdentity(record), tunnelId: record.tunnelId, target: `http://127.0.0.1:${this.supervisorControlPort}/mcp`, workloadProcessesStarted: false };
     } catch (error) {
