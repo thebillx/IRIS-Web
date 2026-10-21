@@ -8,7 +8,7 @@ import { readOwnerAccessSecret } from './persistence.js';
 import { createSupervisor } from './supervisor.js';
 import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, reconcileStoppedLaunchAgent, resolveReviewedRuntimeEntrypoints, stopLaunchAgentForMigration, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
-import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, reconcileRecoveryPolicyLock, reconcileRecoveryPolicyOperation, revokeRecoveryAuthorizationPolicy } from './recovery-policy.js';
+import { archiveRecoveryPolicyHistory, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, reconcileRecoveryPolicyLock, reconcileRecoveryPolicyOperation, revokeRecoveryAuthorizationPolicy } from './recovery-policy.js';
 import { readMachineId } from './machine-identity.js';
 
 const command = process.argv[2];
@@ -51,6 +51,16 @@ try {
       process.stdout.write(`${JSON.stringify(await issueRecoveryAuthorizationPolicy({ ...policy, sourceBindings: [{ sourceSha: policy.sourceSha, sourceTree: policy.sourceTree, sourceRoot: policy.sourceRoot, controlScript: policy.controlScript, executable: policy.executable, ...(policy.executableSha256 === undefined ? {} : { executableSha256: policy.executableSha256 }), executableArguments: policy.executableArguments, runtimePreflightSha256: policy.runtimePreflightSha256, runtimeLoaderSha256: policy.runtimeLoaderSha256 }], dataRoot, ...(machineId === null ? {} : { machineId }) }), null, 2)}\n`);
     } else if (command === 'recovery-policy' && process.argv[3] === 'status') {
       process.stdout.write(`${JSON.stringify(await readRecoveryAuthorizationPolicy(dataRoot), null, 2)}\n`);
+    } else if (command === 'recovery-policy' && process.argv[3] === 'archive') {
+      const archive = parseRecoveryPolicyArchiveOptions(process.argv.slice(4));
+      const launchdState = await launchAgentStatus(dataRoot);
+      if (launchdState.loaded || launchdState.registered) throw new Error('Recovery policy archival requires the Supervisor LaunchAgent to be absent');
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type ARCHIVE IRIS RECOVERY POLICY HISTORY to archive terminal policy history: ');
+        if (confirmation.trim() !== 'ARCHIVE IRIS RECOVERY POLICY HISTORY') throw new Error('Owner recovery policy archival was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await archiveRecoveryPolicyHistory({ ...archive, dataRoot }), null, 2)}\n`);
     } else if (command === 'recovery-policy' && process.argv[3] === 'reconcile') {
       const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
       process.stdout.write(`${JSON.stringify(await reconcileRecoveryPolicyOperation({ ...recovery, dataRoot }), null, 2)}\n`);
@@ -274,6 +284,15 @@ interface RecoveryPolicyIssueOptions {
   readonly supersedesPolicyId?: string | undefined;
 }
 
+interface RecoveryPolicyArchiveOptions {
+  readonly policyId: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly sourceRoot: string;
+  readonly beforeMetadataSha256: string;
+  readonly beforePlistSha256: string;
+}
+
 interface RecoveryPolicyOperationOptions {
   readonly policyId: string;
   readonly operation: 'MIGRATION_APPROVAL' | 'SOURCE_MIGRATION' | 'SUPERVISOR_BOOTSTRAP' | 'ADMIN_TUNNEL_START';
@@ -336,6 +355,20 @@ function parseRecoveryPolicyIssueOptions(argumentsList: readonly string[]): Reco
     ...(values.get('--protected-reference-root') === undefined ? {} : { protectedReferenceRoot: values.get('--protected-reference-root') }),
     ...(values.get('--supersedes-policy-id') === undefined ? {} : { supersedesPolicyId: values.get('--supersedes-policy-id') }),
   };
+}
+
+function parseRecoveryPolicyArchiveOptions(argumentsList: readonly string[]): RecoveryPolicyArchiveOptions {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0 || name === undefined || !name.startsWith('--') || values.has(name)) throw new Error(RECOVERY_POLICY_ARCHIVE_USAGE);
+    values.set(name, value);
+  }
+  const required = (name: string): string => { const value = values.get(name); if (value === undefined) throw new Error(RECOVERY_POLICY_ARCHIVE_USAGE); return value; };
+  const allowed = new Set(['--policy-id', '--source-sha', '--source-tree', '--source-root', '--before-metadata-sha256', '--before-plist-sha256']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error(RECOVERY_POLICY_ARCHIVE_USAGE);
+  return { policyId: required('--policy-id'), sourceSha: required('--source-sha'), sourceTree: required('--source-tree'), sourceRoot: required('--source-root'), beforeMetadataSha256: required('--before-metadata-sha256'), beforePlistSha256: required('--before-plist-sha256') };
 }
 
 function parseRecoveryPolicyOperationOptions(argumentsList: readonly string[]): RecoveryPolicyOperationOptions {
@@ -530,6 +563,7 @@ const LAUNCHD_ADMIN_TUNNEL_START_USAGE = 'Usage: iris launchd start-admin-tunnel
 const LAUNCHD_SOURCE_APPROVAL_USAGE = 'Usage: iris launchd authorize-migrate-source --source-root <directory> --control-script <file> --executable <file> --source-sha <commit> --source-tree <tree> --request-id <uuid> [--protected-reference-root <directory>]';
 const LAUNCHD_SOURCE_APPROVAL_RECONCILIATION_USAGE = 'Usage: iris launchd reconcile-migrate-approval --source-sha <commit> --source-tree <tree> --request-id <uuid>';
 const MALFORMED_APPROVAL_RECOVERY_USAGE = 'Usage: iris launchd reconcile-malformed-approval --approval-id <uuid> --request-id <uuid> --approval-sha256 <digest> --recovery-request-id <uuid>';
+const RECOVERY_POLICY_ARCHIVE_USAGE = 'Usage: iris recovery-policy archive --policy-id <uuid> --source-sha <commit> --source-tree <tree> --source-root <directory> --before-metadata-sha256 <digest> --before-plist-sha256 <digest>';
 const RECOVERY_POLICY_USAGE = 'Usage: iris recovery-policy issue --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> [--executable-sha256 <digest>] --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> --allowed-operations <comma-separated> --max-operations <count> --expires-at <ISO> [--protected-reference-root <directory>] [--supersedes-policy-id <uuid>]';
 const RECOVERY_POLICY_OPERATION_USAGE = 'Usage: iris recovery-policy reconcile --policy-id <uuid> --operation <MIGRATION_APPROVAL|SOURCE_MIGRATION|SUPERVISOR_BOOTSTRAP|ADMIN_TUNNEL_START> --request-id <uuid> --transaction-id <uuid> --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> [--executable-sha256 <digest>] --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> [--protected-reference-root <directory>] [--machine-id <uuid>]';
 const RECOVERY_POLICY_LOCK_USAGE = 'Usage: iris recovery-policy reconcile-lock --lock-id <uuid> --pid <pid> --process-start-marker <marker>';
