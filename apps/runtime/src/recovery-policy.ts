@@ -127,6 +127,11 @@ interface RecoveryPolicyArchiveRecord {
   readonly predecessorPolicyId: string;
   readonly beforePolicySha256: string;
   readonly createdAt: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly sourceRoot: string;
+  readonly protectedMetadataSha256: string;
+  readonly protectedPlistSha256: string;
   readonly records: readonly RecoveryPolicyHistoricalRecord[];
   readonly signature: string;
 }
@@ -291,7 +296,7 @@ async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIss
     audit: [{ event: "ISSUED", at: now }],
     ...(input.supersedesPolicyId === undefined ? {} : { supersedesPolicyId: input.supersedesPolicyId }),
     ...(existing === null ? {} : existing.retiredPoliciesArchive !== undefined ? {
-      retiredPolicies: [],
+      retiredPolicies: [existing],
       retiredPoliciesArchive: existing.retiredPoliciesArchive,
     } : {
       retiredPolicies: [
@@ -329,21 +334,25 @@ async function archiveRecoveryPolicyHistoryUnlocked(input: RecoveryPolicyArchive
   const current = await requirePolicy(filename, secret);
   if (current.policyId !== input.policyId) throw new RuntimeError("CONTROL_DENIED", "Recovery policy identity does not match");
   if (current.state !== "REVOKED" && current.state !== "EXPIRED") throw new RuntimeError("CONTROL_DENIED", "Only a terminal recovery policy may be archived");
-  if (current.beforeMetadataSha256 !== input.beforeMetadataSha256 || current.beforePlistSha256 !== input.beforePlistSha256) throw new RuntimeError("CONTROL_DENIED", "Recovery policy before-image does not match");
-  if (!current.sourceBindings.some((candidate) => candidate.sourceSha === input.sourceSha && candidate.sourceTree === input.sourceTree && candidate.sourceRoot === input.sourceRoot)) throw new RuntimeError("CONTROL_DENIED", "Recovery policy source binding does not match");
   const canonicalSourceRoot = await realpath(input.sourceRoot).catch(() => { throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Recovery policy source root is unavailable"); });
   if (canonicalSourceRoot !== input.sourceRoot) throw new RuntimeError("PERSISTENCE_FAILURE", "Recovery policy source root is not canonical");
   const sourceIdentity = await gitIdentity(canonicalSourceRoot);
   if (sourceIdentity.sourceSha !== input.sourceSha || sourceIdentity.sourceTree !== input.sourceTree || sourceIdentity.dirty) throw new RuntimeError("CONTROL_DENIED", "Recovery policy source identity is not the exact clean checkout");
+  const metadataContent = await readPrivateContent(path.join(dataRoot, "launchd", "com.iris.supervisor.plist.metadata.json"), "IRIS LaunchAgent metadata");
+  const plistContent = await readPrivateContent(path.join(dataRoot, "launchd", "com.iris.supervisor.plist"), "IRIS private LaunchAgent");
+  if (sha256(metadataContent) !== input.beforeMetadataSha256 || sha256(plistContent) !== input.beforePlistSha256) throw new RuntimeError("CONTROL_DENIED", "Protected LaunchAgent before-image does not match");
+  let metadata: unknown;
+  try { metadata = JSON.parse(metadataContent); } catch (error) { throw new RuntimeError("PERSISTENCE_FAILURE", "IRIS LaunchAgent metadata is invalid JSON", { cause: error }); }
+  if (typeof metadata !== "object" || metadata === null || (metadata as { sourceRoot?: unknown }).sourceRoot !== canonicalSourceRoot || (metadata as { schemaVersion?: unknown }).schemaVersion !== 3) throw new RuntimeError("CONTROL_DENIED", "Protected LaunchAgent source binding does not match");
   if (allPolicyOperations(current).some((entry) => entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED")) throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Recovery policy has unresolved operations");
   if (current.retiredPoliciesArchive !== undefined) {
     await readPolicyArchive(dataRoot, current.retiredPoliciesArchive, secret);
-    return publicRecord(current);
+    if ((current.retiredPolicies?.length ?? 0) === 0) return publicRecord(current);
   }
-  const archiveRecords = uniquePolicies([current, ...(current.retiredPolicies ?? [])]);
+  const archiveRecords = uniquePolicies([...(current as SignedRecoveryPolicyWithArchive)[ARCHIVED_POLICIES] ?? [], current, ...(current.retiredPolicies ?? [])]);
   const beforePolicySha256 = sha256(await readPrivateContent(filename, "Recovery authorization policy"));
   const existingArchive = await findMatchingArchive(dataRoot, current.policyId, beforePolicySha256, secret);
-  const archive = existingArchive ?? await createPolicyArchive(dataRoot, current, archiveRecords, beforePolicySha256, secret);
+  const archive = existingArchive ?? await createPolicyArchive(dataRoot, current, archiveRecords, beforePolicySha256, secret, input);
   const next: RecoveryPolicyPublicRecord = {
     ...current,
     retiredPolicies: [],
@@ -894,9 +903,9 @@ async function writeArchive(filename: string, record: RecoveryPolicyArchiveRecor
   }
 }
 
-async function createPolicyArchive(dataRoot: string, predecessor: SignedRecoveryPolicy, records: readonly RecoveryPolicyHistoricalRecord[], beforePolicySha256: string, secret: string): Promise<{ readonly record: RecoveryPolicyArchiveRecord; readonly reference: RecoveryPolicyArchiveReference }> {
+async function createPolicyArchive(dataRoot: string, predecessor: SignedRecoveryPolicy, records: readonly RecoveryPolicyHistoricalRecord[], beforePolicySha256: string, secret: string, input: RecoveryPolicyArchiveInput): Promise<{ readonly record: RecoveryPolicyArchiveRecord; readonly reference: RecoveryPolicyArchiveReference }> {
   const archiveId = randomUUID();
-  const record = signArchive({ schemaVersion: 1, archiveId, predecessorPolicyId: predecessor.policyId, beforePolicySha256, createdAt: new Date().toISOString(), records }, secret);
+  const record = signArchive({ schemaVersion: 1, archiveId, predecessorPolicyId: predecessor.policyId, beforePolicySha256, createdAt: new Date().toISOString(), sourceSha: input.sourceSha, sourceTree: input.sourceTree, sourceRoot: input.sourceRoot, protectedMetadataSha256: input.beforeMetadataSha256, protectedPlistSha256: input.beforePlistSha256, records }, secret);
   const content = await writeArchive(path.join(dataRoot, "launchd", archiveFilename(archiveId)), record);
   return { record, reference: archiveReference(record, content) };
 }
@@ -926,8 +935,8 @@ async function readPolicyArchive(dataRoot: string, reference: RecoveryPolicyArch
   try { parsed = JSON.parse(content); } catch (error) { throw new RuntimeError("PERSISTENCE_FAILURE", "Recovery policy archive is invalid JSON", { cause: error }); }
   if (typeof parsed !== "object" || parsed === null) throw new RuntimeError("PERSISTENCE_FAILURE", "Recovery policy archive is malformed");
   const archive = parsed as RecoveryPolicyArchiveRecord;
-  if (archive.schemaVersion !== 1 || archive.archiveId !== reference.archiveId || archive.predecessorPolicyId !== reference.predecessorPolicyId || !HASH64.test(archive.beforePolicySha256) || !Array.isArray(archive.records) || archive.records.length === 0 || archive.records[0]?.policyId !== reference.predecessorPolicyId || archive.records.length > MAX_ARCHIVE_RECORDS || archive.records.some((record) => !isSignedPolicy(record))) throw new RuntimeError("PERSISTENCE_FAILURE", "Recovery policy archive is malformed");
-  const unsigned = { schemaVersion: archive.schemaVersion, archiveId: archive.archiveId, predecessorPolicyId: archive.predecessorPolicyId, beforePolicySha256: archive.beforePolicySha256, createdAt: archive.createdAt, records: archive.records };
+  if (archive.schemaVersion !== 1 || archive.archiveId !== reference.archiveId || archive.predecessorPolicyId !== reference.predecessorPolicyId || !HASH64.test(archive.beforePolicySha256) || !HASH40.test(archive.sourceSha) || !HASH40.test(archive.sourceTree) || archive.sourceRoot.length === 0 || !HASH64.test(archive.protectedMetadataSha256) || !HASH64.test(archive.protectedPlistSha256) || !Array.isArray(archive.records) || archive.records.length === 0 || archive.records[0]?.policyId !== reference.predecessorPolicyId || archive.records.length > MAX_ARCHIVE_RECORDS || archive.records.some((record) => !isSignedPolicy(record))) throw new RuntimeError("PERSISTENCE_FAILURE", "Recovery policy archive is malformed");
+  const unsigned = { schemaVersion: archive.schemaVersion, archiveId: archive.archiveId, predecessorPolicyId: archive.predecessorPolicyId, beforePolicySha256: archive.beforePolicySha256, createdAt: archive.createdAt, sourceSha: archive.sourceSha, sourceTree: archive.sourceTree, sourceRoot: archive.sourceRoot, protectedMetadataSha256: archive.protectedMetadataSha256, protectedPlistSha256: archive.protectedPlistSha256, records: archive.records };
   const expected = createHmac("sha256", secret).update(archivePayload(unsigned)).digest("hex");
   const actual = Buffer.from(archive.signature, "hex");
   const candidate = Buffer.from(expected, "hex");

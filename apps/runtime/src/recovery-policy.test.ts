@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -347,6 +348,12 @@ describe('recovery authorization policy', () => {
   it('archives the 8/8 terminal history and preserves rollover replay protection', async () => {
     const dataRoot = await fixture();
     const source = await sourceFixture();
+    const metadata = JSON.stringify({ schemaVersion: 3, sourceRoot: source.root });
+    const plist = '<plist>fixture</plist>\n';
+    await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.plist.metadata.json'), metadata, { mode: 0o600 });
+    await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.plist'), plist, { mode: 0o600 });
+    const currentMetadataSha = createHash('sha256').update(metadata).digest('hex');
+    const currentPlistSha = createHash('sha256').update(plist).digest('hex');
     const binding = { ...sourceBinding, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root };
     let policy = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [binding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString() });
     const requestId = crypto.randomUUID();
@@ -358,13 +365,17 @@ describe('recovery authorization policy', () => {
     }
     await revokeRecoveryAuthorizationPolicy(dataRoot);
     expect(policy.retiredPolicies).toHaveLength(8);
-    const archived = await archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha });
+    const archived = await archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha });
     expect(archived.retiredPolicies).toEqual([]);
     expect(archived.retiredPoliciesArchive?.policyIds).toHaveLength(9);
-    await expect(archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha })).resolves.toMatchObject({ retiredPoliciesArchive: archived.retiredPoliciesArchive });
+    await expect(archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha })).resolves.toMatchObject({ retiredPoliciesArchive: archived.retiredPoliciesArchive });
     const next = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [binding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(), supersedesPolicyId: policy.policyId });
-    expect(next.retiredPolicies).toEqual([]);
+    expect(next.retiredPolicies).toHaveLength(1);
     await expect(reserveRecoveryPolicyOperation({ dataRoot, policyId: next.policyId, operation: 'SOURCE_MIGRATION', requestId, ...binding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha })).rejects.toThrow('retired policy history');
+    await revokeRecoveryAuthorizationPolicy(dataRoot);
+    const afterSecondRollover = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [binding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(), supersedesPolicyId: next.policyId });
+    expect(afterSecondRollover.retiredPolicies).toHaveLength(1);
+    await expect(reserveRecoveryPolicyOperation({ dataRoot, policyId: afterSecondRollover.policyId, operation: 'SOURCE_MIGRATION', requestId, ...binding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha })).rejects.toThrow('retired policy history');
     const archiveFilename = path.join(dataRoot, 'launchd', archived.retiredPoliciesArchive!.filename);
     const archiveContent = await readFile(archiveFilename, 'utf8');
     await rm(archiveFilename);
