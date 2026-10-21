@@ -369,7 +369,8 @@ describe('recovery authorization policy', () => {
     expect(policy.retiredPolicies).toHaveLength(8);
     const wrongSourceSha = `${source.sourceSha[0] === '0' ? '1' : '0'}${source.sourceSha.slice(1)}`;
     await expect(archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: wrongSourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha })).rejects.toThrow('exact clean checkout');
-    await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.source-binding-migration.json'), migration.replace(source.sourceSha, source.sourceSha.slice(0, 39) + '0'), { mode: 0o600 });
+    const wrongMigrationSha = `${source.sourceSha[0] === '0' ? '1' : '0'}${source.sourceSha.slice(1)}`;
+    await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.source-binding-migration.json'), migration.replace(source.sourceSha, wrongMigrationSha), { mode: 0o600 });
     await expect(archiveRecoveryPolicyHistory({ dataRoot, policyId: policy.policyId, sourceSha: source.sourceSha, sourceTree: source.sourceTree, sourceRoot: source.root, beforeMetadataSha256: currentMetadataSha, beforePlistSha256: currentPlistSha })).rejects.toThrow('source migration evidence');
     await writeFile(path.join(dataRoot, 'launchd', 'com.iris.supervisor.source-binding-migration.json'), migration, { mode: 0o600 });
     const policyBeforeArchive = await readFile(recoveryPolicyPath(dataRoot), 'utf8');
