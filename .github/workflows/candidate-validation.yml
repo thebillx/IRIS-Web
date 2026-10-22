@@ -86,7 +86,7 @@ jobs:
 
       - name: Run Supervisor and repository authority regressions
         run: |
-          pnpm --filter @iris/runtime exec vitest run --testTimeout 30000 \
+          pnpm --filter @iris/runtime exec vitest run \
             src/supervisor.test.ts \
             src/repository-reconcile.test.ts \
             src/registry-authority-reconcile.test.ts \
