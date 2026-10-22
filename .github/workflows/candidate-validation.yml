@@ -27,8 +27,8 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: c4603ad3a871cda6dc69031438221efd038db107
-      APPROVED_TARGET_TREE: a37ce8b945c36fb0a77c9195cbca0c22596ee579
+      APPROVED_TARGET_SHA: 163523bfdafa07ea6e5eb0b1c25aba08b5d4ec53
+      APPROVED_TARGET_TREE: db1cafaabd11cb09d1f5c75a0bfa3dbc69374772
       BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
     steps:
       - name: Validate the approved target
@@ -142,4 +142,5 @@ jobs:
 
       - name: Run unified MCP workload routing regression
         run: |
-          pnpm --filter @iris/runtime exec vitest run src/mcp-v21.test.ts --testTimeout=60000
+          pnpm --filter @iris/runtime exec vitest run src/mcp-v21.test.ts src/supervisor-native-control.test.ts --testTimeout=60000
+          pnpm --filter @iris/runtime exec tsx src/control-setup.test.ts
