@@ -50,4 +50,14 @@ describe('KeepAwakeLeaseManager', () => {
     expect(provider.stops).toBe(1);
     expect((await manager.snapshot()).leaseCount).toBe(0);
   });
+
+  it('replaces a provider session that disappeared before the next lease request', async () => {
+    const provider = new DisposableProvider();
+    const manager = new KeepAwakeLeaseManager(provider);
+    await manager.request('runtime');
+    await provider.stop({ providerSessionId: 'fixture-1' });
+    await manager.request('session');
+    expect(provider.starts).toBe(2);
+    expect((await manager.snapshot()).observed).toBe('ACTIVE');
+  });
 });

@@ -52,6 +52,10 @@ export class KeepAwakeLeaseManager {
         this.observed = 'UNAVAILABLE';
         throw new RuntimeError('CAPABILITY_DENIED', capability.reason ?? 'Keep-awake provider is unavailable');
       }
+      if (this.providerSession !== null && !await this.provider.observe(this.providerSession)) {
+        this.providerSession = null;
+        this.observed = 'OFF';
+      }
       if (this.providerSession === null) {
         this.providerSession = await this.provider.start();
         this.observed = 'ACTIVE';
@@ -140,9 +144,14 @@ export class MacOSCaffeinateProvider implements KeepAwakeProvider {
     const sessionId = randomUUID();
     this.child = child;
     this.sessionId = sessionId;
-    child.once('exit', () => {
-      if (this.sessionId === sessionId) this.child = null;
-    });
+    const clearSession = () => {
+      if (this.sessionId === sessionId) {
+        this.child = null;
+        this.sessionId = null;
+      }
+    };
+    child.once('error', clearSession);
+    child.once('exit', clearSession);
     return { providerSessionId: sessionId };
   }
 
