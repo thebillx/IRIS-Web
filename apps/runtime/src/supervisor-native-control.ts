@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { RuntimeError } from '@iris/domain';
-import { readTunnelServiceSecret } from './credentials.js';
+import { readControlPlaneApiKey, readTunnelServiceSecret } from './credentials.js';
 import { LEGACY_MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import { adminToolDefinitions, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 
@@ -37,6 +37,7 @@ export interface AdminTunnelRecycleInput {
 export interface SupervisorWorkloadCallContext {
   readonly clientId?: string;
   readonly sessionId?: string;
+  readonly requestId?: string;
 }
 
 export interface SupervisorNativeOperations {
@@ -73,8 +74,9 @@ export async function startSupervisorNativeControlServer(
   }
   const secret = await readTunnelServiceSecret(dataRoot);
   if (secret === null) throw new RuntimeError('CREDENTIAL_MISSING', 'Supervisor native control requires the persistent tunnel service credential');
+  const ownerSecret = await readControlPlaneApiKey(dataRoot);
   const server = createServer((request, response) => {
-    void handleRequest(request, response, secret, operations).catch(() => {
+    void handleRequest(request, response, secret, ownerSecret, operations).catch(() => {
       if (!response.headersSent) writeJson(response, 500, { error: 'internal_error' });
       else response.end();
     });
@@ -94,7 +96,8 @@ export async function startSupervisorNativeControlServer(
 async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
-  secret: string,
+  tunnelSecret: string,
+  ownerSecret: string | null,
   operations: SupervisorNativeOperations,
 ): Promise<void> {
   if (request.method === 'GET' && isUnsupportedOAuthMetadataPath(request.url)) {
@@ -102,7 +105,10 @@ async function handleRequest(
     writeEmptyNotFound(response);
     return;
   }
-  if (request.headers.authorization !== `Bearer ${secret}`) {
+  const authorization = request.headers.authorization;
+  const tunnelAuthenticated = authorization === `Bearer ${tunnelSecret}`;
+  const ownerAuthenticated = ownerSecret !== null && authorization === `Bearer ${ownerSecret}`;
+  if (!tunnelAuthenticated && !ownerAuthenticated) {
     writeJson(response, 401, { error: 'unauthorized' });
     return;
   }
@@ -209,12 +215,14 @@ async function handleRequest(
     }
     if (name === 'runtime_on') {
       requireNoArguments(args);
+      if (!ownerAuthenticated) throw new RuntimeError('CONTROL_DENIED', 'Runtime lifecycle requires the owner control-plane credential');
       if (operations.runtimeOn === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime lifecycle is unavailable');
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOn()));
       return;
     }
     if (name === 'runtime_off') {
       requireNoArguments(args);
+      if (!ownerAuthenticated) throw new RuntimeError('CONTROL_DENIED', 'Runtime lifecycle requires the owner control-plane credential');
       if (operations.runtimeOff === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime lifecycle is unavailable');
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOff()));
       return;
@@ -263,6 +271,7 @@ async function handleRequest(
       const context: SupervisorWorkloadCallContext = {
         ...(clientId === undefined ? {} : { clientId }),
         ...(sessionId === undefined ? {} : { sessionId }),
+        ...(typeof rpc.id === 'string' || typeof rpc.id === 'number' ? { requestId: String(rpc.id) } : {}),
       };
       const result = await operations.workloadToolCall(name, args, context);
       writeJsonRpcResult(response, rpc.id ?? null, {

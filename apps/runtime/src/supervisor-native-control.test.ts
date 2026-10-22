@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RuntimeError } from '@iris/domain';
 import { catalogToolNames } from './mcp-catalog.js';
-import { loadOrCreateTunnelServiceSecret } from './credentials.js';
+import { loadOrCreateTunnelServiceSecret, persistControlPlaneApiKey } from './credentials.js';
 import { MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import {
   startSupervisorNativeControlServer,
@@ -126,8 +126,10 @@ describe('outer supervisor native control', () => {
       expect(adminToolDefinitions().map((tool) => tool.name)).toContain('admin_status');
       expect(structured(await rpcTool(harness, 'supervisor_status', {}))).toMatchObject({ supervisor: 'outer', workloadRuntimeId: 'runtime-a' });
       expect(structured(await rpcTool(harness, 'runtime_status', {}))).toMatchObject({ state: 'stopped', workloadOnly: true });
-      expect(structured(await rpcTool(harness, 'runtime_on', {}))).toMatchObject({ state: 'RUNNING', workloadOnly: true });
-      expect(structured(await rpcTool(harness, 'runtime_off', {}))).toMatchObject({ state: 'STOPPED', workloadOnly: true });
+      expect(toolError(await rpcTool(harness, 'runtime_on', {}))).toMatchObject({ code: 'CONTROL_DENIED' });
+      const ownerHeaders = { authorization: `Bearer ${harness.ownerSecret}` };
+      expect(structured(await rpcTool(harness, 'runtime_on', {}, ownerHeaders))).toMatchObject({ state: 'RUNNING', workloadOnly: true });
+      expect(structured(await rpcTool(harness, 'runtime_off', {}, ownerHeaders))).toMatchObject({ state: 'STOPPED', workloadOnly: true });
       expect(structured(await rpcTool(harness, 'list_projects', {}))).toMatchObject({ defaultProjectId: null, projects: [{ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' }] });
       expect(structured(await rpcTool(harness, 'project_info', { projectId: '11111111-1111-4111-8111-111111111111' }))).toEqual({ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' });
       expect(toolError(await rpcTool(harness, 'project_info', { projectId: '../escape' }))).toMatchObject({ code: 'INVALID_REQUEST' });
@@ -193,7 +195,10 @@ describe('outer supervisor native control', () => {
       await rpc(harness, {
         jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name: 'file_read', arguments: { projectId: '11111111-1111-4111-8111-111111111111', targetPath: 'README.md' } },
       }, { 'Mcp-Name': 'file_read', 'x-iris-client-id': 'conversation-b', 'x-iris-session-id': 'session-b' });
-      expect(harness.workloadContexts).toEqual([{ }, { clientId: 'conversation-b', sessionId: 'session-b' }]);
+      expect(harness.workloadContexts).toMatchObject([
+        {},
+        { clientId: 'conversation-b', sessionId: 'session-b', requestId: expect.any(String) },
+      ]);
       const invalid = await rpc(harness, {
         jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name: 'file_read', arguments: { projectId: '11111111-1111-4111-8111-111111111111', targetPath: 'README.md' } },
       }, { 'Mcp-Name': 'file_read', 'x-iris-client-id': 'x'.repeat(201) });
@@ -244,6 +249,7 @@ async function startHarness(withWorkload = false) {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-native-supervisor-control-'));
   roots.push(dataRoot);
   const secret = await loadOrCreateTunnelServiceSecret(dataRoot);
+  await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
   const recycleInputs: AdminRecycleInput[] = [];
   const workloadCalls: string[] = [];
   const workloadContexts: Array<{ clientId?: string; sessionId?: string }> = [];
@@ -282,6 +288,7 @@ async function startHarness(withWorkload = false) {
     ...harness,
     dataRoot,
     secret,
+    ownerSecret: 'control-plane-credential-for-test-only-12345',
     recycleInputs,
     workloadCalls,
     workloadContexts,
@@ -298,10 +305,10 @@ async function startHarness(withWorkload = false) {
   };
 }
 
-async function rpcTool(harness: Awaited<ReturnType<typeof startHarness>>, name: string, args: object): Promise<Record<string, unknown>> {
+async function rpcTool(harness: Awaited<ReturnType<typeof startHarness>>, name: string, args: object, extraHeaders: Record<string, string> = {}): Promise<Record<string, unknown>> {
   return rpc(harness, {
     jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name, arguments: args },
-  }, { 'Mcp-Name': name });
+  }, { 'Mcp-Name': name, ...extraHeaders });
 }
 
 async function rpc(

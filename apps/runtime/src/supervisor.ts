@@ -45,6 +45,11 @@ const DEFAULT_SUPERVISOR_CONTROL_PORT = 43_112;
 const DEFAULT_ADMIN_TUNNEL_HEALTH_PORT = 43_113;
 const DEFAULT_TUNNEL_CLIENT = 'tunnel-client';
 const OPERATION_LOCK_FILE = 'operation.lock';
+const FORWARDED_READ_ONLY_TOOLS = new Set([
+  'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'file_read',
+  'mission_list', 'session_get', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events',
+  'project_validation_discover', 'project_validation_job', 'catalog_identity',
+]);
 
 export type StackState = 'READY' | 'DEGRADED' | 'FAILED' | 'UNKNOWN';
 
@@ -861,6 +866,17 @@ export class Supervisor {
   }
 
   private async forwardWorkloadTool(name: string, args: Record<string, unknown>, context: SupervisorWorkloadCallContext = {}): Promise<SupervisorAdminToolCallResult> {
+    if (context.clientId === undefined) {
+      throw new RuntimeError('CONTROL_DENIED', 'Unified workload calls require a bounded client identity');
+    }
+    const mutation = !FORWARDED_READ_ONLY_TOOLS.has(name);
+    const requestId = context.requestId;
+    if (mutation && requestId === undefined) {
+      throw new RuntimeError('INVALID_REQUEST', 'Unified workload mutations require a durable requestId for reconciliation');
+    }
+    if (mutation && name !== 'session_open' && context.sessionId === undefined) {
+      throw new RuntimeError('INVALID_REQUEST', 'Unified workload mutations require a bounded session identity');
+    }
     const state = await this.readState();
     if (state.runtime === null || await inspectProcess(state.runtime) !== 'running') {
       throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Workload Runtime is not supervisor-owned and ready');
@@ -875,7 +891,6 @@ export class Supervisor {
     if (registry === null || binding === undefined || serviceSecret === null || binding.runtimeId !== endpoint.runtimeId || binding.deploymentEpoch !== registry.deploymentEpoch) {
       throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'Unified workload binding is not current and authenticated');
     }
-    const clientId = context.clientId ?? 'iris-supervisor-unified';
     const headers: Record<string, string> = {
       authorization: `Bearer ${serviceSecret}`,
       'content-type': 'application/json',
@@ -884,11 +899,12 @@ export class Supervisor {
       'x-iris-connector-profile': 'FULL',
       'x-iris-deployment-epoch': String(registry.deploymentEpoch),
       'x-iris-runtime-id': endpoint.runtimeId,
-      'x-iris-client-id': clientId,
+      'x-iris-client-id': context.clientId,
     };
     if (context.sessionId !== undefined) headers['x-iris-session-id'] = context.sessionId;
+    if (requestId !== undefined) headers['x-iris-request-id'] = requestId;
     const response = await postJson(`${endpoint.apiUrl}/mcp`, {
-      jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name, arguments: args },
+      jsonrpc: '2.0', id: requestId ?? randomUUID(), method: 'tools/call', params: { name, arguments: args },
     }, headers);
     if (!isRecord(response) || !isRecord(response.result)) {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Authenticated workload MCP outcome is unknown; reconcile its durable request or job state before retrying');
