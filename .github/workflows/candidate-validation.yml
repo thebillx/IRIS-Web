@@ -27,7 +27,7 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: f80fcbf4bf43db2f43397233b10a02225771e390
+      APPROVED_TARGET_SHA: c618f7b8d9afb22cac12ca118ab6d3bd2c22b822
       APPROVED_TARGET_TREE: acb900c3ba065fe66a10ac03967f1d6a9f6b9462
       BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
     steps:
