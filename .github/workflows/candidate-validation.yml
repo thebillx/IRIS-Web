@@ -83,7 +83,6 @@ jobs:
             src/supervisor-daemon-exit.test.ts \
             src/supervisor-failure-stop.test.ts \
             src/lifecycle-grant.test.ts \
-            src/mcp-v21.test.ts \
             --testTimeout=30000
 
       - name: Run Supervisor and repository authority regressions
@@ -140,3 +139,7 @@ jobs:
           done < <(git diff --name-only --diff-filter=ACMR "$BASELINE_SHA" "$TARGET_SHA" -- '*.js' '*.mjs' '*.ts' '*.tsx')
           test "${#changed_sources[@]}" -gt 0
           pnpm exec eslint "${changed_sources[@]}"
+
+      - name: Run unified MCP workload routing regression
+        run: |
+          pnpm --filter @iris/runtime exec vitest run src/mcp-v21.test.ts --testTimeout=60000
