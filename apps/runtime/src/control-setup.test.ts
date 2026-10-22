@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -82,4 +82,18 @@ test('setup serializes same-root first-run binding publication', async () => {
   const secondWon = registry.includes(otherFullTunnelId) && registry.includes(otherProTunnelId);
   assert.equal(firstWon || secondWon, true);
   assert.equal(firstWon && secondWon, false);
+});
+
+test('setup fails closed when a stale operation lock requires reconciliation', async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-setup-stale-lock-'));
+  roots.push(dataRoot);
+  await persistControlPlaneApiKey(dataRoot, 'fixture-control-plane-key-stale-123456');
+  await mkdir(path.join(dataRoot, 'supervisor'), { recursive: true });
+  await writeFile(path.join(dataRoot, 'supervisor', 'operation.lock'), JSON.stringify({ schemaVersion: 1, pid: 999999, startedAt: new Date(0).toISOString(), operation: 'crashed-setup', processStartMarker: '1:000000' }));
+  const results = await Promise.allSettled([
+    runSetup(dataRoot, '--full-tunnel-id', fullTunnelId, '--pro-tunnel-id', proTunnelId),
+    runSetup(dataRoot, '--full-tunnel-id', 'tunnel_cccccccccccccccccccccccccccccccc', '--pro-tunnel-id', 'tunnel_dddddddddddddddddddddddddddddddd'),
+  ]);
+  assert.equal(results.every((result) => result.status === 'rejected'), true);
+  await assert.rejects(stat(path.join(dataRoot, 'connector-registry.json')), { code: 'ENOENT' });
 });

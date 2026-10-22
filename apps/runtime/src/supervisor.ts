@@ -286,7 +286,12 @@ export class Supervisor {
 
   public async runSetupExclusive<T>(work: () => Promise<T>): Promise<T> {
     await this.prepareDirectories();
-    return this.withOperationLock('setup', work);
+    const release = await acquireSetupOperationLock(path.join(this.supervisorDirectory(), OPERATION_LOCK_FILE), 'setup');
+    try {
+      return await work();
+    } finally {
+      await release();
+    }
   }
 
   /** Start only the authenticated ADMIN transport for an already-running native Supervisor. */
@@ -4065,6 +4070,30 @@ async function acquireOperationLock(filename: string, operation: string): Promis
     }
   }
   throw new RuntimeError('SUPERVISOR_BUSY', 'Supervisor operation lock changed while stale recovery was in progress');
+}
+
+async function acquireSetupOperationLock(filename: string, operation: string): Promise<() => Promise<void>> {
+  const processStart = observeProcessStart(process.pid);
+  if (processStart.state !== 'live') throw new RuntimeError('PERSISTENCE_FAILURE', 'Supervisor process start identity could not be measured safely');
+  const lockToken = randomUUID();
+  try {
+    const handle = await open(filename, 'wx', 0o600);
+    let initialized = false;
+    try {
+      await handle.writeFile(`${JSON.stringify({ schemaVersion: 1, pid: process.pid, startedAt: new Date().toISOString(), operation, processStartMarker: processStart.marker, lockToken })}\n`, 'utf8');
+      await handle.sync();
+      initialized = true;
+    } finally {
+      try { if (!initialized) await rm(filename, { force: true }); } finally { await handle.close(); }
+    }
+  } catch (error) {
+    if (isAlreadyExists(error)) throw new RuntimeError('SUPERVISOR_BUSY', `Supervisor operation ${operation} requires explicit stale-lock reconciliation`);
+    throw new RuntimeError('PERSISTENCE_FAILURE', 'Supervisor setup operation lock could not be created', { cause: error });
+  }
+  return async () => {
+    const current = await readFile(filename, 'utf8').catch(() => null);
+    if (current !== null && current.includes(`"lockToken":"${lockToken}"`)) await rm(filename, { force: true });
+  };
 }
 
 async function readOperationLockContent(filename: string): Promise<string | null> {
