@@ -259,6 +259,41 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     expect((await readFile(path.join(fixture.projectARoot, 'spawn-count.txt'), 'utf8')).trim().split('\n')).toEqual(['spawn']);
   }, 15_000);
 
+  it('M71 keeps concurrent jobs pinned to their submitted project and rejects cross-project status', async () => {
+    const fixture = await serviceFixture();
+    const primaryA = await fixture.resources.primaryWorkspace(fixture.projectA.id);
+    const primaryB = await fixture.resources.primaryWorkspace(fixture.projectB.id);
+    await writeFile(path.join(fixture.projectARoot, 'route.mjs'), "setTimeout(() => console.log('PROJECT_A'), 120)\n");
+    await writeFile(path.join(fixture.projectBRoot, 'route.mjs'), "setTimeout(() => console.log('PROJECT_B'), 60)\n");
+
+    const start = (projectId: string, workspaceId: string, requestId: string, session: typeof fixture.sessionA) => fixture.service.execute({
+      capabilityId: 'shell.start', clientId: session.clientId, sessionId: session.id,
+      projectId, workspaceId, executable: 'node', argv: ['route.mjs'], cwd: '.',
+      executionProfile: 'node-script', envOverrides: {}, timeoutMs: 5_000, requestId, expectedEffects: ALL_EXECUTION_EFFECTS,
+    });
+    const [startedA, startedB] = await Promise.all([
+      start(fixture.projectA.id, primaryA.workspaceId, `m71-a-${randomUUID()}`, fixture.sessionA),
+      start(fixture.projectB.id, primaryB.workspaceId, `m71-b-${randomUUID()}`, fixture.sessionB),
+    ]);
+    const jobA = executedValue<Record<string, unknown>>(startedA);
+    const jobB = executedValue<Record<string, unknown>>(startedB);
+    expect(jobA.workspaceId).toBe(primaryA.workspaceId);
+    expect(jobB.workspaceId).toBe(primaryB.workspaceId);
+    expect(jobA.jobId).not.toBe(jobB.jobId);
+
+    await expect(fixture.service.execute({
+      capabilityId: 'job.status', clientId: fixture.sessionB.clientId, sessionId: fixture.sessionB.id,
+      projectId: fixture.projectB.id, jobId: String(jobA.jobId), expectedEffects: ['READ'],
+    })).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
+
+    const [resultA, resultB] = await Promise.all([
+      waitForResult(fixture, String(jobA.jobId), fixture.projectA.id, fixture.sessionA),
+      waitForResult(fixture, String(jobB.jobId), fixture.projectB.id, fixture.sessionB),
+    ]);
+    expect(resultA).toMatchObject({ state: 'SUCCEEDED' });
+    expect(resultB).toMatchObject({ state: 'SUCCEEDED' });
+  }, 15_000);
+
   it('AC-SEC-006 times out only the owned target process group including descendants', async () => {
     const fixture = await serviceFixture();
     const primary = await fixture.resources.primaryWorkspace(fixture.projectA.id);
@@ -366,10 +401,10 @@ async function serviceFixture(options: { readonly homeSource?: boolean } = {}) {
   return { sourceRoot, dataRoot, legacyRoot, projectARoot, projectBRoot, state, projectA, projectB, sessionA, sessionB, settings, audit, resources, jobs, service };
 }
 
-async function waitForResult(fixture: Awaited<ReturnType<typeof serviceFixture>>, jobId: string): Promise<Record<string, unknown>> {
+async function waitForResult(fixture: Awaited<ReturnType<typeof serviceFixture>>, jobId: string, projectId = fixture.projectA.id, session = fixture.sessionA): Promise<Record<string, unknown>> {
   let last: Record<string, unknown> = {};
   for (let i = 0; i < 120; i += 1) {
-    last = executedValue<Record<string, unknown>>(await fixture.service.execute({ capabilityId: 'job.result', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id, projectId: fixture.projectA.id, jobId, expectedEffects: ['READ'] }));
+    last = executedValue<Record<string, unknown>>(await fixture.service.execute({ capabilityId: 'job.result', clientId: session.clientId, sessionId: session.id, projectId, jobId, expectedEffects: ['READ'] }));
     if (last.state !== 'RUNNING' && last.state !== 'QUEUED') return last;
     await delay(50);
   }
