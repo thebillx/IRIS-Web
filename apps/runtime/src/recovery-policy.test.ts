@@ -324,7 +324,9 @@ describe('recovery authorization policy', () => {
     await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({ policyId: policyB.policyId, supersedesPolicyId: policyA.policyId });
 
     const tampered = JSON.parse(await readFile(recoveryPolicyPath(dataRoot), 'utf8')) as { retiredPolicies: Array<{ signature: string }> };
-    tampered.retiredPolicies[0]!.signature = `${tampered.retiredPolicies[0]!.signature.slice(0, 63)}0`;
+    const originalRetiredSignature = tampered.retiredPolicies[0]!.signature;
+    const replacementNibble = originalRetiredSignature.endsWith('0') ? '1' : '0';
+    tampered.retiredPolicies[0]!.signature = `${originalRetiredSignature.slice(0, 63)}${replacementNibble}`;
     await writeFile(recoveryPolicyPath(dataRoot), `${JSON.stringify(tampered, null, 2)}\n`);
     await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toThrow('authentication');
   });
