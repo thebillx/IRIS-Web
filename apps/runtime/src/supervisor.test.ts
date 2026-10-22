@@ -81,6 +81,22 @@ describe('IRIS supervisor', () => {
     await expect(readFile(registryPath, 'utf8')).resolves.toBe(before);
   });
 
+  it('controls only the workload Runtime through the Supervisor lifecycle', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-runtime-only-'));
+    roots.push(dataRoot);
+    await startRuntime({ dataRoot, sourceRoot });
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot });
+    try {
+      await supervisor.adoptRuntime();
+      await expect(supervisor.runtimeOff()).resolves.toMatchObject({ state: 'STOPPED', workloadOnly: true });
+      expect((await runtimeStatus(dataRoot)).state).toBe('stopped');
+      await expect(supervisor.runtimeOn()).resolves.toMatchObject({ state: 'RUNNING', workloadOnly: true });
+      expect((await runtimeStatus(dataRoot)).state).toBe('running');
+    } finally {
+      await supervisor.runtimeOff().catch(() => undefined);
+    }
+  }, 60_000);
+
   it('reports missing migration state without creating files during status', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-status-'));
     roots.push(dataRoot);

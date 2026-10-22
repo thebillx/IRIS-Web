@@ -59,8 +59,10 @@ export interface UnifiedConnectorBinding {
 }
 
 export function unifiedConnectorBinding(registry: ConnectorRegistryDocument): UnifiedConnectorBinding | null {
-  const tunnelId = registry.admin?.tunnelId ?? registry.connectors.find((connector) => connector.mcpPath === '/mcp')?.tunnelId;
-  if (tunnelId === undefined) return null;
+  // The unified product surface is the persistent Supervisor control gateway.
+  // A workload FULL binding is never a safe fallback for that contract.
+  if (registry.admin === null) return null;
+  const tunnelId = registry.admin.tunnelId;
   return {
     connectorId: UNIFIED_CONNECTOR_ID,
     label: 'ONE IRIS',

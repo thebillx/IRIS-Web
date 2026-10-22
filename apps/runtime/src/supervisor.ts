@@ -22,7 +22,7 @@ import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } 
 import { readMachineId } from './machine-identity.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
-import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput } from './supervisor-native-control.js';
+import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput, type SupervisorWorkloadCallContext } from './supervisor-native-control.js';
 import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, readRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
 import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
 
@@ -798,7 +798,69 @@ export class Supervisor {
     return { ...project };
   }
 
-  private async forwardWorkloadTool(name: string, args: Record<string, unknown>): Promise<SupervisorAdminToolCallResult> {
+  public async runtimeStatus(): Promise<RuntimeObservedStatus> {
+    await this.prepareDirectories();
+    return runtimeStatus(this.dataRoot);
+  }
+
+  public async runtimeOn(): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('runtime-on', () => this.startupTransaction(async () => {
+      let state = await this.readState();
+      const observed = await runtimeStatus(this.dataRoot);
+      if (observed.state === 'indeterminate') throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Runtime authority is indeterminate');
+      if (observed.state === 'stale') throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Stale Runtime authority requires reconciliation');
+      if (observed.state === 'running' && observed.endpoint !== null) {
+        if (state.runtime === null) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'A running Runtime is not supervisor-owned');
+        assertRuntimeOwnership(state.runtime, observed);
+        await assertOwnedRuntimeProcess(state.runtime);
+        return { state: 'RUNNING', runtimeId: observed.endpoint.runtimeId, instanceId: observed.endpoint.instanceId, alreadyRunning: true, workloadOnly: true };
+      }
+      if (state.runtime !== null) {
+        await this.retireRuntime(state.runtime, observed);
+        state = await this.readState();
+      }
+      const operation = await this.prepareStartup('runtime', canonicalNodeRuntime().path, state.workloadSourceRoot, null, {});
+      const started = await this.startRecordedRuntime(operation, {
+        onSpawn: (pid) => this.observeStartupPid(operation, pid),
+        dataRoot: this.dataRoot,
+        sourceRoot: state.workloadSourceRoot,
+        ...(this.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: this.protectedReferenceRoot }),
+      });
+      if (started.endpoint === null) throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Runtime started without an endpoint descriptor');
+      const verified = await this.verifyStartup(operation, await runtimeRecordFromObserved(started.endpoint, state.workloadSourceRoot));
+      await this.writeState({ ...state, runtime: verified });
+      return { state: 'RUNNING', runtimeId: verified.runtimeId, instanceId: verified.instanceId, workloadOnly: true };
+    }));
+  }
+
+  public async runtimeOff(): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('runtime-off', async () => {
+      await this.migrateHistoricalOwnership();
+      await this.assertStartupReconciled();
+      const state = await this.readState();
+      const observed = await runtimeStatus(this.dataRoot);
+      if (observed.state === 'stopped' && state.runtime === null) return { state: 'STOPPED', alreadyStopped: true, workloadOnly: true };
+      if (observed.state !== 'running' || observed.endpoint === null || state.runtime === null) {
+        throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Runtime authority is not verified');
+      }
+      assertRuntimeOwnership(state.runtime, observed);
+      await assertOwnedRuntimeProcess(state.runtime);
+      await this.retireRuntime(state.runtime, observed);
+      const after = await runtimeStatus(this.dataRoot);
+      if (after.state !== 'stopped') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime shutdown was not durably proven');
+      const cleared = await this.readState();
+      await this.writeState({
+        ...cleared,
+        runtime: null,
+        startupOperations: cleared.startupOperations.map((operation) => operation.component === 'runtime' && operation.state === 'RUNNING' ? { ...operation, state: 'STOPPED' as const } : operation),
+      }, true);
+      return { state: 'STOPPED', workloadOnly: true };
+    });
+  }
+
+  private async forwardWorkloadTool(name: string, args: Record<string, unknown>, context: SupervisorWorkloadCallContext = {}): Promise<SupervisorAdminToolCallResult> {
     const state = await this.readState();
     if (state.runtime === null || await inspectProcess(state.runtime) !== 'running') {
       throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Workload Runtime is not supervisor-owned and ready');
@@ -813,9 +875,8 @@ export class Supervisor {
     if (registry === null || binding === undefined || serviceSecret === null || binding.runtimeId !== endpoint.runtimeId || binding.deploymentEpoch !== registry.deploymentEpoch) {
       throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'Unified workload binding is not current and authenticated');
     }
-    const response = await postJson(`${endpoint.apiUrl}/mcp`, {
-      jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name, arguments: args },
-    }, {
+    const clientId = context.clientId ?? 'iris-supervisor-unified';
+    const headers: Record<string, string> = {
       authorization: `Bearer ${serviceSecret}`,
       'content-type': 'application/json',
       'MCP-Protocol-Version': '2026-07-28',
@@ -823,10 +884,14 @@ export class Supervisor {
       'x-iris-connector-profile': 'FULL',
       'x-iris-deployment-epoch': String(registry.deploymentEpoch),
       'x-iris-runtime-id': endpoint.runtimeId,
-      'x-iris-client-id': 'iris-supervisor-unified',
-    });
+      'x-iris-client-id': clientId,
+    };
+    if (context.sessionId !== undefined) headers['x-iris-session-id'] = context.sessionId;
+    const response = await postJson(`${endpoint.apiUrl}/mcp`, {
+      jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name, arguments: args },
+    }, headers);
     if (!isRecord(response) || !isRecord(response.result)) {
-      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'Authenticated workload MCP call did not return a result');
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Authenticated workload MCP outcome is unknown; reconcile its durable request or job state before retrying');
     }
     const result = response.result;
     return {
@@ -1008,7 +1073,10 @@ export class Supervisor {
       listProjects: () => this.listProjects(),
       projectInfo: (projectId) => this.projectInfo(projectId),
       workloadToolDefinitions: () => fullMcpToolDefinitionsV21(),
-      workloadToolCall: (name, args) => this.forwardWorkloadTool(name, args),
+      runtimeStatus: () => this.runtimeStatus(),
+      runtimeOn: () => this.runtimeOn(),
+      runtimeOff: () => this.runtimeOff(),
+      workloadToolCall: (name, args, context) => this.forwardWorkloadTool(name, args, context),
       adminStatus: () => this.adminNativeStatus(),
       runtimeReconcile: () => this.runtimeReconcile(),
       adminRecycle: (input) => this.adminRecycle(input),

@@ -24,6 +24,13 @@ describe('connector registry', () => {
       legacyConnectorIds: ['iris-full', 'iris-pro', 'iris-admin'],
     });
   });
+  it('does not fall back to a workload tunnel when the persistent control gateway is absent', () => {
+    const registry = createConnectorRegistry('/private/iris', {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    }, 1);
+    expect(unifiedConnectorBinding(registry)).toBeNull();
+  });
   it('persists distinct FULL and PRO bindings and bumps deployment when runtime ownership changes', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-registry-'));
     roots.push(dataRoot);

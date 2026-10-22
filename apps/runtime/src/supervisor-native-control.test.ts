@@ -51,7 +51,7 @@ describe('outer supervisor native control', () => {
         'Mcp-Method': 'tools/list',
       });
       expect(toolNames(listed)).toEqual([
-        'supervisor_status', 'supervisor_doctor', 'list_projects', 'project_info', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
+        'supervisor_status', 'supervisor_doctor', 'runtime_status', 'runtime_on', 'runtime_off', 'list_projects', 'project_info', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
         'activation_status', 'activation_prepare', 'activation_apply', 'activation_confirm', 'activation_rollback',
       ]);
       expect(catalogToolNames('FULL')).not.toContain('admin_tunnel_recycle');
@@ -101,6 +101,9 @@ describe('outer supervisor native control', () => {
       expect(toolNames(listed)).toEqual([
         'supervisor_status',
         'supervisor_doctor',
+        'runtime_status',
+        'runtime_on',
+        'runtime_off',
         'list_projects',
         'project_info',
         'admin_status',
@@ -113,7 +116,7 @@ describe('outer supervisor native control', () => {
         'activation_confirm',
         'activation_rollback',
       ]);
-      for (const name of ['supervisor_status', 'supervisor_doctor', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
+      for (const name of ['supervisor_status', 'supervisor_doctor', 'runtime_on', 'runtime_off', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
         expect(catalogToolNames('FULL')).not.toContain(name);
         expect(catalogToolNames('PRO')).not.toContain(name);
       }
@@ -122,6 +125,9 @@ describe('outer supervisor native control', () => {
       }
       expect(adminToolDefinitions().map((tool) => tool.name)).toContain('admin_status');
       expect(structured(await rpcTool(harness, 'supervisor_status', {}))).toMatchObject({ supervisor: 'outer', workloadRuntimeId: 'runtime-a' });
+      expect(structured(await rpcTool(harness, 'runtime_status', {}))).toMatchObject({ state: 'stopped', workloadOnly: true });
+      expect(structured(await rpcTool(harness, 'runtime_on', {}))).toMatchObject({ state: 'RUNNING', workloadOnly: true });
+      expect(structured(await rpcTool(harness, 'runtime_off', {}))).toMatchObject({ state: 'STOPPED', workloadOnly: true });
       expect(structured(await rpcTool(harness, 'list_projects', {}))).toMatchObject({ defaultProjectId: null, projects: [{ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' }] });
       expect(structured(await rpcTool(harness, 'project_info', { projectId: '11111111-1111-4111-8111-111111111111' }))).toEqual({ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' });
       expect(toolError(await rpcTool(harness, 'project_info', { projectId: '../escape' }))).toMatchObject({ code: 'INVALID_REQUEST' });
@@ -171,11 +177,27 @@ describe('outer supervisor native control', () => {
       expect(names).toContain('runtime_status');
       expect(names).toContain('file_read');
       expect(new Set(names).size).toBe(names.length);
-      expect(structured(await rpcTool(harness, 'runtime_status', {}))).toEqual({ runtime: 'off', truthful: true });
       expect(structured(await rpcTool(harness, 'file_read', { projectId: '11111111-1111-4111-8111-111111111111', targetPath: 'README.md' }))).toEqual({ runtime: 'off', code: 'RUNTIME_NOT_RUNNING' });
-      expect(harness.workloadCalls).toEqual(['runtime_status', 'file_read']);
+      expect(harness.workloadCalls).toEqual(['file_read']);
       harness.workloadAvailable = false;
-      expect(toolError(await rpcTool(harness, 'runtime_status', {}))).toMatchObject({ code: 'RUNTIME_NOT_RUNNING' });
+      expect(toolError(await rpcTool(harness, 'file_read', { projectId: '11111111-1111-4111-8111-111111111111', targetPath: 'README.md' }))).toMatchObject({ code: 'RUNTIME_NOT_RUNNING' });
+    } finally {
+      await harness.server.close();
+    }
+  });
+
+  it('propagates bounded client and session identity to workload calls', async () => {
+    const harness = await startHarness(true);
+    try {
+      await rpcTool(harness, 'file_read', { projectId: '11111111-1111-4111-8111-111111111111', targetPath: 'README.md' });
+      await rpc(harness, {
+        jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name: 'file_read', arguments: { projectId: '11111111-1111-4111-8111-111111111111', targetPath: 'README.md' } },
+      }, { 'Mcp-Name': 'file_read', 'x-iris-client-id': 'conversation-b', 'x-iris-session-id': 'session-b' });
+      expect(harness.workloadContexts).toEqual([{ }, { clientId: 'conversation-b', sessionId: 'session-b' }]);
+      const invalid = await rpc(harness, {
+        jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name: 'file_read', arguments: { projectId: '11111111-1111-4111-8111-111111111111', targetPath: 'README.md' } },
+      }, { 'Mcp-Name': 'file_read', 'x-iris-client-id': 'x'.repeat(201) });
+      expect(toolError(invalid)).toMatchObject({ code: 'INVALID_REQUEST' });
     } finally {
       await harness.server.close();
     }
@@ -224,10 +246,14 @@ async function startHarness(withWorkload = false) {
   const secret = await loadOrCreateTunnelServiceSecret(dataRoot);
   const recycleInputs: AdminRecycleInput[] = [];
   const workloadCalls: string[] = [];
+  const workloadContexts: Array<{ clientId?: string; sessionId?: string }> = [];
   const harness = { workloadRuntimeId: 'runtime-a', workloadAvailable: true };
   const operations: SupervisorNativeOperations = {
     supervisorStatus: async () => ({ supervisor: 'outer', workloadRuntimeId: harness.workloadRuntimeId }),
     supervisorDoctor: async () => ({ IRIS_STACK: 'DEGRADED', FAILED_LAYER: null }),
+    runtimeStatus: async () => ({ state: 'stopped', workloadOnly: true }),
+    runtimeOn: async () => ({ state: 'RUNNING', workloadOnly: true }),
+    runtimeOff: async () => ({ state: 'STOPPED', workloadOnly: true }),
     listProjects: async () => ({ defaultProjectId: null, projects: [{ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' }] }),
     projectInfo: async (projectId) => {
       if (projectId !== '11111111-1111-4111-8111-111111111111') throw new Error('Registered project was not found');
@@ -243,9 +269,10 @@ async function startHarness(withWorkload = false) {
     adminToolCall: async (name): Promise<SupervisorAdminToolCallResult> => ({ structuredContent: { proxied: name }, isError: false }),
     ...(withWorkload ? {
       workloadToolDefinitions: () => fullMcpToolDefinitionsV21(),
-      workloadToolCall: async (name: string): Promise<SupervisorAdminToolCallResult> => {
+      workloadToolCall: async (name: string, _args: Record<string, unknown>, context): Promise<SupervisorAdminToolCallResult> => {
         if (!harness.workloadAvailable) throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Workload Runtime is unavailable');
         workloadCalls.push(name);
+        workloadContexts.push(context ?? {});
         return { structuredContent: name === 'runtime_status' ? { runtime: 'off', truthful: true } : { runtime: 'off', code: 'RUNTIME_NOT_RUNNING' }, isError: false };
       },
     } : {}),
@@ -257,6 +284,7 @@ async function startHarness(withWorkload = false) {
     secret,
     recycleInputs,
     workloadCalls,
+    workloadContexts,
     server,
     restart: async () => {
       const port = server.port;

@@ -34,13 +34,21 @@ export interface AdminTunnelRecycleInput {
   readonly expectedAdminProfileDigest: string;
 }
 
+export interface SupervisorWorkloadCallContext {
+  readonly clientId?: string;
+  readonly sessionId?: string;
+}
+
 export interface SupervisorNativeOperations {
   supervisorStatus(): Promise<unknown>;
   supervisorDoctor?: () => Promise<unknown>;
+  runtimeStatus?: () => Promise<unknown>;
+  runtimeOn?: () => Promise<unknown>;
+  runtimeOff?: () => Promise<unknown>;
   readonly listProjects?: () => Promise<unknown>;
   readonly projectInfo?: (projectId: string) => Promise<unknown>;
   readonly workloadToolDefinitions?: () => readonly Record<string, unknown>[];
-  readonly workloadToolCall?: (name: string, args: Record<string, unknown>) => Promise<SupervisorAdminToolCallResult>;
+  readonly workloadToolCall?: (name: string, args: Record<string, unknown>, context?: SupervisorWorkloadCallContext) => Promise<SupervisorAdminToolCallResult>;
   adminStatus(): Promise<unknown>;
   runtimeReconcile(): Promise<unknown>;
   adminRecycle(input: AdminRecycleInput): Promise<unknown>;
@@ -193,6 +201,24 @@ async function handleRequest(
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.supervisorDoctor()));
       return;
     }
+    if (name === 'runtime_status') {
+      requireNoArguments(args);
+      if (operations.runtimeStatus === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime status is unavailable');
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeStatus()));
+      return;
+    }
+    if (name === 'runtime_on') {
+      requireNoArguments(args);
+      if (operations.runtimeOn === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime lifecycle is unavailable');
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOn()));
+      return;
+    }
+    if (name === 'runtime_off') {
+      requireNoArguments(args);
+      if (operations.runtimeOff === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime lifecycle is unavailable');
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOff()));
+      return;
+    }
     if (name === 'list_projects') {
       requireNoArguments(args);
       if (operations.listProjects === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Project registry read is unavailable');
@@ -232,7 +258,13 @@ async function handleRequest(
       return;
     }
     if (operations.workloadToolCall !== undefined) {
-      const result = await operations.workloadToolCall(name, args);
+      const clientId = boundedHeader(request.headers['x-iris-client-id'], 200);
+      const sessionId = boundedHeader(request.headers['x-iris-session-id'], 200);
+      const context: SupervisorWorkloadCallContext = {
+        ...(clientId === undefined ? {} : { clientId }),
+        ...(sessionId === undefined ? {} : { sessionId }),
+      };
+      const result = await operations.workloadToolCall(name, args, context);
       writeJsonRpcResult(response, rpc.id ?? null, {
         content: [{ type: 'text', text: JSON.stringify(result.structuredContent) }],
         structuredContent: result.structuredContent,
@@ -266,6 +298,24 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
       description: 'Read the Supervisor control-plane diagnosis without starting or mutating workload processes.',
       inputSchema: noArgs,
       annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'runtime_status',
+      description: 'Read workload Runtime state without starting or stopping the workload process.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'runtime_on',
+      description: 'Start only the governed workload Runtime; Supervisor and connector processes remain unchanged.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    {
+      name: 'runtime_off',
+      description: 'Stop only the governed workload Runtime; Supervisor and connector processes remain unchanged.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: false, destructiveHint: true },
     },
     {
       name: 'list_projects',
@@ -376,6 +426,14 @@ function optionalBoundedString(args: Record<string, unknown>, key: string, maxLe
   if (value === undefined) return undefined;
   if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) {
     throw new RuntimeError('INVALID_REQUEST', `${key} must be a bounded non-empty string when provided`);
+  }
+  return value;
+}
+
+function boundedHeader(value: string | string[] | undefined, maxLength: number): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) {
+    throw new RuntimeError('INVALID_REQUEST', 'MCP identity headers must be bounded strings');
   }
   return value;
 }
