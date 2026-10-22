@@ -73,9 +73,24 @@ export class KeepAwakePreferenceStore {
     }
   }
 
+  public async readOrDefault(): Promise<KeepAwakePreference> {
+    const inspected = await inspectPrivateRegularFile(this.filename(), 'Keep-awake preference');
+    if (inspected.state === 'missing') return emptyKeepAwakePreference();
+    if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
+    try {
+      const parsed = JSON.parse(inspected.content) as unknown;
+      if (!isKeepAwakePreference(parsed)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Keep-awake preference is invalid');
+      return parsed;
+    } catch (error: unknown) {
+      if (error instanceof RuntimeError) throw error;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Keep-awake preference contains invalid JSON', { cause: error });
+    }
+  }
+
   public setEnabled(enabled: boolean): Promise<KeepAwakePreference> {
     let result!: KeepAwakePreference;
     const operation = this.mutationTail.then(async () => {
+      await this.initialize();
       const current = await this.read();
       result = { schemaVersion: 1, enabled, updatedAt: new Date().toISOString() };
       if (current.enabled === enabled) result = current;

@@ -457,6 +457,7 @@ export class Supervisor {
   private async upUnlocked(expectedSourceIdentity?: ActivationSourceIdentity): Promise<SupervisorStackStatus> {
     await this.migrateHistoricalOwnership();
     await this.assertStartupReconciled();
+    await this.keepAwakePreference.initialize();
     await this.ensureOwnerKeepAwake();
     this.startupTransactionId = randomUUID();
     this.startupRecords.clear();
@@ -825,7 +826,7 @@ export class Supervisor {
 
   public async keepAwakeStatus(): Promise<Record<string, unknown>> {
     await this.prepareDirectories();
-    const preference = await this.keepAwakePreference.read();
+    const preference = await this.keepAwakePreference.readOrDefault();
     const observed = await this.keepAwake.snapshot();
     return { preferenceEnabled: preference.enabled, preferenceUpdatedAt: preference.updatedAt, ...observed };
   }
@@ -1100,6 +1101,7 @@ export class Supervisor {
 
   private async adoptRuntimeUnlocked(): Promise<SupervisorStackStatus> {
     const state = await this.migrateHistoricalOwnership();
+    await this.keepAwakePreference.initialize();
     const observed = await runtimeStatus(this.dataRoot);
     if (observed.state !== 'running' || observed.endpoint === null) throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Only a verified running IRIS runtime can be adopted');
     if (!(await commandLooksLikeIris(observed.endpoint.pid, state.workloadSourceRoot))) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Runtime process identity could not be verified against the persisted workload source binding');
@@ -1116,6 +1118,7 @@ export class Supervisor {
 
   public async runSupervisorDaemon(): Promise<void> {
     await this.prepareDirectories();
+    await this.keepAwakePreference.initialize();
     const persisted = await this.readState();
     if (persisted.recovery.terminal || persisted.startupOperations.some(unresolvedStartup)) {
       // SuccessfulExit:false KeepAlive must not loop on a durable owner-decision gate.
@@ -1233,7 +1236,7 @@ export class Supervisor {
     const adminTunnelOwnershipVerified = adminTunnelProbe.ownershipVerified;
     const adminTunnelListenerOwnershipVerified = adminTunnelProbe.listenerOwnershipVerified;
     const adminTunnelStatus = adminTunnelProbe.status;
-    const keepAwakePreference = await this.keepAwakePreference.read();
+    const keepAwakePreference = await this.keepAwakePreference.readOrDefault();
     const keepAwakeObserved = await this.keepAwake.snapshot();
     const [confirmedState, confirmedRegistryInspection] = await Promise.all([
       this.readState().catch(() => null),
@@ -1979,7 +1982,6 @@ export class Supervisor {
       const problem = await privateDirectoryProblem(directory, `IRIS supervisor directory ${directory}`);
       if (problem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', problem);
     }
-    await this.keepAwakePreference.initialize();
   }
 
   private async ensureAdmin(

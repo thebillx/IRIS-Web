@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -183,6 +183,14 @@ describe('IRIS supervisor', () => {
     expect(status.state).toBe('FAILED');
     expect(status.localRuntime.code).toBe('MIGRATION_REQUIRED');
     await expect(import('node:fs/promises').then(({ access }) => access(path.join(dataRoot, 'supervisor')))).rejects.toThrow();
+  });
+
+  it('does not persist the Owner keep-awake preference during a read-only status probe', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-keep-awake-status-'));
+    roots.push(dataRoot);
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot: '/Users/example/iris' });
+    await expect(supervisor.keepAwakeStatus()).resolves.toMatchObject({ preferenceEnabled: false, observed: 'OFF' });
+    await expect(access(path.join(dataRoot, 'keep-awake.json'))).rejects.toThrow();
   });
 
   it('does not misclassify a stopped runtime as an MCP authentication failure', async () => {
