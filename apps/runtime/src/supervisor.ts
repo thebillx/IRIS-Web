@@ -50,6 +50,7 @@ const FORWARDED_READ_ONLY_TOOLS = new Set([
   'mission_list', 'session_get', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events',
   'project_validation_discover', 'project_validation_job', 'catalog_identity',
 ]);
+const FORWARDED_DURABLE_MUTATION_TOOLS = new Set(['project_validation_start']);
 
 export type StackState = 'READY' | 'DEGRADED' | 'FAILED' | 'UNKNOWN';
 
@@ -870,9 +871,14 @@ export class Supervisor {
       throw new RuntimeError('CONTROL_DENIED', 'Unified workload calls require a bounded client identity');
     }
     const mutation = !FORWARDED_READ_ONLY_TOOLS.has(name);
-    const requestId = context.requestId;
+    if (mutation && !FORWARDED_DURABLE_MUTATION_TOOLS.has(name)) {
+      throw new RuntimeError('CONTROL_DENIED', 'Unified workload mutation has no durable idempotency contract');
+    }
+    const requestId = mutation
+      ? (typeof args.requestId === 'string' && args.requestId.length > 0 && args.requestId.length <= 200 ? args.requestId : undefined)
+      : undefined;
     if (mutation && requestId === undefined) {
-      throw new RuntimeError('INVALID_REQUEST', 'Unified workload mutations require a durable requestId for reconciliation');
+      throw new RuntimeError('INVALID_REQUEST', 'Unified workload mutation requires its durable requestId');
     }
     if (mutation && name !== 'session_open' && context.sessionId === undefined) {
       throw new RuntimeError('INVALID_REQUEST', 'Unified workload mutations require a bounded session identity');

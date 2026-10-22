@@ -97,6 +97,17 @@ describe('IRIS supervisor', () => {
     }
   }, 60_000);
 
+  it('fails closed before forwarding workload mutations without a durable runtime contract', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-unified-mutation-'));
+    roots.push(dataRoot);
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot });
+    const forward = (supervisor as unknown as {
+      forwardWorkloadTool(name: string, args: Record<string, unknown>, context: { clientId: string; sessionId: string }): Promise<unknown>;
+    }).forwardWorkloadTool.bind(supervisor);
+    await expect(forward('file_write', {}, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(forward('project_validation_start', {}, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+  });
+
   it('reports missing migration state without creating files during status', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-status-'));
     roots.push(dataRoot);
