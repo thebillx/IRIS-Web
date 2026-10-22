@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { RuntimeError } from '@iris/domain';
 import { catalogToolNames } from './mcp-catalog.js';
 import { loadOrCreateTunnelServiceSecret } from './credentials.js';
 import { MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
@@ -13,6 +14,7 @@ import {
   type SupervisorNativeOperations,
 } from './supervisor-native-control.js';
 import { adminToolDefinitions, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
+import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
@@ -49,7 +51,7 @@ describe('outer supervisor native control', () => {
         'Mcp-Method': 'tools/list',
       });
       expect(toolNames(listed)).toEqual([
-        'supervisor_status', 'list_projects', 'project_info', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
+        'supervisor_status', 'supervisor_doctor', 'list_projects', 'project_info', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
         'activation_status', 'activation_prepare', 'activation_apply', 'activation_confirm', 'activation_rollback',
       ]);
       expect(catalogToolNames('FULL')).not.toContain('admin_tunnel_recycle');
@@ -98,6 +100,7 @@ describe('outer supervisor native control', () => {
       const listed = await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
       expect(toolNames(listed)).toEqual([
         'supervisor_status',
+        'supervisor_doctor',
         'list_projects',
         'project_info',
         'admin_status',
@@ -110,11 +113,11 @@ describe('outer supervisor native control', () => {
         'activation_confirm',
         'activation_rollback',
       ]);
-      for (const name of ['supervisor_status', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
+      for (const name of ['supervisor_status', 'supervisor_doctor', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
         expect(catalogToolNames('FULL')).not.toContain(name);
         expect(catalogToolNames('PRO')).not.toContain(name);
       }
-      for (const name of ['supervisor_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
+      for (const name of ['supervisor_status', 'supervisor_doctor', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
         expect(adminToolDefinitions().map((tool) => tool.name)).not.toContain(name);
       }
       expect(adminToolDefinitions().map((tool) => tool.name)).toContain('admin_status');
@@ -159,6 +162,25 @@ describe('outer supervisor native control', () => {
     }
   });
 
+  it('combines the authenticated control and workload catalogs on one MCP connection', async () => {
+    const harness = await startHarness(true);
+    try {
+      const names = toolNames(await rpc(harness, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }));
+      expect(names).toContain('supervisor_status');
+      expect(names).toContain('supervisor_doctor');
+      expect(names).toContain('runtime_status');
+      expect(names).toContain('file_read');
+      expect(new Set(names).size).toBe(names.length);
+      expect(structured(await rpcTool(harness, 'runtime_status', {}))).toEqual({ runtime: 'off', truthful: true });
+      expect(structured(await rpcTool(harness, 'file_read', { projectId: '11111111-1111-4111-8111-111111111111', targetPath: 'README.md' }))).toEqual({ runtime: 'off', code: 'RUNTIME_NOT_RUNNING' });
+      expect(harness.workloadCalls).toEqual(['runtime_status', 'file_read']);
+      harness.workloadAvailable = false;
+      expect(toolError(await rpcTool(harness, 'runtime_status', {}))).toMatchObject({ code: 'RUNTIME_NOT_RUNNING' });
+    } finally {
+      await harness.server.close();
+    }
+  });
+
   it('keeps the outer native endpoint reachable across admin recycle and workload replacement simulation', async () => {
     const harness = await startHarness();
     try {
@@ -196,14 +218,16 @@ describe('outer supervisor native control', () => {
   });
 });
 
-async function startHarness() {
+async function startHarness(withWorkload = false) {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-native-supervisor-control-'));
   roots.push(dataRoot);
   const secret = await loadOrCreateTunnelServiceSecret(dataRoot);
   const recycleInputs: AdminRecycleInput[] = [];
-  const harness = { workloadRuntimeId: 'runtime-a' };
+  const workloadCalls: string[] = [];
+  const harness = { workloadRuntimeId: 'runtime-a', workloadAvailable: true };
   const operations: SupervisorNativeOperations = {
     supervisorStatus: async () => ({ supervisor: 'outer', workloadRuntimeId: harness.workloadRuntimeId }),
+    supervisorDoctor: async () => ({ IRIS_STACK: 'DEGRADED', FAILED_LAYER: null }),
     listProjects: async () => ({ defaultProjectId: null, projects: [{ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' }] }),
     projectInfo: async (projectId) => {
       if (projectId !== '11111111-1111-4111-8111-111111111111') throw new Error('Registered project was not found');
@@ -217,6 +241,14 @@ async function startHarness() {
     },
     adminTunnelRecycle: async (input: AdminTunnelRecycleInput) => ({ ...input, readiness: 'READY' }),
     adminToolCall: async (name): Promise<SupervisorAdminToolCallResult> => ({ structuredContent: { proxied: name }, isError: false }),
+    ...(withWorkload ? {
+      workloadToolDefinitions: () => fullMcpToolDefinitionsV21(),
+      workloadToolCall: async (name: string): Promise<SupervisorAdminToolCallResult> => {
+        if (!harness.workloadAvailable) throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Workload Runtime is unavailable');
+        workloadCalls.push(name);
+        return { structuredContent: name === 'runtime_status' ? { runtime: 'off', truthful: true } : { runtime: 'off', code: 'RUNTIME_NOT_RUNNING' }, isError: false };
+      },
+    } : {}),
   };
   const server = await startSupervisorNativeControlServer(dataRoot, await freePort(), operations);
   return {
@@ -224,6 +256,7 @@ async function startHarness() {
     dataRoot,
     secret,
     recycleInputs,
+    workloadCalls,
     server,
     restart: async () => {
       const port = server.port;
@@ -232,6 +265,8 @@ async function startHarness() {
     },
     get workloadRuntimeId() { return harness.workloadRuntimeId; },
     set workloadRuntimeId(value: string) { harness.workloadRuntimeId = value; },
+    get workloadAvailable() { return harness.workloadAvailable; },
+    set workloadAvailable(value: boolean) { harness.workloadAvailable = value; },
   };
 }
 

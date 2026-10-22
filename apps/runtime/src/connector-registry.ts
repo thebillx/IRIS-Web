@@ -13,6 +13,7 @@ import { loadOrCreateMachineId } from './machine-identity.js';
 
 const REGISTRY_FILE = 'connector-registry.json';
 const TUNNEL_ID_PATTERN = /^tunnel_[a-f0-9]{32}$/;
+export const UNIFIED_CONNECTOR_ID = 'iris-one-iris' as const;
 
 export type ConnectorMode = 'FULL' | 'PRO';
 
@@ -43,6 +44,30 @@ export interface AdminConnectorBinding {
   readonly managedProfilePath: string;
   readonly machineId: string | null;
   readonly leaseGeneration: number;
+}
+
+/**
+ * The product-facing connector is derived without rewriting legacy bindings.
+ * FULL/PRO/ADMIN records remain readable until their governed migration is accepted.
+ */
+export interface UnifiedConnectorBinding {
+  readonly connectorId: typeof UNIFIED_CONNECTOR_ID;
+  readonly label: 'ONE IRIS';
+  readonly tunnelId: string;
+  readonly mcpPath: '/mcp';
+  readonly legacyConnectorIds: readonly string[];
+}
+
+export function unifiedConnectorBinding(registry: ConnectorRegistryDocument): UnifiedConnectorBinding | null {
+  const tunnelId = registry.admin?.tunnelId ?? registry.connectors.find((connector) => connector.mcpPath === '/mcp')?.tunnelId;
+  if (tunnelId === undefined) return null;
+  return {
+    connectorId: UNIFIED_CONNECTOR_ID,
+    label: 'ONE IRIS',
+    tunnelId,
+    mcpPath: '/mcp',
+    legacyConnectorIds: [...registry.connectors.map((connector) => connector.connectorId), ...(registry.admin === null ? [] : [registry.admin.connectorId])],
+  };
 }
 
 export interface ConnectorRegistryDocument {

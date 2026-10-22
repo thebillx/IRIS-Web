@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { bindAdminTunnelIdentity, bindConnectorRuntime, catalogFingerprint, createConnectorRegistry, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry, replaceConnectorCatalogManifest } from './connector-registry.js';
+import { bindAdminTunnelIdentity, bindConnectorRuntime, catalogFingerprint, createConnectorRegistry, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry, replaceConnectorCatalogManifest, unifiedConnectorBinding } from './connector-registry.js';
 import { fullMcpToolNames } from './mcp-v21.js';
 import { PRO_TOOL_NAMES } from './mcp.js';
 
@@ -10,6 +10,20 @@ const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 describe('connector registry', () => {
+  it('derives one product-facing connector while retaining legacy bindings', () => {
+    const registry = createConnectorRegistry('/private/iris', {
+      fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      adminTunnelId: 'tunnel_cccccccccccccccccccccccccccccccc',
+    }, 1);
+    expect(unifiedConnectorBinding(registry)).toEqual({
+      connectorId: 'iris-one-iris',
+      label: 'ONE IRIS',
+      tunnelId: 'tunnel_cccccccccccccccccccccccccccccccc',
+      mcpPath: '/mcp',
+      legacyConnectorIds: ['iris-full', 'iris-pro', 'iris-admin'],
+    });
+  });
   it('persists distinct FULL and PRO bindings and bumps deployment when runtime ownership changes', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-registry-'));
     roots.push(dataRoot);

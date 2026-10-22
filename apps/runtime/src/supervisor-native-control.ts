@@ -36,8 +36,11 @@ export interface AdminTunnelRecycleInput {
 
 export interface SupervisorNativeOperations {
   supervisorStatus(): Promise<unknown>;
+  supervisorDoctor?: () => Promise<unknown>;
   readonly listProjects?: () => Promise<unknown>;
   readonly projectInfo?: (projectId: string) => Promise<unknown>;
+  readonly workloadToolDefinitions?: () => readonly Record<string, unknown>[];
+  readonly workloadToolCall?: (name: string, args: Record<string, unknown>) => Promise<SupervisorAdminToolCallResult>;
   adminStatus(): Promise<unknown>;
   runtimeReconcile(): Promise<unknown>;
   adminRecycle(input: AdminRecycleInput): Promise<unknown>;
@@ -156,7 +159,10 @@ async function handleRequest(
     return;
   }
   if (rpc.method === 'tools/list') {
-    writeJsonRpcResult(response, rpc.id ?? null, { tools: nativeToolDefinitions() });
+    const native = nativeToolDefinitions();
+    const nativeNames = new Set(native.flatMap((tool) => typeof tool.name === 'string' ? [tool.name] : []));
+    const workload = operations.workloadToolDefinitions?.().filter((tool) => typeof tool.name === 'string' && !nativeNames.has(tool.name)) ?? [];
+    writeJsonRpcResult(response, rpc.id ?? null, { tools: [...native, ...workload] });
     return;
   }
   if (rpc.method !== 'tools/call') {
@@ -179,6 +185,12 @@ async function handleRequest(
     if (name === 'supervisor_status') {
       requireNoArguments(args);
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.supervisorStatus()));
+      return;
+    }
+    if (name === 'supervisor_doctor') {
+      requireNoArguments(args);
+      if (operations.supervisorDoctor === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Supervisor doctor is unavailable');
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.supervisorDoctor()));
       return;
     }
     if (name === 'list_projects') {
@@ -219,6 +231,15 @@ async function handleRequest(
       });
       return;
     }
+    if (operations.workloadToolCall !== undefined) {
+      const result = await operations.workloadToolCall(name, args);
+      writeJsonRpcResult(response, rpc.id ?? null, {
+        content: [{ type: 'text', text: JSON.stringify(result.structuredContent) }],
+        structuredContent: result.structuredContent,
+        isError: result.isError,
+      });
+      return;
+    }
   } catch (error) {
     writeJsonRpcResult(response, rpc.id ?? null, toolErrorResult(error));
     return;
@@ -237,6 +258,12 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
     {
       name: 'supervisor_status',
       description: 'Read bounded identity, readiness, tunnel identity, and profile digest state owned by the outer supervisor daemon.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'supervisor_doctor',
+      description: 'Read the Supervisor control-plane diagnosis without starting or mutating workload processes.',
       inputSchema: noArgs,
       annotations: { readOnlyHint: true },
     },

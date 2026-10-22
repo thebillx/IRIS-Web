@@ -798,6 +798,43 @@ export class Supervisor {
     return { ...project };
   }
 
+  private async forwardWorkloadTool(name: string, args: Record<string, unknown>): Promise<SupervisorAdminToolCallResult> {
+    const state = await this.readState();
+    if (state.runtime === null || await inspectProcess(state.runtime) !== 'running') {
+      throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Workload Runtime is not supervisor-owned and ready');
+    }
+    const endpoint = await readEndpoint(this.dataRoot).catch(() => null);
+    if (endpoint === null || endpoint.runtimeId !== state.runtime.runtimeId || endpoint.instanceId !== state.runtime.instanceId) {
+      throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Workload Runtime endpoint identity is stale or ambiguous');
+    }
+    const registry = await readConnectorRegistry(this.dataRoot);
+    const binding = registry?.connectors.find((candidate) => candidate.mode === 'FULL');
+    const serviceSecret = await readTunnelServiceSecret(this.dataRoot);
+    if (registry === null || binding === undefined || serviceSecret === null || binding.runtimeId !== endpoint.runtimeId || binding.deploymentEpoch !== registry.deploymentEpoch) {
+      throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'Unified workload binding is not current and authenticated');
+    }
+    const response = await postJson(`${endpoint.apiUrl}/mcp`, {
+      jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name, arguments: args },
+    }, {
+      authorization: `Bearer ${serviceSecret}`,
+      'content-type': 'application/json',
+      'MCP-Protocol-Version': '2026-07-28',
+      'Mcp-Name': name,
+      'x-iris-connector-profile': 'FULL',
+      'x-iris-deployment-epoch': String(registry.deploymentEpoch),
+      'x-iris-runtime-id': endpoint.runtimeId,
+      'x-iris-client-id': 'iris-supervisor-unified',
+    });
+    if (!isRecord(response) || !isRecord(response.result)) {
+      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'Authenticated workload MCP call did not return a result');
+    }
+    const result = response.result;
+    return {
+      structuredContent: result.structuredContent ?? null,
+      isError: result.isError === true,
+    };
+  }
+
   public async doctor(): Promise<Record<string, unknown>> {
     const status = await this.status();
     const failedLayer = status.localRuntime.state !== 'READY'
@@ -967,8 +1004,11 @@ export class Supervisor {
     try {
       nativeControl = await startSupervisorNativeControlServer(this.dataRoot, this.supervisorControlPort, {
       supervisorStatus: () => this.supervisorNativeStatus(),
+      supervisorDoctor: () => this.doctor(),
       listProjects: () => this.listProjects(),
       projectInfo: (projectId) => this.projectInfo(projectId),
+      workloadToolDefinitions: () => fullMcpToolDefinitionsV21(),
+      workloadToolCall: (name, args) => this.forwardWorkloadTool(name, args),
       adminStatus: () => this.adminNativeStatus(),
       runtimeReconcile: () => this.runtimeReconcile(),
       adminRecycle: (input) => this.adminRecycle(input),
