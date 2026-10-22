@@ -284,6 +284,11 @@ export class Supervisor {
     return this.withOperationLock('up', () => this.upUnlocked());
   }
 
+  public async runSetupExclusive<T>(work: () => Promise<T>): Promise<T> {
+    await this.prepareDirectories();
+    return this.withOperationLock('setup', work);
+  }
+
   /** Start only the authenticated ADMIN transport for an already-running native Supervisor. */
   public async startControlOnlyAdminTunnel(input: {
     readonly recoveryPolicyId: string;

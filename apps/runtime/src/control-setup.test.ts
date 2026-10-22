@@ -65,3 +65,21 @@ test('setup keeps two disposable installations isolated and rejects binding repl
   await assert.rejects(runSetup(firstRoot, '--full-tunnel-id', proTunnelId, '--pro-tunnel-id', fullTunnelId));
   assert.equal(await readFile(path.join(firstRoot, 'connector-registry.json'), 'utf8'), before);
 });
+
+test('setup serializes same-root first-run binding publication', async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-setup-race-'));
+  roots.push(dataRoot);
+  await persistControlPlaneApiKey(dataRoot, 'fixture-control-plane-key-race-123456');
+  const otherFullTunnelId = 'tunnel_cccccccccccccccccccccccccccccccc';
+  const otherProTunnelId = 'tunnel_dddddddddddddddddddddddddddddddd';
+  const first = runSetup(dataRoot, '--full-tunnel-id', fullTunnelId, '--pro-tunnel-id', proTunnelId);
+  const second = runSetup(dataRoot, '--full-tunnel-id', otherFullTunnelId, '--pro-tunnel-id', otherProTunnelId);
+  const results = await Promise.allSettled([first, second]);
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+  const registry = await readFile(path.join(dataRoot, 'connector-registry.json'), 'utf8');
+  const firstWon = registry.includes(fullTunnelId) && registry.includes(proTunnelId);
+  const secondWon = registry.includes(otherFullTunnelId) && registry.includes(otherProTunnelId);
+  assert.equal(firstWon || secondWon, true);
+  assert.equal(firstWon && secondWon, false);
+});

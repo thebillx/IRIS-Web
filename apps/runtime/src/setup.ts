@@ -28,6 +28,31 @@ export async function guidedSetup(supervisor: Supervisor, dataRoot: string, opti
     };
   }
 
+  const prepared = await supervisor.runSetupExclusive(() => prepareSetup(dataRoot, options));
+  const status = options.start ? await supervisor.up() : await supervisor.status();
+  return {
+    status: options.start ? (status.state === 'READY' ? 'READY' : 'NEEDS_ATTENTION') : 'READY_TO_START',
+    repeated: prepared.repeated,
+    machineId: prepared.registry.connectors[0]?.machineId ?? prepared.registry.admin?.machineId ?? null,
+    connectors: prepared.registry.connectors.map(({ connectorId, tunnelId }) => ({ connectorId, tunnelId })),
+    adminTunnelId: prepared.registry.admin?.tunnelId ?? null,
+    credentials: {
+      controlPlaneApiKeyPresent: prepared.credentials.controlPlaneApiKeyPresent,
+      tunnelServicePresent: prepared.credentials.tunnelServicePresent,
+      tunnelServiceGeneration: prepared.credentials.tunnelServiceGeneration,
+      legacyMigrationRequired: prepared.credentials.legacy.migrationRequired,
+    },
+    local: { stack: status.state, runtime: status.runtime, tunnel: status.tunnel, controlPlane: status.controlPlane },
+    next: options.start ? ['node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'] : ['node scripts/iris.mjs up', 'node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'],
+    message: 'Remote tunnel provisioning and ChatGPT connector selection remain owner-verifiable steps; this command does not claim either occurred.',
+  };
+}
+
+async function prepareSetup(dataRoot: string, options: GuidedSetupOptions): Promise<{
+  readonly registry: NonNullable<Awaited<ReturnType<typeof readConnectorRegistry>>>;
+  readonly repeated: boolean;
+  readonly credentials: Awaited<ReturnType<typeof inspectCredentialStatus>>;
+}> {
   let registry = await readConnectorRegistry(dataRoot);
   let repeated = registry !== null;
   if (registry === null) {
@@ -45,24 +70,7 @@ export async function guidedSetup(supervisor: Supervisor, dataRoot: string, opti
   }
 
   await loadOrCreateTunnelServiceSecret(dataRoot);
-  const configuredCredentials = await inspectCredentialStatus(dataRoot);
-  const status = options.start ? await supervisor.up() : await supervisor.status();
-  return {
-    status: options.start ? (status.state === 'READY' ? 'READY' : 'NEEDS_ATTENTION') : 'READY_TO_START',
-    repeated,
-    machineId: registry.connectors[0]?.machineId ?? registry.admin?.machineId ?? null,
-    connectors: registry.connectors.map(({ connectorId, tunnelId }) => ({ connectorId, tunnelId })),
-    adminTunnelId: registry.admin?.tunnelId ?? null,
-    credentials: {
-      controlPlaneApiKeyPresent: configuredCredentials.controlPlaneApiKeyPresent,
-      tunnelServicePresent: configuredCredentials.tunnelServicePresent,
-      tunnelServiceGeneration: configuredCredentials.tunnelServiceGeneration,
-      legacyMigrationRequired: configuredCredentials.legacy.migrationRequired,
-    },
-    local: { stack: status.state, runtime: status.runtime, tunnel: status.tunnel, controlPlane: status.controlPlane },
-    next: options.start ? ['node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'] : ['node scripts/iris.mjs up', 'node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'],
-    message: 'Remote tunnel provisioning and ChatGPT connector selection remain owner-verifiable steps; this command does not claim either occurred.',
-  };
+  return { registry, repeated, credentials: await inspectCredentialStatus(dataRoot) };
 }
 
 function requiredTunnelId(value: string | undefined): string {
