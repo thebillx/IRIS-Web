@@ -188,6 +188,25 @@ describe('outer supervisor native control', () => {
     }
   });
 
+  it('forwards grouped workload reads and exposes durable shell start on the same native connection', async () => {
+    const harness = await startHarness(true);
+    try {
+      for (const [name, arguments_] of [
+        ['workspace', { operation: 'list', projectId: '11111111-1111-4111-8111-111111111111' }],
+        ['fs', { operation: 'list', projectId: '11111111-1111-4111-8111-111111111111', workspaceId: 'workspace-1' }],
+        ['artifact', { operation: 'stat', projectId: '11111111-1111-4111-8111-111111111111', artifactId: 'artifact-1' }],
+        ['job', { operation: 'status', projectId: '11111111-1111-4111-8111-111111111111', jobId: 'job-1' }],
+        ['git', { operation: 'status', projectId: '11111111-1111-4111-8111-111111111111', workspaceId: 'workspace-1' }],
+        ['shell', { operation: 'start', projectId: '11111111-1111-4111-8111-111111111111', workspaceId: 'workspace-1', requestId: randomUUID() }],
+      ] as const) {
+        expect(await rpcTool(harness, name, arguments_)).toMatchObject({ result: { isError: false } });
+      }
+      expect(harness.workloadCalls).toEqual(['workspace', 'fs', 'artifact', 'job', 'git', 'shell']);
+    } finally {
+      await harness.server.close();
+    }
+  });
+
   it('propagates bounded client and session identity to workload calls', async () => {
     const harness = await startHarness(true);
     try {

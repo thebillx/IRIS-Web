@@ -55,6 +55,25 @@ const FORWARDED_READ_ONLY_TOOLS = new Set([
 ]);
 const FORWARDED_DURABLE_MUTATION_TOOLS = new Set(['project_validation_start']);
 
+const FORWARDED_GROUPED_READ_ONLY_TOOLS = new Set(['workspace', 'fs', 'artifact', 'job', 'git']);
+
+function groupedWorkloadReadOnly(name: string, args: Record<string, unknown>): boolean {
+  const operation = args.operation;
+  if (typeof operation !== 'string') return false;
+  if (name === 'workspace') return operation === 'list' || operation === 'get';
+  if (name === 'fs') return operation === 'list' || operation === 'stat' || operation === 'read' || operation === 'hash' || operation === 'find';
+  if (name === 'artifact') return operation === 'stat' || operation === 'open_ref';
+  if (name === 'job') return operation === 'status' || operation === 'logs' || operation === 'result';
+  if (name === 'git') return operation === 'status' || operation === 'head' || operation === 'diff' || operation === 'log'
+    || operation === 'show' || operation === 'cat_file' || operation === 'merge_base' || operation === 'ancestry'
+    || operation === 'refs' || operation === 'branch_list' || operation === 'worktree_list';
+  return false;
+}
+
+function groupedWorkloadDurableMutation(name: string, args: Record<string, unknown>): boolean {
+  return name === 'shell' && args.operation === 'start' && typeof args.requestId === 'string' && args.requestId.length > 0 && args.requestId.length <= 200;
+}
+
 export type StackState = 'READY' | 'DEGRADED' | 'FAILED' | 'UNKNOWN';
 
 export interface LayerStatus {
@@ -1053,8 +1072,10 @@ export class Supervisor {
     if (context.clientId === undefined) {
       throw new RuntimeError('CONTROL_DENIED', 'Unified workload calls require a bounded client identity');
     }
-    const mutation = !FORWARDED_READ_ONLY_TOOLS.has(name);
-    if (mutation && !FORWARDED_DURABLE_MUTATION_TOOLS.has(name)) {
+    const groupedReadOnly = FORWARDED_GROUPED_READ_ONLY_TOOLS.has(name) && groupedWorkloadReadOnly(name, args);
+    const durableMutation = FORWARDED_DURABLE_MUTATION_TOOLS.has(name) || groupedWorkloadDurableMutation(name, args);
+    const mutation = !FORWARDED_READ_ONLY_TOOLS.has(name) && !groupedReadOnly;
+    if (mutation && !durableMutation) {
       throw new RuntimeError('CONTROL_DENIED', 'Unified workload mutation has no durable idempotency contract');
     }
     const requestId = mutation
