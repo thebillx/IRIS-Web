@@ -1,5 +1,8 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { KeepAwakeLeaseManager, type KeepAwakeProvider, type KeepAwakeProviderSession } from './keep-awake.js';
+import { caffeinateArguments, KeepAwakeLeaseManager, KeepAwakePreferenceStore, type KeepAwakeProvider, type KeepAwakeProviderSession } from './keep-awake.js';
 
 class DisposableProvider implements KeepAwakeProvider {
   public readonly id = 'test-disposable';
@@ -59,5 +62,24 @@ describe('KeepAwakeLeaseManager', () => {
     await manager.request('session');
     expect(provider.starts).toBe(2);
     expect((await manager.snapshot()).observed).toBe('ACTIVE');
+  });
+
+  it('persists the Owner preference separately from provider leases', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'iris-keep-awake-preference-'));
+    try {
+      const first = new KeepAwakePreferenceStore(root);
+      await expect(first.initialize()).resolves.toMatchObject({ schemaVersion: 1, enabled: false });
+      await expect(first.setEnabled(true)).resolves.toMatchObject({ schemaVersion: 1, enabled: true });
+      const restarted = new KeepAwakePreferenceStore(root);
+      await expect(restarted.read()).resolves.toMatchObject({ schemaVersion: 1, enabled: true });
+      await expect(restarted.setEnabled(false)).resolves.toMatchObject({ schemaVersion: 1, enabled: false });
+      expect((await restarted.read()).enabled).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('binds caffeinate lifetime to the Supervisor process and never discovers foreign sessions', () => {
+    expect(caffeinateArguments(1234)).toEqual(['-dimsu', '-w', '1234']);
   });
 });

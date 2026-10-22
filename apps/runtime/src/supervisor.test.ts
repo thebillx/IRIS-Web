@@ -136,6 +136,34 @@ describe('IRIS supervisor', () => {
     }
   }, 60_000);
 
+  it('keeps the Owner preference and lease through Runtime OFF while remaining separate from the Runtime lease', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-keep-awake-preference-'));
+    roots.push(dataRoot);
+    await startRuntime({ dataRoot, sourceRoot });
+    const provider = new FixtureKeepAwakeProvider();
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot, keepAwakeProvider: provider });
+    try {
+      await supervisor.setKeepAwakePreference(true);
+      await supervisor.adoptRuntime();
+      expect(provider.starts).toBe(1);
+      await supervisor.runtimeOff();
+      expect(provider.stops).toBe(0);
+      await expect(supervisor.keepAwakeStatus()).resolves.toMatchObject({ preferenceEnabled: true, requested: true, observed: 'ACTIVE' });
+      await supervisor.runtimeOn();
+      const restartedProvider = new FixtureKeepAwakeProvider();
+      const restarted = await createSupervisor({ dataRoot, sourceRoot, keepAwakeProvider: restartedProvider });
+      await restarted.adoptRuntime();
+      expect(restartedProvider.starts).toBe(1);
+      await restarted.runtimeOff();
+      expect(restartedProvider.stops).toBe(0);
+      await restarted.setKeepAwakePreference(false);
+      expect(restartedProvider.stops).toBe(1);
+    } finally {
+      await supervisor.setKeepAwakePreference(false).catch(() => undefined);
+      await supervisor.runtimeOff().catch(() => undefined);
+    }
+  }, 60_000);
+
   it('fails closed before forwarding workload mutations without a durable runtime contract', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-unified-mutation-'));
     roots.push(dataRoot);
