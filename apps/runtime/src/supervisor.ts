@@ -19,6 +19,7 @@ import { fullMcpToolDefinitionsV21 } from './mcp-v21.js';
 import { FoundationStateStore, loadOrCreateRuntimeId, readEndpoint, readRuntimeControl, removeEndpointIfInstance, removeRuntimeControlIfInstance } from './persistence.js';
 import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
+import { KeepAwakeLeaseManager, MacOSCaffeinateProvider, type KeepAwakeLease, type KeepAwakeProvider } from './keep-awake.js';
 import { readMachineId } from './machine-identity.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
@@ -141,6 +142,7 @@ export interface SupervisorOptions {
   readonly supervisorControlPort?: number;
   readonly adminTunnelHealthPort?: number;
   readonly protectedReferenceRoot?: string;
+  readonly keepAwakeProvider?: KeepAwakeProvider;
 }
 
 interface SupervisorOperationLock {
@@ -216,11 +218,14 @@ export async function createSupervisor(options: SupervisorOptions = {}): Promise
     options.supervisorControlPort ?? DEFAULT_SUPERVISOR_CONTROL_PORT,
     options.adminTunnelHealthPort ?? DEFAULT_ADMIN_TUNNEL_HEALTH_PORT,
     protectedReferenceRoot,
+    options.keepAwakeProvider,
   );
 }
 
 export class Supervisor {
   private nativeControlActive = false;
+  private readonly keepAwake: KeepAwakeLeaseManager;
+  private runtimeKeepAwakeLease: KeepAwakeLease | null = null;
 
   public constructor(
     public readonly dataRoot: string,
@@ -231,7 +236,9 @@ export class Supervisor {
     private readonly supervisorControlPort: number,
     private readonly adminTunnelHealthPort: number,
     private readonly protectedReferenceRoot?: string,
+    keepAwakeProvider: KeepAwakeProvider = new MacOSCaffeinateProvider(),
   ) {
+    this.keepAwake = new KeepAwakeLeaseManager(keepAwakeProvider);
     for (const [label, port] of [
       ['Supervisor admin', adminPort],
       ['Supervisor native control', supervisorControlPort],
@@ -515,6 +522,7 @@ export class Supervisor {
         }
         state = { ...state, runtime: replacement };
         await this.writeState(state);
+        await this.ensureRuntimeKeepAwake();
         started.push('runtime');
         runtimeReplaced = true;
       }
@@ -525,6 +533,7 @@ export class Supervisor {
         state = { ...state, runtime: await runtimeRecordFromObserved(runtime.endpoint, state.workloadSourceRoot) };
         await this.writeState(state);
       }
+      await this.ensureRuntimeKeepAwake();
       if (expectedSourceIdentity !== undefined) {
         await assertActivationSourceIdentity(
           state.workloadSourceRoot,
@@ -820,6 +829,7 @@ export class Supervisor {
         if (state.runtime === null) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'A running Runtime is not supervisor-owned');
         assertRuntimeOwnership(state.runtime, observed);
         await assertOwnedRuntimeProcess(state.runtime);
+        await this.ensureRuntimeKeepAwake();
         return { state: 'RUNNING', runtimeId: observed.endpoint.runtimeId, instanceId: observed.endpoint.instanceId, alreadyRunning: true, workloadOnly: true };
       }
       if (state.runtime !== null) {
@@ -836,6 +846,7 @@ export class Supervisor {
       if (started.endpoint === null) throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Runtime started without an endpoint descriptor');
       const verified = await this.verifyStartup(operation, await runtimeRecordFromObserved(started.endpoint, state.workloadSourceRoot));
       await this.writeState({ ...state, runtime: verified });
+      await this.ensureRuntimeKeepAwake();
       return { state: 'RUNNING', runtimeId: verified.runtimeId, instanceId: verified.instanceId, workloadOnly: true };
     }));
   }
@@ -1072,6 +1083,7 @@ export class Supervisor {
     if (state.runtime !== null) return this.status();
     const adopted = await runtimeRecordFromObserved(observed.endpoint, state.workloadSourceRoot);
     await this.persistVerifiedOwnership({ ...state, runtime: adopted }, [adopted]);
+    await this.ensureRuntimeKeepAwake();
     return this.status();
   }
 
@@ -1843,6 +1855,23 @@ export class Supervisor {
       }
       await removeRuntimeControlIfInstance(this.dataRoot, control.instanceId);
     }
+    await this.releaseRuntimeKeepAwake();
+  }
+
+  private async ensureRuntimeKeepAwake(): Promise<void> {
+    if (this.runtimeKeepAwakeLease !== null) return;
+    try {
+      this.runtimeKeepAwakeLease = await this.keepAwake.request('runtime');
+    } catch (error) {
+      if (error instanceof RuntimeError && error.code === 'CAPABILITY_DENIED') return;
+      throw error;
+    }
+  }
+
+  private async releaseRuntimeKeepAwake(): Promise<void> {
+    const lease = this.runtimeKeepAwakeLease;
+    this.runtimeKeepAwakeLease = null;
+    if (lease !== null) await lease.release();
   }
 
   private async retireStaleRuntimeMetadata(observed: RuntimeObservedStatus, workloadSourceRoot: string): Promise<void> {

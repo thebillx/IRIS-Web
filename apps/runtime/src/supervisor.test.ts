@@ -16,6 +16,7 @@ import { catalogProfileStatusWithoutAuthoritativeIdentity, createSupervisor, sup
 import { startSupervisorNativeControlServer } from './supervisor-native-control.js';
 import { MCP_PROTOCOL_VERSION, proMcpToolDefinitions } from './mcp.js';
 import { runtimeStatus, startRuntime, stopRuntime } from './lifecycle.js';
+import type { KeepAwakeProvider, KeepAwakeProviderSession } from './keep-awake.js';
 
 
 // Disposable process tests must not use the stopped Protected Live listener ports.
@@ -30,6 +31,28 @@ vi.mock('./daemon.js', async () => {
 
 const roots: string[] = [];
 const sourceRoot = path.resolve(import.meta.dirname, '../../..');
+
+class FixtureKeepAwakeProvider implements KeepAwakeProvider {
+  public readonly id = 'fixture-keep-awake';
+  public starts = 0;
+  public stops = 0;
+  private active: KeepAwakeProviderSession | null = null;
+
+  public async probe(): Promise<{ readonly supported: boolean }> { return { supported: true }; }
+  public async start(): Promise<KeepAwakeProviderSession> {
+    this.starts += 1;
+    this.active = { providerSessionId: `fixture-${this.starts}` };
+    return this.active;
+  }
+  public async stop(session: KeepAwakeProviderSession): Promise<void> {
+    if (this.active?.providerSessionId !== session.providerSessionId) throw new Error('wrong keep-awake session');
+    this.stops += 1;
+    this.active = null;
+  }
+  public async observe(session: KeepAwakeProviderSession): Promise<boolean> {
+    return this.active?.providerSessionId === session.providerSessionId;
+  }
+}
 afterEach(async () => {
   const allocated = roots.splice(0);
   for (const root of allocated) {
@@ -92,6 +115,22 @@ describe('IRIS supervisor', () => {
       expect((await runtimeStatus(dataRoot)).state).toBe('stopped');
       await expect(supervisor.runtimeOn()).resolves.toMatchObject({ state: 'RUNNING', workloadOnly: true });
       expect((await runtimeStatus(dataRoot)).state).toBe('running');
+    } finally {
+      await supervisor.runtimeOff().catch(() => undefined);
+    }
+  }, 60_000);
+
+  it('owns and releases the keep-awake lease with the workload Runtime', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-keep-awake-'));
+    roots.push(dataRoot);
+    await startRuntime({ dataRoot, sourceRoot });
+    const provider = new FixtureKeepAwakeProvider();
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot, keepAwakeProvider: provider });
+    try {
+      await supervisor.adoptRuntime();
+      expect(provider.starts).toBe(1);
+      await supervisor.runtimeOff();
+      expect(provider.stops).toBe(1);
     } finally {
       await supervisor.runtimeOff().catch(() => undefined);
     }
