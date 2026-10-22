@@ -159,6 +159,7 @@ export interface WorkerExecutionAssociation {
   readonly assignmentId: string;
   readonly workerId: string;
   readonly authorityDigest: string;
+  readonly operationId: string;
 }
 
 export interface MissionOrchestratorHandoff {
@@ -643,6 +644,7 @@ export type CapabilityId =
   | 'session.delete'
   | 'session.current_project.set'
   | 'session.instruction.submit'
+  | 'repository.reconcile'
   | 'project.register'
   | 'project.default.set'
   | 'file.read'

@@ -5,6 +5,7 @@ import { RuntimeError } from '@iris/domain';
 const PYTHON = '/usr/bin/python3';
 const HELPER = path.resolve(import.meta.dirname, '..', 'macos-safety-helper.py');
 const MAX_HELPER_OUTPUT_BYTES = 4 * 1024 * 1024;
+const PROCESS_START_ATTEMPTS = 3;
 
 export type ProcessStartObservation =
   | { readonly state: 'live'; readonly marker: string }
@@ -22,18 +23,32 @@ export interface SecureProjectFileEditResult {
 }
 
 export function observeProcessStart(pid: number): ProcessStartObservation {
-  const result = spawnSync(PYTHON, ['-I', '-S', HELPER, 'process-start', String(pid)], {
+  for (let attempt = 0; attempt < PROCESS_START_ATTEMPTS; attempt += 1) {
+    const result = spawnSync(PYTHON, ['-I', '-S', HELPER, 'process-start', String(pid)], {
+      encoding: 'utf8',
+      timeout: 2_000,
+      maxBuffer: 16 * 1024,
+      env: { PATH: '/usr/bin:/bin' },
+    });
+    if (result.status === 0) {
+      const marker = result.stdout.trim();
+      if (/^\d+:\d{6}$/.test(marker)) return { state: 'live', marker };
+    }
+    if (result.status === 2 && result.stderr.includes('process does not exist')) return { state: 'dead' };
+  }
+  return { state: 'indeterminate' };
+}
+
+export function observeProcessExecutable(pid: number): string | null {
+  const result = spawnSync(PYTHON, ['-I', '-S', HELPER, 'process-executable', String(pid)], {
     encoding: 'utf8',
     timeout: 2_000,
     maxBuffer: 16 * 1024,
     env: { PATH: '/usr/bin:/bin' },
   });
-  if (result.status === 0) {
-    const marker = result.stdout.trim();
-    return /^\d+:\d{6}$/.test(marker) ? { state: 'live', marker } : { state: 'indeterminate' };
-  }
-  if (result.status === 2 && result.stderr.includes('process does not exist')) return { state: 'dead' };
-  return { state: 'indeterminate' };
+  if (result.status !== 0) return null;
+  const executable = result.stdout.trim();
+  return executable.length > 0 && path.isAbsolute(executable) ? executable : null;
 }
 
 export async function secureProjectFileRead(projectRoot: string, targetPath: string): Promise<string> {

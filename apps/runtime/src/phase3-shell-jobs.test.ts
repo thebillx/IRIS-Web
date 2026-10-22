@@ -323,12 +323,12 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     const fixture = await serviceFixture();
     expect(phase3GroupedToolDefinitions().map((tool) => tool.name)).toEqual(['shell','job']);
     expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['shell','job','workspace','fs','artifact','project_validation_run','project_validation_start']));
-    expect(catalogToolNames('FULL')).toHaveLength(56);
+    expect(catalogToolNames('FULL')).toHaveLength(58);
     expect(catalogToolNames('PRO')).toEqual(['list_projects','project_info','git_status','file_read','search']);
 
     await expect(runDeclaredProjectScript(fixture.projectARoot, 'anything')).rejects.toMatchObject({ code: 'CAPABILITY_DENIED' });
     await writeFile(path.join(fixture.projectARoot, 'declared.mjs'), "console.log('safe-declared-script')\n");
-    await writeFile(path.join(fixture.projectARoot, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.0.0', scripts: { safe: 'node declared.mjs' } }));
+    await writeFile(path.join(fixture.projectARoot, 'package.json'), JSON.stringify({ packageManager: 'npm@11.17.0', scripts: { safe: 'node declared.mjs' } }));
     const validation = await runDeclaredProjectScript(fixture.projectARoot, 'safe');
     expect(validation.scriptName).toBe('safe');
     expect(validation.passed).toBe(true);
