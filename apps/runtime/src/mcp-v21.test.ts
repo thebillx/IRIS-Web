@@ -53,6 +53,32 @@ describe('IRIS V2.1 Full MCP lifecycle transport', () => {
     expect(await mutation.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'INVALID_REQUEST' } } });
   });
 
+  it('routes grouped workspace and filesystem workload operations through the same authenticated Full MCP connection', async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.project.rootPath, 'README.md'), 'unified-mcp-workload\n');
+    const listed = await handleMcpV21Request(
+      rpc('tools/list', 5, undefined, f.session.clientId, f.session.id),
+      f.service, f.state, f.broker, f.lifecycle,
+    );
+    const listedBody = await listed.json() as { result: { tools: Array<{ name: string }> } };
+    expect(listedBody.result.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['workspace', 'fs', 'artifact', 'shell', 'job', 'git']));
+
+    const call = async (id: number, name: string, args: Record<string, unknown>) => {
+      const response = await handleMcpV21Request(
+        rpc('tools/call', id, { name, arguments: args }, f.session.clientId, f.session.id, name),
+        f.service, f.state, f.broker, f.lifecycle,
+      );
+      return response.json() as Promise<{ result: { isError: boolean; structuredContent: Record<string, unknown> } }>;
+    };
+    const workspaces = await call(6, 'workspace', { operation: 'list', projectId: f.project.id });
+    expect(workspaces.result).toMatchObject({ isError: false, structuredContent: { workspaces: expect.any(Array) } });
+    const workspaceId = String((workspaces.result.structuredContent.workspaces as Array<{ workspaceId: string }>)[0]?.workspaceId);
+    const read = await call(7, 'fs', {
+      operation: 'read', projectId: f.project.id, workspaceId, path: 'README.md', readMode: 'TEXT',
+    });
+    expect(read.result).toMatchObject({ isError: false, structuredContent: { text: 'unified-mcp-workload\n' } });
+  });
+
   it('executes create, start, checkpoint, directive, resume with one durable mission id and fail-closed stale revision', async () => {
     const f = await fixture();
     const call = async (id: number, name: string, args: Record<string, unknown>) => {
