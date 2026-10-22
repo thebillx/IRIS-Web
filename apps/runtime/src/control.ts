@@ -10,6 +10,7 @@ import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, 
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, reconcileRecoveryPolicyLock, reconcileRecoveryPolicyOperation, revokeRecoveryAuthorizationPolicy } from './recovery-policy.js';
 import { readMachineId } from './machine-identity.js';
+import { formatSetupOutput, guidedSetup, type GuidedSetupOptions } from './setup.js';
 
 const command = process.argv[2];
 const legacyRuntimeControl = process.env.IRIS_STACK_CLI !== '1';
@@ -19,9 +20,11 @@ try {
   const launchdInstallOptions = command === 'launchd' && process.argv[3] === 'install'
     ? parseLaunchdInstallOptions(process.argv.slice(4))
     : null;
-  const dataRoot = launchdInstallOptions?.runtimeDataRoot === undefined
+  const setupOptions = command === 'setup' ? parseSetupOptions(process.argv.slice(3)) : null;
+  const configuredDataRoot = setupOptions?.runtimeDataRoot ?? launchdInstallOptions?.runtimeDataRoot;
+  const dataRoot = configuredDataRoot === undefined
     ? await resolveRuntimeDataRoot()
-    : await resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: launchdInstallOptions.runtimeDataRoot });
+    : await resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: configuredDataRoot });
   if (legacyRuntimeControl && command === 'start') {
     process.stdout.write(`${JSON.stringify(await startRuntime({ dataRoot }), null, 2)}\n`);
   } else if (legacyRuntimeControl && command === 'status') {
@@ -33,8 +36,11 @@ try {
     if (secret === null) throw new Error('IRIS owner access credential is not initialized');
     process.stdout.write(`${secret}\n`);
   } else {
-    const supervisor = await createSupervisor({ dataRoot });
-    if (command === 'recovery-policy' && process.argv[3] === 'issue') {
+    const supervisor = await createSupervisor({ dataRoot, ...(setupOptions?.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: setupOptions.protectedReferenceRoot }) });
+    if (command === 'setup') {
+      const result = await guidedSetup(supervisor, dataRoot, setupOptions!);
+      process.stdout.write(setupOptions!.json ? `${JSON.stringify(result, null, 2)}\n` : formatSetupOutput(result));
+    } else if (command === 'recovery-policy' && process.argv[3] === 'issue') {
       const policy = parseRecoveryPolicyIssueOptions(process.argv.slice(4));
       const machineId = policy.allowedOperations.some((operation) => operation === 'SUPERVISOR_BOOTSTRAP' || operation === 'ADMIN_TUNNEL_START') ? await readMachineId(dataRoot) : null;
       if (policy.allowedOperations.some((operation) => operation === 'SUPERVISOR_BOOTSTRAP' || operation === 'ADMIN_TUNNEL_START') && machineId === null) throw new Error('Supervisor bootstrap policy requires an existing protected machine identity');
@@ -247,7 +253,7 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'status') {
       process.stdout.write(`${JSON.stringify(await launchAgentStatus(dataRoot), null, 2)}\n`);
     } else {
-      process.stderr.write('Usage: iris <up|down|restart|status|doctor|connectors|catalog|logs|adopt-runtime|runtime-reconcile|startup-reconcile|supervisor|credentials|lifecycle-grant|launchd>\n');
+      process.stderr.write('Usage: iris <setup --full-tunnel-id <id> --pro-tunnel-id <id>|up|down|restart|status|doctor|connectors|catalog|logs|adopt-runtime|runtime-reconcile|startup-reconcile|supervisor|credentials|lifecycle-grant|launchd>\n');
       process.exitCode = 2;
     }
   }
@@ -256,6 +262,11 @@ try {
   const message = error instanceof Error ? error.message : 'IRIS command failed';
   process.stderr.write(`IRIS_COMMAND_FAILED code=${code} message=${message}\n`);
   process.exitCode = 1;
+}
+
+interface SetupCliOptions extends GuidedSetupOptions {
+  readonly runtimeDataRoot?: string;
+  readonly protectedReferenceRoot?: string;
 }
 
 interface LaunchdInstallOptions {
@@ -459,6 +470,36 @@ function parseRecoveryPolicyLockOptions(argumentsList: readonly string[]): Recov
 }
 
 const LAUNCHD_INSTALL_USAGE = 'Usage: iris launchd install --recovery-policy-id <uuid> --request-id <uuid> --source-sha <commit> --source-tree <tree> [--runtime-data-root <external-directory>] [--protected-reference-root <existing-directory>]';
+const SETUP_USAGE = 'Usage: iris setup --full-tunnel-id <id> --pro-tunnel-id <id> [--admin-tunnel-id <id>] [--start] [--json] [--runtime-data-root <directory>] [--protected-reference-root <directory>]';
+
+function parseSetupOptions(argumentsList: readonly string[]): SetupCliOptions {
+  let fullTunnelId: string | undefined;
+  let proTunnelId: string | undefined;
+  let adminTunnelId: string | undefined;
+  let runtimeDataRoot: string | undefined;
+  let protectedReferenceRoot: string | undefined;
+  let start = false;
+  let json = false;
+  for (let index = 0; index < argumentsList.length; index += 1) {
+    const name = argumentsList[index];
+    if (name === '--start' || name === '--json') {
+      if (name === '--start' ? start : json) throw new Error(SETUP_USAGE);
+      if (name === '--start') start = true; else json = true;
+      continue;
+    }
+    const value = argumentsList[index + 1]?.trim();
+    if (value === undefined || value.length === 0) throw new Error(SETUP_USAGE);
+    if (name === '--full-tunnel-id' && fullTunnelId === undefined) fullTunnelId = value;
+    else if (name === '--pro-tunnel-id' && proTunnelId === undefined) proTunnelId = value;
+    else if (name === '--admin-tunnel-id' && adminTunnelId === undefined) adminTunnelId = value;
+    else if (name === '--runtime-data-root' && runtimeDataRoot === undefined) runtimeDataRoot = value;
+    else if (name === '--protected-reference-root' && protectedReferenceRoot === undefined) protectedReferenceRoot = value;
+    else throw new Error(SETUP_USAGE);
+    index += 1;
+  }
+  if ((fullTunnelId === undefined) !== (proTunnelId === undefined)) throw new Error(SETUP_USAGE);
+  return { ...(fullTunnelId === undefined ? {} : { fullTunnelId }), ...(proTunnelId === undefined ? {} : { proTunnelId }), ...(adminTunnelId === undefined ? {} : { adminTunnelId }), ...(runtimeDataRoot === undefined ? {} : { runtimeDataRoot }), ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }), start, json };
+}
 
 function parseLaunchdInstallOptions(argumentsList: readonly string[]): LaunchdInstallOptions {
   if (argumentsList.length % 2 !== 0) throw new Error(LAUNCHD_INSTALL_USAGE);
