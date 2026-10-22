@@ -243,6 +243,42 @@ describe('outer supervisor native control', () => {
       await (replacement ?? harness.server).close();
     }
   });
+
+  it('requires a bounded lifecycle grant for tunnel runtime controls while preserving owner control', async () => {
+    const harness = await startHarness();
+    const calls: string[] = [];
+    // The harness starts with no authorized callback; install a dedicated server for this contract proof.
+    await harness.server.close();
+    const server = await startSupervisorNativeControlServer(harness.dataRoot, await freePort(), {
+      supervisorStatus: async () => ({}),
+      runtimeStatus: async () => ({ state: 'stopped' }),
+      runtimeOn: async () => ({ state: 'RUNNING' }),
+      runtimeOff: async () => ({ state: 'STOPPED' }),
+      runtimeOnAuthorized: async (input) => { calls.push(`on:${input.operationId}`); return { state: 'RUNNING', authorized: true }; },
+      runtimeOffAuthorized: async (input) => { calls.push(`off:${input.operationId}`); return { state: 'STOPPED', authorized: true }; },
+      listProjects: async () => ({ projects: [] }),
+      projectInfo: async () => ({}),
+      adminStatus: async () => ({}),
+      runtimeReconcile: async () => ({}),
+      adminRecycle: async () => ({}),
+      adminTunnelRecycle: async () => ({}),
+      adminToolCall: async (): Promise<SupervisorAdminToolCallResult> => ({ structuredContent: {}, isError: false }),
+    });
+    try {
+      expect(toolError(await rpcTool({ ...harness, server }, 'runtime_on', {}))).toMatchObject({ code: 'CONTROL_DENIED' });
+      const grantArgs = {
+        grantId: '11111111-1111-4111-8111-111111111111',
+        requestId: '22222222-2222-4222-8222-222222222222',
+        operationId: '33333333-3333-4333-8333-333333333333',
+        tunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      };
+      expect(structured(await rpcTool({ ...harness, server }, 'runtime_on', grantArgs))).toMatchObject({ state: 'RUNNING', authorized: true });
+      expect(calls).toEqual(['on:33333333-3333-4333-8333-333333333333']);
+      expect(structured(await rpcTool({ ...harness, server }, 'runtime_on', {}, { authorization: `Bearer ${harness.ownerSecret}` }))).toMatchObject({ state: 'RUNNING' });
+    } finally {
+      await server.close();
+    }
+  });
 });
 
 async function startHarness(withWorkload = false) {

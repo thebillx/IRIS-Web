@@ -21,9 +21,11 @@ import { privateDirectoryProblem } from './private-fs.js';
 import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } from './lifecycle.js';
 import { KeepAwakeLeaseManager, KeepAwakePreferenceStore, MacOSCaffeinateProvider, type KeepAwakeLease, type KeepAwakeProvider } from './keep-awake.js';
 import { readMachineId } from './machine-identity.js';
+import { readVerifiedSourceIdentity } from './mission-delegation.js';
+import { LifecycleGrantStore, type LifecycleGrantBinding, type LifecycleGrantTarget, type LifecycleOperation } from './lifecycle-grant.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
-import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput, type SupervisorWorkloadCallContext } from './supervisor-native-control.js';
+import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput, type LifecycleGrantCall, type SupervisorWorkloadCallContext } from './supervisor-native-control.js';
 import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, readRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
 import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
 
@@ -228,6 +230,7 @@ export class Supervisor {
   private readonly keepAwakePreference: KeepAwakePreferenceStore;
   private runtimeKeepAwakeLease: KeepAwakeLease | null = null;
   private ownerKeepAwakeLease: KeepAwakeLease | null = null;
+  private readonly lifecycleGrants: LifecycleGrantStore;
 
   public constructor(
     public readonly dataRoot: string,
@@ -240,6 +243,7 @@ export class Supervisor {
     private readonly protectedReferenceRoot?: string,
     keepAwakeProvider: KeepAwakeProvider = new MacOSCaffeinateProvider(),
   ) {
+    this.lifecycleGrants = new LifecycleGrantStore(dataRoot);
     this.keepAwake = new KeepAwakeLeaseManager(keepAwakeProvider);
     this.keepAwakePreference = new KeepAwakePreferenceStore(dataRoot);
     for (const [label, port] of [
@@ -842,10 +846,11 @@ export class Supervisor {
     });
   }
 
-  public async runtimeOn(): Promise<Record<string, unknown>> {
+  public async runtimeOn(expectedLifecycleBinding?: LifecycleGrantBinding, lifecycleOperationId?: string): Promise<Record<string, unknown>> {
     await this.prepareDirectories();
     return this.withOperationLock('runtime-on', () => this.startupTransaction(async () => {
       let state = await this.readState();
+      if (expectedLifecycleBinding !== undefined) await this.assertCurrentLifecycleBinding(expectedLifecycleBinding);
       const observed = await runtimeStatus(this.dataRoot);
       if (observed.state === 'indeterminate') throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Runtime authority is indeterminate');
       if (observed.state === 'stale') throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Stale Runtime authority requires reconciliation');
@@ -860,7 +865,7 @@ export class Supervisor {
         await this.retireRuntime(state.runtime, observed);
         state = await this.readState();
       }
-      const operation = await this.prepareStartup('runtime', canonicalNodeRuntime().path, state.workloadSourceRoot, null, {});
+      const operation = await this.prepareStartup('runtime', canonicalNodeRuntime().path, state.workloadSourceRoot, null, {}, this.dataRoot, lifecycleOperationId);
       const started = await this.startRecordedRuntime(operation, {
         onSpawn: (pid) => this.observeStartupPid(operation, pid),
         dataRoot: this.dataRoot,
@@ -875,12 +880,13 @@ export class Supervisor {
     }));
   }
 
-  public async runtimeOff(): Promise<Record<string, unknown>> {
+  public async runtimeOff(expectedLifecycleBinding?: LifecycleGrantBinding): Promise<Record<string, unknown>> {
     await this.prepareDirectories();
     return this.withOperationLock('runtime-off', async () => {
       await this.migrateHistoricalOwnership();
       await this.assertStartupReconciled();
       const state = await this.readState();
+      if (expectedLifecycleBinding !== undefined) await this.assertCurrentLifecycleBinding(expectedLifecycleBinding);
       const observed = await runtimeStatus(this.dataRoot);
       if (observed.state === 'stopped' && state.runtime === null) return { state: 'STOPPED', alreadyStopped: true, workloadOnly: true };
       if (observed.state !== 'running' || observed.endpoint === null || state.runtime === null) {
@@ -899,6 +905,148 @@ export class Supervisor {
       }, true);
       return { state: 'STOPPED', workloadOnly: true };
     });
+  }
+
+  public async issueRuntimeLifecycleGrant(input: {
+    readonly requestId: string;
+    readonly allowedOperations: readonly LifecycleOperation[];
+    readonly expiresAt: string;
+    readonly maxOperationCount: number;
+  }): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('runtime-lifecycle-grant-issue', async () => {
+      const binding = await this.currentLifecycleGrantBinding();
+      const grant = await this.lifecycleGrants.issue({ ...input, ...binding });
+      return { grantId: grant.grantId, requestId: grant.requestId, machineId: grant.machineId, tunnelId: grant.tunnelId, sourceRoot: grant.sourceRoot, sourceSha: grant.sourceSha, sourceTree: grant.sourceTree, allowedOperations: grant.allowedOperations, expiresAt: grant.expiresAt, maxOperationCount: grant.maxOperationCount, state: 'ISSUED' };
+    });
+  }
+
+  public async revokeRuntimeLifecycleGrant(grantId: string): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('runtime-lifecycle-grant-revoke', async () => {
+      await this.lifecycleGrants.revoke(grantId);
+      return { grantId, state: 'REVOKED' };
+    });
+  }
+
+  public async reconcileRuntimeLifecycleGrant(grantId: string, operationId: string): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('runtime-lifecycle-grant-reconcile', async () => {
+      const grant = await this.lifecycleGrants.get(grantId);
+      const operation = grant.operations.find((entry) => entry.operationId === operationId);
+      if (operation === undefined) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle operation was not found');
+      if (operation.state !== 'RECONCILIATION_REQUIRED' && operation.state !== 'RESERVED') throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle operation is not awaiting reconciliation');
+      await this.assertCurrentLifecycleBinding(grant);
+      const state = await this.readState();
+      if (state.startupOperations.some((entry) => entry.component === 'runtime' && unresolvedStartup(entry))) {
+        throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime startup ownership remains unresolved');
+      }
+      const observed = await runtimeStatus(this.dataRoot);
+      let terminal: 'COMMITTED' | 'FAILED';
+      let correlatedTransactionId: string | null = null;
+      if (operation.operation === 'runtime_on') {
+        if (observed.state === 'running' && observed.endpoint !== null && state.runtime !== null) {
+          assertRuntimeOwnership(state.runtime, observed);
+          await assertOwnedRuntimeProcess(state.runtime);
+          const startup = state.startupOperations.find((entry) => entry.id === operationId && entry.component === 'runtime' && entry.state === 'RUNNING' && entry.pid === observed.endpoint?.pid && entry.processStartMarker === state.runtime?.processStartMarker);
+          if (startup === undefined) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime process is not correlated to the lifecycle operation');
+          correlatedTransactionId = startup.transactionId;
+          terminal = 'COMMITTED';
+        } else if (observed.state === 'stopped' && state.runtime === null) {
+          const startup = state.startupOperations.find((entry) => entry.id === operationId && entry.component === 'runtime' && ['SPAWN_FAILED', 'STOPPED'].includes(entry.state));
+          if (startup === undefined) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Failed runtime start is not correlated to the lifecycle operation');
+          correlatedTransactionId = startup.transactionId;
+          terminal = 'FAILED';
+        } else {
+          throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Runtime lifecycle outcome is not provable');
+        }
+      } else if (observed.state === 'stopped' && state.runtime === null) {
+        if (operation.target === undefined) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime stop target identity is unavailable');
+        const startup = state.startupOperations.find((entry) => entry.component === 'runtime' && entry.state === 'STOPPED' && entry.pid === operation.target?.pid && entry.processStartMarker === operation.target?.processStartMarker);
+        if (startup === undefined) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime stop process identity is not correlated to the lifecycle operation');
+        correlatedTransactionId = startup.transactionId;
+        terminal = 'COMMITTED';
+      } else if (observed.state === 'running' && observed.endpoint !== null && state.runtime !== null) {
+        assertRuntimeOwnership(state.runtime, observed);
+        await assertOwnedRuntimeProcess(state.runtime);
+        if (operation.target === undefined || operation.target.pid !== observed.endpoint.pid || operation.target.processStartMarker !== state.runtime.processStartMarker) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime process identity changed during lifecycle reconciliation');
+        const startup = state.startupOperations.find((entry) => entry.component === 'runtime' && entry.state === 'RUNNING' && entry.pid === observed.endpoint?.pid && entry.processStartMarker === state.runtime?.processStartMarker);
+        if (startup === undefined) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime process is not correlated to the lifecycle operation');
+        correlatedTransactionId = startup.transactionId;
+        terminal = 'FAILED';
+      } else {
+        throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Runtime lifecycle outcome is not provable');
+      }
+      const evidence = { operation: operation.operation, observedState: observed.state, runtimeId: observed.endpoint?.runtimeId ?? null, instanceId: observed.endpoint?.instanceId ?? null, pid: observed.endpoint?.pid ?? null, transactionId: correlatedTransactionId };
+      await this.lifecycleGrants.reconcile(grantId, operationId, terminal, evidence, true);
+      return { grantId, operationId, state: terminal, observedState: observed.state };
+    });
+  }
+
+  private async currentLifecycleGrantBinding(): Promise<LifecycleGrantBinding> {
+    const state = await this.readState();
+    const tunnel = state.adminTunnel;
+    if (tunnel === null || tunnel.tunnelId === null || await inspectProcess(tunnel) !== 'running') throw new RuntimeError('CONTROL_DENIED', 'A verified ADMIN tunnel is required for lifecycle grant issuance');
+    const tunnelWorkingDirectory = tunnel.workingDirectory;
+    if (typeof tunnelWorkingDirectory !== 'string' || !sameSourceRoot(tunnelWorkingDirectory, this.sourceRoot)) throw new RuntimeError('AUTHORITY_CHANGED', 'ADMIN tunnel working directory is not bound to the Supervisor source');
+    const registry = await readConnectorRegistry(this.dataRoot);
+    if (registry?.admin?.tunnelId !== tunnel.tunnelId) throw new RuntimeError('AUTHORITY_CHANGED', 'Current ADMIN tunnel is not bound to the registered ADMIN connector');
+    const machineId = await readMachineId(this.dataRoot);
+    if (machineId === null) throw new RuntimeError('PERSISTENCE_FAILURE', 'Machine identity is unavailable');
+    if (registry.admin !== null && registry.admin.machineId !== null && registry.admin.machineId !== machineId) throw new RuntimeError('AUTHORITY_CHANGED', 'Current ADMIN connector is bound to a different machine');
+    const tunnelProbe = await this.probeAdminTunnel(state, tunnel);
+    if (!tunnelProbe.ownershipVerified || !tunnelProbe.listenerOwnershipVerified) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'ADMIN tunnel process or listener ownership is not verified');
+    let source;
+    try { source = await readVerifiedSourceIdentity(this.sourceRoot); } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Current Supervisor source identity could not be verified', { cause: error }); }
+    let canonicalSourceRoot: string;
+    try { canonicalSourceRoot = realpathSync(this.sourceRoot); } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Supervisor source root could not be canonicalized', { cause: error }); }
+    let workloadSource;
+    let canonicalWorkloadSourceRoot: string;
+    try {
+      canonicalWorkloadSourceRoot = realpathSync(state.workloadSourceRoot);
+      workloadSource = await readVerifiedSourceIdentity(canonicalWorkloadSourceRoot);
+    } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Current workload source identity could not be verified', { cause: error }); }
+    return { machineId, tunnelId: tunnel.tunnelId, sourceRoot: canonicalSourceRoot, sourceSha: source.sha, sourceTree: source.tree, workloadSourceRoot: canonicalWorkloadSourceRoot, workloadSourceSha: workloadSource.sha, workloadSourceTree: workloadSource.tree };
+  }
+
+  private async executeRuntimeWithGrant(input: LifecycleGrantCall, operation: LifecycleOperation): Promise<Record<string, unknown>> {
+    const binding = await this.currentLifecycleGrantBinding();
+    if (input.tunnelId !== binding.tunnelId) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant tunnel identity does not match the current ADMIN tunnel');
+    const grant = await this.withOperationLock('runtime-lifecycle-grant-reserve', async () => {
+      const target = operation === 'runtime_off' ? await this.lifecycleGrantRuntimeTarget() : undefined;
+      return this.lifecycleGrants.reserve(binding, operation, { ...input, ...(target === undefined ? {} : { target }) });
+    });
+    try {
+      const result = operation === 'runtime_on' ? await this.runtimeOn(binding, input.operationId) : await this.runtimeOff(binding);
+      await this.withOperationLock('runtime-lifecycle-grant-commit', () => this.lifecycleGrants.complete(grant.grantId, input.operationId, 'COMMITTED', result));
+      return { ...result, lifecycleGrantId: grant.grantId, lifecycleOperationId: input.operationId };
+    } catch (error) {
+      await this.withOperationLock('runtime-lifecycle-grant-unknown', () => this.lifecycleGrants.complete(grant.grantId, input.operationId, 'RECONCILIATION_REQUIRED'));
+      throw error;
+    }
+  }
+
+  public async runtimeOnAuthorized(input: LifecycleGrantCall): Promise<Record<string, unknown>> {
+    return this.executeRuntimeWithGrant(input, 'runtime_on');
+  }
+
+  public async runtimeOffAuthorized(input: LifecycleGrantCall): Promise<Record<string, unknown>> {
+    return this.executeRuntimeWithGrant(input, 'runtime_off');
+  }
+
+  private async assertCurrentLifecycleBinding(expected: LifecycleGrantBinding): Promise<void> {
+    const current = await this.currentLifecycleGrantBinding();
+    if (current.machineId !== expected.machineId || current.tunnelId !== expected.tunnelId || current.sourceRoot !== expected.sourceRoot || current.sourceSha !== expected.sourceSha || current.sourceTree !== expected.sourceTree || current.workloadSourceRoot !== expected.workloadSourceRoot || current.workloadSourceSha !== expected.workloadSourceSha || current.workloadSourceTree !== expected.workloadSourceTree) {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant binding changed before runtime mutation');
+    }
+  }
+
+  private async lifecycleGrantRuntimeTarget(): Promise<LifecycleGrantTarget | undefined> {
+    const state = await this.readState();
+    const runtime = state.runtime;
+    if (runtime === null) return undefined;
+    if (typeof runtime.processStartMarker !== 'string' || await inspectProcess(runtime) !== 'running') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Runtime stop target identity is not live and verified');
+    return { pid: runtime.pid, processStartMarker: runtime.processStartMarker!, ...(runtime.runtimeId === undefined ? {} : { runtimeId: runtime.runtimeId }), ...(runtime.instanceId === undefined ? {} : { instanceId: runtime.instanceId }) };
   }
 
   private async forwardWorkloadTool(name: string, args: Record<string, unknown>, context: SupervisorWorkloadCallContext = {}): Promise<SupervisorAdminToolCallResult> {
@@ -1141,6 +1289,8 @@ export class Supervisor {
       runtimeStatus: () => this.runtimeStatus(),
       runtimeOn: () => this.runtimeOn(),
       runtimeOff: () => this.runtimeOff(),
+      runtimeOnAuthorized: (input) => this.runtimeOnAuthorized(input),
+      runtimeOffAuthorized: (input) => this.runtimeOffAuthorized(input),
       workloadToolCall: (name, args, context) => this.forwardWorkloadTool(name, args, context),
       adminStatus: () => this.adminNativeStatus(),
       runtimeReconcile: () => this.runtimeReconcile(),
@@ -2653,7 +2803,7 @@ export class Supervisor {
     await this.writeState({ ...state, startupOperations: state.startupOperations.map((op) => op.id === id ? { ...op, ...observation, state: phase } : op) }, true);
   }
 
-  private async prepareStartup(component: string, executable: string, sourceRoot: string, profilePath: string | null, environment: Record<string, string>, targetDataRoot = this.dataRoot, operationId = randomUUID()): Promise<string> {
+  private async prepareStartup(component: string, executable: string, sourceRoot: string, profilePath: string | null, environment: Record<string, string>, targetDataRoot = this.dataRoot, operationId: string = randomUUID()): Promise<string> {
     const supervisor = observeProcessStart(process.pid);
     if (supervisor.state !== 'live') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Supervisor start identity is unavailable');
     const state = await this.readState();

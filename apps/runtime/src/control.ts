@@ -74,6 +74,34 @@ try {
         if (confirmation.trim() !== 'REVOKE IRIS RECOVERY POLICY') throw new Error('Owner recovery policy revocation was not confirmed');
       } finally { prompt.close(); }
       process.stdout.write(`${JSON.stringify(await revokeRecoveryAuthorizationPolicy(dataRoot), null, 2)}\n`);
+    } else if (command === 'lifecycle-grant' && process.argv[3] === 'issue') {
+      const grant = parseLifecycleGrantIssueOptions(process.argv.slice(4));
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type AUTHORIZE IRIS RUNTIME LIFECYCLE GRANT to issue the bounded runtime lifecycle grant: ');
+        if (confirmation.trim() !== 'AUTHORIZE IRIS RUNTIME LIFECYCLE GRANT') throw new Error('Owner runtime lifecycle grant authorization was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await supervisor.issueRuntimeLifecycleGrant(grant), null, 2)}\n`);
+    } else if (command === 'lifecycle-grant' && process.argv[3] === 'status') {
+      const { LifecycleGrantStore } = await import('./lifecycle-grant.js');
+      process.stdout.write(`${JSON.stringify(await new LifecycleGrantStore(dataRoot).read(), null, 2)}\n`);
+    } else if (command === 'lifecycle-grant' && process.argv[3] === 'revoke') {
+      const grantId = process.argv[4];
+      if (grantId === undefined) throw new Error('Usage: iris lifecycle-grant revoke <grant-id>');
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type REVOKE IRIS RUNTIME LIFECYCLE GRANT to revoke the bounded runtime lifecycle grant: ');
+        if (confirmation.trim() !== 'REVOKE IRIS RUNTIME LIFECYCLE GRANT') throw new Error('Owner runtime lifecycle grant revocation was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await supervisor.revokeRuntimeLifecycleGrant(grantId), null, 2)}\n`);
+    } else if (command === 'lifecycle-grant' && process.argv[3] === 'reconcile') {
+      const reconciliation = parseLifecycleGrantReconciliationOptions(process.argv.slice(4));
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type RECONCILE IRIS RUNTIME LIFECYCLE GRANT to close the verified operation: ');
+        if (confirmation.trim() !== 'RECONCILE IRIS RUNTIME LIFECYCLE GRANT') throw new Error('Owner runtime lifecycle grant reconciliation was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await supervisor.reconcileRuntimeLifecycleGrant(reconciliation.grantId, reconciliation.operationId), null, 2)}\n`);
     } else if (command === 'up') {
       printStatus(await supervisor.up());
     } else if (command === 'down') {
@@ -219,7 +247,7 @@ try {
     } else if (command === 'launchd' && process.argv[3] === 'status') {
       process.stdout.write(`${JSON.stringify(await launchAgentStatus(dataRoot), null, 2)}\n`);
     } else {
-      process.stderr.write('Usage: iris <up|down|restart|status|doctor|connectors|connectors admin-bind <tunnel-id>|catalog status|catalog reload|logs|adopt-runtime|runtime-reconcile|startup-reconcile|supervisor|credentials|launchd>\n');
+      process.stderr.write('Usage: iris <up|down|restart|status|doctor|connectors|catalog|logs|adopt-runtime|runtime-reconcile|startup-reconcile|supervisor|credentials|lifecycle-grant|launchd>\n');
       process.exitCode = 2;
     }
   }
@@ -309,6 +337,49 @@ interface RecoveryPolicyLockOptions {
   readonly lockId: string;
   readonly pid: number;
   readonly processStartMarker: string;
+}
+
+interface LifecycleGrantIssueOptions {
+  readonly requestId: string;
+  readonly allowedOperations: readonly ('runtime_on' | 'runtime_off')[];
+  readonly expiresAt: string;
+  readonly maxOperationCount: number;
+}
+
+interface LifecycleGrantReconciliationOptions {
+  readonly grantId: string;
+  readonly operationId: string;
+}
+
+function parseLifecycleGrantIssueOptions(argumentsList: readonly string[]): LifecycleGrantIssueOptions {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (name === undefined || value === undefined || value.length === 0 || !name.startsWith('--') || values.has(name)) throw new Error('Usage: iris lifecycle-grant issue --request-id <uuid> --operations <runtime_on,runtime_off> --expires-at <ISO-8601> --max-operations <n>');
+    values.set(name, value);
+  }
+  const required = (name: string): string => values.get(name) ?? (() => { throw new Error('Usage: iris lifecycle-grant issue --request-id <uuid> --operations <runtime_on,runtime_off> --expires-at <ISO-8601> --max-operations <n>'); })();
+  const allowed = new Set(['--request-id', '--operations', '--expires-at', '--max-operations']);
+  if ([...values.keys()].some((name) => !allowed.has(name))) throw new Error('Usage: iris lifecycle-grant issue --request-id <uuid> --operations <runtime_on,runtime_off> --expires-at <ISO-8601> --max-operations <n>');
+  const operations = required('--operations').split(',').map((value) => value.trim()) as LifecycleGrantIssueOptions['allowedOperations'];
+  const maxOperationCount = Number(required('--max-operations'));
+  if (!Number.isSafeInteger(maxOperationCount)) throw new Error('Lifecycle grant max operations must be an integer');
+  return { requestId: required('--request-id'), allowedOperations: operations, expiresAt: required('--expires-at'), maxOperationCount };
+}
+
+function parseLifecycleGrantReconciliationOptions(argumentsList: readonly string[]): LifecycleGrantReconciliationOptions {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (name === undefined || value === undefined || value.length === 0 || !name.startsWith('--') || values.has(name)) throw new Error('Usage: iris lifecycle-grant reconcile --grant-id <uuid> --operation-id <id>');
+    values.set(name, value);
+  }
+  const grantId = values.get('--grant-id');
+  const operationId = values.get('--operation-id');
+  if (grantId === undefined || operationId === undefined || [...values.keys()].some((name) => !new Set(['--grant-id', '--operation-id']).has(name))) throw new Error('Usage: iris lifecycle-grant reconcile --grant-id <uuid> --operation-id <id>');
+  return { grantId, operationId };
 }
 
 function parseRecoveryPolicyIssueOptions(argumentsList: readonly string[]): RecoveryPolicyIssueOptions {

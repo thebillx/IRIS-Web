@@ -40,12 +40,21 @@ export interface SupervisorWorkloadCallContext {
   readonly requestId?: string;
 }
 
+export interface LifecycleGrantCall {
+  readonly grantId: string;
+  readonly requestId: string;
+  readonly operationId: string;
+  readonly tunnelId: string;
+}
+
 export interface SupervisorNativeOperations {
   supervisorStatus(): Promise<unknown>;
   supervisorDoctor?: () => Promise<unknown>;
   runtimeStatus?: () => Promise<unknown>;
   runtimeOn?: () => Promise<unknown>;
   runtimeOff?: () => Promise<unknown>;
+  runtimeOnAuthorized?: (input: LifecycleGrantCall) => Promise<unknown>;
+  runtimeOffAuthorized?: (input: LifecycleGrantCall) => Promise<unknown>;
   readonly listProjects?: () => Promise<unknown>;
   readonly projectInfo?: (projectId: string) => Promise<unknown>;
   readonly workloadToolDefinitions?: () => readonly Record<string, unknown>[];
@@ -214,17 +223,27 @@ async function handleRequest(
       return;
     }
     if (name === 'runtime_on') {
-      requireNoArguments(args);
-      if (!ownerAuthenticated) throw new RuntimeError('CONTROL_DENIED', 'Runtime lifecycle requires the owner control-plane credential');
-      if (operations.runtimeOn === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime lifecycle is unavailable');
-      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOn()));
+      if (ownerAuthenticated) {
+        requireNoArguments(args);
+        if (operations.runtimeOn === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime lifecycle is unavailable');
+        writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOn()));
+      } else {
+        if (!tunnelAuthenticated || operations.runtimeOnAuthorized === undefined) throw new RuntimeError('CONTROL_DENIED', 'Runtime lifecycle requires an owner-bound lifecycle grant');
+        if (Object.keys(args).length === 0) throw new RuntimeError('CONTROL_DENIED', 'Runtime lifecycle requires an owner-bound lifecycle grant');
+        writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOnAuthorized(lifecycleGrantCall(args))));
+      }
       return;
     }
     if (name === 'runtime_off') {
-      requireNoArguments(args);
-      if (!ownerAuthenticated) throw new RuntimeError('CONTROL_DENIED', 'Runtime lifecycle requires the owner control-plane credential');
-      if (operations.runtimeOff === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime lifecycle is unavailable');
-      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOff()));
+      if (ownerAuthenticated) {
+        requireNoArguments(args);
+        if (operations.runtimeOff === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Runtime lifecycle is unavailable');
+        writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOff()));
+      } else {
+        if (!tunnelAuthenticated || operations.runtimeOffAuthorized === undefined) throw new RuntimeError('CONTROL_DENIED', 'Runtime lifecycle requires an owner-bound lifecycle grant');
+        if (Object.keys(args).length === 0) throw new RuntimeError('CONTROL_DENIED', 'Runtime lifecycle requires an owner-bound lifecycle grant');
+        writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOffAuthorized(lifecycleGrantCall(args))));
+      }
       return;
     }
     if (name === 'list_projects') {
@@ -317,13 +336,13 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
     {
       name: 'runtime_on',
       description: 'Start only the governed workload Runtime; Supervisor and connector processes remain unchanged.',
-      inputSchema: noArgs,
+      inputSchema: lifecycleGrantInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
     {
       name: 'runtime_off',
       description: 'Stop only the governed workload Runtime; Supervisor and connector processes remain unchanged.',
-      inputSchema: noArgs,
+      inputSchema: lifecycleGrantInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
     {
@@ -387,6 +406,17 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
   ];
 }
 
+const lifecycleGrantInputSchema = {
+  type: 'object',
+  properties: {
+    grantId: { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' },
+    requestId: { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' },
+    operationId: { type: 'string', minLength: 1, maxLength: 200 },
+    tunnelId: { type: 'string', minLength: 1, maxLength: 200 },
+  },
+  additionalProperties: false,
+};
+
 function adminRecycleArguments(args: Record<string, unknown>): AdminRecycleInput {
   assertAllowedKeys(args, ['expectedAdminIdentity', 'expectedAdminProfileDigest']);
   const expectedAdminIdentity = optionalBoundedString(args, 'expectedAdminIdentity', 300);
@@ -398,6 +428,20 @@ function adminRecycleArguments(args: Record<string, unknown>): AdminRecycleInput
     ...(expectedAdminIdentity === undefined ? {} : { expectedAdminIdentity }),
     ...(expectedAdminProfileDigest === undefined ? {} : { expectedAdminProfileDigest }),
   };
+}
+
+function lifecycleGrantCall(args: Record<string, unknown>): LifecycleGrantCall {
+  const grantId = args.grantId;
+  const requestId = args.requestId;
+  const operationId = args.operationId;
+  const tunnelId = args.tunnelId;
+  if (typeof grantId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(grantId)
+    || typeof requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(requestId)
+    || typeof operationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(operationId)
+    || typeof tunnelId !== 'string' || tunnelId.length === 0 || tunnelId.length > 200) {
+    throw new RuntimeError('INVALID_REQUEST', 'Owner-bound lifecycle grant arguments are invalid');
+  }
+  return { grantId, requestId, operationId, tunnelId };
 }
 
 function adminTunnelRecycleArguments(args: Record<string, unknown>): AdminTunnelRecycleInput {
