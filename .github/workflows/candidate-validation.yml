@@ -27,8 +27,8 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: 7cf48ab77004fdc6db438d11512a8d9ba0255f8a
-      APPROVED_TARGET_TREE: c84fb0b3f633edb77a1337d7ff9bda063fe2ed89
+      APPROVED_TARGET_SHA: 521aa3ad003abe4ddfd24498de313e01725ea5c5
+      APPROVED_TARGET_TREE: ff2e0857fa45ee31efd3017472e2839519406641
       BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
     steps:
       - name: Validate the approved target
@@ -83,6 +83,7 @@ jobs:
             src/supervisor-daemon-exit.test.ts \
             src/supervisor-failure-stop.test.ts \
             src/lifecycle-grant.test.ts \
+            src/mcp-v21.test.ts \
             --testTimeout=30000
 
       - name: Run Supervisor and repository authority regressions
