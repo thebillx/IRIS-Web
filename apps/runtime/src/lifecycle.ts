@@ -10,6 +10,8 @@ import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { readEndpoint, readRuntimeControl, type EndpointDocument, type RuntimeControlDocument } from './persistence.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
 
+import { confirmChildSpawn } from './spawn-outcome.js';
+
 export interface RuntimeObservedStatus {
   readonly state: 'running' | 'stopped' | 'stale' | 'indeterminate';
   readonly endpoint: EndpointDocument | null;
@@ -18,6 +20,7 @@ export interface RuntimeObservedStatus {
 }
 
 export interface StartRuntimeOptions {
+  readonly onSpawn?: (pid: number) => Promise<void>;
   readonly dataRoot?: string;
   readonly preferredPort?: number;
   readonly startupDeadlineMs?: number;
@@ -148,7 +151,10 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
     stdio: 'ignore',
     env: runtimeChildEnvironment(dataRoot, options.preferredPort, process.env, options.protectedReferenceRoot),
   });
+  child.on('error', () => undefined);
   child.unref();
+  const pid = await confirmChildSpawn(child);
+  await options.onSpawn?.(pid);
   return waitForRunningRuntime(
     dataRoot,
     options.startupDeadlineMs ?? 10_000,

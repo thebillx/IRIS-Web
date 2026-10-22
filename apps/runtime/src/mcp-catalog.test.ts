@@ -24,20 +24,22 @@ describe('canonical MCP catalog', () => {
     const v25 = catalogIdentityAtVersion('PRO', definitions, '2.5.0');
     const v26 = catalogIdentityAtVersion('PRO', definitions, '2.6.0');
     const v27 = catalogIdentityAtVersion('PRO', definitions, '2.7.0');
+    const v28 = catalogIdentityAtVersion('PRO', definitions, '2.8.0');
 
     expect(v23).toMatchObject({ profile: 'PRO', catalogVersion: '2.3.0', toolCount: 5 });
     expect(v24).toMatchObject({ profile: 'PRO', catalogVersion: '2.4.0', toolCount: 5 });
     expect(v25).toMatchObject({ profile: 'PRO', catalogVersion: '2.5.0', toolCount: 5 });
     expect(v26).toMatchObject({ profile: 'PRO', catalogVersion: '2.6.0', toolCount: 5 });
     expect(v27).toMatchObject({ profile: 'PRO', catalogVersion: '2.7.0', toolCount: 5 });
+    expect(v28).toMatchObject({ profile: 'PRO', catalogVersion: '2.8.0', toolCount: 5 });
     expect(v23.catalogHash).toBe('sha256:8952f22b28a5fc43b99a215455a024a7d422acb8d0da7d5d4f4b037e73e9f363');
     expect(v24.catalogHash).toBe('sha256:93f69d86d1b010b7ad7756c186d93dd4edf59cdb17cbc93fd308c72c2f303e09');
     expect(v23.catalogHash).not.toBe(v24.catalogHash);
     expect(v24.catalogHash).not.toBe(v25.catalogHash);
     expect(v25.catalogHash).not.toBe(v26.catalogHash);
     expect(v26.catalogHash).not.toBe(v27.catalogHash);
-    expect(MCP_CATALOG_VERSION).toBe('2.7.0');
-    expect(catalogIdentity('PRO', definitions)).toEqual(v27);
+    expect(MCP_CATALOG_VERSION).toBe('2.8.0');
+    expect(catalogIdentity('PRO', definitions)).toEqual(v28);
   });
 
   it('keeps the exact read-only PRO allowlist separate from governed FULL tools', () => {
@@ -58,5 +60,11 @@ describe('canonical MCP catalog', () => {
     const definitions = fullMcpToolDefinitionsV21().toReversed();
     expect(orderToolDefinitions('FULL', definitions).map((definition) => definition.name)).toEqual(catalogToolNames('FULL'));
     expect(orderToolDefinitions('FULL', [...definitions, { name: 'unregistered_tool' }]).map((definition) => definition.name)).toEqual(catalogToolNames('FULL'));
+  });
+
+  it('keeps mission delegation controls discoverable in the governed FULL catalog', () => {
+    const names = orderToolDefinitions('FULL', fullMcpToolDefinitionsV21()).map((definition) => definition.name);
+    expect(names).toContain('mission_delegation_issue');
+    expect(names).toContain('mission_delegation_revoke');
   });
 });

@@ -7,6 +7,7 @@ import { createAgentExecutorFromEnvironment } from './agent-executor.js';
 import { CapabilityService } from './capability-service.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
+import { MissionDelegationStore, readVerifiedSourceIdentity } from './mission-delegation.js';
 import { FoundationStateStore, loadOrCreateOwnerAccessSecret, loadOrCreateRuntimeId, removeEndpointIfInstance, removeRuntimeControlIfInstance, writeEndpoint, writeRuntimeControl } from './persistence.js';
 import { loadOrCreateTunnelServiceSecret } from './credentials.js';
 import { inspectConnectorRegistry } from './connector-registry.js';
@@ -114,7 +115,16 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     const permissionSettings = new PermissionSettingsStore(dataRoot);
     await permissionSettings.initialize();
     const sourceRoot = await resolveSourceRoot();
-    const permissionPolicy = new PermissionPolicyEngine(state, permissionSettings, sourceRoot, dataRoot);
+    let startupSource;
+    let sourceVerificationFailed = false;
+    try {
+      startupSource = await readVerifiedSourceIdentity(sourceRoot);
+    } catch {
+      startupSource = undefined;
+      sourceVerificationFailed = true;
+    }
+    const missionDelegations = new MissionDelegationStore(dataRoot, sourceRoot, startupSource, sourceVerificationFailed);
+    const permissionPolicy = new PermissionPolicyEngine(state, permissionSettings, sourceRoot, dataRoot, undefined, missionDelegations);
     const permissionAudit = new PermissionAuditStore(dataRoot);
     const controlSecret = randomBytes(32).toString('base64url');
 
@@ -161,6 +171,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       durableJobs,
       multiWorker,
       new AdoRequirementContextService(dataRoot),
+      missionDelegations,
     );
 
     const doctor = async (): Promise<DoctorReport> => {
