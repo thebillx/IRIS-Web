@@ -27,8 +27,8 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: 0175e83b09e9dc0fa47246776ca72dc641cc6622
-      APPROVED_TARGET_TREE: f662b176040d32edf6dcaf9a0b5b4f81b7098d10
+      APPROVED_TARGET_SHA: a4242f89f964b5fa8b74993c213cd0e1a98f9cbc
+      APPROVED_TARGET_TREE: 1025c84ae8514b5b5d790ee62b303002a243df23
       BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
     steps:
       - name: Validate the approved target
@@ -147,3 +147,11 @@ jobs:
         run: |
           pnpm --filter @iris/runtime exec vitest run src/mcp-v21.test.ts src/supervisor-native-control.test.ts --testTimeout=60000
           pnpm --filter @iris/runtime exec tsx src/control-setup.test.ts
+
+      - name: Run unified setup and durable mutation regressions
+        run: |
+          pnpm --filter @iris/runtime exec vitest run \
+            src/connector-registry.test.ts \
+            src/durable-mutation-journal.test.ts \
+            src/phase4-git-worktree.test.ts \
+            --testTimeout=180000
