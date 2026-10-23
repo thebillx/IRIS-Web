@@ -28,6 +28,7 @@ import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorA
 import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput, type LifecycleGrantCall, type SupervisorWorkloadCallContext } from './supervisor-native-control.js';
 import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, readRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
 import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
+import { DurableMutationJournal } from './durable-mutation-journal.js';
 
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
 import { readSupervisorStateFile, writeSupervisorStateFile, unresolvedStartup, validStartupOperations, type StartupOperation, type StartupState } from './supervisor-startup.js';
@@ -57,6 +58,10 @@ const FORWARDED_DURABLE_MUTATION_TOOLS = new Set(['project_validation_start']);
 
 const FORWARDED_GROUPED_READ_ONLY_TOOLS = new Set(['workspace', 'fs', 'artifact', 'job', 'git']);
 
+function isUnifiedConnectorRegistry(registry: ConnectorRegistryDocument): boolean {
+  return registry.admin === null && registry.connectors.length === 1 && registry.connectors[0]?.label === 'IRIS';
+}
+
 function groupedWorkloadReadOnly(name: string, args: Record<string, unknown>): boolean {
   const operation = args.operation;
   if (typeof operation !== 'string') return false;
@@ -71,7 +76,14 @@ function groupedWorkloadReadOnly(name: string, args: Record<string, unknown>): b
 }
 
 function groupedWorkloadDurableMutation(name: string, args: Record<string, unknown>): boolean {
-  return name === 'shell' && args.operation === 'start' && typeof args.requestId === 'string' && args.requestId.length > 0 && args.requestId.length <= 200;
+  if (typeof args.operation !== 'string') return false;
+  if (name === 'workspace') return args.operation === 'create_scratch' || args.operation === 'revoke_scratch';
+  if (name === 'fs') return ['write', 'edit', 'mkdir', 'delete'].includes(args.operation);
+  if (name === 'artifact') return args.operation === 'register_existing' || args.operation === 'release';
+  if (name === 'shell') return args.operation === 'run' || args.operation === 'start';
+  if (name === 'job') return args.operation === 'cancel';
+  if (name === 'git') return ['branch_create', 'worktree_add', 'worktree_remove', 'add', 'commit', 'fetch', 'push'].includes(args.operation);
+  return false;
 }
 
 export type StackState = 'READY' | 'DEGRADED' | 'FAILED' | 'UNKNOWN';
@@ -250,6 +262,7 @@ export class Supervisor {
   private runtimeKeepAwakeLease: KeepAwakeLease | null = null;
   private ownerKeepAwakeLease: KeepAwakeLease | null = null;
   private readonly lifecycleGrants: LifecycleGrantStore;
+  private readonly workloadMutationJournal: DurableMutationJournal;
 
   public constructor(
     public readonly dataRoot: string,
@@ -263,6 +276,7 @@ export class Supervisor {
     keepAwakeProvider: KeepAwakeProvider = new MacOSCaffeinateProvider(),
   ) {
     this.lifecycleGrants = new LifecycleGrantStore(dataRoot);
+    this.workloadMutationJournal = new DurableMutationJournal(dataRoot);
     this.keepAwake = new KeepAwakeLeaseManager(keepAwakeProvider);
     this.keepAwakePreference = new KeepAwakePreferenceStore(dataRoot);
     for (const [label, port] of [
@@ -502,6 +516,7 @@ export class Supervisor {
     await loadOrCreateTunnelServiceSecret(this.dataRoot);
     const runtimeId = await loadOrCreateRuntimeId(this.dataRoot);
     const boundRegistry = await bindConnectorRuntime(this.dataRoot, runtimeId);
+    const unified = isUnifiedConnectorRegistry(boundRegistry);
     const registryChanged = registryResult.changed || boundRegistry.deploymentEpoch !== registryResult.registry.deploymentEpoch;
     let state = await this.readState();
     const started: Array<'runtime' | 'web' | 'admin' | 'full' | 'pro' | 'admin-tunnel'> = [];
@@ -582,13 +597,15 @@ export class Supervisor {
 
       state = await this.ensureAdmin(state, started);
       const profiles = await this.writeManagedProfiles(boundRegistry, runtime.endpoint.apiUrl);
-      if (this.nativeControlActive) {
+      if (this.nativeControlActive && !unified) {
         if (profiles.admin === null) throw new RuntimeError('PRECONDITION_FAILED', 'Persistent native supervisor control requires a dedicated ADMIN tunnel identity');
         state = await this.ensureAdminTunnel(state, boundRegistry, profiles.admin, started);
       }
       state = await this.ensureWeb(state, runtime.endpoint.apiUrl, started, runtimeReplaced, expectedSourceIdentity);
       state = await this.ensureTunnel(state, 'full', boundRegistry, profiles.full, runtime.endpoint.instanceId, started, runtimeReplaced);
-      state = await this.ensureTunnel(state, 'pro', boundRegistry, profiles.pro, runtime.endpoint.instanceId, started, runtimeReplaced);
+      if (!unified && profiles.pro !== null) {
+        state = await this.ensureTunnel(state, 'pro', boundRegistry, profiles.pro, runtime.endpoint.instanceId, started, runtimeReplaced);
+      }
       await this.writeState(state);
       const result = await this.statusFrom(state, boundRegistry, credentials);
       if (result.localRuntime.state === 'FAILED' || result.tunnel.state === 'FAILED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `IRIS stack did not reach local and tunnel readiness: ${JSON.stringify({ runtime: result.runtime, localRuntime: result.localRuntime, tunnel: result.tunnel, connectors: result.connectors })}`);
@@ -1123,17 +1140,19 @@ export class Supervisor {
     };
     if (context.sessionId !== undefined) headers['x-iris-session-id'] = context.sessionId;
     if (requestId !== undefined) headers['x-iris-request-id'] = requestId;
-    const response = await postJson(`${endpoint.apiUrl}/mcp`, {
-      jsonrpc: '2.0', id: requestId ?? randomUUID(), method: 'tools/call', params: { name, arguments: args },
-    }, headers);
-    if (!isRecord(response) || !isRecord(response.result)) {
-      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Authenticated workload MCP outcome is unknown; reconcile its durable request or job state before retrying');
-    }
-    const result = response.result;
-    return {
-      structuredContent: result.structuredContent ?? null,
-      isError: result.isError === true,
+    const call = async (): Promise<SupervisorAdminToolCallResult> => {
+      const response = await postJson(`${endpoint.apiUrl}/mcp`, {
+        jsonrpc: '2.0', id: requestId ?? randomUUID(), method: 'tools/call', params: { name, arguments: args },
+      }, headers);
+      if (!isRecord(response) || !isRecord(response.result)) {
+        throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Authenticated workload MCP outcome is unknown; reconcile its durable request or job state before retrying');
+      }
+      const result = response.result;
+      return { structuredContent: result.structuredContent ?? null, isError: result.isError === true };
     };
+    if (!mutation || requestId === undefined) return call();
+    const fingerprint = createHash('sha256').update(stableJson({ name, args, clientId: context.clientId, sessionId: context.sessionId, projectId: args.projectId ?? null, workspaceId: args.workspaceId ?? null })).digest('hex');
+    return this.workloadMutationJournal.execute(requestId, fingerprint, call);
   }
 
   public async doctor(): Promise<Record<string, unknown>> {
@@ -1385,6 +1404,7 @@ export class Supervisor {
     const runtimeProbe = await this.probeOwnedRuntime(state, state.runtime);
     const observed = runtimeProbe.observed;
     const registry = registryInspection?.registry ?? null;
+    const unified = registry !== null && isUnifiedConnectorRegistry(registry);
     const expectedAdminEnvironmentDigest = launchEnvironmentDigest(
       supervisorAdminChildEnvironment(this.dataRoot, this.adminPort, this.protectedReferenceRoot),
     );
@@ -1442,11 +1462,11 @@ export class Supervisor {
       && admin.deploymentEpoch === registry?.deploymentEpoch;
     const fullBinding = registry?.connectors.find((binding) => binding.mode === 'FULL') ?? null;
     const proBinding = registry?.connectors.find((binding) => binding.mode === 'PRO') ?? null;
-    const machineBindingCoherent = machineId !== null && registry !== null && registry.admin !== null
+    const machineBindingCoherent = machineId !== null && registry !== null
       && registry.connectors.every((binding) => binding.machineId === machineId)
-      && registry.admin.machineId === machineId;
+      && (unified || (registry.admin !== null && registry.admin.machineId === machineId));
     const connectorBindingCoherent = machineId !== null && observed.endpoint !== null
-      && fullBinding !== null && proBinding !== null
+      && fullBinding !== null && (unified || proBinding !== null)
       && registry?.connectors.every((binding) => binding.machineId === machineId
         && binding.runtimeId === observed.endpoint?.runtimeId
         && binding.deploymentEpoch === registry.deploymentEpoch
@@ -1456,11 +1476,11 @@ export class Supervisor {
       && state.tunnels.full.runtimeId === observed.endpoint.runtimeId
       && state.tunnels.full.instanceId === observed.endpoint.instanceId
       && state.tunnels.full.deploymentEpoch === registry.deploymentEpoch
-      && state.tunnels.pro?.tunnelId === proBinding.tunnelId
-      && state.tunnels.pro.profilePath === proBinding.managedProfilePath
-      && state.tunnels.pro.runtimeId === observed.endpoint.runtimeId
-      && state.tunnels.pro.instanceId === observed.endpoint.instanceId
-      && state.tunnels.pro.deploymentEpoch === registry.deploymentEpoch;
+      && (unified || (state.tunnels.pro?.tunnelId === proBinding?.tunnelId
+        && state.tunnels.pro?.profilePath === proBinding?.managedProfilePath
+        && state.tunnels.pro?.runtimeId === observed.endpoint.runtimeId
+        && state.tunnels.pro?.instanceId === observed.endpoint.instanceId
+        && state.tunnels.pro?.deploymentEpoch === registry.deploymentEpoch));
     const adminTunnelBindingCoherent = registry?.admin !== null && registry?.admin !== undefined
       && machineId !== null
       && registry.admin.machineId === machineId
@@ -1482,17 +1502,17 @@ export class Supervisor {
       [!runtimeOwnershipVerified, 'RUNTIME_OWNERSHIP_UNVERIFIED'],
       [!runtimeListenerOwnershipVerified, 'RUNTIME_LISTENER_OWNERSHIP_UNVERIFIED'],
       [!connectorBindingCoherent, 'CONNECTOR_BINDING_MISMATCH'],
-      [!fullTunnelOwnershipVerified || !proTunnelOwnershipVerified, 'WORKLOAD_TUNNEL_OWNERSHIP_UNVERIFIED'],
+      [!fullTunnelOwnershipVerified || (!unified && !proTunnelOwnershipVerified), 'WORKLOAD_TUNNEL_OWNERSHIP_UNVERIFIED'],
       [!adminOwnershipVerified, 'ADMIN_OWNERSHIP_UNVERIFIED'],
       [!adminSourceCoherent, 'ADMIN_SOURCE_MISMATCH'],
       [!adminListenerOwnershipVerified, 'ADMIN_LISTENER_OWNERSHIP_UNVERIFIED'],
       [!adminEnvironmentCoherent, 'ADMIN_ENVIRONMENT_MISMATCH'],
       [!adminAuthenticated, 'ADMIN_READINESS_UNVERIFIED'],
       [!adminIdentityCoherent, 'ADMIN_IDENTITY_MISMATCH'],
-      [!adminTunnelOwnershipVerified, 'ADMIN_TUNNEL_OWNERSHIP_UNVERIFIED'],
-      [!adminTunnelListenerOwnershipVerified, 'ADMIN_TUNNEL_LISTENER_OWNERSHIP_UNVERIFIED'],
-      [!adminTunnelBindingCoherent, 'ADMIN_TUNNEL_BINDING_MISMATCH'],
-      [adminTunnelStatus.state !== 'READY', 'ADMIN_TUNNEL_NOT_READY'],
+      [!unified && !adminTunnelOwnershipVerified, 'ADMIN_TUNNEL_OWNERSHIP_UNVERIFIED'],
+      [!unified && !adminTunnelListenerOwnershipVerified, 'ADMIN_TUNNEL_LISTENER_OWNERSHIP_UNVERIFIED'],
+      [!unified && !adminTunnelBindingCoherent, 'ADMIN_TUNNEL_BINDING_MISMATCH'],
+      [!unified && adminTunnelStatus.state !== 'READY', 'ADMIN_TUNNEL_NOT_READY'],
     ];
     const readinessCode = readinessFailures.find(([failed]) => failed)?.[1] ?? 'READY';
     return {
@@ -1525,12 +1545,12 @@ export class Supervisor {
       runtimeListenerOwnershipVerified,
       adminOwnershipVerified,
       fullTunnelOwnershipVerified,
-      proTunnelOwnershipVerified,
+      proTunnelOwnershipVerified: unified ? true : proTunnelOwnershipVerified,
       adminTunnelOwnershipVerified,
       adminTunnelListenerOwnershipVerified,
       machineBindingCoherent,
       connectorBindingCoherent,
-      adminTunnelBindingCoherent,
+      adminTunnelBindingCoherent: unified ? true : adminTunnelBindingCoherent,
       keepAwakePreferenceEnabled: keepAwakePreference.enabled,
       keepAwakePreferenceUpdatedAt: keepAwakePreference.updatedAt,
       keepAwakeRequested: keepAwakeObserved.requested,
@@ -2017,12 +2037,14 @@ export class Supervisor {
         : layer('FAILED', runtime.reason === 'STALE_AUTHORITY' ? 'RUNTIME_IDENTITY_MISMATCH' : 'SUPERVISOR_NOT_RUNNING', runtime.reason ?? 'IRIS runtime is not supervisor-owned');
     const webLayer = await this.probeWeb(state.web);
     const adminLayer = await this.probeAdmin(state.admin);
-    const tunnelResults = await Promise.all([
-      this.probeTunnel(state.tunnels.full, registry.connectors.find((connector) => connector.connectorId === 'iris-full') ?? null),
-      this.probeTunnel(state.tunnels.pro, registry.connectors.find((connector) => connector.connectorId === 'iris-pro') ?? null),
-    ]);
-    const tunnelLayer = tunnelResults.every((result) => result.state === 'READY') ? layer('READY', 'READY', 'FULL and PRO workload tunnel clients are healthy') : combineLayers(tunnelResults, 'TUNNEL_NOT_RUNNING', 'One or more supervisor-owned workload tunnel clients is not ready');
-    const isolatedAdminRequired = this.nativeControlActive || state.adminTunnel !== null;
+    const unified = isUnifiedConnectorRegistry(registry);
+    const fullTunnel = await this.probeTunnel(state.tunnels.full, registry.connectors.find((connector) => connector.connectorId === 'iris-full') ?? null);
+    const proTunnel = unified ? layer('READY', 'UNIFIED_CONNECTOR', 'ONE IRIS uses one public connector') : await this.probeTunnel(state.tunnels.pro, registry.connectors.find((connector) => connector.connectorId === 'iris-pro') ?? null);
+    const tunnelResults = [fullTunnel, proTunnel] as const;
+    const tunnelLayer = unified
+      ? fullTunnel
+      : tunnelResults.every((result) => result.state === 'READY') ? layer('READY', 'READY', 'FULL and PRO workload tunnel clients are healthy') : combineLayers(tunnelResults, 'TUNNEL_NOT_RUNNING', 'One or more supervisor-owned workload tunnel clients is not ready');
+    const isolatedAdminRequired = (this.nativeControlActive || state.adminTunnel !== null) && !unified;
     const adminTunnelLayer = isolatedAdminRequired
       ? (await this.probeAdminTunnel(durableState, durableState.adminTunnel, true)).status
       : layer('READY', 'LEGACY_ADMIN_TRANSPORT', 'Isolated admin tunnel is required only for the persistent native supervisor daemon');
@@ -2034,7 +2056,7 @@ export class Supervisor {
     const controlPlane = controlPlaneParts.every((result) => result.state === 'READY')
       ? layer('READY', 'READY', 'Workload tunnels, isolated admin tunnel, and persistent supervisor-admin endpoint are healthy')
       : combineLayers(controlPlaneParts, 'CONTROL_PLANE_UNREACHABLE', 'Control-plane readiness is not proven for workload and isolated admin transport');
-    const connectorStatuses = registry.connectors.map((binding) => connectorStatus(binding, local.connectors.find((entry) => entry.connectorId === binding.connectorId), tunnelResults[binding.connectorId === 'iris-full' ? 0 : 1]));
+    const connectorStatuses = registry.connectors.map((binding) => connectorStatus(binding, local.connectors.find((entry) => entry.connectorId === binding.connectorId), binding.connectorId === 'iris-full' ? fullTunnel : proTunnel));
     const e2e = layer('UNKNOWN', 'E2E_PROBE_UNAVAILABLE', 'No safe remote connector probe is configured; /readyz is not treated as end-to-end proof');
     const stateValue = runtimeLayer.state === 'FAILED' || local.status.state === 'FAILED' || tunnelLayer.state === 'FAILED' ? 'FAILED'
       : e2e.state === 'UNKNOWN' || webLayer.state !== 'READY' ? 'DEGRADED' : 'READY';
@@ -2467,16 +2489,18 @@ export class Supervisor {
     }
   }
 
-  private async writeManagedProfiles(registry: ConnectorRegistryDocument, runtimeApiUrl: string): Promise<{ readonly full: string; readonly pro: string; readonly admin: string | null }> {
+  private async writeManagedProfiles(registry: ConnectorRegistryDocument, runtimeApiUrl: string): Promise<{ readonly full: string; readonly pro: string | null; readonly admin: string | null }> {
     const credentials = credentialPaths(this.dataRoot);
     const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
     const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
-    if (full === undefined || pro === undefined) throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'FULL and PRO connector bindings are required');
+    if (full === undefined) throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'A workload connector binding is required');
     const fullPath = full.managedProfilePath;
-    const proPath = pro.managedProfilePath;
+    const proPath = pro?.managedProfilePath ?? null;
     const adminPath = registry.admin?.managedProfilePath ?? null;
     await writePrivateText(fullPath, managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
-    await writePrivateText(proPath, managedProfile(pro, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
+    if (pro !== undefined && proPath !== null) {
+      await writePrivateText(proPath, managedProfile(pro, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
+    }
     if (registry.admin !== null && adminPath !== null) {
       await writePrivateText(adminPath, managedAdminProfile(registry.admin, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), this.adminTunnelHealthPort, `http://127.0.0.1:${this.supervisorControlPort}/mcp`));
     }
@@ -4121,6 +4145,12 @@ function recoveryWindowExpired(record: RecoveryRecord): boolean {
 }
 
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
 
 async function listenerReleased(port: number): Promise<boolean> {
   return new Promise((resolve) => {

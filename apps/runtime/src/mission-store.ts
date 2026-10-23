@@ -117,12 +117,16 @@ export class MissionLedgerStore {
     };
     const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
+    const publish = async (): Promise<void> => {
       handle = await open(filename, flags, 0o600);
       await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, 'utf8');
       await handle.sync();
       await handle.close();
       handle = undefined;
+    };
+    try {
+      if (this.safety === undefined) await publish();
+      else await this.safety.runMutation('mission-state', publish);
     } catch (error) {
       await handle?.close().catch(() => undefined);
       const raced = await inspectPrivateRegularFile(filename, 'Archived mission record');

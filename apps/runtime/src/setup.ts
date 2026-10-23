@@ -30,13 +30,10 @@ export async function guidedSetup(supervisor: Supervisor, dataRoot: string, opti
     };
   }
 
-  if (options.unifiedTunnelId !== undefined && options.start) {
-    throw new Error('Unified ONE IRIS setup publishes the connector first; Runtime activation requires the governed unified lifecycle path');
-  }
   const prepared = await supervisor.runSetupExclusive(() => prepareSetup(dataRoot, options));
   // A fresh ONE IRIS registry is publishable before Runtime activation; the
   // legacy status path requires FULL/PRO bindings and must not be used here.
-  const status = options.unifiedTunnelId !== undefined && !options.start ? null : options.start ? await supervisor.up() : await supervisor.status();
+  const status = options.start ? await supervisor.up() : await supervisor.status();
   return {
     status: options.start ? (status!.state === 'READY' ? 'READY' : 'NEEDS_ATTENTION') : 'READY_TO_START',
     repeated: prepared.repeated,
@@ -89,6 +86,13 @@ function requiredTunnelId(value: string | undefined): string {
 
 function assertRequestedBindings(registry: Awaited<ReturnType<typeof readConnectorRegistry>>, options: GuidedSetupOptions): void {
   if (registry === null) throw new Error('IRIS connector registry is not initialized');
+  const unified = registry.connectors.length === 1 && registry.connectors[0]?.label === 'IRIS';
+  if (options.unifiedTunnelId !== undefined) {
+    if (!unified || registry.connectors[0]?.tunnelId !== options.unifiedTunnelId || registry.admin !== null) {
+      throw new Error('Existing connector bindings do not match the requested setup identity');
+    }
+    return;
+  }
   const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
   const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
   if ((options.fullTunnelId !== undefined && full?.tunnelId !== options.fullTunnelId)

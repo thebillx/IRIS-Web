@@ -59,6 +59,7 @@ test('setup creates one public ONE IRIS binding without legacy tunnel IDs', asyn
   const second = JSON.parse((await runSetup(dataRoot, '--one-tunnel-id', oneTunnelId)).stdout) as { repeated: boolean; connectors: Array<{ connectorId: string; tunnelId: string }> };
   assert.equal(second.repeated, true);
   assert.deepEqual(second.connectors, first.connectors);
+  await assert.rejects(runSetup(dataRoot, '--one-tunnel-id', 'tunnel_ffffffffffffffffffffffffffffffff'));
 });
 
 test('setup keeps two disposable installations isolated and rejects binding replacement', async () => {
