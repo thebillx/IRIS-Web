@@ -31,6 +31,26 @@ describe('connector registry', () => {
     }, 1);
     expect(unifiedConnectorBinding(registry)).toBeNull();
   });
+
+  it('creates one first-class ONE IRIS binding for a fresh installation', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-registry-unified-'));
+    roots.push(dataRoot);
+    const tunnelId = 'tunnel_dddddddddddddddddddddddddddddddd';
+    const created = await initializeConnectorRegistry(dataRoot, { unified: true, fullTunnelId: tunnelId });
+    expect(created.connectors).toHaveLength(1);
+    expect(created.connectors[0]).toMatchObject({ connectorId: 'iris-full', label: 'IRIS', tunnelId, mcpPath: '/mcp' });
+    expect(created.admin).toBeNull();
+    expect(unifiedConnectorBinding(created)).toMatchObject({ connectorId: 'iris-one-iris', tunnelId, mcpPath: '/mcp' });
+    expect((await readConnectorRegistry(dataRoot))?.connectors).toHaveLength(1);
+    expect(() => createConnectorRegistry(dataRoot, { unified: true, fullTunnelId: tunnelId, proTunnelId: tunnelId }, 1)).toThrow(/one public tunnel/);
+  });
+
+  it('rejects adding a second public binding to a unified installation', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-registry-unified-fence-'));
+    roots.push(dataRoot);
+    await initializeConnectorRegistry(dataRoot, { unified: true, fullTunnelId: 'tunnel_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' });
+    await expect(bindAdminTunnelIdentity(dataRoot, 'tunnel_ffffffffffffffffffffffffffffffff')).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+  });
   it('persists distinct FULL and PRO bindings and bumps deployment when runtime ownership changes', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-registry-'));
     roots.push(dataRoot);

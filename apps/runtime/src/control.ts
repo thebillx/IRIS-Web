@@ -470,9 +470,10 @@ function parseRecoveryPolicyLockOptions(argumentsList: readonly string[]): Recov
 }
 
 const LAUNCHD_INSTALL_USAGE = 'Usage: iris launchd install --recovery-policy-id <uuid> --request-id <uuid> --source-sha <commit> --source-tree <tree> [--runtime-data-root <external-directory>] [--protected-reference-root <existing-directory>]';
-const SETUP_USAGE = 'Usage: iris setup --full-tunnel-id <id> --pro-tunnel-id <id> [--admin-tunnel-id <id>] [--start] [--json] [--runtime-data-root <directory>] [--protected-reference-root <directory>]';
+const SETUP_USAGE = 'Usage: iris setup --one-tunnel-id <id> | --full-tunnel-id <id> --pro-tunnel-id <id> [--admin-tunnel-id <id>] [--start] [--json] [--runtime-data-root <directory>] [--protected-reference-root <directory>]';
 
 function parseSetupOptions(argumentsList: readonly string[]): SetupCliOptions {
+  let unifiedTunnelId: string | undefined;
   let fullTunnelId: string | undefined;
   let proTunnelId: string | undefined;
   let adminTunnelId: string | undefined;
@@ -489,7 +490,8 @@ function parseSetupOptions(argumentsList: readonly string[]): SetupCliOptions {
     }
     const value = argumentsList[index + 1]?.trim();
     if (value === undefined || value.length === 0) throw new Error(SETUP_USAGE);
-    if (name === '--full-tunnel-id' && fullTunnelId === undefined) fullTunnelId = value;
+    if (name === '--one-tunnel-id' && unifiedTunnelId === undefined) unifiedTunnelId = value;
+    else if (name === '--full-tunnel-id' && fullTunnelId === undefined) fullTunnelId = value;
     else if (name === '--pro-tunnel-id' && proTunnelId === undefined) proTunnelId = value;
     else if (name === '--admin-tunnel-id' && adminTunnelId === undefined) adminTunnelId = value;
     else if (name === '--runtime-data-root' && runtimeDataRoot === undefined) runtimeDataRoot = value;
@@ -497,8 +499,9 @@ function parseSetupOptions(argumentsList: readonly string[]): SetupCliOptions {
     else throw new Error(SETUP_USAGE);
     index += 1;
   }
+  if (unifiedTunnelId !== undefined && (fullTunnelId !== undefined || proTunnelId !== undefined || adminTunnelId !== undefined)) throw new Error(SETUP_USAGE);
   if ((fullTunnelId === undefined) !== (proTunnelId === undefined)) throw new Error(SETUP_USAGE);
-  return { ...(fullTunnelId === undefined ? {} : { fullTunnelId }), ...(proTunnelId === undefined ? {} : { proTunnelId }), ...(adminTunnelId === undefined ? {} : { adminTunnelId }), ...(runtimeDataRoot === undefined ? {} : { runtimeDataRoot }), ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }), start, json };
+  return { ...(unifiedTunnelId === undefined ? {} : { unifiedTunnelId }), ...(fullTunnelId === undefined ? {} : { fullTunnelId }), ...(proTunnelId === undefined ? {} : { proTunnelId }), ...(adminTunnelId === undefined ? {} : { adminTunnelId }), ...(runtimeDataRoot === undefined ? {} : { runtimeDataRoot }), ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }), start, json };
 }
 
 function parseLaunchdInstallOptions(argumentsList: readonly string[]): LaunchdInstallOptions {

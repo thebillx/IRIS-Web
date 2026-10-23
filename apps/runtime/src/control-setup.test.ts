@@ -12,6 +12,7 @@ const roots: string[] = [];
 const sourceRoot = path.resolve(import.meta.dirname, '../../..');
 const fullTunnelId = 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const proTunnelId = 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const oneTunnelId = 'tunnel_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
@@ -44,6 +45,20 @@ test('setup persists one machine binding and repeats without replacing it', asyn
   assert.equal(second.repeated, true);
   assert.equal(second.machineId, first.machineId);
   assert.equal(await readFile(path.join(dataRoot, 'connector-registry.json'), 'utf8'), before);
+});
+
+test('setup creates one public ONE IRIS binding without legacy tunnel IDs', async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-setup-unified-'));
+  roots.push(dataRoot);
+  await persistControlPlaneApiKey(dataRoot, 'fixture-control-plane-key-unified-123456');
+  const first = JSON.parse((await runSetup(dataRoot, '--one-tunnel-id', oneTunnelId)).stdout) as { status: string; repeated: boolean; connectors: Array<{ connectorId: string; tunnelId: string }>; adminTunnelId: string | null };
+  assert.equal(first.status, 'READY_TO_START');
+  assert.equal(first.repeated, false);
+  assert.deepEqual(first.connectors, [{ connectorId: 'iris-full', tunnelId: oneTunnelId }]);
+  assert.equal(first.adminTunnelId, null);
+  const second = JSON.parse((await runSetup(dataRoot, '--one-tunnel-id', oneTunnelId)).stdout) as { repeated: boolean; connectors: Array<{ connectorId: string; tunnelId: string }> };
+  assert.equal(second.repeated, true);
+  assert.deepEqual(second.connectors, first.connectors);
 });
 
 test('setup keeps two disposable installations isolated and rejects binding replacement', async () => {

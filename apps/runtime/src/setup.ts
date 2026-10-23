@@ -3,6 +3,8 @@ import { initializeConnectorRegistry, readConnectorRegistry, seedFromLegacyProfi
 import type { Supervisor } from './supervisor.js';
 
 export interface GuidedSetupOptions {
+  /** Fresh installs may bind one public ONE IRIS tunnel; legacy bindings remain supported. */
+  readonly unifiedTunnelId?: string;
   readonly fullTunnelId?: string;
   readonly proTunnelId?: string;
   readonly adminTunnelId?: string;
@@ -23,15 +25,20 @@ export async function guidedSetup(supervisor: Supervisor, dataRoot: string, opti
     return {
       status: 'NEEDS_CREDENTIALS',
       credentials: safeCredentials,
-      next: ['node scripts/iris.mjs credentials migrate <existing-profile-path>', 'node scripts/iris.mjs setup --full-tunnel-id <id> --pro-tunnel-id <id>'],
+      next: ['node scripts/iris.mjs credentials migrate <existing-profile-path>', 'node scripts/iris.mjs setup --one-tunnel-id <id>'],
       message: 'Provide the existing control-plane credential through the explicit migration command; no registry or runtime state was created.',
     };
   }
 
+  if (options.unifiedTunnelId !== undefined && options.start) {
+    throw new Error('Unified ONE IRIS setup publishes the connector first; Runtime activation requires the governed unified lifecycle path');
+  }
   const prepared = await supervisor.runSetupExclusive(() => prepareSetup(dataRoot, options));
-  const status = options.start ? await supervisor.up() : await supervisor.status();
+  // A fresh ONE IRIS registry is publishable before Runtime activation; the
+  // legacy status path requires FULL/PRO bindings and must not be used here.
+  const status = options.unifiedTunnelId !== undefined && !options.start ? null : options.start ? await supervisor.up() : await supervisor.status();
   return {
-    status: options.start ? (status.state === 'READY' ? 'READY' : 'NEEDS_ATTENTION') : 'READY_TO_START',
+    status: options.start ? (status!.state === 'READY' ? 'READY' : 'NEEDS_ATTENTION') : 'READY_TO_START',
     repeated: prepared.repeated,
     machineId: prepared.registry.connectors[0]?.machineId ?? prepared.registry.admin?.machineId ?? null,
     connectors: prepared.registry.connectors.map(({ connectorId, tunnelId }) => ({ connectorId, tunnelId })),
@@ -42,7 +49,7 @@ export async function guidedSetup(supervisor: Supervisor, dataRoot: string, opti
       tunnelServiceGeneration: prepared.credentials.tunnelServiceGeneration,
       legacyMigrationRequired: prepared.credentials.legacy.migrationRequired,
     },
-    local: { stack: status.state, runtime: status.runtime, tunnel: status.tunnel, controlPlane: status.controlPlane },
+    local: status === null ? { stack: 'DEGRADED' } : { stack: status.state, runtime: status.runtime, tunnel: status.tunnel, controlPlane: status.controlPlane },
     next: options.start ? ['node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'] : ['node scripts/iris.mjs up', 'node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'],
     message: 'Remote tunnel provisioning and ChatGPT connector selection remain owner-verifiable steps; this command does not claim either occurred.',
   };
@@ -56,8 +63,10 @@ async function prepareSetup(dataRoot: string, options: GuidedSetupOptions): Prom
   let registry = await readConnectorRegistry(dataRoot);
   let repeated = registry !== null;
   if (registry === null) {
-    const { fullTunnelId, proTunnelId, adminTunnelId } = options;
-    registry = fullTunnelId === undefined && proTunnelId === undefined && adminTunnelId === undefined
+    const { unifiedTunnelId, fullTunnelId, proTunnelId, adminTunnelId } = options;
+    registry = unifiedTunnelId !== undefined
+      ? await initializeConnectorRegistry(dataRoot, { unified: true, fullTunnelId: unifiedTunnelId })
+      : fullTunnelId === undefined && proTunnelId === undefined && adminTunnelId === undefined
       ? await seedFromLegacyProfiles(dataRoot)
       : await initializeConnectorRegistry(dataRoot, {
         fullTunnelId: requiredTunnelId(fullTunnelId),
@@ -74,7 +83,7 @@ async function prepareSetup(dataRoot: string, options: GuidedSetupOptions): Prom
 }
 
 function requiredTunnelId(value: string | undefined): string {
-  if (value === undefined) throw new Error(`Usage: iris setup --full-tunnel-id <id> --pro-tunnel-id <id> [--admin-tunnel-id <id>] [--start] [--json]`);
+  if (value === undefined) throw new Error(`Usage: iris setup --one-tunnel-id <id> | --full-tunnel-id <id> --pro-tunnel-id <id> [--admin-tunnel-id <id>] [--start] [--json]`);
   return value;
 }
 
