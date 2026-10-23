@@ -7,7 +7,7 @@ import { privateDirectoryProblem } from './private-fs.js';
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
 type MutationState = 'PREPARED' | 'APPLYING' | 'COMMITTED' | 'FAILED' | 'RECONCILIATION_REQUIRED';
-interface MutationRecord { readonly schemaVersion: 1; readonly requestId: string; readonly fingerprint: string; readonly state: MutationState; readonly result: unknown; readonly errorCode: string | null; readonly updatedAt: string; }
+export interface MutationRecord { readonly schemaVersion: 1; readonly requestId: string; readonly fingerprint: string; readonly state: MutationState; readonly result: unknown; readonly errorCode: string | null; readonly updatedAt: string; }
 
 /** A per-request durable guard. APPLYING is deliberately terminal for retries: the caller must reconcile. */
 export class DurableMutationJournal {
@@ -20,15 +20,18 @@ export class DurableMutationJournal {
     return run;
   }
 
+  public inspect(requestId: string, fingerprint: string): Promise<MutationRecord | null> {
+    return this.tail.then(() => this.inspectSerialized(requestId, fingerprint), () => this.inspectSerialized(requestId, fingerprint));
+  }
+
+  public reconcile<T>(requestId: string, fingerprint: string, result: T): Promise<T> {
+    const run = this.tail.then(() => this.reconcileSerialized(requestId, fingerprint, result), () => this.reconcileSerialized(requestId, fingerprint, result));
+    this.tail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
   private async executeSerialized<T>(requestId: string, fingerprint: string, operation: () => Promise<T>): Promise<T> {
-    if (!REQUEST_ID.test(requestId)) throw new RuntimeError('INVALID_REQUEST', 'Mutation requestId is invalid');
-    if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new RuntimeError('INVALID_REQUEST', 'Mutation fingerprint is invalid');
-    const directory = path.join(this.dataRoot, this.directoryName);
-    const problem = await privateDirectoryProblem(this.dataRoot, 'Mutation journal parent');
-    if (problem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', problem);
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    await chmod(directory, 0o700);
-    const filename = path.join(directory, `${createHash('sha256').update(requestId).digest('hex')}.json`);
+    const filename = await this.recordFilename(requestId, fingerprint);
     const existing = await readMutation(filename);
     if (existing !== null) {
       if (existing.requestId !== requestId || existing.fingerprint !== fingerprint) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation request identity conflicts with its durable record');
@@ -57,6 +60,32 @@ export class DurableMutationJournal {
       }).catch(() => undefined);
       throw error;
     }
+  }
+
+  private async inspectSerialized(requestId: string, fingerprint: string): Promise<MutationRecord | null> {
+    return readMutation(await this.recordFilename(requestId, fingerprint));
+  }
+
+  private async reconcileSerialized<T>(requestId: string, fingerprint: string, result: T): Promise<T> {
+    const filename = await this.recordFilename(requestId, fingerprint);
+    const existing = await readMutation(filename);
+    if (existing === null) throw new RuntimeError('PERSISTENCE_FAILURE', 'Mutation request has no durable record to reconcile');
+    if (existing.requestId !== requestId || existing.fingerprint !== fingerprint) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation request identity conflicts with its durable record');
+    if (existing.state === 'COMMITTED') return existing.result as T;
+    if (existing.state !== 'RECONCILIATION_REQUIRED') throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation request is not awaiting reconciliation');
+    await writeRecord(filename, { ...existing, state: 'COMMITTED', result, errorCode: null, updatedAt: new Date().toISOString() });
+    return result;
+  }
+
+  private async recordFilename(requestId: string, fingerprint: string): Promise<string> {
+    if (!REQUEST_ID.test(requestId)) throw new RuntimeError('INVALID_REQUEST', 'Mutation requestId is invalid');
+    if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new RuntimeError('INVALID_REQUEST', 'Mutation fingerprint is invalid');
+    const directory = path.join(this.dataRoot, this.directoryName);
+    const problem = await privateDirectoryProblem(this.dataRoot, 'Mutation journal parent');
+    if (problem !== null) throw new RuntimeError('PERSISTENCE_FAILURE', problem);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+    return path.join(directory, `${createHash('sha256').update(requestId).digest('hex')}.json`);
   }
 }
 

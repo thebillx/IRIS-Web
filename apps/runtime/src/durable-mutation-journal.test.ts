@@ -53,6 +53,18 @@ describe('DurableMutationJournal', () => {
     await expect(readFile(recordPath, 'utf8')).resolves.toContain('RECONCILIATION_REQUIRED');
   });
 
+  it('settles an unknown outcome only with the same request fingerprint', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const journal = new DurableMutationJournal(root);
+    const { RuntimeError } = await import('@iris/domain');
+    await expect(journal.execute('unknown-reconcile-1', fingerprint, async () => {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'response lost');
+    })).rejects.toMatchObject({ code: 'AUTHORITY_INDETERMINATE' });
+    await expect(journal.reconcile('unknown-reconcile-1', fingerprint, { committed: true })).resolves.toEqual({ committed: true });
+    await expect(journal.inspect('unknown-reconcile-1', fingerprint)).resolves.toMatchObject({ state: 'COMMITTED', result: { committed: true } });
+    await expect(journal.reconcile('unknown-reconcile-1', 'b'.repeat(64), { committed: false })).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
+  });
+
   it('allows the Supervisor and Runtime journals to consume one forwarded request independently', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
     await mkdir(path.join(root, 'supervisor'), { mode: 0o700 });

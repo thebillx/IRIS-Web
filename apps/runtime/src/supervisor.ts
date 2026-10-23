@@ -1151,6 +1151,10 @@ export class Supervisor {
     };
     if (!mutation || requestId === undefined) return call();
     const fingerprint = createHash('sha256').update(stableJson({ name, args, clientId: context.clientId, sessionId: context.sessionId, projectId: args.projectId ?? null, workspaceId: args.workspaceId ?? null })).digest('hex');
+    const existing = await this.workloadMutationJournal.inspect(requestId, fingerprint);
+    if (existing?.state === 'RECONCILIATION_REQUIRED') {
+      return this.workloadMutationJournal.reconcile(requestId, fingerprint, await call());
+    }
     return this.workloadMutationJournal.execute(requestId, fingerprint, call);
   }
 
