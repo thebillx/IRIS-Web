@@ -121,6 +121,11 @@ export interface MutationLease {
   readonly release: () => Promise<void>;
 }
 
+/** A narrow adapter for durable stores; it does not grant owner authority. */
+export interface SafetyWriterGate {
+  runMutation<T>(writer: SafetyWriterName, operation: () => Promise<T>): Promise<T>;
+}
+
 export interface ReadinessReport {
   readonly status: 'READY_FOR_OWNER_WINDOW' | 'BLOCKED';
   readonly reasons: readonly string[];
@@ -219,6 +224,15 @@ export class ProductionSafetyController {
   }
 
   public snapshot(): SafetySnapshot { return structuredClone(this.document); }
+
+  public async runMutation<T>(writer: SafetyWriterName, operation: () => Promise<T>): Promise<T> {
+    const lease = await this.beginMutation(writer);
+    try {
+      return await operation();
+    } finally {
+      await lease.release();
+    }
+  }
 
   public async inspect(): Promise<SafetySnapshot> {
     return parseDocument(await readPrivateFile(path.join(this.dataRoot, SAFETY_FILE), 'Production safety state'));
@@ -342,6 +356,17 @@ export class ProductionSafetyController {
     if (fence.state !== 'QUIESCED') reasons.push(`fence state is ${fence.state}`);
     if (fence.reservation !== null) reasons.push(`reservation ${fence.reservation.id} is ${fence.reservation.status.toLowerCase()}`);
     reasons.push(...quiescenceReasons(fence, {}, this.writerVerifier));
+    if (this.writerVerifier !== undefined) {
+      for (const writer of REQUIRED_WRITERS) {
+        if (INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) continue;
+        const record = fence.writers[writer];
+        if (record === undefined || record.state === 'UNKNOWN') continue;
+        try {
+          const verified = await verifyWriterEvidence(fence, this.identity, this.writerVerifier, writer);
+          if (verified.state !== record.state || verified.inFlight !== record.inFlight) reasons.push(`writer ${writer} changed since inventory verification`);
+        } catch { reasons.push(`writer ${writer} could not be freshly verified`); }
+      }
+    }
     if (fence.backup === null) reasons.push('a verified backup is not recorded');
     if (fence.restore === null) reasons.push('a disposable restore drill is not recorded');
     if (fence.backup !== null) {
@@ -371,6 +396,17 @@ export class ProductionSafetyController {
       if (latest.state !== 'QUIESCED') reasons.push(`fence state changed to ${latest.state} during readiness evaluation`);
       if (latest.reservation !== null) reasons.push('a safety reservation became active during readiness evaluation');
       reasons.push(...quiescenceReasons(latest, {}, this.writerVerifier));
+      if (this.writerVerifier !== undefined) {
+        for (const writer of REQUIRED_WRITERS) {
+          if (INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) continue;
+          const record = latest.writers[writer];
+          if (record === undefined || record.state === 'UNKNOWN') continue;
+          try {
+            const verified = await verifyWriterEvidence(latest, this.identity, this.writerVerifier, writer);
+            if (verified.state !== record.state || verified.inFlight !== record.inFlight) reasons.push(`writer ${writer} changed during readiness recheck`);
+          } catch { reasons.push(`writer ${writer} could not be freshly verified during readiness recheck`); }
+        }
+      }
     } catch {
       reasons.push('safety state could not be rechecked after artifact verification');
     }
@@ -571,6 +607,7 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
       await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
       await copyFile(source, target);
       await chmod(target, file.mode);
+      await syncFile(target);
     }
     if (manifest.checkpoint !== null) {
       if (input.checkpointFile === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Restore requires a disposable checkpoint target');
@@ -579,12 +616,17 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
       checkpointStaging = `${checkpointTarget}.${process.pid}.${randomUUID()}.staging`;
       await copyFile(safeJoin(backupRoot, CHECKPOINT_FILE), checkpointStaging);
       await chmod(checkpointStaging, manifest.checkpoint.mode);
+      await syncFile(checkpointStaging);
       await copyFile(safeJoin(backupRoot, CHECKPOINT_FILE), path.join(staging, CHECKPOINT_FILE));
       await chmod(path.join(staging, CHECKPOINT_FILE), manifest.checkpoint.mode);
+      await syncFile(path.join(staging, CHECKPOINT_FILE));
       await writePrivateJson(path.join(staging, MANIFEST_FILE), manifest);
       await verifyRuntimeBackup(staging);
+      await syncDirectory(staging);
       await rename(staging, destination);
+      await syncDirectory(path.dirname(destination));
       await rename(checkpointStaging, checkpointTarget);
+      await syncDirectory(path.dirname(checkpointTarget));
       await verifyRuntimeBackup(destination);
       await verifyCheckpointTarget(checkpointTarget!, manifest.checkpoint.sha256);
       await input.controller.completeRestore(input.ownerAccessToken, reservation.id, {
@@ -601,7 +643,9 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
     }
     await writePrivateJson(path.join(staging, MANIFEST_FILE), manifest);
     await verifyRuntimeBackup(staging);
+    await syncDirectory(staging);
     await rename(staging, destination);
+    await syncDirectory(path.dirname(destination));
     await verifyRuntimeBackup(destination);
     await input.controller.completeRestore(input.ownerAccessToken, reservation.id, {
       backupId: manifest.backupId,
@@ -711,6 +755,7 @@ async function copyTree(source: string, destination: string): Promise<BackupMani
     await mkdir(path.dirname(to), { recursive: true, mode: 0o700 });
     await writeFile(to, content, { mode: before.mode, flag: 'wx' });
     await chmod(to, before.mode);
+    await syncFile(to);
     files.push({ path: relative, size: content.length, sha256: createHash('sha256').update(content).digest('hex'), mode: before.mode });
   }
   return files;
@@ -726,6 +771,7 @@ async function copyCheckpoint(sourceInput: string, destination: string): Promise
   const target = path.join(destination, CHECKPOINT_FILE);
   await writeFile(target, content, { mode: metadata.mode, flag: 'wx' });
   await chmod(target, metadata.mode);
+  await syncFile(target);
   return { size: content.length, sha256: createHash('sha256').update(content).digest('hex'), mode: metadata.mode };
 }
 
@@ -809,8 +855,27 @@ function safeJoin(root: string, relative: string): string {
 async function writeDocument(filename: string, document: SafetyDocument): Promise<void> { await writePrivateJson(filename, document); }
 async function writePrivateJson(filename: string, value: unknown): Promise<void> {
   const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
-  try { await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: 'wx' }); await rename(temporary, filename); }
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+    await syncFile(temporary);
+    await rename(temporary, filename);
+    await syncDirectory(path.dirname(filename));
+  }
   catch (error) { await rm(temporary, { force: true }).catch(() => undefined); throw new RuntimeError('PERSISTENCE_FAILURE', 'Safety state publication failed', { cause: error }); }
+}
+
+async function syncFile(filename: string): Promise<void> {
+  let handle: FileHandle | undefined;
+  try { handle = await open(filename, 'r'); await handle.sync(); }
+  catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Safety file synchronization failed', { cause: error }); }
+  finally { await handle?.close().catch(() => undefined); }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  let handle: FileHandle | undefined;
+  try { handle = await open(directory, 'r'); await handle.sync(); }
+  catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Safety directory synchronization failed', { cause: error }); }
+  finally { await handle?.close().catch(() => undefined); }
 }
 async function readPrivateFile(filename: string, label: string): Promise<string> {
   const metadata = await lstat(filename).catch((error) => { throw new RuntimeError('PERSISTENCE_FAILURE', `${label} is unavailable`, { cause: error }); });

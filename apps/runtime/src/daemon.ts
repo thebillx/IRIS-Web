@@ -30,6 +30,8 @@ import { recoverMultiWorkerRuns } from './multi-worker/recovery.js';
 import { AdoRequirementContextService } from './ado/runtime-context.js';
 import { SecurityAuditStore } from './security-audit/store.js';
 import { SecurityAuditService } from './security-audit/service.js';
+import { ProductionSafetyController } from './production-safety.js';
+import { MissionLedgerStore } from './mission-store.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -98,8 +100,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   };
 
   try {
-    const store = new FoundationStateStore(dataRoot);
-    const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env));
+    const productionSafety = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret });
+    for (const writer of ['runtime-state', 'mission-state', 'durable-jobs'] as const) {
+      await productionSafety.registerWriter(writer);
+    }
+    const store = new FoundationStateStore(dataRoot, productionSafety);
+    const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env), new MissionLedgerStore(dataRoot, productionSafety));
     const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
     const lifecycleStore = new DurableMissionLifecycleStore(dataRoot);
     const lifecycleWorkers = new WorkerAdapterRegistry();
@@ -155,7 +161,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     await recoverMultiWorkerRuns(state, resourceRegistry, multiWorkerStore, lifecycleWorkers);
     const securityAudit = new SecurityAuditService(state, multiWorker, resourceRegistry, new SecurityAuditStore(dataRoot), health);
     await securityAudit.recover();
-    const durableJobs = new DurableJobManager(dataRoot, resourceRegistry);
+    const durableJobs = new DurableJobManager(dataRoot, resourceRegistry, productionSafety);
     await durableJobs.recover();
     missionLifecycle.setCompletionGuard(async (missionId) => {
       await durableJobs.assertMissionCodeReviewsFinalized(missionId);

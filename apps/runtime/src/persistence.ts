@@ -3,6 +3,7 @@ import { open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { RuntimeError, type ProjectReference } from '@iris/domain';
 import { inspectPrivateRegularFile } from './private-fs.js';
+import type { SafetyWriterGate } from './production-safety.js';
 
 const RUNTIME_ID_FILE = 'runtime-id.json';
 const STATE_FILE = 'state.json';
@@ -122,7 +123,7 @@ export async function readOwnerAccessSecret(dataRoot: string): Promise<string | 
 }
 
 export class FoundationStateStore {
-  public constructor(public readonly dataRoot: string) {}
+  public constructor(public readonly dataRoot: string, private readonly safety?: SafetyWriterGate) {}
 
   public async read(): Promise<FoundationStateDocument> {
     const filename = path.join(this.dataRoot, STATE_FILE);
@@ -141,7 +142,9 @@ export class FoundationStateStore {
 
   public async write(state: FoundationStateDocument): Promise<void> {
     if (!isStateDocument(state)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing to write invalid project registry');
-    await writeJsonAtomic(path.join(this.dataRoot, STATE_FILE), state);
+    const write = () => writeJsonAtomic(path.join(this.dataRoot, STATE_FILE), state);
+    if (this.safety === undefined) await write();
+    else await this.safety.runMutation('runtime-state', write);
   }
 }
 

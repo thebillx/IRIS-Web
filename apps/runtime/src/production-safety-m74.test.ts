@@ -87,7 +87,24 @@ test('M74 failed reservation remains durable and blocks recovery until reconcile
   await assert.rejects(fixture.controller.recover(fixture.token, {}), { code: 'PRECONDITION_FAILED' });
 });
 
-async function createFixture(): Promise<{
+test('M74 readiness freshly verifies non-instrumented writers before owner window', async () => {
+  let drift = false;
+  const fixture = await createFixture(() => drift);
+  for (const writer of writers) await fixture.controller.registerWriter(writer);
+  await writeFile(path.join(fixture.dataRoot, 'state.json'), 'safe\n', { mode: 0o600 });
+  const checkpoint = path.join(fixture.root, 'checkpoint.json');
+  await writeFile(checkpoint, 'checkpoint\n', { mode: 0o600 });
+  await fixture.controller.quiesce(fixture.token);
+  await createRuntimeBackup({ controller: fixture.controller, ownerAccessToken: fixture.token, destination: path.join(fixture.root, 'backup'), checkpointFile: checkpoint });
+  const restored = path.join(fixture.root, 'restored');
+  await restoreRuntimeBackup({ controller: fixture.controller, ownerAccessToken: fixture.token, backupRoot: path.join(fixture.root, 'backup'), destination: restored, disposable: true, checkpointFile: path.join(fixture.root, 'restored-checkpoint.json') });
+  drift = true;
+  const readiness = await fixture.controller.readiness();
+  assert.equal(readiness.status, 'BLOCKED');
+  assert.match(readiness.reasons.join('; '), /writer mission-lifecycle could not be freshly verified|changed during readiness/);
+});
+
+async function createFixture(drift?: () => boolean): Promise<{
   readonly root: string;
   readonly dataRoot: string;
   readonly token: string;
@@ -103,8 +120,8 @@ async function createFixture(): Promise<{
   const token = 'owner-token-for-m74-test';
   const identity = { runtimeId: 'runtime-m74-test', instanceId: 'instance-m74-test', dataRoot };
   const verifier: TrustedWriterVerifier = {
-    verify: async (_writer, currentIdentity, context) => ({
-      state: 'IDLE', inFlight: 0, runtimeId: currentIdentity.runtimeId, instanceId: currentIdentity.instanceId,
+    verify: async (writer, currentIdentity, context) => ({
+      state: drift?.() && writer === 'mission-lifecycle' ? 'ACTIVE' : 'IDLE', inFlight: 0, runtimeId: currentIdentity.runtimeId, instanceId: currentIdentity.instanceId,
       dataRoot: currentIdentity.dataRoot, fenceEpoch: context.fenceEpoch, generation: context.generation,
     }),
   };

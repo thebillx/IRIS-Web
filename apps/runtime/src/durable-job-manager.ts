@@ -12,6 +12,7 @@ import { resolveExecutionProfile, resolveServerOwnedCodeReviewExecutionProfile, 
 import { boundedTail, StreamingRedactor } from './output-redaction.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { observeProcessStart } from './macos-safety.js';
+import type { SafetyWriterGate } from './production-safety.js';
 
 const execFileAsync = promisify(execFile);
 const JOB_FILE = 'vnext-jobs.json';
@@ -133,7 +134,7 @@ interface RunnerResult {
 export class DurableJobManager {
   private mutationTail: Promise<void> = Promise.resolve();
 
-  public constructor(private readonly dataRoot: string, private readonly resources: VNextResourceRegistry) {}
+  public constructor(private readonly dataRoot: string, private readonly resources: VNextResourceRegistry, private readonly safety?: SafetyWriterGate) {}
 
   public async prepare(input: ShellExecutionInput): Promise<PreparedShellExecution> {
     return this.prepareWithResolver(input, resolveExecutionProfile);
@@ -757,7 +758,8 @@ export class DurableJobManager {
   }
   private async writeDocument(document: JobDocument): Promise<void> {
     const filename = path.join(this.dataRoot, JOB_FILE); const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
-    try { await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600, flag: 'wx' }); await rename(temporary, filename); }
+    const write = async () => { await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600, flag: 'wx' }); await rename(temporary, filename); };
+    try { if (this.safety === undefined) await write(); else await this.safety.runMutation('durable-jobs', write); }
     catch (error) { await rm(temporary, { force: true }).catch(() => undefined); throw new RuntimeError('PERSISTENCE_FAILURE', 'vNext job state publication failed', { cause: error }); }
   }
 }

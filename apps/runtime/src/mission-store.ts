@@ -5,6 +5,7 @@ import path from 'node:path';
 import { RuntimeError, type MissionRebindAuditEvent, type MissionSnapshot } from '@iris/domain';
 import { capabilityDefinition } from './capability-registry.js';
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
+import type { SafetyWriterGate } from './production-safety.js';
 
 const MISSION_FILE = 'missions.json';
 const MISSION_ARCHIVE_DIR = 'mission-archive';
@@ -28,7 +29,7 @@ export interface ArchivedMissionRecord {
 }
 
 export class MissionLedgerStore {
-  public constructor(private readonly dataRoot: string) {}
+  public constructor(private readonly dataRoot: string, private readonly safety?: SafetyWriterGate) {}
 
   public async read(): Promise<MissionLedgerDocument> {
     const filename = path.join(this.dataRoot, MISSION_FILE);
@@ -48,7 +49,9 @@ export class MissionLedgerStore {
 
   public async write(document: MissionLedgerDocument): Promise<void> {
     if (!isMissionLedgerDocument(document)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing to write invalid mission ledger');
-    await writeJsonAtomic(path.join(this.dataRoot, MISSION_FILE), document);
+    const write = () => writeJsonAtomic(path.join(this.dataRoot, MISSION_FILE), document);
+    if (this.safety === undefined) await write();
+    else await this.safety.runMutation('mission-state', write);
   }
 
   public async readArchived(missionId: string): Promise<MissionSnapshot | null> {
