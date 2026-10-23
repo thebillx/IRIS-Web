@@ -391,6 +391,8 @@ describe('owner-authorized repository device reconciliation', () => {
     await chmod(hook, 0o700);
     await writeFile(path.join(f.projectRoot, '.gitattributes'), 'tracked.txt filter=evil\n');
     await git(f.projectRoot, ['config', 'filter.evil.clean', hook]);
+    await git(f.projectRoot, ['add', '.gitattributes']);
+    await writeFile(path.join(f.projectRoot, 'tracked.txt'), 'changed bytes');
     await git(f.projectRoot, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-color']);
     expect(await readFile(marker, 'utf8')).toBe('executed');
     await rm(marker);
@@ -408,6 +410,8 @@ describe('owner-authorized repository device reconciliation', () => {
     await git(f.projectRoot, ['config', 'extensions.worktreeConfig', 'true']);
     await git(f.linkedRoot, ['config', '--worktree', 'filter.evil.clean', hook]);
     await writeFile(path.join(f.linkedRoot, '.gitattributes'), 'tracked.txt filter=evil\n');
+    await git(f.linkedRoot, ['add', '.gitattributes']);
+    await writeFile(path.join(f.linkedRoot, 'tracked.txt'), 'changed linked bytes');
     await git(f.linkedRoot, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-color']);
     expect(await readFile(marker, 'utf8')).toBe('executed');
     await rm(marker);
