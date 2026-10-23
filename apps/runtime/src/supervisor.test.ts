@@ -192,6 +192,14 @@ describe('IRIS supervisor', () => {
     await expect(import('node:fs/promises').then(({ access }) => access(path.join(dataRoot, 'supervisor')))).rejects.toThrow();
   });
 
+  it('reports unified catalog status without requiring a legacy PRO binding', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-unified-catalog-'));
+    roots.push(dataRoot);
+    await initializeConnectorRegistry(dataRoot, { unified: true, fullTunnelId: 'tunnel_0123456789abcdef0123456789abcdef' });
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot: '/Users/example/iris' });
+    await expect(supervisor.catalogStatus()).resolves.toMatchObject({ sourceMode: 'STRICT_CONTROL_SOURCE', pro: null });
+  });
+
   it('does not persist the Owner keep-awake preference during a read-only status probe', async () => {
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-keep-awake-status-'));
     roots.push(dataRoot);
