@@ -12,7 +12,8 @@
     "ado:binding": "node ../../scripts/node24.mjs src/ado/runtime-binding-cli.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "safety": "node ../../scripts/node24.mjs src/production-safety-cli.ts"
   },
   "dependencies": { "@iris/ado": "workspace:*", "@iris/domain": "workspace:*", "@iris/shared": "workspace:*" },
   "devDependencies": { "@types/node": "^24.3.0", "tsx": "^4.20.5" }
