@@ -16,6 +16,7 @@ import { MissionLedgerStore } from './mission-store.js';
 import { MultiWorkerStore } from './multi-worker/store.js';
 import { VNextResourceRegistry, primaryWorkspaceId, type ExistingWorktreeExpectation, type RepositoryReconciliationInput } from './resource-registry.js';
 import { createPhysicalRepositoryObservation, type PhysicalRepositoryObservation } from './repository-physical-observation.js';
+import { DurableMutationJournal } from './durable-mutation-journal.js';
 
 const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 120_000;
@@ -86,8 +87,8 @@ export type Phase4GitRequest =
   | (GitRequestBase & { readonly operation: 'branch_create'; readonly repositoryId: string; readonly branchName: string; readonly baseRef: string })
   | (GitRequestBase & { readonly operation: 'worktree_add'; readonly repositoryId: string; readonly branchName: string; readonly baseRef: string; readonly destinationPath: string })
   | (GitRequestBase & { readonly operation: 'worktree_remove'; readonly repositoryId: string })
-  | (GitRequestBase & { readonly operation: 'add'; readonly repositoryId: string; readonly paths: readonly string[] })
-  | (GitRequestBase & { readonly operation: 'commit'; readonly repositoryId: string; readonly paths: readonly string[]; readonly message: string })
+  | (GitRequestBase & { readonly operation: 'add'; readonly repositoryId: string; readonly paths: readonly string[]; readonly requestId?: string | undefined })
+  | (GitRequestBase & { readonly operation: 'commit'; readonly repositoryId: string; readonly paths: readonly string[]; readonly message: string; readonly requestId?: string | undefined })
   | (GitRequestBase & { readonly operation: 'fetch'; readonly repositoryId: string; readonly remote: string })
   | (GitRequestBase & { readonly operation: 'push'; readonly repositoryId: string; readonly remote: string; readonly branch: string });
 
@@ -124,10 +125,14 @@ export type RegistryReferenceInspector = (
 ) => Promise<unknown>;
 
 export class GovernedGitEngine {
+  private readonly mutations: DurableMutationJournal;
+
   public constructor(
     private readonly resources: VNextResourceRegistry,
     private readonly referenceInspector: RegistryReferenceInspector = inspectRegistryReferences,
-  ) {}
+  ) {
+    this.mutations = new DurableMutationJournal(resources.dataRoot);
+  }
 
   public async preflight(request: Phase4GitRequest): Promise<Phase4GitPreflight> {
     validateOperationInput(request);
@@ -165,8 +170,8 @@ export class GovernedGitEngine {
     if (request.operation === 'branch_create') return this.branchCreate(identity, request.branchName, request.baseRef);
     if (request.operation === 'worktree_add') return this.worktreeAdd(identity, request.branchName, request.baseRef, request.destinationPath, createdByAction);
     if (request.operation === 'worktree_remove') return this.worktreeRemove(identity);
-    if (request.operation === 'add') return this.add(identity, request.paths);
-    if (request.operation === 'commit') return this.commit(identity, request.paths, request.message);
+    if (request.operation === 'add') return this.executeMutation(request, identity, () => this.add(identity, request.paths));
+    if (request.operation === 'commit') return this.executeMutation(request, identity, () => this.commit(identity, request.paths, request.message));
     if (request.operation === 'fetch') return this.fetch(identity, request.remote);
     if (request.operation === 'push') return this.push(identity, request.remote, request.branch);
     throw new RuntimeError('CAPABILITY_DENIED', 'Unsupported governed Git operation');
@@ -558,6 +563,15 @@ export class GovernedGitEngine {
     }
     const removed = await this.resources.completeWorktreeRemoval(identity.projectId, identity.workspaceId, identity.repositoryId);
     return { ...repositoryView(identity), operation: 'worktree_remove', workspaceId: removed.workspaceId, removed: true, lifecycleState: removed.lifecycleState };
+  }
+
+  private async executeMutation(request: Extract<Phase4GitRequest, { operation: 'add' | 'commit' }>, identity: GitRepositoryIdentity, operation: () => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
+    if (request.requestId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Git mutation requires a durable requestId');
+    const fingerprint = createHash('sha256').update(JSON.stringify({
+      projectId: request.projectId, workspaceId: request.workspaceId, repositoryId: identity.repositoryId,
+      operation: request.operation, paths: request.paths, message: request.operation === 'commit' ? request.message : null,
+    })).digest('hex');
+    return this.mutations.execute(request.requestId, fingerprint, operation);
   }
 
   private async add(identity: GitRepositoryIdentity, paths: readonly string[]): Promise<Record<string, unknown>> {

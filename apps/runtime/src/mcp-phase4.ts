@@ -15,7 +15,7 @@ export const PHASE4_GROUPED_TOOL_NAMES = ['git'] as const;
 export type Phase4GroupedToolName = (typeof PHASE4_GROUPED_TOOL_NAMES)[number];
 
 const GIT_KEYS = new Set([
-  'operation','sessionId','projectId','workspaceId','repositoryId','expectedEffects','missionId','taskId','actionId',
+  'operation','sessionId','projectId','workspaceId','repositoryId','requestId','expectedEffects','missionId','taskId','actionId',
   'paths','ref','object','left','right','ancestor','descendant','maxCount','maxEntries',
   'branchName','baseRef','destinationPath','message','remote','branch',
 ]);
@@ -39,6 +39,7 @@ export function phase4GroupedToolDefinitions(): readonly Record<string, unknown>
         taskId: { type: 'string', description: 'Optional prepared CHATGPT task identity; missionId/taskId/actionId must be supplied together.' },
         actionId: { type: 'string', description: 'Optional prepared CHATGPT action identity; missionId/taskId/actionId must be supplied together.' },
         repositoryId: { type: 'string', description: 'Opaque verified repository UUID. Required for mutation/network operations; optional assertion for reads.' },
+        requestId: { type: 'string', minLength: 1, maxLength: 200, description: 'Required for Git mutations; duplicate requests return the durable result and unknown outcomes fail closed.' },
         operation: { enum: OPERATIONS },
         paths: { type: 'array', minItems: 1, maxItems: 24, items: { type: 'string', minLength: 1, maxLength: 1000 }, description: 'Explicit workspace-relative physical regular-file paths only.' },
         ref: { type: 'string', minLength: 1, maxLength: 200 },
@@ -79,6 +80,7 @@ export async function executePhase4GroupedTool(
   const workspaceId = requiredBoundedString(args, 'workspaceId', 200);
   const operation = requiredEnum(args, 'operation', OPERATIONS);
   const repositoryId = optionalBoundedString(args, 'repositoryId', 200);
+  const requestId = optionalBoundedString(args, 'requestId', 200);
   const expectedEffects = optionalExpectedEffects(args);
   const mission = await optionalMissionAssociation(args, state, identity);
   const common = { ...identity, projectId, workspaceId, ...(repositoryId === undefined ? {} : { repositoryId }), ...(expectedEffects === undefined ? {} : { expectedEffects }), ...(mission === undefined ? {} : { mission }) };
@@ -109,8 +111,8 @@ export async function executePhase4GroupedTool(
   if (operation === 'branch_create') return capabilities.execute({ capabilityId: 'git.branch_create', operation, ...common, repositoryId: requiredRepositoryId, branchName: requiredBoundedString(args, 'branchName', 200), baseRef: requiredBoundedString(args, 'baseRef', 200) });
   if (operation === 'worktree_add') return capabilities.execute({ capabilityId: 'git.worktree_add', operation, ...common, repositoryId: requiredRepositoryId, branchName: requiredBoundedString(args, 'branchName', 200), baseRef: requiredBoundedString(args, 'baseRef', 200), destinationPath: requiredBoundedString(args, 'destinationPath', 4000) });
   if (operation === 'worktree_remove') return capabilities.execute({ capabilityId: 'git.worktree_remove', operation, ...common, repositoryId: requiredRepositoryId });
-  if (operation === 'add') return capabilities.execute({ capabilityId: 'git.add', operation, ...common, repositoryId: requiredRepositoryId, paths: requiredStringArray(args, 'paths', 24, 1000) });
-  if (operation === 'commit') return capabilities.execute({ capabilityId: 'git.commit', operation, ...common, repositoryId: requiredRepositoryId, paths: requiredStringArray(args, 'paths', 24, 1000), message: requiredBoundedString(args, 'message', 200) });
+  if (operation === 'add') return capabilities.execute({ capabilityId: 'git.add', operation, ...common, repositoryId: requiredRepositoryId, paths: requiredStringArray(args, 'paths', 24, 1000), requestId: requiredMutationRequestId(requestId) });
+  if (operation === 'commit') return capabilities.execute({ capabilityId: 'git.commit', operation, ...common, repositoryId: requiredRepositoryId, paths: requiredStringArray(args, 'paths', 24, 1000), message: requiredBoundedString(args, 'message', 200), requestId: requiredMutationRequestId(requestId) });
   if (operation === 'fetch') return capabilities.execute({ capabilityId: 'git.fetch', operation, ...common, repositoryId: requiredRepositoryId, remote: requiredBoundedString(args, 'remote', 100) });
   return capabilities.execute({ capabilityId: 'git.push', operation, ...common, repositoryId: requiredRepositoryId, remote: requiredBoundedString(args, 'remote', 100), branch: requiredBoundedString(args, 'branch', 200) });
 }
@@ -143,6 +145,10 @@ async function optionalMissionAssociation(
 
 function requireMutationRepositoryId(value: string | undefined): string {
   if (value === undefined) throw new RuntimeError('INVALID_REQUEST', 'repositoryId is required for Git mutation/network operations');
+  return value;
+}
+function requiredMutationRequestId(value: string | undefined): string {
+  if (value === undefined) throw new RuntimeError('INVALID_REQUEST', 'requestId is required for Git mutations');
   return value;
 }
 
