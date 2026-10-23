@@ -172,7 +172,14 @@ describe('IRIS supervisor', () => {
       forwardWorkloadTool(name: string, args: Record<string, unknown>, context: { clientId: string; sessionId: string }): Promise<unknown>;
     }).forwardWorkloadTool.bind(supervisor);
     await expect(forward('file_write', {}, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(forward('fs', { operation: 'write', requestId: randomUUID() }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(forward('git', { operation: 'commit', requestId: randomUUID() }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(forward('project_test_run', { requestId: randomUUID() }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(forward('shell', { operation: 'run', requestId: randomUUID() }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(forward('shell', { operation: 'start' }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(forward('shell', { operation: 'start', requestId: randomUUID() }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'RUNTIME_NOT_RUNNING' });
     await expect(forward('project_validation_start', {}, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(forward('project_validation_start', { requestId: randomUUID() }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'RUNTIME_NOT_RUNNING' });
   });
 
   it('reports missing migration state without creating files during status', async () => {
