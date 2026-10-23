@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -55,6 +55,7 @@ describe('DurableMutationJournal', () => {
 
   it('allows the Supervisor and Runtime journals to consume one forwarded request independently', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    await mkdir(path.join(root, 'supervisor'), { mode: 0o700 });
     const supervisor = new DurableMutationJournal(path.join(root, 'supervisor'));
     const runtime = new DurableMutationJournal(root);
     const requestId = 'forwarded-git-1';
