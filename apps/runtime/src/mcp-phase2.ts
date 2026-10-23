@@ -16,6 +16,7 @@ export function isPhase2GroupedTool(name: string): name is Phase2GroupedToolName
 
 export function phase2GroupedToolDefinitions(): readonly Record<string, unknown>[] {
   const sessionId = { sessionId: { type: 'string', description: 'Optional explicit IRIS runtime session UUID. Authenticated tunnel connectors may omit it and use project-bound direct context.' } };
+  const requestId = { requestId: { type: 'string', minLength: 1, maxLength: 200, description: 'Required for durable workspace mutations; retries return the original result or fail closed for reconciliation.' } };
   const projectId = { projectId: { type: 'string', description: 'Registered project UUID; direct context is isolated to this project.' } };
   const workspaceId = { workspaceId: { type: 'string', description: 'Opaque IRIS workspace UUID, never a raw path.' } };
   const expectedEffects = {
@@ -34,7 +35,7 @@ export function phase2GroupedToolDefinitions(): readonly Record<string, unknown>
       inputSchema: {
         type: 'object',
         required: ['operation', 'projectId'],
-        properties: { ...sessionId, ...projectId, ...workspaceId, operation: { enum: ['list', 'get', 'create_scratch', 'revoke_scratch'] }, ...expectedEffects },
+        properties: { ...sessionId, ...requestId, ...projectId, ...workspaceId, operation: { enum: ['list', 'get', 'create_scratch', 'revoke_scratch'] }, ...expectedEffects },
         additionalProperties: false,
       },
     },
@@ -46,6 +47,7 @@ export function phase2GroupedToolDefinitions(): readonly Record<string, unknown>
         required: ['operation', 'projectId', 'workspaceId'],
         properties: {
           ...sessionId,
+          ...requestId,
           ...projectId,
           ...workspaceId,
           operation: { enum: ['list', 'stat', 'read', 'write', 'edit', 'mkdir', 'delete', 'hash', 'find'] },
@@ -85,6 +87,7 @@ export function phase2GroupedToolDefinitions(): readonly Record<string, unknown>
         required: ['operation', 'projectId'],
         properties: {
           ...sessionId,
+          ...requestId,
           ...projectId,
           ...workspaceId,
           operation: { enum: ['stat', 'open_ref', 'register_existing', 'release'] },

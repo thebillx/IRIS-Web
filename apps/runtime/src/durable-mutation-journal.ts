@@ -49,7 +49,12 @@ export class DurableMutationJournal {
       return result;
     } catch (error: unknown) {
       const code = error instanceof RuntimeError ? error.code : 'PERSISTENCE_FAILURE';
-      await writeRecord(filename, { ...prepared, state: 'FAILED', errorCode: code, updatedAt: new Date().toISOString() }).catch(() => undefined);
+      await writeRecord(filename, {
+        ...prepared,
+        state: code === 'AUTHORITY_INDETERMINATE' ? 'RECONCILIATION_REQUIRED' : 'FAILED',
+        errorCode: code,
+        updatedAt: new Date().toISOString(),
+      }).catch(() => undefined);
       throw error;
     }
   }

@@ -54,7 +54,7 @@ export function phase3GroupedToolDefinitions(): readonly Record<string, unknown>
         type: 'object',
         required: ['operation','projectId','jobId'],
         properties: {
-          ...sessionId, ...projectId,
+          ...sessionId, requestId: { type: 'string', minLength: 1, maxLength: 200, description: 'Required for durable cancellation and unknown-outcome reconciliation.' }, ...projectId,
           operation: { enum: ['status','logs','result','cancel'] },
           jobId: { type: 'string', minLength: 1, maxLength: 200 },
           stream: { enum: ['stdout','stderr'] },
@@ -124,7 +124,7 @@ async function executeJob(
 }
 
 const SHELL_KEYS = new Set(['operation','sessionId','projectId','workspaceId','executable','argv','cwd','executionProfile','envOverrides','timeoutMs','requestId','stdinArtifactId','expectedEffects']);
-const JOB_KEYS = new Set(['operation','sessionId','projectId','jobId','stream','cursor','maxBytes','expectedEffects']);
+const JOB_KEYS = new Set(['operation','sessionId','projectId','jobId','stream','cursor','maxBytes','requestId','expectedEffects']);
 
 function assertOnlyPhase3Keys(name: Phase3GroupedToolName, args: Record<string, unknown>): void {
   const allowed = name === 'shell' ? SHELL_KEYS : JOB_KEYS;

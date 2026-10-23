@@ -40,4 +40,16 @@ describe('DurableMutationJournal', () => {
     await expect(journal.execute('git-commit-4', fingerprint, async () => { throw new Error('known failure'); })).rejects.toThrow('known failure');
     await expect(journal.execute('git-commit-4', fingerprint, async () => ({ ok: false }))).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
   });
+
+  it('preserves an unknown transport outcome as reconciliation-required', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const journal = new DurableMutationJournal(root);
+    await expect(journal.execute('unknown-1', fingerprint, async () => {
+      const { RuntimeError } = await import('@iris/domain');
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'response lost');
+    })).rejects.toMatchObject({ code: 'AUTHORITY_INDETERMINATE' });
+    await expect(journal.execute('unknown-1', fingerprint, async () => ({ replayed: true }))).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    const recordPath = path.join(root, 'vnext-mutations', `${await import('node:crypto').then(({ createHash }) => createHash('sha256').update('unknown-1').digest('hex'))}.json`);
+    await expect(readFile(recordPath, 'utf8')).resolves.toContain('RECONCILIATION_REQUIRED');
+  });
 });
