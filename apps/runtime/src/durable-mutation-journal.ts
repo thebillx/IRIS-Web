@@ -24,12 +24,6 @@ export class DurableMutationJournal {
     return this.tail.then(() => this.inspectSerialized(requestId, fingerprint), () => this.inspectSerialized(requestId, fingerprint));
   }
 
-  public reconcile<T>(requestId: string, fingerprint: string, result: T): Promise<T> {
-    const run = this.tail.then(() => this.reconcileSerialized(requestId, fingerprint, result), () => this.reconcileSerialized(requestId, fingerprint, result));
-    this.tail = run.then(() => undefined, () => undefined);
-    return run;
-  }
-
   private async executeSerialized<T>(requestId: string, fingerprint: string, operation: () => Promise<T>): Promise<T> {
     const filename = await this.recordFilename(requestId, fingerprint);
     const existing = await readMutation(filename);
@@ -63,18 +57,11 @@ export class DurableMutationJournal {
   }
 
   private async inspectSerialized(requestId: string, fingerprint: string): Promise<MutationRecord | null> {
-    return readMutation(await this.recordFilename(requestId, fingerprint));
-  }
-
-  private async reconcileSerialized<T>(requestId: string, fingerprint: string, result: T): Promise<T> {
-    const filename = await this.recordFilename(requestId, fingerprint);
-    const existing = await readMutation(filename);
-    if (existing === null) throw new RuntimeError('PERSISTENCE_FAILURE', 'Mutation request has no durable record to reconcile');
-    if (existing.requestId !== requestId || existing.fingerprint !== fingerprint) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation request identity conflicts with its durable record');
-    if (existing.state === 'COMMITTED') return existing.result as T;
-    if (existing.state !== 'RECONCILIATION_REQUIRED') throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation request is not awaiting reconciliation');
-    await writeRecord(filename, { ...existing, state: 'COMMITTED', result, errorCode: null, updatedAt: new Date().toISOString() });
-    return result;
+    const record = await readMutation(await this.recordFilename(requestId, fingerprint));
+    if (record !== null && (record.requestId !== requestId || record.fingerprint !== fingerprint)) {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation request identity conflicts with its durable record');
+    }
+    return record;
   }
 
   private async recordFilename(requestId: string, fingerprint: string): Promise<string> {
