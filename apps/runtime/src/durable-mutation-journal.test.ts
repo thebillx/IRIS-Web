@@ -52,4 +52,13 @@ describe('DurableMutationJournal', () => {
     const recordPath = path.join(root, 'vnext-mutations', `${await import('node:crypto').then(({ createHash }) => createHash('sha256').update('unknown-1').digest('hex'))}.json`);
     await expect(readFile(recordPath, 'utf8')).resolves.toContain('RECONCILIATION_REQUIRED');
   });
+
+  it('allows the Supervisor and Runtime journals to consume one forwarded request independently', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const supervisor = new DurableMutationJournal(path.join(root, 'supervisor'));
+    const runtime = new DurableMutationJournal(root);
+    const requestId = 'forwarded-git-1';
+    await expect(supervisor.execute(requestId, fingerprint, async () => ({ layer: 'supervisor' }))).resolves.toEqual({ layer: 'supervisor' });
+    await expect(runtime.execute(requestId, fingerprint, async () => ({ layer: 'runtime' }))).resolves.toEqual({ layer: 'runtime' });
+  });
 });

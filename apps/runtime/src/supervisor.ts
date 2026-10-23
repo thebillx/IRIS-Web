@@ -208,7 +208,7 @@ export interface SupervisorCatalogStatus {
   readonly state: CatalogActivationState;
   readonly sourceMode: 'STRICT_CONTROL_SOURCE' | 'BOUND_WORKLOAD_COMPATIBILITY';
   readonly full: CatalogProfileStatus;
-  readonly pro: CatalogProfileStatus;
+  readonly pro: CatalogProfileStatus | null;
   readonly runtimeId: string | null;
   readonly instanceId: string | null;
   readonly deploymentEpoch: number;
@@ -276,7 +276,9 @@ export class Supervisor {
     keepAwakeProvider: KeepAwakeProvider = new MacOSCaffeinateProvider(),
   ) {
     this.lifecycleGrants = new LifecycleGrantStore(dataRoot);
-    this.workloadMutationJournal = new DurableMutationJournal(dataRoot);
+    // Keep the Supervisor transport journal separate from the Runtime's
+    // journal; both receive the same request id for one forwarded mutation.
+    this.workloadMutationJournal = new DurableMutationJournal(path.join(dataRoot, 'supervisor'));
     this.keepAwake = new KeepAwakeLeaseManager(keepAwakeProvider);
     this.keepAwakePreference = new KeepAwakePreferenceStore(dataRoot);
     for (const [label, port] of [
@@ -743,8 +745,9 @@ export class Supervisor {
     }
     const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
     const pro = registry.connectors.find((connector) => connector.connectorId === 'iris-pro');
-    if (full === undefined || pro === undefined || full.runtimeId === null || pro.runtimeId === null) {
-      throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'FULL and PRO runtime-bound connector identities are required before target catalog probing');
+    const unified = isUnifiedConnectorRegistry(registry);
+    if (full === undefined || full.runtimeId === null || (!unified && (pro === undefined || pro.runtimeId === null))) {
+      throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'A runtime-bound workload connector identity is required before target catalog probing');
     }
     const baselineStatus = await this.catalogStatus();
     const baselineFullIdentity = baselineStatus.full.live;
@@ -763,12 +766,9 @@ export class Supervisor {
     let manifest: ConnectorCatalogManifest | null = null;
     let failure: unknown = null;
     try {
-      await initializeConnectorRegistry(probeDataRoot, {
-        fullTunnelId: full.tunnelId,
-        proTunnelId: pro.tunnelId,
-        fullHealthPort: full.healthPort,
-        proHealthPort: pro.healthPort,
-      });
+      await initializeConnectorRegistry(probeDataRoot, unified
+        ? { unified: true, fullTunnelId: full.tunnelId, fullHealthPort: full.healthPort }
+        : { fullTunnelId: full.tunnelId, proTunnelId: pro!.tunnelId, fullHealthPort: full.healthPort, proHealthPort: pro!.healthPort });
       const probeRuntimeId = await loadOrCreateRuntimeId(probeDataRoot);
       await bindConnectorRuntime(probeDataRoot, probeRuntimeId);
       const serviceSecret = await loadOrCreateTunnelServiceSecret(probeDataRoot);
@@ -778,8 +778,8 @@ export class Supervisor {
       }
       const probeFull = probeRegistry.connectors.find((connector) => connector.connectorId === 'iris-full');
       const probePro = probeRegistry.connectors.find((connector) => connector.connectorId === 'iris-pro');
-      if (probeFull === undefined || probePro === undefined) {
-        throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Isolated target catalog probe is missing FULL or PRO connector identity');
+      if (probeFull === undefined || (!unified && probePro === undefined)) {
+        throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'Isolated target catalog probe is missing its workload connector identity');
       }
 
       const probe = await this.startRecordedRuntime(probeOperation, {
@@ -801,38 +801,37 @@ export class Supervisor {
         'x-iris-runtime-id': probeRuntimeId,
         'x-iris-client-id': clientId,
       });
-      const [fullListed, proListed, fullIdentityResponse] = await Promise.all([
-        postJson(`${probe.endpoint.apiUrl}${probeFull.mcpPath}`, { jsonrpc: '2.0', id: 1, method: 'tools/list' }, headersFor(probeFull, 'iris-supervisor-target-full')),
-        postJson(`${probe.endpoint.apiUrl}${probePro.mcpPath}`, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, headersFor(probePro, 'iris-supervisor-target-pro')),
-        postJson(`${probe.endpoint.apiUrl}${probeFull.mcpPath}`, {
+      const fullIdentityRequest = postJson(`${probe.endpoint.apiUrl}${probeFull.mcpPath}`, {
           jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'catalog_identity', arguments: {} },
-        }, { ...headersFor(probeFull, 'iris-supervisor-target-catalog'), 'Mcp-Name': 'catalog_identity' }),
-      ]);
+        }, { ...headersFor(probeFull, 'iris-supervisor-target-catalog'), 'Mcp-Name': 'catalog_identity' });
+      const fullListedRequest = postJson(`${probe.endpoint.apiUrl}${probeFull.mcpPath}`, { jsonrpc: '2.0', id: 1, method: 'tools/list' }, headersFor(probeFull, 'iris-supervisor-target-full'));
+      const [fullListed, fullIdentityResponse] = await Promise.all([fullListedRequest, fullIdentityRequest]);
       const fullNames = toolNames(fullListed);
-      const proNames = toolNames(proListed);
-      if (fullNames.length === 0 || proNames.length === 0) {
-        throw new RuntimeError('MCP_CATALOG_STALE', 'Target workload catalog probe did not return complete FULL and PRO tool lists');
+      if (fullNames.length === 0) {
+        throw new RuntimeError('MCP_CATALOG_STALE', 'Target workload catalog probe did not return a complete workload tool list');
       }
-      if (proNames.length !== pro.expectedToolNames.length || !proNames.every((name, index) => name === pro.expectedToolNames[index])) {
-        throw new RuntimeError('PRECONDITION_FAILED', 'Target workload changes the PRO catalog; bounded Phase 5 activation permits a FULL catalog transition only');
+      if (unified) {
+        const fullIdentity = catalogIdentityFromToolResponse(fullIdentityResponse);
+        if (fullIdentity === null || fullIdentity.toolCount !== fullNames.length) throw new RuntimeError('MCP_CATALOG_STALE', 'Target unified catalog identity did not match its live tool list');
+        manifest = { full: { expectedToolNames: fullNames, catalogHash: fullIdentity.catalogHash }, pro: { expectedToolNames: sourceCatalogs().PRO.names, catalogHash: sourceCatalogs().PRO.identity.catalogHash } };
+      } else {
+        const proListed = await postJson(`${probe.endpoint.apiUrl}${probePro!.mcpPath}`, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, headersFor(probePro!, 'iris-supervisor-target-pro'));
+        const proNames = toolNames(proListed);
+        if (proNames.length === 0) throw new RuntimeError('MCP_CATALOG_STALE', 'Target workload catalog probe did not return a complete PRO tool list');
+        if (proNames.length !== pro!.expectedToolNames.length || !proNames.every((name, index) => name === pro!.expectedToolNames[index])) {
+          throw new RuntimeError('PRECONDITION_FAILED', 'Target workload changes the PRO catalog; bounded Phase 5 activation permits a FULL catalog transition only');
+        }
+        const fullIdentity = catalogIdentityFromToolResponse(fullIdentityResponse);
+        if (fullIdentity === null || fullIdentity.toolCount !== fullNames.length) {
+          throw new RuntimeError('MCP_CATALOG_STALE', 'Target FULL catalog identity did not match its live tool list');
+        }
+        const targetProDefinitions = listedToolDefinitions(proListed);
+        const baselineVersionProIdentity = catalogIdentityAtVersion('PRO', targetProDefinitions, baselineFullIdentity.catalogVersion);
+        if (baselineVersionProIdentity.catalogHash !== pro!.catalogHash) throw new RuntimeError('PRECONDITION_FAILED', 'Target workload changes the bounded PRO catalog schema');
+        const proIdentity = catalogIdentityAtVersion('PRO', targetProDefinitions, fullIdentity.catalogVersion);
+        if (proIdentity.toolCount !== proNames.length) throw new RuntimeError('MCP_CATALOG_STALE', 'Target PRO catalog identity did not match its live tool list');
+        manifest = { full: { expectedToolNames: fullNames, catalogHash: fullIdentity.catalogHash }, pro: { expectedToolNames: proNames, catalogHash: proIdentity.catalogHash } };
       }
-      const fullIdentity = catalogIdentityFromToolResponse(fullIdentityResponse);
-      if (fullIdentity === null || fullIdentity.toolCount !== fullNames.length) {
-        throw new RuntimeError('MCP_CATALOG_STALE', 'Target FULL catalog identity did not match its live tool list');
-      }
-      const targetProDefinitions = listedToolDefinitions(proListed);
-      const baselineVersionProIdentity = catalogIdentityAtVersion('PRO', targetProDefinitions, baselineFullIdentity.catalogVersion);
-      if (baselineVersionProIdentity.catalogHash !== pro.catalogHash) {
-        throw new RuntimeError('PRECONDITION_FAILED', 'Target workload changes the bounded PRO catalog schema');
-      }
-      const proIdentity = catalogIdentityAtVersion('PRO', targetProDefinitions, fullIdentity.catalogVersion);
-      if (proIdentity.toolCount !== proNames.length) {
-        throw new RuntimeError('MCP_CATALOG_STALE', 'Target PRO catalog identity did not match its live tool list');
-      }
-      manifest = {
-        full: { expectedToolNames: fullNames, catalogHash: fullIdentity.catalogHash },
-        pro: { expectedToolNames: proNames, catalogHash: proIdentity.catalogHash },
-      };
     } catch (error) {
       failure = error;
     }
@@ -1951,11 +1950,13 @@ export class Supervisor {
         ? { ...profile, state: 'STALE_CONNECTOR' as const }
         : profile;
     }) ?? registry.connectors.map((binding) => catalogProfileStatus(binding, expectedSource(binding), null, [], false));
-    const fullBinding = registry.connectors.find((binding) => binding.mode === 'FULL')!;
-    const proBinding = registry.connectors.find((binding) => binding.mode === 'PRO')!;
+    const unified = isUnifiedConnectorRegistry(registry);
+    const fullBinding = registry.connectors.find((binding) => binding.mode === 'FULL');
+    if (fullBinding === undefined) throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', 'A workload connector binding is required');
+    const proBinding = registry.connectors.find((binding) => binding.mode === 'PRO');
     const full = profiles.find((profile) => profile.profile === 'FULL') ?? catalogProfileStatus(fullBinding, expectedSource(fullBinding), null, [], false);
-    const pro = profiles.find((profile) => profile.profile === 'PRO') ?? catalogProfileStatus(proBinding, expectedSource(proBinding), null, [], false);
-    const state = catalogActivationState([full, pro]);
+    const pro = unified ? null : profiles.find((profile) => profile.profile === 'PRO') ?? catalogProfileStatus(proBinding!, expectedSource(proBinding!), null, [], false);
+    const state = catalogActivationState(pro === null ? [full] : [full, pro]);
     return {
       state,
       sourceMode: strictCatalog ? 'STRICT_CONTROL_SOURCE' : 'BOUND_WORKLOAD_COMPATIBILITY',

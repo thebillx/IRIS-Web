@@ -306,8 +306,9 @@ describe('IRIS supervisor', () => {
     expect(status.sourceMode).toBe('BOUND_WORKLOAD_COMPATIBILITY');
     expect(status.state).toBe('UNKNOWN');
     expect(status.recommendedAction).toBe('USE_CONTROLLED_ACTIVATION_BEFORE_CATALOG_RELOAD');
-    expect(status.pro.live).toBeNull();
-    expect(status.pro.liveToolCount).toBeNull();
+    expect(status.pro).not.toBeNull();
+    expect(status.pro!.live).toBeNull();
+    expect(status.pro!.liveToolCount).toBeNull();
     await expect(supervisor.catalogReload()).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
   });
 
