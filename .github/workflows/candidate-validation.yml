@@ -124,6 +124,9 @@ jobs:
             if (output.includes(secret)) throw new Error("Synthetic redaction marker leaked");
           '
 
+      - name: Run production safety disposable regressions
+        run: pnpm --filter @iris/runtime exec tsx --test src/production-safety-m74.test.ts
+
       - name: Typecheck and build Runtime
         run: |
           pnpm --filter @iris/runtime typecheck
