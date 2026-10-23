@@ -545,6 +545,7 @@ export async function createRuntimeBackup(input: CreateBackupInput): Promise<Bac
     await chmod(staging, 0o700);
     await verifyRuntimeBackup(staging);
     await rename(staging, destination);
+    await syncDirectory(path.dirname(destination));
     await verifyRuntimeBackup(destination);
     await input.controller.completeBackup(input.ownerAccessToken, reservation.id, {
       backupId: manifest.backupId,
