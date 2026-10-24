@@ -89,35 +89,34 @@ export class MissionLedgerStore {
       throw new RuntimeError('CAPABILITY_DENIED', 'Mission is not eligible for capacity archival');
     }
     const directory = path.join(this.dataRoot, MISSION_ARCHIVE_DIR);
-    await ensurePrivateArchiveDirectory(directory);
     const filename = path.join(directory, `${mission.id}.json`);
-    const existing = await inspectPrivateRegularFile(filename, 'Archived mission record');
-    if (existing.state === 'ok') {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(existing.content) as unknown;
-      } catch (error) {
-        throw new RuntimeError('PERSISTENCE_FAILURE', 'Archived mission record is invalid JSON', { cause: error });
-      }
-      const record = normalizeArchivedMissionRecord(parsed);
-      if (record === null
-        || record.reason !== 'ACTIVE_LEDGER_CAPACITY'
-        || JSON.stringify(record.mission) !== JSON.stringify(mission)) {
-        throw new RuntimeError('PRECONDITION_FAILED', 'Archived mission identity is already bound to different content');
-      }
-      return;
-    }
-    if (existing.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', existing.reason);
-
-    const record: ArchivedMissionRecord = {
-      schemaVersion: 1,
-      archivedAt: new Date().toISOString(),
-      reason: 'ACTIVE_LEDGER_CAPACITY',
-      mission,
-    };
     const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     const publish = async (): Promise<void> => {
+      await ensurePrivateArchiveDirectory(directory);
+      const existing = await inspectPrivateRegularFile(filename, 'Archived mission record');
+      if (existing.state === 'ok') {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(existing.content) as unknown;
+        } catch (error) {
+          throw new RuntimeError('PERSISTENCE_FAILURE', 'Archived mission record is invalid JSON', { cause: error });
+        }
+        const record = normalizeArchivedMissionRecord(parsed);
+        if (record === null
+          || record.reason !== 'ACTIVE_LEDGER_CAPACITY'
+          || JSON.stringify(record.mission) !== JSON.stringify(mission)) {
+          throw new RuntimeError('PRECONDITION_FAILED', 'Archived mission identity is already bound to different content');
+        }
+        return;
+      }
+      if (existing.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', existing.reason);
+      const record: ArchivedMissionRecord = {
+        schemaVersion: 1,
+        archivedAt: new Date().toISOString(),
+        reason: 'ACTIVE_LEDGER_CAPACITY',
+        mission,
+      };
       handle = await open(filename, flags, 0o600);
       await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, 'utf8');
       await handle.sync();
@@ -129,6 +128,7 @@ export class MissionLedgerStore {
       else await this.safety.runMutation('mission-state', publish);
     } catch (error) {
       await handle?.close().catch(() => undefined);
+      if (error instanceof RuntimeError && error.code === 'PRECONDITION_FAILED') throw error;
       const raced = await inspectPrivateRegularFile(filename, 'Archived mission record');
       if (raced.state === 'ok') {
         let parsed: unknown;

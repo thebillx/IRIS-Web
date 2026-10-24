@@ -139,6 +139,7 @@ export interface ArtifactRegistrationInput {
 
 export class VNextResourceRegistry {
   private mutationTail: Promise<void> = Promise.resolve();
+  private safetyAdmissionDepth = 0;
 
   public constructor(
     private readonly state: RuntimeState,
@@ -767,35 +768,45 @@ export class VNextResourceRegistry {
       transactions.push(record);
     }
     const write = () => writePrivateJson(path.join(this.dataRoot, RECONCILIATION_FILE), { schemaVersion: 1, transactions });
-    if (this.safety === undefined) await write();
-    else await this.safety.runMutation('resource-registry', write);
+    await this.runSafetyMutation(write);
   }
 
   private async writeDocument(document: ResourceDocument): Promise<void> {
     if (!isResourceDocument(document)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing to write invalid vNext resource registry');
     const write = () => writePrivateJson(path.join(this.dataRoot, RESOURCE_FILE), document);
-    if (this.safety === undefined) await write();
-    else await this.safety.runMutation('resource-registry', write);
+    await this.runSafetyMutation(write);
   }
 
   private serializeMutation<T>(operation: () => Promise<T>, reconciliationRequestId?: string, lockPersistentState = true): Promise<T> {
     const guarded = async () => {
-      if (!lockPersistentState) {
-        await this.assertMutationLockForPlanning();
-        await this.assertTransactionFence(reconciliationRequestId);
-        return operation();
-      }
-      const release = await this.acquireMutationLock(reconciliationRequestId !== undefined);
-      try {
-        await this.assertTransactionFence(reconciliationRequestId);
-        return await operation();
-      } finally {
-        await release();
-      }
+      return this.runSafetyMutation(async () => {
+        if (!lockPersistentState) {
+          await this.assertMutationLockForPlanning();
+          await this.assertTransactionFence(reconciliationRequestId);
+          return operation();
+        }
+        const release = await this.acquireMutationLock(reconciliationRequestId !== undefined);
+        try {
+          await this.assertTransactionFence(reconciliationRequestId);
+          return await operation();
+        } finally {
+          await release();
+        }
+      });
     };
     const result = this.mutationTail.then(guarded, guarded);
     this.mutationTail = result.then(() => undefined, () => undefined);
     return result;
+  }
+
+  private async runSafetyMutation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.safety === undefined || this.safetyAdmissionDepth > 0) return operation();
+    this.safetyAdmissionDepth += 1;
+    try {
+      return await this.safety.runMutation('resource-registry', operation);
+    } finally {
+      this.safetyAdmissionDepth -= 1;
+    }
   }
 
   private async assertMutationLockForPlanning(): Promise<void> {
