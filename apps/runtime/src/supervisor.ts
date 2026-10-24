@@ -29,7 +29,7 @@ import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminT
 import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, readRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
 import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
 import { DurableMutationJournal, type MutationBinding } from './durable-mutation-journal.js';
-import { withSafetyWriterAdmission, type SafetyIdentity } from './production-safety.js';
+import { ProductionSafetyController, withSafetyWriterAdmission, type SafetyIdentity } from './production-safety.js';
 
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
 import { readSupervisorStateFile, writeSupervisorStateFile, unresolvedStartup, validStartupOperations, type StartupOperation, type StartupState } from './supervisor-startup.js';
@@ -255,6 +255,12 @@ export async function createSupervisor(options: SupervisorOptions = {}): Promise
   const sourceRoot = options.sourceRoot === undefined ? await resolveSourceRoot() : path.resolve(options.sourceRoot);
   const protectedReferenceRoot = options.protectedReferenceRoot ?? process.env.IRIS_PROTECTED_REFERENCE_ROOT?.trim();
   const safetyAdmission = options.safetyAdmission ?? await lstat(path.join(dataRoot, 'production-safety.json')).then(() => true, () => false);
+  let safetyIdentity = options.safetyIdentity;
+  if (safetyAdmission && safetyIdentity === undefined) {
+    const safety = await ProductionSafetyController.openReadOnly({ dataRoot });
+    safetyIdentity = safety?.snapshot().identity;
+    if (safetyIdentity === undefined) throw new RuntimeError('AUTHORITY_CHANGED', 'Supervisor safety identity is unavailable');
+  }
   return new Supervisor(
     dataRoot,
     sourceRoot,
@@ -266,7 +272,7 @@ export async function createSupervisor(options: SupervisorOptions = {}): Promise
     protectedReferenceRoot,
     options.keepAwakeProvider,
     safetyAdmission,
-    options.safetyIdentity,
+    safetyIdentity,
   );
 }
 

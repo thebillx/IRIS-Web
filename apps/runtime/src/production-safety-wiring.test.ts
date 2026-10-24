@@ -10,6 +10,7 @@ import { FoundationStateStore } from './persistence.js';
 import { MissionLedgerStore } from './mission-store.js';
 import { RuntimeState } from './state.js';
 import { VNextResourceRegistry } from './resource-registry.js';
+import { createSupervisor } from './supervisor.js';
 
 const roots: string[] = [];
 const writers = Object.keys(runtimeWriterBindings()) as SafetyWriterName[];
@@ -130,4 +131,23 @@ test('R09 quiescence prevents mission archive directory creation', async () => {
   await controller.quiesce('r09-owner');
   await assert.rejects(store.archiveForCapacity(completed), { code: 'PRECONDITION_FAILED' });
   await assert.rejects(lstat(path.join(dataRoot, 'mission-archive')), { code: 'ENOENT' });
+});
+
+test('R09 default Supervisor construction rejects a rolled runtime identity', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-supervisor-identity-'));
+  roots.push(root);
+  await chmod(root, 0o700);
+  const dataRoot = path.join(root, 'runtime');
+  await mkdir(dataRoot, { mode: 0o700 });
+  const identity = { runtimeId: 'r09-supervisor-runtime', instanceId: 'r09-supervisor-instance', dataRoot };
+  const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret: 'r09-owner', writerVerifier: createRuntimeWriterVerifier(dataRoot) });
+  for (const writer of writers) await controller.registerWriter(writer);
+  const supervisor = await createSupervisor({ dataRoot, sourceRoot: root, safetyAdmission: true });
+  await ProductionSafetyController.open({
+    dataRoot,
+    identity: { ...identity, instanceId: 'r09-supervisor-next-instance' },
+    ownerAccessSecret: 'r09-owner',
+    writerVerifier: createRuntimeWriterVerifier(dataRoot),
+  });
+  await assert.rejects(supervisor.down(), { code: 'AUTHORITY_CHANGED' });
 });
