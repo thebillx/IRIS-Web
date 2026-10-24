@@ -111,6 +111,53 @@ test('M74 failed reservation remains durable and blocks recovery until reconcile
   await assert.rejects(fixture.controller.recover(fixture.token, {}), { code: 'PRECONDITION_FAILED' });
 });
 
+test('M74 active backup reservation survives restart and has authenticated terminal reconciliation', async () => {
+  const fixture = await createFixture();
+  for (const writer of writers) await fixture.controller.registerWriter(writer);
+  await fixture.controller.quiesce(fixture.token);
+  const reservation = await fixture.controller.reserveBackup(fixture.token, path.join(fixture.root, 'backup-after-restart'));
+  const restarted = await ProductionSafetyController.open({
+    dataRoot: fixture.dataRoot,
+    identity: { ...fixture.identity, instanceId: 'restart-instance' },
+    ownerAccessSecret: fixture.token,
+    writerVerifier: fixture.verifier,
+  });
+  const interrupted = await restarted.inspect();
+  assert.equal(interrupted.state, 'RECOVERY_REQUIRED');
+  assert.equal(interrupted.reservation?.id, reservation.id);
+  assert.equal(interrupted.reservation?.status, 'FAILED');
+  assert.equal(interrupted.reservation?.destination, path.join(fixture.root, 'backup-after-restart'));
+  await assert.rejects(restarted.reconcileReservation('wrong-owner', reservation.id, 'not authorized'), { code: 'CONTROL_DENIED' });
+  await restarted.reconcileReservation(fixture.token, reservation.id, 'backup publication outcome was inspected and is not trusted');
+  const reconciled = await restarted.inspect();
+  assert.equal(reconciled.reservation, null);
+  assert.equal(reconciled.reservationHistory.at(-1)?.id, reservation.id);
+  assert.match(reconciled.blockedReason ?? '', /terminally reconciled as FAILED/);
+  const observations = Object.fromEntries(writers.map((writer) => [writer, { state: 'IDLE' as const }]));
+  assert.equal((await restarted.recover(fixture.token, observations)).state, 'ACTIVE');
+});
+
+test('M74 active restore reservation survives restart and reconciliation is idempotent', async () => {
+  const fixture = await createFixture();
+  for (const writer of writers) await fixture.controller.registerWriter(writer);
+  await writeFile(path.join(fixture.dataRoot, 'state.json'), 'safe\n', { mode: 0o600 });
+  await fixture.controller.quiesce(fixture.token);
+  await createRuntimeBackup({ controller: fixture.controller, ownerAccessToken: fixture.token, destination: path.join(fixture.root, 'source-backup') });
+  const reservation = await fixture.controller.reserveRestore(fixture.token, path.join(fixture.root, 'restore-after-restart'), null);
+  const restarted = await ProductionSafetyController.open({
+    dataRoot: fixture.dataRoot,
+    identity: { ...fixture.identity, instanceId: 'restore-restart-instance' },
+    ownerAccessSecret: fixture.token,
+    writerVerifier: fixture.verifier,
+  });
+  assert.equal((await restarted.inspect()).reservation?.id, reservation.id);
+  await restarted.reconcileReservation(fixture.token, reservation.id, 'restore outcome was inspected and destination remains untrusted');
+  await restarted.reconcileReservation(fixture.token, reservation.id, 'idempotent replay');
+  const reconciled = await restarted.inspect();
+  assert.equal(reconciled.reservation, null);
+  assert.equal(reconciled.reservationHistory.filter((entry) => entry.id === reservation.id).length, 1);
+});
+
 test('M74 readiness freshly verifies non-instrumented writers before owner window', async () => {
   let drift = false;
   const fixture = await createFixture(() => drift);

@@ -69,6 +69,20 @@ interface SafetyReservation {
   readonly status: 'ACTIVE' | 'FAILED';
 }
 
+interface SafetyReservationOutcome {
+  readonly id: string;
+  readonly operation: SafetyReservation['operation'];
+  readonly ownerInstanceId: string;
+  readonly fenceEpoch: number;
+  readonly destination: string;
+  readonly checkpointTarget: string | null;
+  readonly startedAt: string;
+  readonly status: 'FAILED';
+  readonly reason: string;
+  readonly reconciledAt: string;
+  readonly reconciledByInstanceId: string;
+}
+
 interface SafetyDocument {
   readonly schemaVersion: 1;
   readonly generation: number;
@@ -80,6 +94,7 @@ interface SafetyDocument {
   readonly backup: BackupEvidence | null;
   readonly restore: RestoreEvidence | null;
   readonly reservation: SafetyReservation | null;
+  readonly reservationHistory: readonly SafetyReservationOutcome[];
   readonly updatedAt: string;
 }
 
@@ -201,8 +216,8 @@ export class ProductionSafetyController {
         state: recoverable ? 'ACTIVE' as const : 'RECOVERY_REQUIRED' as const,
         identity,
         blockedReason: recoverable ? null : 'Runtime instance changed; owner recovery is required',
-        backup: null,
-        restore: null,
+        backup: current.backup,
+        restore: current.restore,
         reservation: current.reservation === null ? null : { ...current.reservation, status: 'FAILED' as const },
       };
       const published = bump(next);
@@ -478,6 +493,41 @@ export class ProductionSafetyController {
     });
   }
 
+  /**
+   * Close a failed reservation after an authenticated owner has inspected the
+   * interrupted operation. The reservation is retained in history so a
+   * restart cannot silently discard an unknown backup/restore outcome.
+   */
+  public async reconcileReservation(ownerAccessToken: string, reservationId: string, reason: string): Promise<void> {
+    if (reason.trim().length === 0 || reason.length > 2048) throw new RuntimeError('INVALID_REQUEST', 'Reservation reconciliation reason is invalid');
+    await this.transaction(async (current) => {
+      this.authorize(current, ownerAccessToken);
+      const existingHistory = current.reservationHistory.find((outcome) => outcome.id === reservationId);
+      if (current.reservation === null) {
+        if (existingHistory !== undefined) return { value: undefined, document: current };
+        throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation is not available for reconciliation');
+      }
+      if (current.reservation.id !== reservationId) throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation identity does not match');
+      if (current.reservation.status !== 'FAILED') throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation must be durably failed before reconciliation');
+      const reservation = current.reservation;
+      const outcome: SafetyReservationOutcome = {
+        ...reservation,
+        status: 'FAILED',
+        reason: reason.trim(),
+        reconciledAt: new Date().toISOString(),
+        reconciledByInstanceId: this.identity.instanceId,
+      };
+      const next = {
+        ...current,
+        state: 'BLOCKED' as const,
+        blockedReason: `Safety reservation ${reservationId} terminally reconciled as FAILED: ${reason.trim()}`,
+        reservation: null,
+        reservationHistory: [...current.reservationHistory, outcome],
+      };
+      return { value: undefined, document: next };
+    });
+  }
+
   private async assertQuiescedForReservation(current: SafetyDocument): Promise<void> {
     if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'A verified QUIESCED fence is required');
     if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A safety reservation is already active');
@@ -673,7 +723,7 @@ export async function restoreRuntimeBackup(input: RestoreBackupInput): Promise<B
 function emptyDocument(identity: SafetyIdentity): SafetyDocument {
   const writers: Record<string, WriterRecord> = {};
   for (const writer of REQUIRED_WRITERS) writers[writer] = { state: 'UNKNOWN', inFlight: 0, ownerInstanceId: null, leaseIds: [] };
-  return { schemaVersion: 1, generation: 0, state: 'ACTIVE', identity, writers, blockedReason: null, fenceEpoch: 0, backup: null, restore: null, reservation: null, updatedAt: new Date().toISOString() };
+  return { schemaVersion: 1, generation: 0, state: 'ACTIVE', identity, writers, blockedReason: null, fenceEpoch: 0, backup: null, restore: null, reservation: null, reservationHistory: [], updatedAt: new Date().toISOString() };
 }
 
 async function applyObservations(document: SafetyDocument, observations: Readonly<Record<string, WriterObservation>>, identity: SafetyIdentity, verifier: TrustedWriterVerifier | undefined): Promise<SafetyDocument> {
@@ -1009,6 +1059,7 @@ function parseDocument(content: string): SafetyDocument {
       backup: value.backup === null || value.backup === undefined ? null : parseBackupEvidence(value.backup),
       restore: value.restore === null || value.restore === undefined ? null : parseRestoreEvidence(value.restore),
       reservation: value.reservation === null || value.reservation === undefined ? null : parseReservation(value.reservation),
+      reservationHistory: value.reservationHistory === undefined ? [] : parseReservationHistory(value.reservationHistory),
       updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date(0).toISOString(),
     };
   } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Production safety state is invalid', { cause: error }); }
@@ -1032,6 +1083,26 @@ function parseRestoreEvidence(value: unknown): RestoreEvidence {
 function parseReservation(value: unknown): SafetyReservation {
   if (!isRecord(value) || typeof value.id !== 'string' || (value.operation !== 'BACKUP' && value.operation !== 'RESTORE') || typeof value.ownerInstanceId !== 'string' || !Number.isSafeInteger(value.fenceEpoch) || (value.fenceEpoch as number) < 0 || typeof value.destination !== 'string' || !path.isAbsolute(value.destination) || (value.checkpointTarget !== null && (typeof value.checkpointTarget !== 'string' || !path.isAbsolute(value.checkpointTarget))) || typeof value.startedAt !== 'string' || (value.status !== 'ACTIVE' && value.status !== 'FAILED')) throw new Error('reservation schema');
   return { id: value.id, operation: value.operation, ownerInstanceId: value.ownerInstanceId, fenceEpoch: value.fenceEpoch as number, destination: value.destination, checkpointTarget: value.checkpointTarget as string | null, startedAt: value.startedAt, status: value.status };
+}
+
+function parseReservationHistory(value: unknown): readonly SafetyReservationOutcome[] {
+  if (!Array.isArray(value)) throw new Error('reservation history schema');
+  return value.map((entry) => {
+    if (!isRecord(entry) || typeof entry.id !== 'string' || (entry.operation !== 'BACKUP' && entry.operation !== 'RESTORE') || typeof entry.ownerInstanceId !== 'string' || !Number.isSafeInteger(entry.fenceEpoch) || (entry.fenceEpoch as number) < 0 || typeof entry.destination !== 'string' || !path.isAbsolute(entry.destination) || (entry.checkpointTarget !== null && (typeof entry.checkpointTarget !== 'string' || !path.isAbsolute(entry.checkpointTarget))) || typeof entry.startedAt !== 'string' || entry.status !== 'FAILED' || typeof entry.reason !== 'string' || entry.reason.length === 0 || typeof entry.reconciledAt !== 'string' || typeof entry.reconciledByInstanceId !== 'string') throw new Error('reservation history entry schema');
+    return {
+      id: entry.id,
+      operation: entry.operation,
+      ownerInstanceId: entry.ownerInstanceId,
+      fenceEpoch: entry.fenceEpoch as number,
+      destination: entry.destination,
+      checkpointTarget: entry.checkpointTarget as string | null,
+      startedAt: entry.startedAt,
+      status: 'FAILED',
+      reason: entry.reason,
+      reconciledAt: entry.reconciledAt,
+      reconciledByInstanceId: entry.reconciledByInstanceId,
+    };
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
