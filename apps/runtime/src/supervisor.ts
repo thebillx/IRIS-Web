@@ -58,6 +58,13 @@ const FORWARDED_READ_ONLY_TOOLS = new Set([
 const FORWARDED_DURABLE_MUTATION_TOOLS = new Set(['project_validation_start']);
 
 const FORWARDED_GROUPED_READ_ONLY_TOOLS = new Set(['workspace', 'fs', 'artifact', 'job', 'git']);
+// Only validation/authority failures prove that the downstream mutation never started.
+const PRE_EFFECT_MUTATION_FAILURE_CODES = new Set([
+  'AUTHORITY_CHANGED', 'CAPABILITY_DENIED', 'CONNECTOR_MANIFEST_STALE', 'CONTROL_DENIED',
+  'INVALID_REQUEST', 'MISSION_NOT_FOUND', 'PRECONDITION_FAILED', 'PROJECT_NOT_FOUND',
+  'RUNTIME_IDENTITY_MISMATCH', 'RUNTIME_NOT_RUNNING', 'SESSION_NOT_FOUND', 'SESSION_BUSY',
+  'WORKSPACE_NOT_FOUND',
+]);
 
 function isUnifiedConnectorRegistry(registry: ConnectorRegistryDocument): boolean {
   return registry.admin === null && registry.connectors.length === 1 && registry.connectors[0]?.label === 'IRIS';
@@ -1225,6 +1232,10 @@ export class Supervisor {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime mutation outcome remains unresolved; do not retry');
     }
     if (evidence.state !== 'COMMITTED' && evidence.state !== 'FAILED') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime mutation outcome is not terminal');
+    if (evidence.state === 'FAILED'
+      && (typeof evidence.errorCode !== 'string' || !PRE_EFFECT_MUTATION_FAILURE_CODES.has(evidence.errorCode))) {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime failure does not prove that the mutation had no effect');
+    }
     const settled = await this.workloadMutationJournal.reconcile(
       record.requestId, record.fingerprint, originalBinding, evidence.state,
       evidence.state === 'COMMITTED' ? evidence.evidence : null,
