@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { RuntimeError, type RuntimeFailureCode } from '@iris/domain';
 import { assertActivationSourceIdentity, assertActivationWorkloadReady, type ActivationSourceIdentity } from './activation-source-identity.js';
+import { probeRuntimeAuthority } from './authority.js';
 import { bindAdminTunnelIdentity, bindConnectorRuntime, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry, replaceConnectorCatalogManifest, seedFromLegacyProfiles, type AdminConnectorBinding, type ConnectorBinding, type ConnectorCatalogManifest, type ConnectorRegistryDocument } from './connector-registry.js';
 import { credentialPaths, inspectCredentialStatus, loadOrCreateTunnelServiceSecret, readTunnelServiceSecret, rotateTunnelServiceSecret, type CredentialStatus } from './credentials.js';
 import { ensureRuntimeDataRoot, resolveRuntimeDataRoot, resolveSourceRoot } from './data-root.js';
@@ -296,7 +297,7 @@ export class Supervisor {
     private readonly protectedReferenceRoot?: string,
     keepAwakeProvider: KeepAwakeProvider = new MacOSCaffeinateProvider(),
     private readonly safetyAdmission = false,
-    private readonly safetyIdentity?: Pick<SafetyIdentity, 'runtimeId' | 'instanceId'>,
+    private safetyIdentity?: Pick<SafetyIdentity, 'runtimeId' | 'instanceId'>,
   ) {
     this.lifecycleGrants = new LifecycleGrantStore(dataRoot);
     // Keep the Supervisor transport journal separate from the Runtime's
@@ -3079,6 +3080,7 @@ export class Supervisor {
       const identity = observeProcessStart(pid);
       if (identity.state !== 'live' || identity.marker !== birth.marker) break;
       if (executable === operation.expectedProcessExecutable) {
+        if (operation.component === 'runtime') await this.rebindRuntimeSafetyIdentity(pid, birth.marker);
         await this.updateStartup(id, 'SPAWNING', { processExecutable: executable });
         return;
       }
@@ -3086,6 +3088,44 @@ export class Supervisor {
     }
     await this.updateStartup(id, 'OWNERSHIP_UNVERIFIED', { failureCode: 'PROCESS_OWNERSHIP_AMBIGUOUS' });
     throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Expected child executable was not established within the identity deadline');
+  }
+
+  private async rebindRuntimeSafetyIdentity(pid: number, processStartMarker: string): Promise<void> {
+    if (!this.safetyAdmission) return;
+    const previous = this.safetyIdentity;
+    if (previous === undefined) throw new RuntimeError('AUTHORITY_CHANGED', 'Supervisor safety identity is unavailable for Runtime replacement');
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const observedProcess = observeProcessStart(pid);
+      const endpoint = await readEndpoint(this.dataRoot).catch(() => null);
+      const control = await readRuntimeControl(this.dataRoot).catch(() => null);
+      const authority = await probeRuntimeAuthority(this.dataRoot).catch(() => ({ state: 'indeterminate' as const, reason: 'runtime authority unavailable' }));
+      const safety = await ProductionSafetyController.openReadOnly({ dataRoot: this.dataRoot }).catch(() => null);
+      const document = safety?.snapshot();
+      const writersClear = document !== undefined
+        && Object.values(document.writers).every((writer) => writer.state !== 'ACTIVE' && writer.inFlight === 0 && writer.leaseIds.length === 0);
+      if (observedProcess.state === 'live' && observedProcess.marker === processStartMarker
+        && authority.state === 'live' && authority.identity.pid === pid
+        && authority.identity.runtimeId === previous.runtimeId
+        && control !== null && control.runtimeId === previous.runtimeId
+        && control.instanceId === authority.identity.instanceId
+        && document !== undefined
+        && document.state === 'ACTIVE'
+        && document.reservation === null
+        && writersClear
+        && document.identity.runtimeId === authority.identity.runtimeId
+        && document.identity.instanceId === authority.identity.instanceId
+        && path.resolve(document.identity.dataRoot) === path.resolve(this.dataRoot)) {
+        if (endpoint !== null && (endpoint.pid !== pid || endpoint.runtimeId !== authority.identity.runtimeId || endpoint.instanceId !== authority.identity.instanceId)) {
+          await delay(25);
+          continue;
+        }
+        this.safetyIdentity = { runtimeId: authority.identity.runtimeId, instanceId: authority.identity.instanceId };
+        return;
+      }
+      await delay(25);
+    }
+    throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Runtime safety identity was not durably rebound');
   }
 
   private async verifyStartup(id: string, record: OwnedProcess): Promise<OwnedProcess> {

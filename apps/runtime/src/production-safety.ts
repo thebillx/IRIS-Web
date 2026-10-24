@@ -291,7 +291,16 @@ export class ProductionSafetyController {
       if (existing.inFlight > 0) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} has active mutation leases`);
       if (state !== 'UNKNOWN' && !INSTRUMENTED_WRITERS.includes(name as typeof INSTRUMENTED_WRITERS[number])) {
         const verified = await verifyWriterEvidence(current, this.identity, this.writerVerifier, name as SafetyWriterName);
-        if (verified === null || verified.state !== state || verified.inFlight !== existing.inFlight) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} is not independently verified`);
+        // The Supervisor holds its verified operation lock while the replacement Runtime registers this writer.
+        const supervisorStartupLock = name === 'supervisor'
+          && state === 'IDLE'
+          && (existing.state === 'IDLE' || existing.state === 'UNKNOWN')
+          && existing.inFlight === 0
+          && verified?.state === 'ACTIVE'
+          && verified.inFlight >= 1;
+        if (verified === null || !supervisorStartupLock && (verified.state !== state || verified.inFlight !== existing.inFlight)) {
+          throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} is not independently verified`);
+        }
       }
       if (state === 'UNKNOWN' && existing.state !== 'UNKNOWN') throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} cannot be weakened to UNKNOWN`);
       const writers = {
