@@ -64,7 +64,7 @@ export class DurableMutationJournal {
     const prepared: MutationRecord = { schemaVersion: 1, requestId, fingerprint, state: 'PREPARED', result: null, errorCode: null, updatedAt: new Date().toISOString(), ...(binding === undefined ? {} : { binding }), ...(logicalFingerprint === undefined ? {} : { logicalFingerprint }) };
     try { await writeNew(filename, prepared); }
     catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') return this.executeSerialized(requestId, fingerprint, operation, binding);
+      if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') return this.executeSerialized(requestId, fingerprint, operation, binding, logicalFingerprint);
       throw new RuntimeError('PERSISTENCE_FAILURE', 'Mutation journal reservation failed', { cause: error });
     }
     await writeRecord(filename, { ...prepared, state: 'APPLYING', updatedAt: new Date().toISOString() });
