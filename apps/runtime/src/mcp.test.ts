@@ -37,6 +37,10 @@ describe('local MCP transport and permission boundary', () => {
     const requestBody = { name: 'mutation_status', arguments: { requestId: 'runtime-evidence-1', fingerprint, operation: 'file_write', clientId: binding.clientId, sessionId: null, projectId: null, workspaceId: null, runtimeId: binding.runtimeId, instanceId: binding.instanceId, deploymentEpoch: binding.deploymentEpoch } };
     const response = await handleMcpRequest(rpc('tools/call', 1, requestBody, true, 'mutation_status', binding.clientId), {} as CapabilityService, undefined, undefined, 'tunnel-service', { runtimeId: binding.runtimeId, instanceId: 'instance-b', deploymentEpoch: 3 }, journal);
     expect(await response.json()).toMatchObject({ result: { isError: false, structuredContent: { requestId: 'runtime-evidence-1', state: 'COMMITTED', evidence: { path: 'value.txt' } } } });
+    const staleRuntime = await handleMcpRequest(rpc('tools/call', 1.5, requestBody, true, 'mutation_status', binding.clientId), {} as CapabilityService, undefined, undefined, 'tunnel-service', { runtimeId: 'runtime-b', instanceId: 'instance-b', deploymentEpoch: 3 }, journal);
+    expect(await staleRuntime.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'AUTHORITY_CHANGED' } } });
+    const staleDeployment = await handleMcpRequest(rpc('tools/call', 1.6, requestBody, true, 'mutation_status', binding.clientId), {} as CapabilityService, undefined, undefined, 'tunnel-service', { runtimeId: binding.runtimeId, instanceId: 'instance-b', deploymentEpoch: 4 }, journal);
+    expect(await staleDeployment.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'AUTHORITY_CHANGED' } } });
     const denied = await handleMcpRequest(rpc('tools/call', 2, requestBody, true, 'mutation_status', binding.clientId), {} as CapabilityService, undefined, undefined, 'owner', { runtimeId: binding.runtimeId, instanceId: binding.instanceId, deploymentEpoch: 3 }, journal);
     expect(await denied.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'CONTROL_DENIED' } } });
   });

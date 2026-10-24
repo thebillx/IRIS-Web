@@ -119,7 +119,7 @@ async function handleMcpTransportRequest(
 
     try {
       if (params.name === 'mutation_status') {
-        return jsonRpcResult(rpc.id ?? null, toolResult(await runtimeMutationStatus(args, state, principal, mutationJournal)));
+        return jsonRpcResult(rpc.id ?? null, toolResult(await runtimeMutationStatus(args, state, principal, runtimeContext, mutationJournal)));
       }
       if (profile === 'full' && params.name === 'catalog_identity') {
         return jsonRpcResult(rpc.id ?? null, catalogIdentityPayload('FULL', toolDefinitions(), runtimeContext));
@@ -192,6 +192,7 @@ async function executeToolWithEvidence(
 
 async function runtimeMutationStatus(
   args: Record<string, unknown>, state: RuntimeState | undefined, principal: McpPrincipal,
+  runtimeContext: McpCatalogRuntimeContext,
   mutationJournal: DurableMutationJournal | undefined,
 ): Promise<Record<string, unknown>> {
   if (principal !== 'tunnel-service' || mutationJournal === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence is restricted to the authenticated Supervisor tunnel');
@@ -207,6 +208,12 @@ async function runtimeMutationStatus(
   const instanceId = requiredBoundedString(args, 'instanceId', 200);
   const deploymentEpoch = args.deploymentEpoch;
   if (typeof deploymentEpoch !== 'number' || !Number.isSafeInteger(deploymentEpoch) || deploymentEpoch <= 0) throw new RuntimeError('INVALID_REQUEST', 'deploymentEpoch is invalid');
+  if (runtimeContext.runtimeId !== null && runtimeContext.runtimeId !== undefined && runtimeId !== runtimeContext.runtimeId) {
+    throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation evidence runtime identity is not current');
+  }
+  if (runtimeContext.deploymentEpoch !== null && runtimeContext.deploymentEpoch !== undefined && deploymentEpoch !== runtimeContext.deploymentEpoch) {
+    throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation evidence deployment lineage is not current');
+  }
   if ((projectId !== null || workspaceId !== null) && sessionId === null) {
     throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence for a project or workspace requires a live session');
   }
