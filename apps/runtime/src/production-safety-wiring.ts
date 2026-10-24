@@ -1,6 +1,6 @@
 import { lstat, readdir } from 'node:fs/promises';
 import path from 'node:path';
-import type { SafetyIdentity, SafetyWriterName, TrustedWriterVerification, TrustedWriterVerifier } from './production-safety.js';
+import type { SafetyWriterName, TrustedWriterVerification, TrustedWriterVerifier } from './production-safety.js';
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
 import { observeProcessStart } from './macos-safety.js';
 
