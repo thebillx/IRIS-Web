@@ -27,8 +27,8 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: 04e2b4bb737f776ad0836d3d77a854567f544eca
-      APPROVED_TARGET_TREE: f63fface6390473ae7df6b65564bbe982845c1b6
+      APPROVED_TARGET_SHA: 4db80221f2c81b9f5c267dbdf133e3b5e5853329
+      APPROVED_TARGET_TREE: d92f28cf65d62e724fc56f1823ef3384b8a2d479
       BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
     steps:
       - name: Validate the approved target
@@ -125,7 +125,7 @@ jobs:
           '
 
       - name: Run production safety disposable regressions
-        run: pnpm --filter @iris/runtime exec tsx --test src/production-safety-m74.test.ts
+        run: pnpm --filter @iris/runtime exec tsx --test src/production-safety-m74.test.ts src/production-safety-wiring.test.ts
 
       - name: Typecheck and build Runtime
         run: |
@@ -145,7 +145,7 @@ jobs:
 
       - name: Run unified MCP workload routing regression
         run: |
-          pnpm --filter @iris/runtime exec vitest run src/mcp-v21.test.ts src/supervisor-native-control.test.ts --testTimeout=60000
+          pnpm --filter @iris/runtime exec vitest run src/mcp.test.ts src/mcp-v21.test.ts src/supervisor-native-control.test.ts --testTimeout=60000
           pnpm --filter @iris/runtime exec tsx src/control-setup.test.ts
 
       - name: Run unified setup and durable mutation regressions
