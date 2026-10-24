@@ -1127,16 +1127,32 @@ export class Supervisor {
       const sessionCheck = await this.forwardWorkloadTool('session_get', { sessionId: context.sessionId }, context);
       if (sessionCheck.isError) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence session is no longer authorized');
     }
-    const fingerprint = createHash('sha256').update(stableJson({ name, args, ...binding })).digest('hex');
-    const record = await this.workloadMutationJournal.inspect(requestId, fingerprint, binding);
+    const projectId = typeof args.projectId === 'string' ? args.projectId : undefined;
+    const workspaceId = typeof args.workspaceId === 'string' ? args.workspaceId : undefined;
+    if (projectId !== undefined) {
+      const projectCheck = workspaceId === undefined
+        ? await this.forwardWorkloadTool('project_info', { projectId }, context)
+        : await this.forwardWorkloadTool('workspace', { operation: 'get', projectId, workspaceId }, context);
+      if (projectCheck.isError) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence project/workspace is no longer authorized');
+    }
+    const logicalFingerprint = createHash('sha256').update(stableJson({
+      name,
+      args,
+      clientId: context.clientId,
+      sessionId: context.sessionId ?? null,
+      projectId: projectId ?? null,
+      workspaceId: workspaceId ?? null,
+    })).digest('hex');
+    const record = await this.workloadMutationJournal.inspectByLogicalIdentity(requestId, logicalFingerprint, binding);
     if (record === null) {
-      return { structuredContent: { requestId, operation: name, state: 'NOT_FOUND', fingerprint }, isError: false };
+      return { structuredContent: { requestId, operation: name, state: 'NOT_FOUND', logicalFingerprint }, isError: false };
     }
     return {
       structuredContent: {
         requestId,
         operation: name,
-        fingerprint,
+        logicalFingerprint,
+        executionFingerprint: record.fingerprint,
         state: record.state,
         errorCode: record.errorCode,
         updatedAt: record.updatedAt,
@@ -1215,11 +1231,19 @@ export class Supervisor {
       deploymentEpoch: registry.deploymentEpoch,
     };
     const fingerprint = createHash('sha256').update(stableJson({ name, args, ...mutationBinding })).digest('hex');
+    const logicalFingerprint = createHash('sha256').update(stableJson({
+      name,
+      args,
+      clientId: context.clientId,
+      sessionId: context.sessionId ?? null,
+      projectId: typeof args.projectId === 'string' ? args.projectId : null,
+      workspaceId: typeof args.workspaceId === 'string' ? args.workspaceId : null,
+    })).digest('hex');
     const existing = await this.workloadMutationJournal.inspect(requestId, fingerprint, mutationBinding);
     if (existing?.state === 'RECONCILIATION_REQUIRED') {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation request has an unresolved outcome; verify its downstream durable result before retrying');
     }
-    return this.workloadMutationJournal.execute(requestId, fingerprint, call, mutationBinding);
+    return this.workloadMutationJournal.execute(requestId, fingerprint, call, mutationBinding, logicalFingerprint);
   }
 
   public async doctor(): Promise<Record<string, unknown>> {

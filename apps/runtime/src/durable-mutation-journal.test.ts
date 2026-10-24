@@ -81,10 +81,15 @@ describe('DurableMutationJournal', () => {
   it('binds status and replay to the exact downstream client/session/project/workspace/runtime identity', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
     const journal = new DurableMutationJournal(root);
-    await journal.execute('bound-1', fingerprint, async () => ({ changed: true }), binding);
+    const logicalFingerprint = 'c'.repeat(64);
+    await journal.execute('bound-1', fingerprint, async () => ({ changed: true }), binding, logicalFingerprint);
     await expect(journal.inspect('bound-1', fingerprint, binding)).resolves.toMatchObject({ state: 'COMMITTED', binding });
+    await expect(journal.inspectByLogicalIdentity('bound-1', logicalFingerprint, binding)).resolves.toMatchObject({ state: 'COMMITTED', binding, logicalFingerprint });
+    await expect(journal.inspectByLogicalIdentity('bound-1', logicalFingerprint, {
+      ...binding, runtimeId: 'runtime-after-restart', instanceId: 'instance-after-restart', deploymentEpoch: 8,
+    })).resolves.toMatchObject({ state: 'COMMITTED', binding });
     await expect(journal.inspect('bound-1', fingerprint, { ...binding, clientId: 'client-b' })).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
-    await expect(journal.execute('bound-1', fingerprint, async () => ({ changed: false }), { ...binding, deploymentEpoch: 8 })).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
+    await expect(journal.execute('bound-1', fingerprint, async () => ({ changed: false }), { ...binding, deploymentEpoch: 8 }, logicalFingerprint)).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
   });
 
   it('rejects legacy records when an authenticated downstream binding is required', async () => {

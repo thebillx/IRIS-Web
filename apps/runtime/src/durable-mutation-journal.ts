@@ -28,6 +28,8 @@ export interface MutationRecord {
   readonly updatedAt: string;
   /** New records carry the authenticated downstream identity used for the mutation. */
   readonly binding?: MutationBinding;
+  /** Stable request identity used to retrieve evidence after a runtime restart. */
+  readonly logicalFingerprint?: string;
 }
 
 /** A per-request durable guard. APPLYING is deliberately terminal for retries: the caller must reconcile. */
@@ -35,8 +37,8 @@ export class DurableMutationJournal {
   private tail: Promise<void> = Promise.resolve();
   public constructor(private readonly dataRoot: string, private readonly directoryName = 'vnext-mutations') {}
 
-  public execute<T>(requestId: string, fingerprint: string, operation: () => Promise<T>, binding?: MutationBinding): Promise<T> {
-    const run = this.tail.then(() => this.executeSerialized(requestId, fingerprint, operation, binding), () => this.executeSerialized(requestId, fingerprint, operation, binding));
+  public execute<T>(requestId: string, fingerprint: string, operation: () => Promise<T>, binding?: MutationBinding, logicalFingerprint?: string): Promise<T> {
+    const run = this.tail.then(() => this.executeSerialized(requestId, fingerprint, operation, binding, logicalFingerprint), () => this.executeSerialized(requestId, fingerprint, operation, binding, logicalFingerprint));
     this.tail = run.then(() => undefined, () => undefined);
     return run;
   }
@@ -45,16 +47,21 @@ export class DurableMutationJournal {
     return this.tail.then(() => this.inspectSerialized(requestId, fingerprint, binding), () => this.inspectSerialized(requestId, fingerprint, binding));
   }
 
-  private async executeSerialized<T>(requestId: string, fingerprint: string, operation: () => Promise<T>, binding?: MutationBinding): Promise<T> {
+  /** Read terminal or unresolved evidence by stable request identity without authorizing replay. */
+  public inspectByLogicalIdentity(requestId: string, logicalFingerprint: string, binding: MutationBinding): Promise<MutationRecord | null> {
+    return this.tail.then(() => this.inspectByLogicalIdentitySerialized(requestId, logicalFingerprint, binding), () => this.inspectByLogicalIdentitySerialized(requestId, logicalFingerprint, binding));
+  }
+
+  private async executeSerialized<T>(requestId: string, fingerprint: string, operation: () => Promise<T>, binding?: MutationBinding, logicalFingerprint?: string): Promise<T> {
     const filename = await this.recordFilename(requestId, fingerprint, true);
     const existing = await readMutation(filename);
     if (existing !== null) {
-      assertRecordBinding(existing, requestId, fingerprint, binding);
+      assertRecordBinding(existing, requestId, fingerprint, binding, logicalFingerprint);
       if (existing.state === 'COMMITTED') return existing.result as T;
       if (existing.state === 'FAILED') throw new RuntimeError(existing.errorCode === 'PRECONDITION_FAILED' ? 'PRECONDITION_FAILED' : 'PERSISTENCE_FAILURE', 'Mutation request already reached a terminal failure');
       throw new RuntimeError('PERSISTENCE_FAILURE', 'Mutation request has an unresolved outcome; reconcile before retry');
     }
-    const prepared: MutationRecord = { schemaVersion: 1, requestId, fingerprint, state: 'PREPARED', result: null, errorCode: null, updatedAt: new Date().toISOString(), ...(binding === undefined ? {} : { binding }) };
+    const prepared: MutationRecord = { schemaVersion: 1, requestId, fingerprint, state: 'PREPARED', result: null, errorCode: null, updatedAt: new Date().toISOString(), ...(binding === undefined ? {} : { binding }), ...(logicalFingerprint === undefined ? {} : { logicalFingerprint }) };
     try { await writeNew(filename, prepared); }
     catch (error: unknown) {
       if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') return this.executeSerialized(requestId, fingerprint, operation, binding);
@@ -83,6 +90,17 @@ export class DurableMutationJournal {
     return record;
   }
 
+  private async inspectByLogicalIdentitySerialized(requestId: string, logicalFingerprint: string, binding: MutationBinding): Promise<MutationRecord | null> {
+    if (!/^[a-f0-9]{64}$/.test(logicalFingerprint)) throw new RuntimeError('INVALID_REQUEST', 'Mutation logical fingerprint is invalid');
+    const filename = await this.recordFilename(requestId, logicalFingerprint, false);
+    const record = await readMutation(filename);
+    if (record === null) return null;
+    if (record.requestId !== requestId || record.logicalFingerprint !== logicalFingerprint || !sameLogicalBinding(record.binding, binding)) {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation evidence identity conflicts with its durable record');
+    }
+    return record;
+  }
+
   private async recordFilename(requestId: string, fingerprint: string, createDirectory: boolean): Promise<string> {
     if (!REQUEST_ID.test(requestId)) throw new RuntimeError('INVALID_REQUEST', 'Mutation requestId is invalid');
     if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new RuntimeError('INVALID_REQUEST', 'Mutation fingerprint is invalid');
@@ -106,13 +124,25 @@ export class DurableMutationJournal {
   }
 }
 
-function assertRecordBinding(record: MutationRecord, requestId: string, fingerprint: string, binding?: MutationBinding): void {
+function assertRecordBinding(record: MutationRecord, requestId: string, fingerprint: string, binding?: MutationBinding, logicalFingerprint?: string): void {
   if (record.requestId !== requestId || record.fingerprint !== fingerprint) {
     throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation request identity conflicts with its durable record');
   }
   if (binding !== undefined && !sameBinding(record.binding, binding)) {
     throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation downstream identity conflicts with its durable record');
   }
+  if (logicalFingerprint !== undefined && record.logicalFingerprint !== logicalFingerprint) {
+    throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation logical identity conflicts with its durable record');
+  }
+}
+
+function sameLogicalBinding(left: MutationBinding | undefined, right: MutationBinding): boolean {
+  return left !== undefined
+    && left.operation === right.operation
+    && left.clientId === right.clientId
+    && left.sessionId === right.sessionId
+    && left.projectId === right.projectId
+    && left.workspaceId === right.workspaceId;
 }
 
 function sameBinding(left: MutationBinding | undefined, right: MutationBinding): boolean {
@@ -134,7 +164,8 @@ async function readMutation(filename: string): Promise<MutationRecord | null> {
     const record = JSON.parse(await readFile(filename, 'utf8')) as MutationRecord;
     if (record.schemaVersion !== 1 || typeof record.requestId !== 'string' || typeof record.fingerprint !== 'string'
       || !['PREPARED','APPLYING','COMMITTED','FAILED','RECONCILIATION_REQUIRED'].includes(record.state)
-      || (record.binding !== undefined && !isMutationBinding(record.binding))) throw new Error('Mutation journal record is invalid');
+      || (record.binding !== undefined && !isMutationBinding(record.binding))
+      || (record.logicalFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(record.logicalFingerprint))) throw new Error('Mutation journal record is invalid');
     return record;
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
