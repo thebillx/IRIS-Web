@@ -72,6 +72,16 @@ async function inspectBinding(dataRoot: string, writer: SafetyWriterName, bindin
       continue;
     }
     if (!metadata.isFile() || metadata.nlink !== 1) return null;
+    if (relative === 'audit.jsonl') {
+      const inspected = await inspectPrivateRegularFile(filename, `${writer} writer store`);
+      if (inspected.state === 'missing') continue;
+      if (inspected.state === 'invalid') return null;
+      for (const line of inspected.content.split('\n')) {
+        if (line.trim().length === 0) continue;
+        try { JSON.parse(line); } catch { return null; }
+      }
+      continue;
+    }
     if (relative.endsWith('.lock')) {
       const lock = await readJsonIfPrivate(filename);
       if (lock.state === 'missing') continue;
