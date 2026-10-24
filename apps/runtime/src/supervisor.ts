@@ -1165,6 +1165,7 @@ export class Supervisor {
   private async reconcileWorkloadMutation(input: SupervisorMutationStatusInput): Promise<SupervisorAdminToolCallResult> {
     const { name, args, context } = input;
     if (context.clientId === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation reconciliation requires a bounded client identity');
+    if (!FORWARDED_DURABLE_MUTATION_TOOLS.has(name) && !groupedWorkloadDurableMutation(name, args)) throw new RuntimeError('CONTROL_DENIED', 'Mutation reconciliation is available only for durable workload mutations');
     const requestId = typeof args.requestId === 'string' && args.requestId.length > 0 && args.requestId.length <= 200 ? args.requestId : undefined;
     if (requestId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation reconciliation requires the original durable requestId');
     if (name !== 'session_open' && context.sessionId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation reconciliation requires the original session identity');

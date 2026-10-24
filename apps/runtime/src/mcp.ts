@@ -198,6 +198,7 @@ async function runtimeMutationStatus(
   const requestId = requiredBoundedString(args, 'requestId', 200);
   const fingerprint = requiredHex(args, 'fingerprint');
   const operation = requiredBoundedString(args, 'operation', 200);
+  if (!DURABLE_MUTATION_TOOLS.has(operation)) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence is available only for durable workload mutations');
   const clientId = requiredBoundedString(args, 'clientId', 200);
   const sessionId = nullableBoundedString(args, 'sessionId', 200);
   const projectId = nullableBoundedString(args, 'projectId', 200);
