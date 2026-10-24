@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, open, readFile, rename, stat } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readFile, readdir, rename, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { RuntimeError } from '@iris/domain';
 import { privateDirectoryProblem } from './private-fs.js';
@@ -52,8 +52,19 @@ export class DurableMutationJournal {
     return this.tail.then(() => this.inspectByLogicalIdentitySerialized(requestId, logicalFingerprint, binding), () => this.inspectByLogicalIdentitySerialized(requestId, logicalFingerprint, binding));
   }
 
+  /** Find an already-reserved logical mutation before a caller can substitute a new request ID. */
+  public findByLogicalIdentity(logicalFingerprint: string, binding: MutationBinding): Promise<MutationRecord | null> {
+    return this.tail.then(() => this.findByLogicalIdentitySerialized(logicalFingerprint, binding), () => this.findByLogicalIdentitySerialized(logicalFingerprint, binding));
+  }
+
   private async executeSerialized<T>(requestId: string, fingerprint: string, operation: () => Promise<T>, binding?: MutationBinding, logicalFingerprint?: string): Promise<T> {
     const filename = await this.recordFilename(requestId, fingerprint, true);
+    if (binding !== undefined && logicalFingerprint !== undefined) {
+      const duplicate = await this.findByLogicalIdentitySerialized(logicalFingerprint, binding);
+      if (duplicate !== null && duplicate.requestId !== requestId) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation logical identity is already bound to another durable request');
+      }
+    }
     const existing = await readMutation(filename);
     if (existing !== null) {
       assertRecordBinding(existing, requestId, fingerprint, binding, logicalFingerprint);
@@ -99,6 +110,23 @@ export class DurableMutationJournal {
       throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation evidence identity conflicts with its durable record');
     }
     return record;
+  }
+
+  private async findByLogicalIdentitySerialized(logicalFingerprint: string, binding: MutationBinding): Promise<MutationRecord | null> {
+    if (!/^[a-f0-9]{64}$/.test(logicalFingerprint)) throw new RuntimeError('INVALID_REQUEST', 'Mutation logical fingerprint is invalid');
+    const probe = await this.recordFilename('logical-lookup', logicalFingerprint, false);
+    let filenames: string[];
+    try {
+      filenames = (await readdir(path.dirname(probe))).filter((filename) => filename.endsWith('.json'));
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Mutation journal directory could not be read safely', { cause: error });
+    }
+    for (const filename of filenames) {
+      const record = await readMutation(path.join(path.dirname(probe), filename));
+      if (record !== null && record.logicalFingerprint === logicalFingerprint && sameLogicalBinding(record.binding, binding)) return record;
+    }
+    return null;
   }
 
   private async recordFilename(requestId: string, fingerprint: string, createDirectory: boolean): Promise<string> {

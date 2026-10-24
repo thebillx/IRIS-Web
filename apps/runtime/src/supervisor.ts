@@ -1135,16 +1135,13 @@ export class Supervisor {
         : await this.forwardWorkloadTool('workspace', { operation: 'get', projectId, workspaceId }, context);
       if (projectCheck.isError) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence project/workspace is no longer authorized');
     }
-    const logicalFingerprint = createHash('sha256').update(stableJson({
-      name,
-      args,
-      clientId: context.clientId,
-      sessionId: context.sessionId ?? null,
-      projectId: projectId ?? null,
-      workspaceId: workspaceId ?? null,
-    })).digest('hex');
+    const logicalFingerprint = mutationLogicalFingerprint(name, args, context);
     const record = await this.workloadMutationJournal.inspectByLogicalIdentity(requestId, logicalFingerprint, binding);
     if (record === null) {
+      const existingLogical = await this.workloadMutationJournal.findByLogicalIdentity(logicalFingerprint, binding);
+      if (existingLogical !== null && existingLogical.requestId !== requestId) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation logical identity is already bound to another durable request');
+      }
       return { structuredContent: { requestId, operation: name, state: 'NOT_FOUND', logicalFingerprint }, isError: false };
     }
     return {
@@ -1231,14 +1228,7 @@ export class Supervisor {
       deploymentEpoch: registry.deploymentEpoch,
     };
     const fingerprint = createHash('sha256').update(stableJson({ name, args, ...mutationBinding })).digest('hex');
-    const logicalFingerprint = createHash('sha256').update(stableJson({
-      name,
-      args,
-      clientId: context.clientId,
-      sessionId: context.sessionId ?? null,
-      projectId: typeof args.projectId === 'string' ? args.projectId : null,
-      workspaceId: typeof args.workspaceId === 'string' ? args.workspaceId : null,
-    })).digest('hex');
+    const logicalFingerprint = mutationLogicalFingerprint(name, args, context);
     const existing = await this.workloadMutationJournal.inspect(requestId, fingerprint, mutationBinding);
     if (existing?.state === 'RECONCILIATION_REQUIRED') {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation request has an unresolved outcome; verify its downstream durable result before retrying');
@@ -4244,6 +4234,18 @@ function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
   return JSON.stringify(value) ?? 'null';
+}
+
+function mutationLogicalFingerprint(name: string, args: Record<string, unknown>, context: SupervisorWorkloadCallContext): string {
+  const { requestId: _requestId, ...logicalArgs } = args;
+  return createHash('sha256').update(stableJson({
+    name,
+    args: logicalArgs,
+    clientId: context.clientId,
+    sessionId: context.sessionId ?? null,
+    projectId: typeof args.projectId === 'string' ? args.projectId : null,
+    workspaceId: typeof args.workspaceId === 'string' ? args.workspaceId : null,
+  })).digest('hex');
 }
 
 async function listenerReleased(port: number): Promise<boolean> {

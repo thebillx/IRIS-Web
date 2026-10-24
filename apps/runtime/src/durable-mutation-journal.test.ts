@@ -99,6 +99,16 @@ describe('DurableMutationJournal', () => {
     await expect(journal.inspect('legacy-1', fingerprint, binding)).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
   });
 
+  it('rejects the same logical mutation under a new request ID before applying it again', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const journal = new DurableMutationJournal(root);
+    const logicalFingerprint = 'd'.repeat(64);
+    let calls = 0;
+    await journal.execute('logical-request-a', fingerprint, async () => { calls += 1; return { committed: true }; }, binding, logicalFingerprint);
+    await expect(journal.execute('logical-request-b', 'b'.repeat(64), async () => { calls += 1; return { duplicate: true }; }, binding, logicalFingerprint)).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
+    expect(calls).toBe(1);
+  });
+
   it('does not create a journal directory during a read-only evidence lookup', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
     const journal = new DurableMutationJournal(root);
