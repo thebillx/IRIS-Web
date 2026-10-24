@@ -29,7 +29,7 @@ import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminT
 import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, readRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
 import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
 import { DurableMutationJournal, type MutationBinding } from './durable-mutation-journal.js';
-import { withSafetyWriterAdmission } from './production-safety.js';
+import { withSafetyWriterAdmission, type SafetyIdentity } from './production-safety.js';
 
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
 import { readSupervisorStateFile, writeSupervisorStateFile, unresolvedStartup, validStartupOperations, type StartupOperation, type StartupState } from './supervisor-startup.js';
@@ -186,6 +186,8 @@ export interface SupervisorOptions {
   readonly keepAwakeProvider?: KeepAwakeProvider;
   /** Enabled automatically for established runtime data roots with safety state. */
   readonly safetyAdmission?: boolean;
+  /** Runtime identity captured when this Supervisor authority was created. */
+  readonly safetyIdentity?: Pick<SafetyIdentity, 'runtimeId' | 'instanceId'>;
 }
 
 interface SupervisorOperationLock {
@@ -264,6 +266,7 @@ export async function createSupervisor(options: SupervisorOptions = {}): Promise
     protectedReferenceRoot,
     options.keepAwakeProvider,
     safetyAdmission,
+    options.safetyIdentity,
   );
 }
 
@@ -287,6 +290,7 @@ export class Supervisor {
     private readonly protectedReferenceRoot?: string,
     keepAwakeProvider: KeepAwakeProvider = new MacOSCaffeinateProvider(),
     private readonly safetyAdmission = false,
+    private readonly safetyIdentity?: Pick<SafetyIdentity, 'runtimeId' | 'instanceId'>,
   ) {
     this.lifecycleGrants = new LifecycleGrantStore(dataRoot);
     // Keep the Supervisor transport journal separate from the Runtime's
@@ -2321,7 +2325,12 @@ export class Supervisor {
   }
 
   private async withOperationLock<T>(operation: string, work: () => Promise<T>): Promise<T> {
-    const release = await acquireOperationLock(path.join(this.supervisorDirectory(), OPERATION_LOCK_FILE), operation, this.safetyAdmission ? this.dataRoot : undefined);
+    const release = await acquireOperationLock(
+      path.join(this.supervisorDirectory(), OPERATION_LOCK_FILE),
+      operation,
+      this.safetyAdmission ? this.dataRoot : undefined,
+      this.safetyIdentity,
+    );
     try {
       return await work();
     } finally {
@@ -3130,7 +3139,7 @@ export class Supervisor {
     const write = () => writeSupervisorStateFile(path.join(this.supervisorDirectory(), STATE_FILE), {
       ...state, schemaVersion: 4, startupOperations: current.startupOperations, updatedAt: new Date().toISOString(),
     });
-    if (this.safetyAdmission) await withSafetyWriterAdmission(this.dataRoot, 'supervisor', write);
+    if (this.safetyAdmission) await withSafetyWriterAdmission(this.dataRoot, 'supervisor', write, this.safetyIdentity);
     else await write();
   }
 
@@ -4216,9 +4225,14 @@ function sameEndpoint(left: NonNullable<RuntimeObservedStatus['endpoint']>, righ
     && left.startedAt === right.startedAt && left.apiUrl === right.apiUrl && left.mcpUrl === right.mcpUrl;
 }
 
-async function acquireOperationLock(filename: string, operation: string, safetyDataRoot?: string): Promise<() => Promise<void>> {
+async function acquireOperationLock(
+  filename: string,
+  operation: string,
+  safetyDataRoot?: string,
+  safetyIdentity?: Pick<SafetyIdentity, 'runtimeId' | 'instanceId'>,
+): Promise<() => Promise<void>> {
   if (safetyDataRoot !== undefined) {
-    return withSafetyWriterAdmission(safetyDataRoot, 'supervisor', () => acquireOperationLock(filename, operation));
+    return withSafetyWriterAdmission(safetyDataRoot, 'supervisor', () => acquireOperationLock(filename, operation), safetyIdentity);
   }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const processStart = observeProcessStart(process.pid);

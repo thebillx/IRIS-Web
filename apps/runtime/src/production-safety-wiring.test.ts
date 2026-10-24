@@ -67,6 +67,10 @@ test('R09 shared admission rejects Supervisor and detached-runner writes after q
   const identity = { runtimeId: 'r09-admission-runtime', instanceId: 'r09-admission-instance', dataRoot };
   const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret: 'r09-owner', writerVerifier: createRuntimeWriterVerifier(dataRoot) });
   for (const writer of writers) await controller.registerWriter(writer);
+  await assert.rejects(
+    withSafetyWriterAdmission(dataRoot, 'supervisor', async () => undefined, { runtimeId: 'stale-runtime', instanceId: identity.instanceId }),
+    { code: 'AUTHORITY_CHANGED' },
+  );
   await withSafetyWriterAdmission(dataRoot, 'supervisor', async () => undefined);
   await controller.quiesce('r09-owner');
   await assert.rejects(withSafetyWriterAdmission(dataRoot, 'supervisor', async () => undefined), { code: 'PRECONDITION_FAILED' });

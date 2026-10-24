@@ -142,9 +142,18 @@ export interface SafetyWriterGate {
 }
 
 /** Serialize non-runtime writers with the safety fence so quiescence cannot race a write. */
-export function withSafetyWriterAdmission<T>(dataRoot: string, writer: SafetyWriterName, operation: () => Promise<T>): Promise<T> {
+export function withSafetyWriterAdmission<T>(
+  dataRoot: string,
+  writer: SafetyWriterName,
+  operation: () => Promise<T>,
+  expectedIdentity?: Pick<SafetyIdentity, 'runtimeId' | 'instanceId'>,
+): Promise<T> {
   return withLock(path.resolve(dataRoot), async () => {
     const document = await readDocument(path.resolve(dataRoot));
+    if (expectedIdentity !== undefined
+      && (document.identity.runtimeId !== expectedIdentity.runtimeId || document.identity.instanceId !== expectedIdentity.instanceId)) {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Safety writer identity is stale for the active runtime instance');
+    }
     const record = document.writers[writer];
     if (document.state !== 'ACTIVE' || record === undefined || record.state === 'UNKNOWN' || record.inFlight > 0) {
       throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} is not admitted by the active safety fence`);

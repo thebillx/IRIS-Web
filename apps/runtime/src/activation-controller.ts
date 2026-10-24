@@ -5,7 +5,7 @@ import { RuntimeError } from '@iris/domain';
 import { ACTIVATION_FINGERPRINT_ALGORITHM, assertActivationWorkloadReady, inspectActivationSourceIdentity, type ActivationSourceIdentity } from './activation-source-identity.js';
 import { writePrivateJsonAtomic } from './credentials.js';
 import { FoundationStateStore } from './persistence.js';
-import { withSafetyWriterAdmission, type SafetyWriterGate } from './production-safety.js';
+import { ProductionSafetyController, withSafetyWriterAdmission, type SafetyWriterGate } from './production-safety.js';
 import { RuntimeState } from './state.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { GovernedGitEngine } from './governed-git-engine.js';
@@ -341,11 +341,13 @@ export class ActivationController {
 }
 
 export async function createProductionActivationController(dataRoot: string): Promise<ActivationController> {
-  const safety: SafetyWriterGate = { runMutation: (writer, operation) => withSafetyWriterAdmission(dataRoot, writer, operation) };
+  const safetyController = await ProductionSafetyController.openReadOnly({ dataRoot });
+  const safetyIdentity = safetyController?.snapshot().identity;
+  const safety: SafetyWriterGate = { runMutation: (writer, operation) => withSafetyWriterAdmission(dataRoot, writer, operation, safetyIdentity) };
   const state = new RuntimeState(new FoundationStateStore(dataRoot, safety));
   const resources = new VNextResourceRegistry(state, dataRoot, safety);
   const git = new GovernedGitEngine(resources);
-  const supervisor = await createSupervisor({ dataRoot, safetyAdmission: true });
+  const supervisor = await createSupervisor({ dataRoot, safetyAdmission: true, ...(safetyIdentity === undefined ? {} : { safetyIdentity }) });
   const controller = new ActivationController(
     dataRoot,
     new ProductionCandidateInspector(state, git),
