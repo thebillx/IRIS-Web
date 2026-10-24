@@ -158,4 +158,24 @@ describe('DurableMutationJournal', () => {
     await expect(journal.reconcile('reconcile-2', fingerprint, binding, 'FAILED', null, 'PRECONDITION_FAILED')).resolves.toMatchObject({ state: 'FAILED', errorCode: 'PRECONDITION_FAILED' });
     await expect(journal.reconcile('unknown-reconcile', fingerprint, binding, 'FAILED', null, 'PRECONDITION_FAILED')).rejects.toMatchObject({ code: 'AUTHORITY_INDETERMINATE' });
   });
+
+  it('preserves unresolved evidence across a Runtime journal restart', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const first = new DurableMutationJournal(root);
+    const { RuntimeError } = await import('@iris/domain');
+    await expect(first.execute('restart-reconcile', fingerprint, async () => {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'response lost during restart');
+    }, binding, '1'.repeat(64))).rejects.toMatchObject({ code: 'AUTHORITY_INDETERMINATE' });
+
+    const restarted = new DurableMutationJournal(root);
+    await expect(restarted.inspect('restart-reconcile', fingerprint, binding)).resolves.toMatchObject({
+      state: 'RECONCILIATION_REQUIRED',
+      requestId: 'restart-reconcile',
+      logicalFingerprint: '1'.repeat(64),
+    });
+    await expect(restarted.reconcile('restart-reconcile', fingerprint, binding, 'COMMITTED', { recovered: true })).resolves.toMatchObject({
+      state: 'COMMITTED',
+      result: { recovered: true },
+    });
+  });
 });
