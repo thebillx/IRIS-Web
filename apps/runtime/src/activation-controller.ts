@@ -347,7 +347,9 @@ export async function createProductionActivationController(dataRoot: string): Pr
   const state = new RuntimeState(new FoundationStateStore(dataRoot, safety));
   const resources = new VNextResourceRegistry(state, dataRoot, safety);
   const git = new GovernedGitEngine(resources);
-  const supervisor = await createSupervisor({ dataRoot, safetyAdmission: true, ...(safetyIdentity === undefined ? {} : { safetyIdentity }) });
+  const supervisor = safetyController === null
+    ? await createSupervisor({ dataRoot })
+    : await createSupervisor({ dataRoot, safetyAdmission: true, safetyIdentity: safetyController.snapshot().identity });
   const controller = new ActivationController(
     dataRoot,
     new ProductionCandidateInspector(state, git),
