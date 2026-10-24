@@ -28,12 +28,12 @@ const ACTIVE_STATES = new Set(['ACTIVE', 'RUNNING', 'QUEUED', 'STARTING', 'PREPA
 export function runtimeWriterBindings(): Readonly<Record<SafetyWriterName, WriterBinding>> { return WRITER_BINDINGS; }
 
 /** Build the daemon's trusted, identity-bound writer verifier. */
-export function createRuntimeWriterVerifier(dataRootInput: string): TrustedWriterVerifier {
+export function createRuntimeWriterVerifier(dataRootInput: string, supervisorStartupId?: string): TrustedWriterVerifier {
   const dataRoot = path.resolve(dataRootInput);
   return {
     verify: async (writer, identity, context) => {
       if (path.resolve(identity.dataRoot) !== dataRoot) return null;
-      const status = await inspectBinding(dataRoot, writer, WRITER_BINDINGS[writer]);
+      const status = await inspectBinding(dataRoot, writer, WRITER_BINDINGS[writer], supervisorStartupId);
       if (status === null) return null;
       return {
         state: status.active === 0 ? 'IDLE' : 'ACTIVE',
@@ -48,7 +48,8 @@ export function createRuntimeWriterVerifier(dataRootInput: string): TrustedWrite
   };
 }
 
-async function inspectBinding(dataRoot: string, writer: SafetyWriterName, binding: WriterBinding): Promise<{ readonly active: number } | null> {
+async function inspectBinding(dataRoot: string, writer: SafetyWriterName, binding: WriterBinding, supervisorStartupId?: string): Promise<{ readonly active: number } | null> {
+  if (writer === 'supervisor') return inspectSupervisorBinding(dataRoot, supervisorStartupId);
   let active = 0;
   for (const relative of binding) {
     const filename = path.join(dataRoot, relative);
@@ -95,6 +96,46 @@ async function inspectBinding(dataRoot: string, writer: SafetyWriterName, bindin
     const document = await readJsonIfPrivate(filename);
     if (document.state === 'invalid') return null;
     if (document.state === 'ok') active += countActiveStates(document.value);
+  }
+  return { active };
+}
+
+async function inspectSupervisorBinding(dataRoot: string, startupIdInput?: string): Promise<{ readonly active: number } | null> {
+  const state = await readJsonIfPrivate(path.join(dataRoot, 'supervisor', 'state.json'));
+  const lock = await readJsonIfPrivate(path.join(dataRoot, 'supervisor', 'operation.lock'));
+  if (state.state === 'invalid' || lock.state === 'invalid') return null;
+  const activeStates = state.state === 'ok' ? countActiveStates(state.value) : 0;
+  let lockActive = 0;
+  let lockValue: Record<string, unknown> | undefined;
+  if (lock.state === 'ok') {
+    if (!isRecord(lock.value) || lock.value.schemaVersion !== 1 || !Number.isSafeInteger(lock.value.pid)
+      || typeof lock.value.processStartMarker !== 'string' || typeof lock.value.operation !== 'string') return null;
+    const observed = observeProcessStart(lock.value.pid as number);
+    if (observed.state === 'indeterminate') return null;
+    if (observed.state === 'live' && observed.marker !== lock.value.processStartMarker) return null;
+    if (observed.state === 'live') {
+      lockActive = 1;
+      lockValue = lock.value;
+    }
+  }
+  const active = activeStates + lockActive;
+  if (active === 0) return { active: 0 };
+  const startupId = startupIdInput?.trim();
+  if (startupId === undefined || !/^[\da-f-]{36}$/.test(startupId) || state.state !== 'ok' || lockValue === undefined) return null;
+  const operations = isRecord(state.value) && Array.isArray(state.value.startupOperations) ? state.value.startupOperations : [];
+  const startup = operations.find((entry) => isRecord(entry) && entry.id === startupId);
+  if (!isRecord(startup)
+    || !['runtime', 'runtime-probe'].includes(startup.component as string)
+    || !['PREPARED', 'SPAWNING', 'OWNERSHIP_VERIFIED'].includes(startup.state as string)
+    || startup.dataRoot !== dataRoot
+    || !Number.isSafeInteger(startup.supervisorPid)
+    || typeof startup.supervisorStartMarker !== 'string'
+    || startup.supervisorPid !== lockValue.pid
+    || startup.supervisorStartMarker !== lockValue.processStartMarker
+    || !['up', 'restart', 'runtime-on', 'automatic-recovery', 'replace-workload-source'].includes(lockValue.operation as string)) return null;
+  if (startup.pid !== null && startup.pid !== undefined) {
+    const current = observeProcessStart(process.pid);
+    if (current.state !== 'live' || startup.pid !== process.pid || startup.processStartMarker !== current.marker) return null;
   }
   return { active };
 }

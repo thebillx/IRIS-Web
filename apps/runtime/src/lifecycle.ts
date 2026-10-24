@@ -27,6 +27,8 @@ export interface StartRuntimeOptions {
   readonly sourceRoot?: string;
   readonly protectedReferenceRoot?: string;
   readonly expectedSourceIdentity?: ActivationSourceIdentity;
+  /** Opaque Supervisor startup operation binding; absent for direct starts. */
+  readonly supervisorStartupId?: string;
 }
 
 export async function runtimeStatus(dataRootInput?: string): Promise<RuntimeObservedStatus> {
@@ -149,7 +151,7 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
     cwd: runtimeSourceRoot,
     detached: true,
     stdio: 'ignore',
-    env: runtimeChildEnvironment(dataRoot, options.preferredPort, process.env, options.protectedReferenceRoot),
+    env: runtimeChildEnvironment(dataRoot, options.preferredPort, process.env, options.protectedReferenceRoot, options.supervisorStartupId),
   });
   child.on('error', () => undefined);
   child.unref();
@@ -229,6 +231,7 @@ export function runtimeChildEnvironment(
   preferredPort?: number,
   source: NodeJS.ProcessEnv = process.env,
   protectedReferenceRoot?: string,
+  supervisorStartupId?: string,
 ): NodeJS.ProcessEnv {
   const configuredProtectedReferenceRoot = protectedReferenceRoot ?? source.IRIS_PROTECTED_REFERENCE_ROOT?.trim();
   const environment: NodeJS.ProcessEnv = {
@@ -238,6 +241,7 @@ export function runtimeChildEnvironment(
     ...(configuredProtectedReferenceRoot === undefined || configuredProtectedReferenceRoot.length === 0
       ? {}
       : { IRIS_PROTECTED_REFERENCE_ROOT: configuredProtectedReferenceRoot }),
+    ...(supervisorStartupId === undefined ? {} : { IRIS_SUPERVISOR_STARTUP_ID: supervisorStartupId }),
   };
   for (const name of ['HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE'] as const) {
     const value = source[name];

@@ -3028,7 +3028,7 @@ export class Supervisor {
   }
 
   private async startRecordedRuntime(id: string, options: Parameters<typeof startRuntime>[0]): Promise<RuntimeObservedStatus> {
-    try { return await startRuntime(options); }
+    try { return await startRuntime({ ...options, supervisorStartupId: id }); }
     catch (error) {
       await this.updateStartup(id, error instanceof DefiniteSpawnFailure ? 'SPAWN_FAILED' : 'RECONCILIATION_REQUIRED', { failureCode: runtimeErrorCode(error) });
       throw error;

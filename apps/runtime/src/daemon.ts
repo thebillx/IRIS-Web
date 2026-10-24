@@ -102,7 +102,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   };
 
   try {
-    const productionSafety = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret, writerVerifier: createRuntimeWriterVerifier(dataRoot) });
+    const productionSafety = await ProductionSafetyController.open({
+      dataRoot,
+      identity,
+      ownerAccessSecret,
+      writerVerifier: createRuntimeWriterVerifier(dataRoot, process.env.IRIS_SUPERVISOR_STARTUP_ID),
+    });
     for (const writer of ['runtime-state', 'mission-state', 'mission-broker', 'durable-jobs'] as const) {
       await productionSafety.registerWriter(writer);
     }

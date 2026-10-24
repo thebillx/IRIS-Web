@@ -2193,7 +2193,7 @@ setInterval(() => undefined, 1000);
     process.kill(before.endpoint.pid, 'SIGKILL');
     await waitForProcessGone(before.endpoint.pid);
 
-    await (supervisor as unknown as { monitorOnceUnlocked(): Promise<void> }).monitorOnceUnlocked();
+    await (supervisor as unknown as { automaticRecoveryTick(): Promise<void> }).automaticRecoveryTick();
     const after = await runtimeStatus(dataRoot);
     if (after.endpoint === null || after.state !== 'running') throw new Error('runtime did not recover');
     expect(after.endpoint.pid).not.toBe(before.endpoint.pid);

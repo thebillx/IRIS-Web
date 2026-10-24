@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,6 +7,7 @@ import { afterEach, test } from 'node:test';
 import type { RepositoryId, WorkspaceId } from '@iris/domain';
 import { ProductionSafetyController, createRuntimeBackup, restoreRuntimeBackup, type SafetyWriterName, withSafetyWriterAdmission } from './production-safety.js';
 import { createRuntimeWriterVerifier, runtimeWriterBindings } from './production-safety-wiring.js';
+import { observeProcessStart } from './macos-safety.js';
 import { FoundationStateStore } from './persistence.js';
 import { MissionLedgerStore } from './mission-store.js';
 import { RuntimeState } from './state.js';
@@ -38,6 +40,44 @@ test('R09 real writer wiring fences all 13 stores and supports disposable backup
   const readiness = await controller.readiness();
   assert.equal(readiness.status, 'READY_FOR_OWNER_WINDOW');
   assert.match(await readFile(path.join(restored, 'state.json'), 'utf8'), /defaultProjectId/);
+});
+
+test('Supervisor writer registration rejects an unrelated active operation lock', { skip: process.platform !== 'darwin' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-supervisor-lock-'));
+  roots.push(root);
+  await chmod(root, 0o700);
+  const dataRoot = path.join(root, 'runtime');
+  await mkdir(path.join(dataRoot, 'supervisor'), { recursive: true, mode: 0o700 });
+  const observed = observeProcessStart(process.pid);
+  assert.equal(observed.state, 'live');
+  await writeFile(path.join(dataRoot, 'supervisor', 'operation.lock'), JSON.stringify({ schemaVersion: 1, pid: process.pid, operation: 'admin-tunnel-start-control-only', processStartMarker: observed.marker }), { mode: 0o600 });
+  const controller = await ProductionSafetyController.open({
+    dataRoot,
+    identity: { runtimeId: 'r09-supervisor-runtime', instanceId: 'r09-supervisor-instance', dataRoot },
+    ownerAccessSecret: 'r09-owner',
+    writerVerifier: createRuntimeWriterVerifier(dataRoot),
+  });
+  await assert.rejects(controller.registerWriter('supervisor'), { code: 'PRECONDITION_FAILED' });
+});
+
+test('Supervisor writer registration accepts only the matching runtime startup operation', { skip: process.platform !== 'darwin' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-supervisor-startup-'));
+  roots.push(root);
+  await chmod(root, 0o700);
+  const dataRoot = path.join(root, 'runtime');
+  await mkdir(path.join(dataRoot, 'supervisor'), { recursive: true, mode: 0o700 });
+  const observed = observeProcessStart(process.pid);
+  assert.equal(observed.state, 'live');
+  const startupId = randomUUID();
+  await writeFile(path.join(dataRoot, 'supervisor', 'state.json'), JSON.stringify({ startupOperations: [{ id: startupId, component: 'runtime', state: 'SPAWNING', dataRoot, supervisorPid: process.pid, supervisorStartMarker: observed.marker, pid: null }] }), { mode: 0o600 });
+  await writeFile(path.join(dataRoot, 'supervisor', 'operation.lock'), JSON.stringify({ schemaVersion: 1, pid: process.pid, operation: 'runtime-on', processStartMarker: observed.marker }), { mode: 0o600 });
+  const controller = await ProductionSafetyController.open({
+    dataRoot,
+    identity: { runtimeId: 'r09-supervisor-runtime', instanceId: 'r09-supervisor-instance', dataRoot },
+    ownerAccessSecret: 'r09-owner',
+    writerVerifier: createRuntimeWriterVerifier(dataRoot, startupId),
+  });
+  await controller.registerWriter('supervisor');
 });
 
 test('R09 real writer wiring rejects malformed stores and active runner evidence', async () => {

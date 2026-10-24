@@ -56,6 +56,7 @@ describe('runtime lifecycle integration', () => {
     });
     expect(environment.NODE_OPTIONS).toBeUndefined();
     expect(environment.CLOUD_TOKEN).toBeUndefined();
+    expect(runtimeChildEnvironment('/private/tmp/iris-runtime-test', undefined, {}, undefined, 'startup-id').IRIS_SUPERVISOR_STARTUP_ID).toBe('startup-id');
 
     const explicitlyConfigured = runtimeChildEnvironment('/private/tmp/iris-runtime-test', 43110, {
       PATH: node24Path(), IRIS_PROTECTED_REFERENCE_ROOT: '/private/tmp/inherited-reference',
