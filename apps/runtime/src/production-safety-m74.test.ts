@@ -41,6 +41,30 @@ test('M74 owner fence rejects incorrect identity and preserves restart recovery 
   await lease.release();
 });
 
+test('M74 runtime identity changes fail closed even when no writer is active', async () => {
+  const fixture = await createFixture();
+  for (const writer of writers) await fixture.controller.registerWriter(writer);
+  const reopened = await ProductionSafetyController.open({
+    dataRoot: fixture.dataRoot,
+    identity: { ...fixture.identity, runtimeId: 'different-runtime' },
+    ownerAccessSecret: fixture.token,
+    writerVerifier: fixture.verifier,
+  });
+  const snapshot = await reopened.inspect();
+  assert.equal(snapshot.state, 'RECOVERY_REQUIRED');
+  assert.equal(snapshot.identity.runtimeId, 'different-runtime');
+});
+
+test('M74 quiesce freshly verifies every non-instrumented writer before fencing', async () => {
+  let drift = false;
+  const fixture = await createFixture(() => drift);
+  for (const writer of writers) await fixture.controller.registerWriter(writer);
+  drift = true;
+  const blocked = await fixture.controller.quiesce(fixture.token);
+  assert.equal(blocked.state, 'BLOCKED');
+  assert.match(blocked.blockedReason ?? '', /mission-lifecycle/);
+});
+
 test('M74 backup publication and disposable restore are integrity checked', async () => {
   const fixture = await createFixture();
   for (const writer of writers) await fixture.controller.registerWriter(writer);

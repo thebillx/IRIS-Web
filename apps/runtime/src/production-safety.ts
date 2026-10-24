@@ -193,9 +193,9 @@ export class ProductionSafetyController {
         return initial;
       }
       const current = parseDocument(inspected.content);
-      if (current.identity.runtimeId !== identity.runtimeId || current.identity.instanceId === identity.instanceId) return current;
+      if (current.identity.runtimeId === identity.runtimeId && current.identity.instanceId === identity.instanceId) return current;
       const unresolvedWriter = Object.values(current.writers).some((writer) => writer.state === 'ACTIVE' || writer.inFlight > 0 || writer.leaseIds.length > 0);
-      const recoverable = current.state === 'ACTIVE' && current.reservation === null && !unresolvedWriter;
+      const recoverable = current.identity.runtimeId === identity.runtimeId && current.state === 'ACTIVE' && current.reservation === null && !unresolvedWriter;
       const next = {
         ...current,
         state: recoverable ? 'ACTIVE' as const : 'RECOVERY_REQUIRED' as const,
@@ -318,9 +318,10 @@ export class ProductionSafetyController {
       if (current.state === 'QUIESCED') return { value: current, document: current };
       if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
       const observed = await applyObservations(current, observations, this.identity, this.writerVerifier);
-      const reasons = quiescenceReasons(observed, observations, this.writerVerifier);
+      const verified = await reverifyNonInstrumentedWriters(observed, this.identity, this.writerVerifier);
+      const reasons = [...verified.reasons, ...quiescenceReasons(verified.document, observations, this.writerVerifier)];
       const state: ProductionFenceState = reasons.length === 0 ? 'QUIESCED' : 'BLOCKED';
-      const next = { ...observed, state, blockedReason: reasons.length === 0 ? null : reasons.join('; '), fenceEpoch: reasons.length === 0 ? observed.fenceEpoch + 1 : observed.fenceEpoch };
+      const next = { ...verified.document, state, blockedReason: reasons.length === 0 ? null : [...new Set(reasons)].join('; '), fenceEpoch: reasons.length === 0 ? verified.document.fenceEpoch + 1 : verified.document.fenceEpoch };
       return { value: next, document: next };
     });
   }
@@ -331,9 +332,10 @@ export class ProductionSafetyController {
       if (!['BLOCKED', 'RECOVERY_REQUIRED'].includes(current.state)) throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
       if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation outcome must be verified before recovery');
       const observed = await applyObservations(current, observations, this.identity, this.writerVerifier);
-      const reasons = quiescenceReasons(observed, observations, this.writerVerifier);
+      const verified = await reverifyNonInstrumentedWriters(observed, this.identity, this.writerVerifier);
+      const reasons = [...verified.reasons, ...quiescenceReasons(verified.document, observations, this.writerVerifier)];
       if (reasons.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Recovery is not verified: ${reasons.join('; ')}`);
-      const next = { ...observed, state: 'ACTIVE' as const, blockedReason: null, backup: null, restore: null, reservation: null };
+      const next = { ...verified.document, state: 'ACTIVE' as const, blockedReason: null, backup: null, restore: null, reservation: null };
       return { value: next, document: next };
     });
   }
@@ -343,9 +345,10 @@ export class ProductionSafetyController {
       this.authorize(current, ownerAccessToken);
       if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Only a verified QUIESCED fence can be released');
       if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A backup or restore reservation is active');
-      const reasons = quiescenceReasons(current, {}, this.writerVerifier);
+      const verified = await reverifyNonInstrumentedWriters(current, this.identity, this.writerVerifier);
+      const reasons = [...verified.reasons, ...quiescenceReasons(verified.document, {}, this.writerVerifier)];
       if (reasons.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Cannot release fence: ${reasons.join('; ')}`);
-      const next = { ...current, state: 'ACTIVE' as const, backup: null, restore: null };
+      const next = { ...verified.document, state: 'ACTIVE' as const, backup: null, restore: null };
       return { value: next, document: next };
     });
   }
@@ -689,6 +692,27 @@ async function applyObservations(document: SafetyDocument, observations: Readonl
   return { ...document, writers };
 }
 
+async function reverifyNonInstrumentedWriters(document: SafetyDocument, identity: SafetyIdentity, verifier: TrustedWriterVerifier | undefined): Promise<{ readonly document: SafetyDocument; readonly reasons: readonly string[] }> {
+  const writers = { ...document.writers };
+  const reasons: string[] = [];
+  for (const writer of REQUIRED_WRITERS) {
+    if (INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) continue;
+    const record = writers[writer];
+    if (record === undefined || record.state === 'UNKNOWN') {
+      reasons.push(`writer ${writer} is unknown`);
+      continue;
+    }
+    try {
+      const verified = await verifyWriterEvidence(document, identity, verifier, writer);
+      writers[writer] = { ...record, state: verified.state, inFlight: verified.inFlight, ownerInstanceId: identity.instanceId, leaseIds: record.leaseIds };
+      if (verified.state !== record.state || verified.inFlight !== record.inFlight) reasons.push(`writer ${writer} changed since inventory verification`);
+    } catch (error) {
+      reasons.push(error instanceof RuntimeError ? error.message : `writer ${writer} could not be freshly verified`);
+    }
+  }
+  return { document: { ...document, writers }, reasons };
+}
+
 async function verifyWriterEvidence(document: SafetyDocument, identity: SafetyIdentity, verifier: TrustedWriterVerifier | undefined, writer: SafetyWriterName): Promise<TrustedWriterVerification> {
   if (verifier === undefined) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} has no trusted verifier`);
   let verified: TrustedWriterVerification | null;
@@ -750,9 +774,11 @@ async function copyTree(source: string, destination: string): Promise<BackupMani
     const from = safeJoin(source, relative);
     const to = safeJoin(destination, relative);
     const before = await safeFileMetadata(from, 'Runtime data file');
+    const beforeDigest = await hashFile(from);
     const content = await readFile(from);
     const after = await safeFileMetadata(from, 'Runtime data file');
-    if (before.size !== after.size || before.mode !== after.mode || before.mtimeMs !== after.mtimeMs) throw new RuntimeError('PERSISTENCE_FAILURE', `Runtime data changed while backing up ${relative}`);
+    const afterDigest = await hashFile(from);
+    if (before.size !== after.size || before.mode !== after.mode || before.mtimeMs !== after.mtimeMs || beforeDigest !== afterDigest) throw new RuntimeError('PERSISTENCE_FAILURE', `Runtime data changed while backing up ${relative}`);
     await mkdir(path.dirname(to), { recursive: true, mode: 0o700 });
     await writeFile(to, content, { mode: before.mode, flag: 'wx' });
     await chmod(to, before.mode);
@@ -766,9 +792,11 @@ async function copyCheckpoint(sourceInput: string, destination: string): Promise
   const source = path.resolve(sourceInput);
   const metadata = await safeFileMetadata(source, 'Checkpoint file');
   if (isWithin(path.resolve(destination), source)) throw new RuntimeError('PRECONDITION_FAILED', 'Checkpoint source overlaps backup staging');
+  const beforeDigest = await hashFile(source);
   const content = await readFile(source);
   const after = await safeFileMetadata(source, 'Checkpoint file');
-  if (metadata.size !== after.size || metadata.mode !== after.mode || metadata.mtimeMs !== after.mtimeMs) throw new RuntimeError('PERSISTENCE_FAILURE', 'Checkpoint changed while backing up');
+  const afterDigest = await hashFile(source);
+  if (metadata.size !== after.size || metadata.mode !== after.mode || metadata.mtimeMs !== after.mtimeMs || beforeDigest !== afterDigest) throw new RuntimeError('PERSISTENCE_FAILURE', 'Checkpoint changed while backing up');
   const target = path.join(destination, CHECKPOINT_FILE);
   await writeFile(target, content, { mode: metadata.mode, flag: 'wx' });
   await chmod(target, metadata.mode);
