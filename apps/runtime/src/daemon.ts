@@ -33,6 +33,7 @@ import { SecurityAuditService } from './security-audit/service.js';
 import { ProductionSafetyController } from './production-safety.js';
 import { MissionLedgerStore } from './mission-store.js';
 import { DurableMutationJournal } from './durable-mutation-journal.js';
+import { createRuntimeWriterVerifier } from './production-safety-wiring.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -101,14 +102,16 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   };
 
   try {
-    const productionSafety = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret });
-    for (const writer of ['runtime-state', 'mission-state', 'durable-jobs'] as const) {
+    const productionSafety = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret, writerVerifier: createRuntimeWriterVerifier(dataRoot) });
+    for (const writer of ['runtime-state', 'mission-state', 'mission-broker', 'durable-jobs'] as const) {
       await productionSafety.registerWriter(writer);
     }
     const store = new FoundationStateStore(dataRoot, productionSafety);
     const state = new RuntimeState(store, createAgentExecutorFromEnvironment(process.env), new MissionLedgerStore(dataRoot, productionSafety));
-    const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot));
-    const lifecycleStore = new DurableMissionLifecycleStore(dataRoot);
+    const missionBroker = new MissionBrokerService(state, new MissionBrokerStore(dataRoot, productionSafety));
+    const lifecycleStore = new DurableMissionLifecycleStore(dataRoot, productionSafety);
+    await lifecycleStore.read();
+    await productionSafety.registerWriter('mission-lifecycle');
     const lifecycleWorkers = new WorkerAdapterRegistry();
     const missionLifecycle = new DurableMissionLifecycleService(state, lifecycleStore, lifecycleWorkers);
     const brokerByMission = new Map((await missionBroker.list()).map((record) => [record.missionId, record]));
@@ -119,8 +122,9 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       if (!terminal) await state.rehydrateBrokerMissionSession(mission.id);
     }
     await recoverDurableMissions(state, lifecycleStore, lifecycleWorkers);
-    const permissionSettings = new PermissionSettingsStore(dataRoot);
+    const permissionSettings = new PermissionSettingsStore(dataRoot, productionSafety);
     await permissionSettings.initialize();
+    await productionSafety.registerWriter('permission-store');
     const sourceRoot = await resolveSourceRoot();
     let startupSource;
     let sourceVerificationFailed = false;
@@ -132,7 +136,8 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     }
     const missionDelegations = new MissionDelegationStore(dataRoot, sourceRoot, startupSource, sourceVerificationFailed);
     const permissionPolicy = new PermissionPolicyEngine(state, permissionSettings, sourceRoot, dataRoot, undefined, missionDelegations);
-    const permissionAudit = new PermissionAuditStore(dataRoot);
+    const permissionAudit = new PermissionAuditStore(dataRoot, productionSafety);
+    await productionSafety.registerWriter('permission-audit');
     const controlSecret = randomBytes(32).toString('base64url');
 
     const health = (): RuntimeHealth => ({
@@ -156,11 +161,20 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       tunnelBindings: identityCoherence.tunnelBindings,
     });
 
-    const resourceRegistry = new VNextResourceRegistry(state, dataRoot);
-    const multiWorkerStore = new MultiWorkerStore(dataRoot);
+    const resourceRegistry = new VNextResourceRegistry(state, dataRoot, productionSafety);
+    await productionSafety.registerWriter('resource-registry');
+    const multiWorkerStore = new MultiWorkerStore(dataRoot, productionSafety);
+    await multiWorkerStore.read();
+    await productionSafety.registerWriter('multi-worker');
     const multiWorker = new MultiWorkerRoutingService(state, resourceRegistry, multiWorkerStore, lifecycleWorkers);
     await recoverMultiWorkerRuns(state, resourceRegistry, multiWorkerStore, lifecycleWorkers);
-    const securityAudit = new SecurityAuditService(state, multiWorker, resourceRegistry, new SecurityAuditStore(dataRoot), health);
+    const securityAuditStore = new SecurityAuditStore(dataRoot, productionSafety);
+    await securityAuditStore.read();
+    await productionSafety.registerWriter('security-audit');
+    await productionSafety.registerWriter('activation');
+    await productionSafety.registerWriter('supervisor');
+    await productionSafety.registerWriter('external-runners');
+    const securityAudit = new SecurityAuditService(state, multiWorker, resourceRegistry, securityAuditStore, health);
     await securityAudit.recover();
     const durableJobs = new DurableJobManager(dataRoot, resourceRegistry, productionSafety);
     await durableJobs.recover();

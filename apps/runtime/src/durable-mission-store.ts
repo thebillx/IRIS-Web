@@ -4,6 +4,7 @@ import { lstat, mkdir, open, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { RuntimeError } from '@iris/domain';
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
+import type { SafetyWriterGate } from './production-safety.js';
 import type { DurableMissionLifecycleSnapshot } from './durable-mission-lifecycle.js';
 import { validateLifecycleRecord } from './durable-mission-validation.js';
 
@@ -24,7 +25,7 @@ export interface ArchivedDurableMissionLifecycleRecord {
 }
 
 export class DurableMissionLifecycleStore {
-  public constructor(private readonly dataRoot: string) {}
+  public constructor(private readonly dataRoot: string, private readonly safety?: SafetyWriterGate) {}
 
   public async read(): Promise<DurableMissionLifecycleDocument> {
     const inspected = await inspectPrivateRegularFile(path.join(this.dataRoot, FILE), 'Durable mission lifecycle state');
@@ -44,9 +45,13 @@ export class DurableMissionLifecycleStore {
     if (!validDocumentShape(document)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing to write invalid durable mission lifecycle state');
     const filename = path.join(this.dataRoot, FILE);
     const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
-    try {
+    const write = async () => {
       await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
       await rename(temporary, filename);
+    };
+    try {
+      if (this.safety === undefined) await write();
+      else await this.safety.runMutation('mission-lifecycle', write);
     } catch (error) {
       throw new RuntimeError('PERSISTENCE_FAILURE', 'Atomic durable mission lifecycle publication failed', { cause: error });
     }

@@ -5,11 +5,12 @@ import { RuntimeError } from '@iris/domain';
 import { inspectPrivateRegularFile } from '../private-fs.js';
 import { emptySecurityAuditDocument, type SecurityAuditDocument } from './model.js';
 import { validateSecurityAuditDocument } from './validation.js';
+import type { SafetyWriterGate } from '../production-safety.js';
 
 const FILE = 'security-audit-engine.json';
 
 export class SecurityAuditStore {
-  public constructor(private readonly dataRoot: string) {}
+  public constructor(private readonly dataRoot: string, private readonly safety?: SafetyWriterGate) {}
 
   public async read(): Promise<SecurityAuditDocument> {
     const filename = path.join(this.dataRoot, FILE);
@@ -38,9 +39,13 @@ export class SecurityAuditStore {
     const validated = validateSecurityAuditDocument(document);
     const filename = path.join(this.dataRoot, FILE);
     const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
-    try {
+    const write = async () => {
       await writeFile(temporary, `${JSON.stringify(validated, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
       await rename(temporary, filename);
+    };
+    try {
+      if (this.safety === undefined) await write();
+      else await this.safety.runMutation('security-audit', write);
     } catch (error) {
       if (error instanceof RuntimeError) throw error;
       throw new RuntimeError('PERSISTENCE_FAILURE', 'Atomic security audit publication failed', { cause: error });

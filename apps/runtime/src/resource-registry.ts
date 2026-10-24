@@ -16,6 +16,7 @@ import {
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
 import { observeProcessStart } from './macos-safety.js';
 import type { RuntimeState } from './state.js';
+import type { SafetyWriterGate } from './production-safety.js';
 
 const RESOURCE_FILE = 'vnext-resources.json';
 const RECONCILIATION_FILE = 'vnext-registry-reconciliation.json';
@@ -142,6 +143,7 @@ export class VNextResourceRegistry {
   public constructor(
     private readonly state: RuntimeState,
     public readonly dataRoot: string,
+    private readonly safety?: SafetyWriterGate,
   ) {}
 
   public async listWorkspaces(projectId?: string): Promise<readonly WorkspaceRecord[]> {
@@ -764,12 +766,16 @@ export class VNextResourceRegistry {
       }
       transactions.push(record);
     }
-    await writePrivateJson(path.join(this.dataRoot, RECONCILIATION_FILE), { schemaVersion: 1, transactions });
+    const write = () => writePrivateJson(path.join(this.dataRoot, RECONCILIATION_FILE), { schemaVersion: 1, transactions });
+    if (this.safety === undefined) await write();
+    else await this.safety.runMutation('resource-registry', write);
   }
 
   private async writeDocument(document: ResourceDocument): Promise<void> {
     if (!isResourceDocument(document)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing to write invalid vNext resource registry');
-    await writePrivateJson(path.join(this.dataRoot, RESOURCE_FILE), document);
+    const write = () => writePrivateJson(path.join(this.dataRoot, RESOURCE_FILE), document);
+    if (this.safety === undefined) await write();
+    else await this.safety.runMutation('resource-registry', write);
   }
 
   private serializeMutation<T>(operation: () => Promise<T>, reconciliationRequestId?: string, lockPersistentState = true): Promise<T> {

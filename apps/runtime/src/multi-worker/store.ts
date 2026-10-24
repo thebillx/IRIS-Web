@@ -5,11 +5,12 @@ import { RuntimeError } from '@iris/domain';
 import { inspectPrivateRegularFile } from '../private-fs.js';
 import { emptyMultiWorkerDocument, type MultiWorkerDocument } from './model.js';
 import { validateMultiWorkerDocument } from './validation.js';
+import type { SafetyWriterGate } from '../production-safety.js';
 
 const FILE = 'multi-worker-orchestration.json';
 
 export class MultiWorkerStore {
-  public constructor(private readonly dataRoot: string) {}
+  public constructor(private readonly dataRoot: string, private readonly safety?: SafetyWriterGate) {}
 
   public async read(): Promise<MultiWorkerDocument> {
     const filename = path.join(this.dataRoot, FILE);
@@ -46,13 +47,17 @@ export class MultiWorkerStore {
     const validated = validateMultiWorkerDocument(document);
     const filename = path.join(this.dataRoot, FILE);
     const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
-    try {
+    const write = async () => {
       await writeFile(temporary, `${JSON.stringify(validated, null, 2)}\n`, {
         encoding: 'utf8',
         mode: 0o600,
         flag: 'wx',
       });
       await rename(temporary, filename);
+    };
+    try {
+      if (this.safety === undefined) await write();
+      else await this.safety.runMutation('multi-worker', write);
     } catch (error) {
       if (error instanceof RuntimeError) throw error;
       throw new RuntimeError('PERSISTENCE_FAILURE', 'Atomic multi-worker orchestration publication failed', { cause: error });

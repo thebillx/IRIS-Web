@@ -12,6 +12,7 @@ import {
 } from '@iris/domain';
 import { inspectPrivateRegularFile } from './private-fs.js';
 import type { RuntimeState } from './state.js';
+import type { SafetyWriterGate } from './production-safety.js';
 
 const BROKER_FILE = 'mission-broker.json';
 const MAX_RECORDS = 100;
@@ -55,7 +56,7 @@ export interface SupervisorDirectiveInput {
 }
 
 export class MissionBrokerStore {
-  public constructor(private readonly dataRoot: string) {}
+  public constructor(private readonly dataRoot: string, private readonly safety?: SafetyWriterGate) {}
 
   public async read(): Promise<MissionBrokerDocument> {
     const inspected = await inspectPrivateRegularFile(path.join(this.dataRoot, BROKER_FILE), 'Mission broker state');
@@ -73,7 +74,9 @@ export class MissionBrokerStore {
 
   public async write(document: MissionBrokerDocument): Promise<void> {
     if (!isDocument(document)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing to write invalid mission broker state');
-    await writeJsonAtomic(path.join(this.dataRoot, BROKER_FILE), document);
+    const write = () => writeJsonAtomic(path.join(this.dataRoot, BROKER_FILE), document);
+    if (this.safety === undefined) await write();
+    else await this.safety.runMutation('mission-broker', write);
   }
 }
 

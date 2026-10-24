@@ -5,6 +5,7 @@ import { RuntimeError } from '@iris/domain';
 import { ACTIVATION_FINGERPRINT_ALGORITHM, assertActivationWorkloadReady, inspectActivationSourceIdentity, type ActivationSourceIdentity } from './activation-source-identity.js';
 import { writePrivateJsonAtomic } from './credentials.js';
 import { FoundationStateStore } from './persistence.js';
+import type { SafetyWriterGate } from './production-safety.js';
 import { RuntimeState } from './state.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { GovernedGitEngine } from './governed-git-engine.js';
@@ -108,6 +109,7 @@ export class ActivationController {
     private readonly dataRoot: string,
     private readonly candidates: ActivationCandidateInspector,
     private readonly runtime: ActivationRuntimeAdapter,
+    private readonly safety?: SafetyWriterGate,
   ) {}
 
   public async status(transactionId?: string): Promise<ActivationStatus> {
@@ -326,7 +328,9 @@ export class ActivationController {
 
   private async writeDocument(document: ActivationTransactionDocument): Promise<void> {
     if (!isTransactionDocument(document)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing to persist invalid activation transaction state');
-    await writePrivateJsonAtomic(transactionPath(this.dataRoot), document);
+    const write = () => writePrivateJsonAtomic(transactionPath(this.dataRoot), document);
+    if (this.safety === undefined) await write();
+    else await this.safety.runMutation('activation', write);
   }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {

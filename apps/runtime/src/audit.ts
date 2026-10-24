@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { RuntimeError, type AuditResult, type PermissionAuditEvent, type PermissionDecisionRecord } from '@iris/domain';
 import { inspectPrivateRegularFile, openPrivateAppendFile } from './private-fs.js';
+import type { SafetyWriterGate } from './production-safety.js';
 
 const AUDIT_FILE = 'audit.jsonl';
 const MAX_AUDIT_READ_BYTES = 1024 * 1024;
@@ -10,11 +11,11 @@ const MAX_RECENT_EVENTS = 200;
 export class PermissionAuditStore {
   private appendTail: Promise<void> = Promise.resolve();
 
-  public constructor(private readonly dataRoot: string) {}
+  public constructor(private readonly dataRoot: string, private readonly safety?: SafetyWriterGate) {}
 
   public append(record: PermissionDecisionRecord, result: AuditResult): Promise<PermissionAuditEvent> {
     const event: PermissionAuditEvent = { id: randomUUID(), ...record, result };
-    const operation = this.appendTail.then(async () => {
+    const append = async () => {
       const filename = path.join(this.dataRoot, AUDIT_FILE);
       let handle: Awaited<ReturnType<typeof openPrivateAppendFile>>;
       try {
@@ -28,6 +29,10 @@ export class PermissionAuditStore {
       } finally {
         await handle.close();
       }
+    };
+    const operation = this.appendTail.then(async () => {
+      if (this.safety === undefined) await append();
+      else await this.safety.runMutation('permission-audit', append);
     });
     this.appendTail = operation.then(() => undefined, () => undefined);
     return operation.then(() => event);

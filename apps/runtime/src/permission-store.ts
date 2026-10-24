@@ -4,6 +4,7 @@ import path from 'node:path';
 import { RuntimeError, type CapabilityId, type PermissionMode } from '@iris/domain';
 import { capabilityDefinition } from './capability-registry.js';
 import { inspectPrivateRegularFile } from './private-fs.js';
+import type { SafetyWriterGate } from './production-safety.js';
 
 const PERMISSIONS_FILE = 'permissions.json';
 
@@ -23,7 +24,7 @@ export const DEFAULT_PERMISSION_MODE: PermissionMode = 'FULL_LOCAL_OWNER';
 export class PermissionSettingsStore {
   private mutationTail: Promise<void> = Promise.resolve();
 
-  public constructor(private readonly dataRoot: string) {}
+  public constructor(private readonly dataRoot: string, private readonly safety?: SafetyWriterGate) {}
 
   public async initialize(): Promise<PermissionSettings> {
     const filename = path.join(this.dataRoot, PERMISSIONS_FILE);
@@ -65,7 +66,9 @@ export class PermissionSettingsStore {
     const operation = this.mutationTail.then(async () => {
       const next = transform(await this.read());
       if (!isPermissionSettings(next)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing to write invalid permission settings');
-      await writePrivateJsonAtomic(path.join(this.dataRoot, PERMISSIONS_FILE), next);
+      const write = () => writePrivateJsonAtomic(path.join(this.dataRoot, PERMISSIONS_FILE), next);
+      if (this.safety === undefined) await write();
+      else await this.safety.runMutation('permission-store', write);
       result = next;
     });
     this.mutationTail = operation.then(() => undefined, () => undefined);

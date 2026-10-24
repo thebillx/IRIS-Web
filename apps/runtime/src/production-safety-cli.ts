@@ -2,12 +2,13 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readEndpoint, readOwnerAccessSecret } from './persistence.js';
 import { createRuntimeBackup, ProductionSafetyController, restoreRuntimeBackup, verifyRuntimeBackup, type SafetyIdentity } from './production-safety.js';
+import { createRuntimeWriterVerifier } from './production-safety-wiring.js';
 
 const TOKEN_ENV = 'IRIS_OWNER_ACCESS_TOKEN';
 
 async function main(argv: readonly string[]): Promise<void> {
   const command = argv[0];
-  if (command === undefined || !['inspect', 'quiesce', 'recover', 'unfence', 'backup', 'verify', 'restore', 'readiness'].includes(command)) throw new Error('Usage: <inspect|quiesce|recover|unfence|backup|verify|restore|readiness> --data-root <absolute-path>');
+  if (command === undefined || !['inspect', 'quiesce', 'recover', 'unfence', 'backup', 'verify', 'restore', 'readiness', 'reconcile-reservation'].includes(command)) throw new Error('Usage: <inspect|quiesce|recover|unfence|backup|verify|restore|readiness|reconcile-reservation> --data-root <absolute-path>');
   const args = parseArgs(argv.slice(1));
   const dataRoot = args.get('data-root');
   if (dataRoot === undefined || !path.isAbsolute(dataRoot)) throw new Error('--data-root must be an absolute path');
@@ -31,7 +32,7 @@ async function main(argv: readonly string[]): Promise<void> {
   const identity = await loadIdentity(dataRoot);
   const ownerAccessSecret = await readOwnerAccessSecret(dataRoot);
   if (ownerAccessSecret === null) throw new Error('Owner access credential is unavailable');
-  const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret });
+  const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret, writerVerifier: createRuntimeWriterVerifier(dataRoot) });
   const token = process.env[TOKEN_ENV];
   let result: unknown;
   {
@@ -39,6 +40,12 @@ async function main(argv: readonly string[]): Promise<void> {
     if (command === 'quiesce') result = await controller.quiesce(token);
     else if (command === 'recover') result = await controller.recover(token, {});
     else if (command === 'unfence') result = await controller.unfence(token);
+    else if (command === 'reconcile-reservation') {
+      const reservationId = args.get('reservation-id');
+      const reason = args.get('reason');
+      if (reservationId === undefined || reason === undefined) throw new Error('reconcile-reservation requires --reservation-id and --reason');
+      result = await controller.reconcileReservation(token, reservationId, reason).then(() => controller.inspect());
+    }
     else if (command === 'backup') {
       const destination = args.get('destination');
       if (destination === undefined) throw new Error('--destination is required for backup');
