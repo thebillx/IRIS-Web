@@ -4237,7 +4237,8 @@ function stableJson(value: unknown): string {
 }
 
 function mutationLogicalFingerprint(name: string, args: Record<string, unknown>, context: SupervisorWorkloadCallContext): string {
-  const { requestId: _requestId, ...logicalArgs } = args;
+  const logicalArgs = { ...args };
+  delete logicalArgs.requestId;
   return createHash('sha256').update(stableJson({
     name,
     args: logicalArgs,
