@@ -141,6 +141,18 @@ export interface SafetyWriterGate {
   runMutation<T>(writer: SafetyWriterName, operation: () => Promise<T>): Promise<T>;
 }
 
+/** Serialize non-runtime writers with the safety fence so quiescence cannot race a write. */
+export function withSafetyWriterAdmission<T>(dataRoot: string, writer: SafetyWriterName, operation: () => Promise<T>): Promise<T> {
+  return withLock(path.resolve(dataRoot), async () => {
+    const document = await readDocument(path.resolve(dataRoot));
+    const record = document.writers[writer];
+    if (document.state !== 'ACTIVE' || record === undefined || record.state === 'UNKNOWN' || record.inFlight > 0) {
+      throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} is not admitted by the active safety fence`);
+    }
+    return operation();
+  });
+}
+
 export interface ReadinessReport {
   readonly status: 'READY_FOR_OWNER_WINDOW' | 'BLOCKED';
   readonly reasons: readonly string[];

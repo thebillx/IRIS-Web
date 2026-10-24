@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
-import { ProductionSafetyController, createRuntimeBackup, restoreRuntimeBackup, type SafetyWriterName } from './production-safety.js';
+import { ProductionSafetyController, createRuntimeBackup, restoreRuntimeBackup, type SafetyWriterName, withSafetyWriterAdmission } from './production-safety.js';
 import { createRuntimeWriterVerifier, runtimeWriterBindings } from './production-safety-wiring.js';
 
 const roots: string[] = [];
@@ -51,4 +51,19 @@ test('R09 real writer wiring rejects malformed stores and active runner evidence
   await writeFile(path.join(dataRoot, 'vnext-jobs.json'), '{"schemaVersion":1,"jobs":[{"state":"RUNNING"}]}\n', { mode: 0o600 });
   await assert.rejects(controller.registerWriter('external-runners'), { code: 'PRECONDITION_FAILED' });
   assert.throws(() => controller.registerWriter('not-a-real-writer'), { code: 'INVALID_REQUEST' });
+});
+
+test('R09 shared admission rejects Supervisor and detached-runner writes after quiescence', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-admission-'));
+  roots.push(root);
+  await chmod(root, 0o700);
+  const dataRoot = path.join(root, 'runtime');
+  await mkdir(dataRoot, { mode: 0o700 });
+  const identity = { runtimeId: 'r09-admission-runtime', instanceId: 'r09-admission-instance', dataRoot };
+  const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret: 'r09-owner', writerVerifier: createRuntimeWriterVerifier(dataRoot) });
+  for (const writer of writers) await controller.registerWriter(writer);
+  await withSafetyWriterAdmission(dataRoot, 'supervisor', async () => undefined);
+  await controller.quiesce('r09-owner');
+  await assert.rejects(withSafetyWriterAdmission(dataRoot, 'supervisor', async () => undefined), { code: 'PRECONDITION_FAILED' });
+  await assert.rejects(controller.runMutation('external-runners', async () => undefined), { code: 'PRECONDITION_FAILED' });
 });

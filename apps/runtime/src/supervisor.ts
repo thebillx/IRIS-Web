@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, existsSync, openSync, realpathSync } from 'node:fs';
-import { mkdir, open, readFile, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import { createConnection } from 'node:net';
 import path from 'node:path';
@@ -29,6 +29,7 @@ import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminT
 import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, readRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
 import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
 import { DurableMutationJournal, type MutationBinding } from './durable-mutation-journal.js';
+import { withSafetyWriterAdmission } from './production-safety.js';
 
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
 import { readSupervisorStateFile, writeSupervisorStateFile, unresolvedStartup, validStartupOperations, type StartupOperation, type StartupState } from './supervisor-startup.js';
@@ -176,6 +177,8 @@ export interface SupervisorOptions {
   readonly adminTunnelHealthPort?: number;
   readonly protectedReferenceRoot?: string;
   readonly keepAwakeProvider?: KeepAwakeProvider;
+  /** Enabled automatically for established runtime data roots with safety state. */
+  readonly safetyAdmission?: boolean;
 }
 
 interface SupervisorOperationLock {
@@ -242,6 +245,7 @@ export async function createSupervisor(options: SupervisorOptions = {}): Promise
     : await resolveRuntimeDataRoot({ ...process.env, IRIS_RUNTIME_DATA_ROOT: options.dataRoot });
   const sourceRoot = options.sourceRoot === undefined ? await resolveSourceRoot() : path.resolve(options.sourceRoot);
   const protectedReferenceRoot = options.protectedReferenceRoot ?? process.env.IRIS_PROTECTED_REFERENCE_ROOT?.trim();
+  const safetyAdmission = options.safetyAdmission ?? await lstat(path.join(dataRoot, 'production-safety.json')).then(() => true, () => false);
   return new Supervisor(
     dataRoot,
     sourceRoot,
@@ -252,6 +256,7 @@ export async function createSupervisor(options: SupervisorOptions = {}): Promise
     options.adminTunnelHealthPort ?? DEFAULT_ADMIN_TUNNEL_HEALTH_PORT,
     protectedReferenceRoot,
     options.keepAwakeProvider,
+    safetyAdmission,
   );
 }
 
@@ -274,6 +279,7 @@ export class Supervisor {
     private readonly adminTunnelHealthPort: number,
     private readonly protectedReferenceRoot?: string,
     keepAwakeProvider: KeepAwakeProvider = new MacOSCaffeinateProvider(),
+    private readonly safetyAdmission = false,
   ) {
     this.lifecycleGrants = new LifecycleGrantStore(dataRoot);
     // Keep the Supervisor transport journal separate from the Runtime's
@@ -2304,7 +2310,7 @@ export class Supervisor {
   }
 
   private async withOperationLock<T>(operation: string, work: () => Promise<T>): Promise<T> {
-    const release = await acquireOperationLock(path.join(this.supervisorDirectory(), OPERATION_LOCK_FILE), operation);
+    const release = await acquireOperationLock(path.join(this.supervisorDirectory(), OPERATION_LOCK_FILE), operation, this.safetyAdmission ? this.dataRoot : undefined);
     try {
       return await work();
     } finally {
@@ -3110,9 +3116,11 @@ export class Supervisor {
 
   private async writeState(state: SupervisorStateDocument, replaceOperations = false): Promise<void> {
     const current = replaceOperations ? state : await this.readState();
-    await writeSupervisorStateFile(path.join(this.supervisorDirectory(), STATE_FILE), {
+    const write = () => writeSupervisorStateFile(path.join(this.supervisorDirectory(), STATE_FILE), {
       ...state, schemaVersion: 4, startupOperations: current.startupOperations, updatedAt: new Date().toISOString(),
     });
+    if (this.safetyAdmission) await withSafetyWriterAdmission(this.dataRoot, 'supervisor', write);
+    else await write();
   }
 
 
@@ -4197,7 +4205,10 @@ function sameEndpoint(left: NonNullable<RuntimeObservedStatus['endpoint']>, righ
     && left.startedAt === right.startedAt && left.apiUrl === right.apiUrl && left.mcpUrl === right.mcpUrl;
 }
 
-async function acquireOperationLock(filename: string, operation: string): Promise<() => Promise<void>> {
+async function acquireOperationLock(filename: string, operation: string, safetyDataRoot?: string): Promise<() => Promise<void>> {
+  if (safetyDataRoot !== undefined) {
+    return withSafetyWriterAdmission(safetyDataRoot, 'supervisor', () => acquireOperationLock(filename, operation));
+  }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const processStart = observeProcessStart(process.pid);
     if (processStart.state !== 'live') {

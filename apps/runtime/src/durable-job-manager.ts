@@ -368,39 +368,43 @@ export class DurableJobManager {
         stdoutPath, stderrPath, runnerClaimPath, permitPath, claimPath, resultPath, cancelPath,
       }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
 
-      const runner = spawn(process.execPath, [RUNNER_PATH, '--spec', specPath, '--job', jobId, '--runner', runnerIdentity], {
-        cwd: this.dataRoot,
-        env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: this.dataRoot, TMPDIR: tmpdir(), LANG: 'en_US.UTF-8' },
-        detached: true,
-        stdio: 'ignore',
-      });
-      if (runner.pid === undefined) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not expose a PID');
-      spawnedRunnerPid = runner.pid;
-      runner.unref();
-
-      const runnerClaim = await waitForRunnerClaim(runnerClaimPath, resultPath, jobId, runnerIdentity, spawnedRunnerPid);
-      if (!(await verifyRunnerClaim(runnerClaim, jobId, runnerIdentity, spawnedRunnerPid))) {
-        throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner identity could not be verified before target spawn');
-      }
-      await writeFile(permitPath, `${JSON.stringify({ jobId, runnerIdentity, permittedAt: new Date().toISOString() })}\n`, { mode: 0o600, flag: 'wx' });
-      let claim: RunnerClaim;
-      try {
-        claim = await waitForClaim(claimPath, resultPath, jobId, runnerIdentity);
-      } catch (error) {
-        const terminal = await waitForTrustedTerminalResult(resultPath, jobId, runnerIdentity, 2_000);
-        if (terminal !== null) return startView(await this.finishFromRunner(queued, terminal));
-        throw error;
-      }
-      const verified = await verifyClaim(claim, jobId, runnerIdentity);
-      if (!verified || claim.runnerPid !== spawnedRunnerPid) {
-        if (claim.runnerPid === spawnedRunnerPid) {
-          const terminal = await waitForTrustedTerminalResult(resultPath, jobId, runnerIdentity, 2_000);
-          if (terminal !== null) {
-            return startView(await this.finishFromRunner(queued, terminal));
-          }
+      const admitRunner = async (): Promise<{ readonly runnerPid: number; readonly claim: RunnerClaim } | { readonly terminal: RunnerResult }> => {
+        const runner = spawn(process.execPath, [RUNNER_PATH, '--spec', specPath, '--job', jobId, '--runner', runnerIdentity], {
+          cwd: this.dataRoot,
+          env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: this.dataRoot, TMPDIR: tmpdir(), LANG: 'en_US.UTF-8' },
+          detached: true,
+          stdio: 'ignore',
+        });
+        if (runner.pid === undefined) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner did not expose a PID');
+        spawnedRunnerPid = runner.pid;
+        runner.unref();
+        const runnerClaim = await waitForRunnerClaim(runnerClaimPath, resultPath, jobId, runnerIdentity, spawnedRunnerPid);
+        if (!(await verifyRunnerClaim(runnerClaim, jobId, runnerIdentity, spawnedRunnerPid))) {
+          throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable runner identity could not be verified before target spawn');
         }
-        throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable target identity could not be verified after permitted spawn');
-      }
+        await writeFile(permitPath, `${JSON.stringify({ jobId, runnerIdentity, permittedAt: new Date().toISOString() })}\n`, { mode: 0o600, flag: 'wx' });
+        let claim: RunnerClaim;
+        try {
+          claim = await waitForClaim(claimPath, resultPath, jobId, runnerIdentity);
+        } catch (error) {
+          const terminal = await waitForTrustedTerminalResult(resultPath, jobId, runnerIdentity, 2_000);
+          if (terminal !== null) return { terminal };
+          throw error;
+        }
+        const verified = await verifyClaim(claim, jobId, runnerIdentity);
+        if (!verified || claim.runnerPid !== spawnedRunnerPid) {
+          const terminal = await waitForTrustedTerminalResult(resultPath, jobId, runnerIdentity, 2_000);
+          if (terminal !== null) return { terminal };
+          throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Durable target identity could not be verified after permitted spawn');
+        }
+        return { runnerPid: spawnedRunnerPid, claim };
+      };
+      const admitted = this.safety === undefined
+        ? await admitRunner()
+        : await this.safety.runMutation('external-runners', admitRunner);
+      if ('terminal' in admitted) return startView(await this.finishFromRunner(queued, admitted.terminal));
+      spawnedRunnerPid = admitted.runnerPid;
+      const claim = admitted.claim;
 
       const running: DurableJobRecord = {
         ...queued, state: 'RUNNING', runnerPid: claim.runnerPid, runnerStartMarker: claim.runnerStartMarker,
