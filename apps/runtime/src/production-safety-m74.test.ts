@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -156,6 +156,27 @@ test('M74 active restore reservation survives restart and reconciliation is idem
   const reconciled = await restarted.inspect();
   assert.equal(reconciled.reservation, null);
   assert.equal(reconciled.reservationHistory.filter((entry) => entry.id === reservation.id).length, 1);
+});
+
+test('M74 rename interruption retains a published backup instead of clearing unknown reservation', async () => {
+  const fixture = await createFixture();
+  for (const writer of writers) await fixture.controller.registerWriter(writer);
+  await fixture.controller.quiesce(fixture.token);
+  const published = path.join(fixture.root, 'published-before-crash');
+  await createRuntimeBackup({ controller: fixture.controller, ownerAccessToken: fixture.token, destination: published });
+  const reservation = await fixture.controller.reserveBackup(fixture.token, path.join(fixture.root, 'backup-after-rename'));
+  await rename(published, reservation.fence.reservation!.destination);
+  const restarted = await ProductionSafetyController.open({
+    dataRoot: fixture.dataRoot,
+    identity: { ...fixture.identity, instanceId: 'rename-restart-instance' },
+    ownerAccessSecret: fixture.token,
+    writerVerifier: fixture.verifier,
+  });
+  await assert.rejects(restarted.reconcileReservation(fixture.token, reservation.id, 'free text cannot prove publication failed'), { code: 'PRECONDITION_FAILED' });
+  const retained = await restarted.inspect();
+  assert.equal(retained.reservation?.id, reservation.id);
+  assert.equal(retained.reservation?.status, 'FAILED');
+  assert.equal(await readFile(path.join(reservation.fence.reservation!.destination, 'manifest.json'), 'utf8').then(() => true), true);
 });
 
 test('M74 readiness freshly verifies non-instrumented writers before owner window', async () => {

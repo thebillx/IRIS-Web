@@ -510,6 +510,8 @@ export class ProductionSafetyController {
       if (current.reservation.id !== reservationId) throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation identity does not match');
       if (current.reservation.status !== 'FAILED') throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation must be durably failed before reconciliation');
       const reservation = current.reservation;
+      const artifacts = await inspectReservationArtifacts(reservation);
+      if (artifacts.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Safety reservation artifacts remain untrusted: ${artifacts.join(', ')}`);
       const outcome: SafetyReservationOutcome = {
         ...reservation,
         status: 'FAILED',
@@ -580,6 +582,37 @@ export class ProductionSafetyController {
     await queued;
     return result;
   }
+}
+
+async function inspectReservationArtifacts(reservation: SafetyReservation): Promise<readonly string[]> {
+  const paths = [reservation.destination, reservation.checkpointTarget].filter((value): value is string => value !== null);
+  const artifacts: string[] = [];
+  for (const filename of paths) {
+    const metadata = await lstat(filename).catch((error: unknown) => {
+      if (isNotFound(error)) return null;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Safety reservation artifact state is unavailable', { cause: error });
+    });
+    if (metadata !== null) artifacts.push(filename);
+    const parent = path.dirname(filename);
+    const basename = path.basename(filename);
+    const parentMetadata = await lstat(parent).catch((error: unknown) => {
+      if (isNotFound(error)) return null;
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Safety reservation staging state is unavailable', { cause: error });
+    });
+    if (parentMetadata === null) continue;
+    if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink() || (parentMetadata.mode & 0o077) !== 0) throw new RuntimeError('PERSISTENCE_FAILURE', 'Safety reservation staging parent is not a private physical directory');
+    const prefix = `${basename}.`;
+    for (const entry of await readdir(parent)) {
+      if (!entry.startsWith(prefix) || !entry.endsWith('.staging')) continue;
+      const staged = path.join(parent, entry);
+      const stagedMetadata = await lstat(staged).catch((error: unknown) => {
+        if (isNotFound(error)) return null;
+        throw new RuntimeError('PERSISTENCE_FAILURE', 'Safety reservation staging state is unavailable', { cause: error });
+      });
+      if (stagedMetadata !== null) artifacts.push(staged);
+    }
+  }
+  return artifacts;
 }
 export async function createRuntimeBackup(input: CreateBackupInput): Promise<BackupManifest> {
   const destination = path.resolve(input.destination);
