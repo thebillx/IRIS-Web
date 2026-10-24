@@ -360,15 +360,14 @@ export class DurableJobManager {
       const targetEnvironment = reviewOutputPath === null
         ? prepared.plan.environment
         : { ...prepared.plan.environment, IRIS_CODE_REVIEW_OUTPUT_PATH: reviewOutputPath };
-      await writeFile(specPath, `${JSON.stringify({
-        schemaVersion: 1, jobId, runnerIdentity, executableIdentity: prepared.plan.executableIdentity, argv: prepared.plan.argv,
-        cwd: prepared.plan.cwd, environment: targetEnvironment, redactionValues: prepared.plan.redactionValues,
-        timeoutMs: prepared.plan.timeoutMs, stdinPath: prepared.plan.stdinPath, reviewOutputPath,
-        cleanupPaths: prepared.plan.cleanupPaths,
-        stdoutPath, stderrPath, runnerClaimPath, permitPath, claimPath, resultPath, cancelPath,
-      }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
-
       const admitRunner = async (): Promise<{ readonly runnerPid: number; readonly claim: RunnerClaim } | { readonly terminal: RunnerResult }> => {
+        await writeFile(specPath, `${JSON.stringify({
+          schemaVersion: 1, jobId, runnerIdentity, executableIdentity: prepared.plan.executableIdentity, argv: prepared.plan.argv,
+          cwd: prepared.plan.cwd, environment: targetEnvironment, redactionValues: prepared.plan.redactionValues,
+          timeoutMs: prepared.plan.timeoutMs, stdinPath: prepared.plan.stdinPath, reviewOutputPath,
+          cleanupPaths: prepared.plan.cleanupPaths,
+          stdoutPath, stderrPath, runnerClaimPath, permitPath, claimPath, resultPath, cancelPath,
+        }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
         const runner = spawn(process.execPath, [RUNNER_PATH, '--spec', specPath, '--job', jobId, '--runner', runnerIdentity], {
           cwd: this.dataRoot,
           env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: this.dataRoot, TMPDIR: tmpdir(), LANG: 'en_US.UTF-8' },
@@ -610,9 +609,11 @@ export class DurableJobManager {
       const lost = await this.markLost(job);
       return { jobId, state: lost.state, cancelRequested: false, reason: 'PROCESS_OWNERSHIP_AMBIGUOUS' };
     }
-    await writeFile(job.cancelPath, `${JSON.stringify({ jobId, runnerIdentity: job.runnerIdentity, requestedAt: new Date().toISOString() })}\n`, { mode: 0o600, flag: 'wx' }).catch((error: NodeJS.ErrnoException) => {
+    const writeCancel = async () => writeFile(job.cancelPath, `${JSON.stringify({ jobId, runnerIdentity: job.runnerIdentity, requestedAt: new Date().toISOString() })}\n`, { mode: 0o600, flag: 'wx' }).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== 'EEXIST') throw error;
     });
+    if (this.safety === undefined) await writeCancel();
+    else await this.safety.runMutation('external-runners', writeCancel);
     safeKillGroup(claim.targetProcessGroupId, 'SIGTERM');
     setTimeout(() => {
       void verifyClaim(claim, job.jobId, job.runnerIdentity).then((exact) => { if (exact) safeKillGroup(claim.targetProcessGroupId, 'SIGKILL'); });

@@ -5,7 +5,7 @@ import { RuntimeError } from '@iris/domain';
 import { ACTIVATION_FINGERPRINT_ALGORITHM, assertActivationWorkloadReady, inspectActivationSourceIdentity, type ActivationSourceIdentity } from './activation-source-identity.js';
 import { writePrivateJsonAtomic } from './credentials.js';
 import { FoundationStateStore } from './persistence.js';
-import type { SafetyWriterGate } from './production-safety.js';
+import { withSafetyWriterAdmission, type SafetyWriterGate } from './production-safety.js';
 import { RuntimeState } from './state.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { GovernedGitEngine } from './governed-git-engine.js';
@@ -341,14 +341,16 @@ export class ActivationController {
 }
 
 export async function createProductionActivationController(dataRoot: string): Promise<ActivationController> {
-  const state = new RuntimeState(new FoundationStateStore(dataRoot));
-  const resources = new VNextResourceRegistry(state, dataRoot);
+  const safety: SafetyWriterGate = { runMutation: (writer, operation) => withSafetyWriterAdmission(dataRoot, writer, operation) };
+  const state = new RuntimeState(new FoundationStateStore(dataRoot, safety));
+  const resources = new VNextResourceRegistry(state, dataRoot, safety);
   const git = new GovernedGitEngine(resources);
-  const supervisor = await createSupervisor({ dataRoot });
+  const supervisor = await createSupervisor({ dataRoot, safetyAdmission: true });
   const controller = new ActivationController(
     dataRoot,
     new ProductionCandidateInspector(state, git),
     new ProductionRuntimeAdapter(dataRoot, supervisor),
+    safety,
   );
   await controller.recoverInterrupted();
   return controller;
