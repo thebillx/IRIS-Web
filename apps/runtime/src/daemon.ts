@@ -32,6 +32,7 @@ import { SecurityAuditStore } from './security-audit/store.js';
 import { SecurityAuditService } from './security-audit/service.js';
 import { ProductionSafetyController } from './production-safety.js';
 import { MissionLedgerStore } from './mission-store.js';
+import { DurableMutationJournal } from './durable-mutation-journal.js';
 
 export const DEFAULT_RUNTIME_PORT = 43_110;
 
@@ -179,6 +180,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       new AdoRequirementContextService(dataRoot),
       missionDelegations,
     );
+    const mutationJournal = new DurableMutationJournal(dataRoot, 'runtime-mutations');
 
     const doctor = async (): Promise<DoctorReport> => {
       const probe = await probeRuntimeAuthority(dataRoot);
@@ -227,6 +229,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
           identityCode: identityCoherence.code,
           tunnelBindings: identityCoherence.tunnelBindings,
         },
+        mutationJournal,
         requestShutdown: () => {
           void close().catch((error: unknown) => {
             process.stderr.write(`IRIS controlled shutdown failed: ${error instanceof Error ? error.message : String(error)}\n`);

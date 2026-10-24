@@ -12,6 +12,7 @@ import type { SecurityAuditService } from './security-audit/service.js';
 import { handleV21OwnerRoute } from './server-v21-routes.js';
 import { handleHermesMcpRequest } from './hermes-mcp.js';
 import type { McpCatalogRuntimeContext } from './mcp-catalog.js';
+import type { DurableMutationJournal } from './durable-mutation-journal.js';
 
 export const LOOPBACK_ADDRESS = '127.0.0.1' as const;
 export const CLIENT_ID_HEADER = 'x-iris-client-id' as const;
@@ -43,6 +44,7 @@ export interface RuntimeServerContext {
   readonly connectorDeploymentEpoch?: number;
   readonly connectorRuntimeId?: string;
   readonly catalogRuntimeContext?: McpCatalogRuntimeContext;
+  readonly mutationJournal?: DurableMutationJournal;
   readonly requestShutdown: () => void;
 }
 
@@ -210,7 +212,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     const init: RequestInit = { method: request.method ?? 'GET', headers };
     if (body.length > 0) init.body = body;
     const mcpResponse = context.missionLifecycle === undefined
-      ? await handleMcpRequest(new Request('http://127.0.0.1/mcp', init), context.capabilities, context.state, context.missionBroker, mcpPrincipal ?? 'owner', context.catalogRuntimeContext)
+      ? await handleMcpRequest(new Request('http://127.0.0.1/mcp', init), context.capabilities, context.state, context.missionBroker, mcpPrincipal ?? 'owner', context.catalogRuntimeContext, context.mutationJournal)
       : await handleMcpV21Request(
         new Request('http://127.0.0.1/mcp', init),
         context.capabilities,
@@ -220,6 +222,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
         mcpPrincipal ?? 'owner',
         context.catalogRuntimeContext,
         context.securityAudit,
+        context.mutationJournal,
       );
     await writeFetchResponse(response, mcpResponse);
     return;
@@ -231,7 +234,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     for (const [name, value] of Object.entries(request.headers)) if (typeof value === 'string') headers.set(name, value);
     const init: RequestInit = { method: request.method ?? 'GET', headers };
     if (body.length > 0) init.body = body;
-    const mcpResponse = await handleMcpProRequest(new Request('http://127.0.0.1/mcp-pro', init), context.capabilities, mcpPrincipal ?? 'owner', context.catalogRuntimeContext);
+    const mcpResponse = await handleMcpProRequest(new Request('http://127.0.0.1/mcp-pro', init), context.capabilities, mcpPrincipal ?? 'owner', context.catalogRuntimeContext, context.mutationJournal);
     await writeFetchResponse(response, mcpResponse);
     return;
   }

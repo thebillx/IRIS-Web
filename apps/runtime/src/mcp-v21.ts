@@ -4,6 +4,7 @@ import type { DurableMissionLifecycleService } from './durable-mission-service.j
 import type { MissionBrokerService } from './mission-broker.js';
 import { catalogIdentityPayload, catalogToolNames, type McpCatalogRuntimeContext } from './mcp-catalog.js';
 import { MCP_PROTOCOL_VERSION, fullMcpToolDefinitions, handleMcpRequest, type McpPrincipal } from './mcp.js';
+import type { DurableMutationJournal } from './durable-mutation-journal.js';
 import { executePhase2GroupedTool, isPhase2GroupedTool } from './mcp-phase2.js';
 import { executePhase3GroupedTool, isPhase3GroupedTool } from './mcp-phase3.js';
 import { executePhase4GroupedTool, isPhase4GroupedTool } from './mcp-phase4.js';
@@ -31,25 +32,26 @@ export async function handleMcpV21Request(
   principal: McpPrincipal = 'owner',
   runtimeContext: McpCatalogRuntimeContext = {},
   securityAudit?: SecurityAuditService,
+  mutationJournal?: DurableMutationJournal,
 ): Promise<Response> {
-  if (request.method !== 'POST') return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
+  if (request.method !== 'POST') return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext, mutationJournal);
 
   let rpc: JsonRpcRequest;
   try {
     rpc = await request.clone().json() as JsonRpcRequest;
   } catch {
-    return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
+    return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext, mutationJournal);
   }
 
   if (rpc.method === 'tools/list') {
-    return augmentToolList(await handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext));
+    return augmentToolList(await handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext, mutationJournal));
   }
-  if (rpc.method !== 'tools/call') return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
+  if (rpc.method !== 'tools/call') return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext, mutationJournal);
 
   const params = isRecord(rpc.params) ? rpc.params : null;
   const args = params !== null && isRecord(params.arguments) ? params.arguments : null;
   const name = params !== null && typeof params.name === 'string' ? params.name : null;
-  if (name === null || args === null) return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
+  if (name === null || args === null) return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext, mutationJournal);
 
   const lifecycleDirective = name === 'mission_directive' && args.basedOnRevision !== undefined;
   const lifecycleCreate = name === 'mission_create';
@@ -61,7 +63,7 @@ export async function handleMcpV21Request(
   const securityAuditTool = isSecurityAuditTool(name);
   const adoTool = isAdoTool(name);
   if (!V21_LIFECYCLE_TOOL_NAMES.has(name) && !lifecycleDirective && !lifecycleCreate && !catalogIdentity && !phase2Grouped && !phase3Grouped && !phase4Grouped && !codeReviewGrouped && !securityAuditTool && !adoTool) {
-    return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext);
+    return handleMcpRequest(request, capabilities, state, broker, principal, runtimeContext, mutationJournal);
   }
 
   if (request.headers.get('MCP-Protocol-Version') !== MCP_PROTOCOL_VERSION) {

@@ -1096,6 +1096,7 @@ export class Supervisor {
 
   private async workloadMutationStatus(input: SupervisorMutationStatusInput): Promise<SupervisorAdminToolCallResult> {
     const { name, args, context } = input;
+    if (args.reconcile === true) return this.reconcileWorkloadMutation(input);
     if (context.clientId === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence requires a bounded client identity');
     const durableMutation = FORWARDED_DURABLE_MUTATION_TOOLS.has(name) || groupedWorkloadDurableMutation(name, args);
     if (!durableMutation) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence is available only for durable workload mutations');
@@ -1159,6 +1160,70 @@ export class Supervisor {
       },
       isError: false,
     };
+  }
+
+  private async reconcileWorkloadMutation(input: SupervisorMutationStatusInput): Promise<SupervisorAdminToolCallResult> {
+    const { name, args, context } = input;
+    if (context.clientId === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation reconciliation requires a bounded client identity');
+    const requestId = typeof args.requestId === 'string' && args.requestId.length > 0 && args.requestId.length <= 200 ? args.requestId : undefined;
+    if (requestId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation reconciliation requires the original durable requestId');
+    if (name !== 'session_open' && context.sessionId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation reconciliation requires the original session identity');
+    const state = await this.readState();
+    const runtime = state.runtime;
+    if (runtime === null || typeof runtime.runtimeId !== 'string' || typeof runtime.instanceId !== 'string') throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Current workload Runtime identity is unavailable for mutation reconciliation');
+    const registry = await readConnectorRegistry(this.dataRoot);
+    const endpoint = await readEndpoint(this.dataRoot).catch(() => null);
+    const serviceSecret = await readTunnelServiceSecret(this.dataRoot);
+    if (registry === null || endpoint === null || serviceSecret === null || endpoint.runtimeId !== runtime.runtimeId || endpoint.instanceId !== runtime.instanceId
+      || !Number.isSafeInteger(registry.deploymentEpoch) || registry.deploymentEpoch <= 0) {
+      throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'Current workload identity is unavailable for mutation reconciliation');
+    }
+    const currentBinding: MutationBinding = {
+      operation: name, clientId: context.clientId, sessionId: context.sessionId ?? null,
+      projectId: typeof args.projectId === 'string' ? args.projectId : null,
+      workspaceId: typeof args.workspaceId === 'string' ? args.workspaceId : null,
+      runtimeId: endpoint.runtimeId, instanceId: endpoint.instanceId, deploymentEpoch: registry.deploymentEpoch,
+    };
+    const logicalFingerprint = mutationLogicalFingerprint(name, args, context);
+    const record = await this.workloadMutationJournal.findByLogicalIdentity(logicalFingerprint, currentBinding);
+    if (record === null) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation reconciliation evidence is unavailable');
+    if (record.requestId !== requestId) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation logical identity is bound to a different durable request');
+    if (record.state !== 'RECONCILIATION_REQUIRED') return {
+      structuredContent: { requestId, operation: name, state: record.state, evidence: record.result, errorCode: record.errorCode, binding: record.binding },
+      isError: false,
+    };
+    const originalBinding = record.binding;
+    if (originalBinding === undefined || record.logicalFingerprint !== logicalFingerprint) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation reconciliation record lacks its authenticated binding');
+    const response = await postJson(`${endpoint.apiUrl}/mcp`, {
+      jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name: 'mutation_status', arguments: {
+        requestId: record.requestId, fingerprint: record.fingerprint, operation: name,
+        clientId: originalBinding.clientId, sessionId: originalBinding.sessionId, projectId: originalBinding.projectId,
+        workspaceId: originalBinding.workspaceId, runtimeId: originalBinding.runtimeId, instanceId: originalBinding.instanceId,
+        deploymentEpoch: originalBinding.deploymentEpoch,
+      } },
+    }, {
+      authorization: `Bearer ${serviceSecret}`, 'content-type': 'application/json', 'MCP-Protocol-Version': '2026-07-28',
+      'Mcp-Name': 'mutation_status', 'x-iris-connector-profile': 'FULL', 'x-iris-deployment-epoch': String(registry.deploymentEpoch),
+      'x-iris-runtime-id': endpoint.runtimeId, 'x-iris-client-id': context.clientId,
+      ...(context.sessionId === undefined ? {} : { 'x-iris-session-id': context.sessionId }),
+    });
+    if (!isRecord(response) || !isRecord(response.result) || response.result.isError === true || !isRecord(response.result.structuredContent)) {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime mutation evidence is unavailable; do not retry the mutation');
+    }
+    const evidence = response.result.structuredContent;
+    if (evidence.requestId !== record.requestId || evidence.fingerprint !== record.fingerprint || evidence.state === 'NOT_FOUND') {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime mutation evidence identity does not match the Supervisor record');
+    }
+    if (evidence.state === 'RECONCILIATION_REQUIRED' || evidence.state === 'PREPARED' || evidence.state === 'APPLYING') {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime mutation outcome remains unresolved; do not retry');
+    }
+    if (evidence.state !== 'COMMITTED' && evidence.state !== 'FAILED') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime mutation outcome is not terminal');
+    const settled = await this.workloadMutationJournal.reconcile(
+      record.requestId, record.fingerprint, originalBinding, evidence.state,
+      evidence.state === 'COMMITTED' ? evidence.evidence : null,
+      evidence.state === 'FAILED' && typeof evidence.errorCode === 'string' ? evidence.errorCode : null,
+    );
+    return { structuredContent: { requestId: settled.requestId, operation: name, state: settled.state, evidence: settled.result, errorCode: settled.errorCode, binding: settled.binding }, isError: false };
   }
 
   private async forwardWorkloadTool(name: string, args: Record<string, unknown>, context: SupervisorWorkloadCallContext = {}): Promise<SupervisorAdminToolCallResult> {

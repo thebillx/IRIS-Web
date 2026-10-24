@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import { RuntimeError, type MissionCheckpoint, type MissionExecutionAssociation, type MissionState, type MissionTaskState, type MissionTimelineEvent, type OrchestratorMode, type SupervisorDecision, type SupervisorDirective, type SupervisorGateState } from '@iris/domain';
 import { catalogIdentityPayload, catalogToolNames, orderToolDefinitions, type McpCatalogRuntimeContext } from './mcp-catalog.js';
+import { DurableMutationJournal, type MutationBinding, type MutationRecord } from './durable-mutation-journal.js';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import type { RuntimeState } from './state.js';
@@ -27,8 +29,9 @@ export async function handleMcpRequest(
   broker?: MissionBrokerService,
   principal: McpPrincipal = 'owner',
   runtimeContext: McpCatalogRuntimeContext = {},
+  mutationJournal?: DurableMutationJournal,
 ): Promise<Response> {
-  return handleMcpTransportRequest(request, capabilities, state, broker, 'full', principal, runtimeContext);
+  return handleMcpTransportRequest(request, capabilities, state, broker, 'full', principal, runtimeContext, mutationJournal);
 }
 
 export async function handleMcpProRequest(
@@ -36,8 +39,9 @@ export async function handleMcpProRequest(
   capabilities: CapabilityService,
   principal: McpPrincipal = 'owner',
   runtimeContext: McpCatalogRuntimeContext = {},
+  mutationJournal?: DurableMutationJournal,
 ): Promise<Response> {
-  return handleMcpTransportRequest(request, capabilities, undefined, undefined, 'pro', principal, runtimeContext);
+  return handleMcpTransportRequest(request, capabilities, undefined, undefined, 'pro', principal, runtimeContext, mutationJournal);
 }
 
 async function handleMcpTransportRequest(
@@ -48,6 +52,7 @@ async function handleMcpTransportRequest(
   profile: 'full' | 'pro',
   principal: McpPrincipal,
   runtimeContext: McpCatalogRuntimeContext,
+  mutationJournal?: DurableMutationJournal,
 ): Promise<Response> {
   if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405, { allow: 'POST' });
 
@@ -113,12 +118,15 @@ async function handleMcpTransportRequest(
     if (toolHeader !== null && toolHeader !== params.name) return jsonRpcError(rpc.id ?? null, -32600, 'Mcp-Name does not match tool name', 400);
 
     try {
+      if (params.name === 'mutation_status') {
+        return jsonRpcResult(rpc.id ?? null, toolResult(await runtimeMutationStatus(args, state, principal, mutationJournal)));
+      }
       if (profile === 'full' && params.name === 'catalog_identity') {
         return jsonRpcResult(rpc.id ?? null, catalogIdentityPayload('FULL', toolDefinitions(), runtimeContext));
       }
       const result = profile === 'pro'
         ? await executeProTool(params.name, args, request, capabilities)
-        : await executeTool(params.name, args, request, capabilities, state, broker, principal);
+        : await executeToolWithEvidence(params.name, args, request, capabilities, state, broker, principal, runtimeContext, mutationJournal);
       return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
     } catch (error) {
       const runtimeError = error instanceof RuntimeError ? error : null;
@@ -143,6 +151,92 @@ export function fullMcpToolDefinitions(): readonly Record<string, unknown>[] {
 export function proMcpToolDefinitions(): readonly Record<string, unknown>[] {
   return proToolDefinitions();
 }
+
+const DURABLE_MUTATION_TOOLS = new Set([
+  'project_validation_start', 'git_local', 'file_write', 'file_edit', 'file_delete',
+  'directory_create', 'directory_delete', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git',
+]);
+
+async function executeToolWithEvidence(
+  name: string, args: Record<string, unknown>, request: Request, capabilities: CapabilityService,
+  state: RuntimeState | undefined, broker: MissionBrokerService | undefined, principal: McpPrincipal,
+  runtimeContext: McpCatalogRuntimeContext, mutationJournal: DurableMutationJournal | undefined,
+): Promise<CapabilityOutcome | unknown> {
+  if (mutationJournal === undefined || principal !== 'tunnel-service' || !DURABLE_MUTATION_TOOLS.has(name)) {
+    return executeTool(name, args, request, capabilities, state, broker, principal);
+  }
+  const requestId = typeof args.requestId === 'string' && args.requestId.length > 0 ? args.requestId : optionalHeader(request, 'x-iris-request-id');
+  const clientId = optionalHeader(request, CLIENT_ID_HEADER);
+  const runtimeId = runtimeContext.runtimeId;
+  const instanceId = runtimeContext.instanceId;
+  const deploymentEpoch = runtimeContext.deploymentEpoch;
+  if (requestId === undefined || clientId === undefined || runtimeId === undefined || runtimeId === null
+    || instanceId === undefined || instanceId === null || deploymentEpoch === undefined || deploymentEpoch === null
+    || !Number.isSafeInteger(deploymentEpoch) || deploymentEpoch <= 0) {
+    return executeTool(name, args, request, capabilities, state, broker, principal);
+  }
+  const binding: MutationBinding = {
+    operation: name, clientId,
+    sessionId: typeof args.sessionId === 'string' ? args.sessionId : optionalHeader(request, SESSION_ID_HEADER) ?? null,
+    projectId: typeof args.projectId === 'string' ? args.projectId : null,
+    workspaceId: typeof args.workspaceId === 'string' ? args.workspaceId : null,
+    runtimeId, instanceId, deploymentEpoch,
+  };
+  const fingerprint = sha256(stableJson({ name, args, ...binding }));
+  const logicalFingerprint = sha256(stableJson({ name, args: withoutRequestId(args), binding: {
+    operation: binding.operation, clientId: binding.clientId, sessionId: binding.sessionId,
+    projectId: binding.projectId, workspaceId: binding.workspaceId,
+  } }));
+  return mutationJournal.execute(requestId, fingerprint, () => executeTool(name, args, request, capabilities, state, broker, principal), binding, logicalFingerprint);
+}
+
+async function runtimeMutationStatus(
+  args: Record<string, unknown>, state: RuntimeState | undefined, principal: McpPrincipal,
+  mutationJournal: DurableMutationJournal | undefined,
+): Promise<Record<string, unknown>> {
+  if (principal !== 'tunnel-service' || mutationJournal === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence is restricted to the authenticated Supervisor tunnel');
+  const requestId = requiredBoundedString(args, 'requestId', 200);
+  const fingerprint = requiredHex(args, 'fingerprint');
+  const operation = requiredBoundedString(args, 'operation', 200);
+  const clientId = requiredBoundedString(args, 'clientId', 200);
+  const sessionId = nullableBoundedString(args, 'sessionId', 200);
+  const projectId = nullableBoundedString(args, 'projectId', 200);
+  const workspaceId = nullableBoundedString(args, 'workspaceId', 200);
+  const runtimeId = requiredBoundedString(args, 'runtimeId', 200);
+  const instanceId = requiredBoundedString(args, 'instanceId', 200);
+  const deploymentEpoch = args.deploymentEpoch;
+  if (typeof deploymentEpoch !== 'number' || !Number.isSafeInteger(deploymentEpoch) || deploymentEpoch <= 0) throw new RuntimeError('INVALID_REQUEST', 'deploymentEpoch is invalid');
+  if ((projectId !== null || workspaceId !== null) && sessionId === null) {
+    throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence for a project or workspace requires a live session');
+  }
+  if (sessionId !== null && state === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence session validation is unavailable');
+  if (state !== undefined && sessionId !== null) {
+    const session = state.getSessionForClient(sessionId, clientId);
+    if (projectId !== null && session.currentProjectId !== projectId) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence project is no longer authorized for the session');
+  }
+  const binding: MutationBinding = { operation, clientId, sessionId, projectId, workspaceId, runtimeId, instanceId, deploymentEpoch };
+  const record = await mutationJournal.inspect(requestId, fingerprint, binding);
+  if (record === null) return { requestId, operation, state: 'NOT_FOUND' };
+  return mutationEvidence(record);
+}
+
+function mutationEvidence(record: MutationRecord): Record<string, unknown> {
+  return {
+    requestId: record.requestId, operation: record.binding?.operation ?? null, state: record.state,
+    fingerprint: record.fingerprint, logicalFingerprint: record.logicalFingerprint ?? null,
+    binding: record.binding ?? null, errorCode: record.errorCode, updatedAt: record.updatedAt,
+    ...(record.state === 'COMMITTED' ? { evidence: record.result } : {}),
+    ...(record.state === 'RECONCILIATION_REQUIRED' ? { reconciliationRequired: true } : {}),
+  };
+}
+
+function sha256(value: string): string { return createHash('sha256').update(value).digest('hex'); }
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+function withoutRequestId(args: Record<string, unknown>): Record<string, unknown> { const copy = { ...args }; delete copy.requestId; return copy; }
 
 async function executeProTool(
   name: string,
@@ -575,6 +669,17 @@ function requiredBoundedString(record: Record<string, unknown>, name: string, ma
   const value = requiredString(record, name).trim();
   if (value.length === 0 || value.length > maxLength || value.includes('\0')) throw new Error(`${name} must be a bounded string`);
   return value;
+}
+
+function requiredHex(record: Record<string, unknown>, name: string): string {
+  const value = requiredString(record, name);
+  if (!/^[a-f0-9]{64}$/.test(value)) throw new RuntimeError('INVALID_REQUEST', `${name} must be a lowercase SHA-256 fingerprint`);
+  return value;
+}
+
+function nullableBoundedString(record: Record<string, unknown>, name: string, maxLength: number): string | null {
+  if (record[name] === null) return null;
+  return requiredBoundedString(record, name, maxLength);
 }
 
 function requiredPositiveInteger(record: Record<string, unknown>, name: string): number {

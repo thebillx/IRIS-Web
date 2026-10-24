@@ -57,6 +57,25 @@ export class DurableMutationJournal {
     return this.tail.then(() => this.findByLogicalIdentitySerialized(logicalFingerprint, binding), () => this.findByLogicalIdentitySerialized(logicalFingerprint, binding));
   }
 
+  /**
+   * Settle an unresolved mutation from independently authenticated downstream
+   * evidence. This never runs the mutation and never turns a missing or
+   * ambiguous record into a terminal result.
+   */
+  public reconcile(
+    requestId: string,
+    fingerprint: string,
+    binding: MutationBinding,
+    state: 'COMMITTED' | 'FAILED',
+    result: unknown = null,
+    errorCode: string | null = null,
+  ): Promise<MutationRecord> {
+    return this.tail.then(
+      () => this.reconcileSerialized(requestId, fingerprint, binding, state, result, errorCode),
+      () => this.reconcileSerialized(requestId, fingerprint, binding, state, result, errorCode),
+    );
+  }
+
   private async executeSerialized<T>(requestId: string, fingerprint: string, operation: () => Promise<T>, binding?: MutationBinding, logicalFingerprint?: string): Promise<T> {
     const filename = await this.recordFilename(requestId, fingerprint, true);
     if (binding !== undefined && logicalFingerprint !== undefined) {
@@ -132,6 +151,33 @@ export class DurableMutationJournal {
       if (record !== null && record.logicalFingerprint === logicalFingerprint && sameLogicalBinding(record.binding, binding)) return record;
     }
     return null;
+  }
+
+  private async reconcileSerialized(
+    requestId: string,
+    fingerprint: string,
+    binding: MutationBinding,
+    state: 'COMMITTED' | 'FAILED',
+    result: unknown,
+    errorCode: string | null,
+  ): Promise<MutationRecord> {
+    const filename = await this.recordFilename(requestId, fingerprint, false);
+    const existing = await readMutation(filename);
+    if (existing === null) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation evidence is unavailable for reconciliation');
+    assertRecordBinding(existing, requestId, fingerprint, binding);
+    if (existing.state === state) return existing;
+    if (existing.state !== 'RECONCILIATION_REQUIRED') {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation record is not awaiting reconciliation');
+    }
+    const settled: MutationRecord = {
+      ...existing,
+      state,
+      result: state === 'COMMITTED' ? result : null,
+      errorCode: state === 'FAILED' ? errorCode ?? 'PERSISTENCE_FAILURE' : null,
+      updatedAt: new Date().toISOString(),
+    };
+    await writeRecord(filename, settled);
+    return settled;
   }
 
   private async recordFilename(requestId: string, fingerprint: string, createDirectory: boolean): Promise<string> {

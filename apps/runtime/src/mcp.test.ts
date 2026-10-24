@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { PermissionAuditStore } from './audit.js';
 import { CapabilityService } from './capability-service.js';
 import { DurableJobManager } from './durable-job-manager.js';
+import { DurableMutationJournal } from './durable-mutation-journal.js';
 import { handleMcpProRequest, handleMcpRequest, MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { PermissionSettingsStore } from './permission-store.js';
@@ -23,6 +24,23 @@ const execFileAsync = promisify(execFile);
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('local MCP transport and permission boundary', () => {
+  it('exposes authenticated runtime-owned mutation evidence without exposing it to owner MCP', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'iris-runtime-evidence-'));
+    roots.push(root);
+    const journal = new DurableMutationJournal(root, 'runtime-mutations');
+    const binding = {
+      operation: 'file_write', clientId: 'chatgpt-client', sessionId: null, projectId: null, workspaceId: null,
+      runtimeId: 'runtime-a', instanceId: 'instance-a', deploymentEpoch: 3,
+    } as const;
+    const fingerprint = 'a'.repeat(64);
+    await journal.execute('runtime-evidence-1', fingerprint, async () => ({ path: 'value.txt', sha256: 'b'.repeat(64) }), binding, 'c'.repeat(64));
+    const requestBody = { name: 'mutation_status', arguments: { requestId: 'runtime-evidence-1', fingerprint, operation: 'file_write', clientId: binding.clientId, sessionId: null, projectId: null, workspaceId: null, runtimeId: binding.runtimeId, instanceId: binding.instanceId, deploymentEpoch: binding.deploymentEpoch } };
+    const response = await handleMcpRequest(rpc('tools/call', 1, requestBody, true, 'mutation_status', binding.clientId), {} as CapabilityService, undefined, undefined, 'tunnel-service', { runtimeId: binding.runtimeId, instanceId: 'instance-b', deploymentEpoch: 3 }, journal);
+    expect(await response.json()).toMatchObject({ result: { isError: false, structuredContent: { requestId: 'runtime-evidence-1', state: 'COMMITTED', evidence: { path: 'value.txt' } } } });
+    const denied = await handleMcpRequest(rpc('tools/call', 2, requestBody, true, 'mutation_status', binding.clientId), {} as CapabilityService, undefined, undefined, 'owner', { runtimeId: binding.runtimeId, instanceId: binding.instanceId, deploymentEpoch: 3 }, journal);
+    expect(await denied.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'CONTROL_DENIED' } } });
+  });
+
   it('issues one owner-bound delegation through authenticated MCP without treating chat text as authority', async () => {
     const fixture = await serviceFixture();
     const owner = fixture.state.createSession('owner-client', 'chatgpt', 'owner');

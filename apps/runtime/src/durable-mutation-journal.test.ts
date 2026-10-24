@@ -134,4 +134,28 @@ describe('DurableMutationJournal', () => {
     await expect(journal.inspect('missing-read-only', fingerprint, binding)).resolves.toBeNull();
     await expect(access(path.join(root, 'vnext-mutations'))).rejects.toThrow();
   });
+
+  it('settles runtime evidence exactly once and rejects mismatched or ambiguous evidence', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const journal = new DurableMutationJournal(root);
+    const { RuntimeError } = await import('@iris/domain');
+    await expect(journal.execute('reconcile-1', fingerprint, async () => {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'response lost');
+    }, binding, 'e'.repeat(64))).rejects.toMatchObject({ code: 'AUTHORITY_INDETERMINATE' });
+    await expect(journal.reconcile('reconcile-1', fingerprint, binding, 'COMMITTED', { changed: true })).resolves.toMatchObject({ state: 'COMMITTED', result: { changed: true } });
+    await expect(journal.reconcile('reconcile-1', fingerprint, binding, 'COMMITTED', { changed: false })).resolves.toMatchObject({ state: 'COMMITTED', result: { changed: true } });
+    await expect(journal.reconcile('reconcile-1', fingerprint, { ...binding, clientId: 'revoked-client' }, 'COMMITTED', {})).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
+    await expect(journal.execute('reconcile-1', fingerprint, async () => ({ replayed: true }), binding, 'e'.repeat(64))).resolves.toEqual({ changed: true });
+  });
+
+  it('can settle a failed downstream outcome but never settles a missing record', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const journal = new DurableMutationJournal(root);
+    const { RuntimeError } = await import('@iris/domain');
+    await expect(journal.execute('reconcile-2', fingerprint, async () => {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'restart interrupted response');
+    }, binding, 'f'.repeat(64))).rejects.toMatchObject({ code: 'AUTHORITY_INDETERMINATE' });
+    await expect(journal.reconcile('reconcile-2', fingerprint, binding, 'FAILED', null, 'PRECONDITION_FAILED')).resolves.toMatchObject({ state: 'FAILED', errorCode: 'PRECONDITION_FAILED' });
+    await expect(journal.reconcile('unknown-reconcile', fingerprint, binding, 'FAILED', null, 'PRECONDITION_FAILED')).rejects.toMatchObject({ code: 'AUTHORITY_INDETERMINATE' });
+  });
 });
