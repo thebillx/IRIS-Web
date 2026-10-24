@@ -1,10 +1,14 @@
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { DurableMutationJournal } from './durable-mutation-journal.js';
+import { DurableMutationJournal, type MutationBinding } from './durable-mutation-journal.js';
 
 const fingerprint = 'a'.repeat(64);
+const binding: MutationBinding = {
+  operation: 'fs', clientId: 'client-a', sessionId: 'session-a', projectId: 'project-a', workspaceId: 'workspace-a',
+  runtimeId: 'runtime-a', instanceId: 'instance-a', deploymentEpoch: 7,
+};
 
 describe('DurableMutationJournal', () => {
   it('returns the committed result for an exact duplicate without rerunning the mutation', async () => {
@@ -72,5 +76,28 @@ describe('DurableMutationJournal', () => {
     const requestId = 'forwarded-git-1';
     await expect(supervisor.execute(requestId, fingerprint, async () => ({ layer: 'supervisor' }))).resolves.toEqual({ layer: 'supervisor' });
     await expect(runtime.execute(requestId, fingerprint, async () => ({ layer: 'runtime' }))).resolves.toEqual({ layer: 'runtime' });
+  });
+
+  it('binds status and replay to the exact downstream client/session/project/workspace/runtime identity', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const journal = new DurableMutationJournal(root);
+    await journal.execute('bound-1', fingerprint, async () => ({ changed: true }), binding);
+    await expect(journal.inspect('bound-1', fingerprint, binding)).resolves.toMatchObject({ state: 'COMMITTED', binding });
+    await expect(journal.inspect('bound-1', fingerprint, { ...binding, clientId: 'client-b' })).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
+    await expect(journal.execute('bound-1', fingerprint, async () => ({ changed: false }), { ...binding, deploymentEpoch: 8 })).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
+  });
+
+  it('rejects legacy records when an authenticated downstream binding is required', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const journal = new DurableMutationJournal(root);
+    await journal.execute('legacy-1', fingerprint, async () => ({ legacy: true }));
+    await expect(journal.inspect('legacy-1', fingerprint, binding)).rejects.toMatchObject({ code: 'AUTHORITY_CHANGED' });
+  });
+
+  it('does not create a journal directory during a read-only evidence lookup', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const journal = new DurableMutationJournal(root);
+    await expect(journal.inspect('missing-read-only', fingerprint, binding)).resolves.toBeNull();
+    await expect(access(path.join(root, 'vnext-mutations'))).rejects.toThrow();
   });
 });

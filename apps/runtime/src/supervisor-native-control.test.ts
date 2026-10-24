@@ -51,7 +51,7 @@ describe('outer supervisor native control', () => {
         'Mcp-Method': 'tools/list',
       });
       expect(toolNames(listed)).toEqual([
-        'supervisor_status', 'supervisor_doctor', 'runtime_status', 'runtime_on', 'runtime_off', 'list_projects', 'project_info', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
+        'supervisor_status', 'supervisor_doctor', 'runtime_status', 'runtime_on', 'runtime_off', 'workload_mutation_status', 'list_projects', 'project_info', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
         'activation_status', 'activation_prepare', 'activation_apply', 'activation_confirm', 'activation_rollback',
       ]);
       expect(catalogToolNames('FULL')).not.toContain('admin_tunnel_recycle');
@@ -104,6 +104,7 @@ describe('outer supervisor native control', () => {
         'runtime_status',
         'runtime_on',
         'runtime_off',
+        'workload_mutation_status',
         'list_projects',
         'project_info',
         'admin_status',
@@ -202,6 +203,23 @@ describe('outer supervisor native control', () => {
         expect(await rpcTool(harness, name, arguments_)).toMatchObject({ result: { isError: false } });
       }
       expect(harness.workloadCalls).toEqual(['workspace', 'fs', 'artifact', 'job', 'git', 'shell']);
+    } finally {
+      await harness.server.close();
+    }
+  });
+
+  it('requires authenticated client/session context for downstream mutation evidence', async () => {
+    const harness = await startHarness(true);
+    try {
+      expect(structured(await rpcTool(harness, 'workload_mutation_status', {
+        operation: 'fs',
+        arguments: { operation: 'write', requestId: 'mutation-1', projectId: 'project-a', workspaceId: 'workspace-a' },
+      }, { 'x-iris-client-id': 'conversation-a', 'x-iris-session-id': 'session-a' }))).toMatchObject({
+        accepted: true, operation: 'fs', requestId: 'mutation-1', clientId: 'conversation-a', sessionId: 'session-a',
+      });
+      expect(toolError(await rpcTool(harness, 'workload_mutation_status', {
+        operation: 'fs', arguments: { operation: 'write', requestId: 'mutation-1' },
+      }))).toMatchObject({ code: 'CONTROL_DENIED' });
     } finally {
       await harness.server.close();
     }
@@ -336,6 +354,10 @@ async function startHarness(withWorkload = false) {
         workloadContexts.push(context ?? {});
         return { structuredContent: name === 'runtime_status' ? { runtime: 'off', truthful: true } : { runtime: 'off', code: 'RUNTIME_NOT_RUNNING' }, isError: false };
       },
+      workloadMutationStatus: async (input): Promise<SupervisorAdminToolCallResult> => ({
+        structuredContent: { accepted: true, operation: input.name, requestId: input.args.requestId, clientId: input.context.clientId, sessionId: input.context.sessionId },
+        isError: false,
+      }),
     } : {}),
   };
   const server = await startSupervisorNativeControlServer(dataRoot, await freePort(), operations);

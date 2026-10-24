@@ -25,10 +25,10 @@ import { readVerifiedSourceIdentity } from './mission-delegation.js';
 import { LifecycleGrantStore, type LifecycleGrantBinding, type LifecycleGrantTarget, type LifecycleOperation } from './lifecycle-grant.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
-import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput, type LifecycleGrantCall, type SupervisorWorkloadCallContext } from './supervisor-native-control.js';
+import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput, type LifecycleGrantCall, type SupervisorMutationStatusInput, type SupervisorWorkloadCallContext } from './supervisor-native-control.js';
 import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, readRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
 import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
-import { DurableMutationJournal } from './durable-mutation-journal.js';
+import { DurableMutationJournal, type MutationBinding } from './durable-mutation-journal.js';
 
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
 import { readSupervisorStateFile, writeSupervisorStateFile, unresolvedStartup, validStartupOperations, type StartupOperation, type StartupState } from './supervisor-startup.js';
@@ -1094,6 +1094,60 @@ export class Supervisor {
     return { pid: runtime.pid, processStartMarker: runtime.processStartMarker!, ...(runtime.runtimeId === undefined ? {} : { runtimeId: runtime.runtimeId }), ...(runtime.instanceId === undefined ? {} : { instanceId: runtime.instanceId }) };
   }
 
+  private async workloadMutationStatus(input: SupervisorMutationStatusInput): Promise<SupervisorAdminToolCallResult> {
+    const { name, args, context } = input;
+    if (context.clientId === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence requires a bounded client identity');
+    const durableMutation = FORWARDED_DURABLE_MUTATION_TOOLS.has(name) || groupedWorkloadDurableMutation(name, args);
+    if (!durableMutation) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence is available only for durable workload mutations');
+    const requestId = typeof args.requestId === 'string' && args.requestId.length > 0 && args.requestId.length <= 200 ? args.requestId : undefined;
+    if (requestId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation evidence requires the original durable requestId');
+    if (name !== 'session_open' && context.sessionId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation evidence requires the original session identity');
+    const state = await this.readState();
+    const runtime = state.runtime;
+    if (runtime === null || typeof runtime.runtimeId !== 'string' || typeof runtime.instanceId !== 'string') {
+      throw new RuntimeError('RUNTIME_NOT_RUNNING', 'Current workload Runtime identity is unavailable for mutation evidence');
+    }
+    const registry = await readConnectorRegistry(this.dataRoot);
+    if (registry === null || !Number.isSafeInteger(registry.deploymentEpoch) || registry.deploymentEpoch <= 0) {
+      throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'Current workload deployment identity is unavailable for mutation evidence');
+    }
+    const binding: MutationBinding = {
+      operation: name,
+      clientId: context.clientId,
+      sessionId: context.sessionId ?? null,
+      projectId: typeof args.projectId === 'string' ? args.projectId : null,
+      workspaceId: typeof args.workspaceId === 'string' ? args.workspaceId : null,
+      runtimeId: runtime.runtimeId,
+      instanceId: runtime.instanceId,
+      deploymentEpoch: registry.deploymentEpoch,
+    };
+    // Revalidate the live runtime session before releasing cached mutation evidence.
+    // A durable record is not an authorization grant after its session is revoked.
+    if (context.sessionId !== undefined) {
+      const sessionCheck = await this.forwardWorkloadTool('session_get', { sessionId: context.sessionId }, context);
+      if (sessionCheck.isError) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence session is no longer authorized');
+    }
+    const fingerprint = createHash('sha256').update(stableJson({ name, args, ...binding })).digest('hex');
+    const record = await this.workloadMutationJournal.inspect(requestId, fingerprint, binding);
+    if (record === null) {
+      return { structuredContent: { requestId, operation: name, state: 'NOT_FOUND', fingerprint }, isError: false };
+    }
+    return {
+      structuredContent: {
+        requestId,
+        operation: name,
+        fingerprint,
+        state: record.state,
+        errorCode: record.errorCode,
+        updatedAt: record.updatedAt,
+        binding: record.binding,
+        ...(record.state === 'COMMITTED' ? { evidence: record.result } : {}),
+        ...(record.state === 'RECONCILIATION_REQUIRED' ? { reconciliationRequired: true } : {}),
+      },
+      isError: false,
+    };
+  }
+
   private async forwardWorkloadTool(name: string, args: Record<string, unknown>, context: SupervisorWorkloadCallContext = {}): Promise<SupervisorAdminToolCallResult> {
     if (context.clientId === undefined) {
       throw new RuntimeError('CONTROL_DENIED', 'Unified workload calls require a bounded client identity');
@@ -1122,9 +1176,9 @@ export class Supervisor {
       throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Workload Runtime endpoint identity is stale or ambiguous');
     }
     const registry = await readConnectorRegistry(this.dataRoot);
-    const binding = registry?.connectors.find((candidate) => candidate.mode === 'FULL');
+    const connectorBinding = registry?.connectors.find((candidate) => candidate.mode === 'FULL');
     const serviceSecret = await readTunnelServiceSecret(this.dataRoot);
-    if (registry === null || binding === undefined || serviceSecret === null || binding.runtimeId !== endpoint.runtimeId || binding.deploymentEpoch !== registry.deploymentEpoch) {
+    if (registry === null || connectorBinding === undefined || serviceSecret === null || connectorBinding.runtimeId !== endpoint.runtimeId || connectorBinding.deploymentEpoch !== registry.deploymentEpoch) {
       throw new RuntimeError('CONNECTOR_MANIFEST_STALE', 'Unified workload binding is not current and authenticated');
     }
     const headers: Record<string, string> = {
@@ -1150,12 +1204,22 @@ export class Supervisor {
       return { structuredContent: result.structuredContent ?? null, isError: result.isError === true };
     };
     if (!mutation || requestId === undefined) return call();
-    const fingerprint = createHash('sha256').update(stableJson({ name, args, clientId: context.clientId, sessionId: context.sessionId, projectId: args.projectId ?? null, workspaceId: args.workspaceId ?? null })).digest('hex');
-    const existing = await this.workloadMutationJournal.inspect(requestId, fingerprint);
+    const mutationBinding: MutationBinding = {
+      operation: name,
+      clientId: context.clientId,
+      sessionId: context.sessionId ?? null,
+      projectId: typeof args.projectId === 'string' ? args.projectId : null,
+      workspaceId: typeof args.workspaceId === 'string' ? args.workspaceId : null,
+      runtimeId: endpoint.runtimeId,
+      instanceId: endpoint.instanceId,
+      deploymentEpoch: registry.deploymentEpoch,
+    };
+    const fingerprint = createHash('sha256').update(stableJson({ name, args, ...mutationBinding })).digest('hex');
+    const existing = await this.workloadMutationJournal.inspect(requestId, fingerprint, mutationBinding);
     if (existing?.state === 'RECONCILIATION_REQUIRED') {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation request has an unresolved outcome; verify its downstream durable result before retrying');
     }
-    return this.workloadMutationJournal.execute(requestId, fingerprint, call);
+    return this.workloadMutationJournal.execute(requestId, fingerprint, call, mutationBinding);
   }
 
   public async doctor(): Promise<Record<string, unknown>> {
@@ -1345,6 +1409,7 @@ export class Supervisor {
       runtimeOnAuthorized: (input) => this.runtimeOnAuthorized(input),
       runtimeOffAuthorized: (input) => this.runtimeOffAuthorized(input),
       workloadToolCall: (name, args, context) => this.forwardWorkloadTool(name, args, context),
+      workloadMutationStatus: (input) => this.workloadMutationStatus(input),
       adminStatus: () => this.adminNativeStatus(),
       runtimeReconcile: () => this.runtimeReconcile(),
       adminRecycle: (input) => this.adminRecycle(input),

@@ -40,6 +40,12 @@ export interface SupervisorWorkloadCallContext {
   readonly requestId?: string;
 }
 
+export interface SupervisorMutationStatusInput {
+  readonly name: string;
+  readonly args: Record<string, unknown>;
+  readonly context: SupervisorWorkloadCallContext;
+}
+
 export interface LifecycleGrantCall {
   readonly grantId: string;
   readonly requestId: string;
@@ -59,6 +65,7 @@ export interface SupervisorNativeOperations {
   readonly projectInfo?: (projectId: string) => Promise<unknown>;
   readonly workloadToolDefinitions?: () => readonly Record<string, unknown>[];
   readonly workloadToolCall?: (name: string, args: Record<string, unknown>, context?: SupervisorWorkloadCallContext) => Promise<SupervisorAdminToolCallResult>;
+  readonly workloadMutationStatus?: (input: SupervisorMutationStatusInput) => Promise<SupervisorAdminToolCallResult>;
   adminStatus(): Promise<unknown>;
   runtimeReconcile(): Promise<unknown>;
   adminRecycle(input: AdminRecycleInput): Promise<unknown>;
@@ -257,6 +264,22 @@ async function handleRequest(
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.projectInfo(requiredProjectId(args))));
       return;
     }
+    if (name === 'workload_mutation_status') {
+      if (operations.workloadMutationStatus === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Workload mutation status is unavailable');
+      const clientId = boundedHeader(request.headers['x-iris-client-id'], 200);
+      const sessionId = boundedHeader(request.headers['x-iris-session-id'], 200);
+      if (clientId === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence requires a bounded client identity');
+      const operation = typeof args.operation === 'string' ? args.operation : null;
+      const originalArgs = isRecord(args.arguments) ? args.arguments : null;
+      if (operation === null || originalArgs === null) throw new RuntimeError('INVALID_REQUEST', 'Mutation evidence requires operation and arguments');
+      const result = await operations.workloadMutationStatus({ name: operation, args: originalArgs, context: { clientId, ...(sessionId === undefined ? {} : { sessionId }) } });
+      writeJsonRpcResult(response, rpc.id ?? null, {
+        content: [{ type: 'text', text: JSON.stringify(result.structuredContent) }],
+        structuredContent: result.structuredContent,
+        isError: result.isError,
+      });
+      return;
+    }
     if (name === 'admin_status') {
       requireNoArguments(args);
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.adminStatus()));
@@ -344,6 +367,20 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
       description: 'Stop only the governed workload Runtime; Supervisor and connector processes remain unchanged.',
       inputSchema: lifecycleGrantInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    {
+      name: 'workload_mutation_status',
+      description: 'Read the authenticated durable evidence for one previously submitted workload mutation. The original operation arguments and client/session identity must match exactly; unresolved outcomes remain blocked.',
+      inputSchema: {
+        type: 'object',
+        required: ['operation', 'arguments'],
+        properties: {
+          operation: { type: 'string', minLength: 1, maxLength: 200 },
+          arguments: { type: 'object', additionalProperties: true },
+        },
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: true },
     },
     {
       name: 'list_projects',
