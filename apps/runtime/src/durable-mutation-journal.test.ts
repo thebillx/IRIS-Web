@@ -109,6 +109,25 @@ describe('DurableMutationJournal', () => {
     expect(calls).toBe(1);
   });
 
+  it('atomically claims a logical mutation across journal instances', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
+    const first = new DurableMutationJournal(root);
+    const second = new DurableMutationJournal(root);
+    const logicalFingerprint = 'd'.repeat(64);
+    let effects = 0;
+    const run = (journal: DurableMutationJournal, requestId: string, operationFingerprint: string) => journal.execute(
+      requestId,
+      operationFingerprint,
+      async () => { effects += 1; return { requestId }; },
+      binding,
+      logicalFingerprint,
+    );
+    const results = await Promise.allSettled([run(first, 'request-a', 'a'.repeat(64)), run(second, 'request-b', 'b'.repeat(64))]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(effects).toBe(1);
+  });
+
   it('does not create a journal directory during a read-only evidence lookup', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'iris-mutation-journal-'));
     const journal = new DurableMutationJournal(root);

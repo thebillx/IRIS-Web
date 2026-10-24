@@ -60,6 +60,11 @@ export class DurableMutationJournal {
   private async executeSerialized<T>(requestId: string, fingerprint: string, operation: () => Promise<T>, binding?: MutationBinding, logicalFingerprint?: string): Promise<T> {
     const filename = await this.recordFilename(requestId, fingerprint, true);
     if (binding !== undefined && logicalFingerprint !== undefined) {
+      const existingLogical = await this.findByLogicalIdentitySerialized(logicalFingerprint, binding);
+      if (existingLogical !== null && existingLogical.requestId !== requestId) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation logical identity is already bound to another durable request');
+      }
+      await reserveLogicalIdentity(path.dirname(filename), logicalFingerprint, requestId, fingerprint);
       const duplicate = await this.findByLogicalIdentitySerialized(logicalFingerprint, binding);
       if (duplicate !== null && duplicate.requestId !== requestId) {
         throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation logical identity is already bound to another durable request');
@@ -117,7 +122,7 @@ export class DurableMutationJournal {
     const probe = await this.recordFilename('logical-lookup', logicalFingerprint, false);
     let filenames: string[];
     try {
-      filenames = (await readdir(path.dirname(probe))).filter((filename) => filename.endsWith('.json'));
+      filenames = (await readdir(path.dirname(probe))).filter((filename) => filename.endsWith('.json') && !filename.endsWith('.claim.json'));
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
       throw new RuntimeError('PERSISTENCE_FAILURE', 'Mutation journal directory could not be read safely', { cause: error });
@@ -214,6 +219,10 @@ function isMutationBinding(value: unknown): value is MutationBinding {
     && typeof candidate.deploymentEpoch === 'number' && Number.isSafeInteger(candidate.deploymentEpoch) && candidate.deploymentEpoch > 0;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 async function writeNew(filename: string, record: MutationRecord): Promise<void> {
   const handle = await open(filename, 'wx', 0o600);
   try { await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8'); await handle.sync(); }
@@ -228,4 +237,26 @@ async function writeRecord(filename: string, record: MutationRecord): Promise<vo
   await rename(temp, filename);
   const parent = await open(path.dirname(filename), 'r');
   try { await parent.sync(); } finally { await parent.close(); }
+}
+
+async function reserveLogicalIdentity(directory: string, logicalFingerprint: string, requestId: string, fingerprint: string): Promise<void> {
+  if (!/^[a-f0-9]{64}$/.test(logicalFingerprint)) throw new RuntimeError('INVALID_REQUEST', 'Mutation logical fingerprint is invalid');
+  const filename = path.join(directory, `${logicalFingerprint}.claim.json`);
+  const claim = JSON.stringify({ schemaVersion: 1, logicalFingerprint, requestId, fingerprint }) + '\n';
+  try {
+    const handle = await open(filename, 'wx', 0o600);
+    try { await handle.writeFile(claim, 'utf8'); await handle.sync(); }
+    finally { await handle.close(); }
+    const parent = await open(directory, 'r');
+    try { await parent.sync(); } finally { await parent.close(); }
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw new RuntimeError('PERSISTENCE_FAILURE', 'Mutation logical identity reservation failed', { cause: error });
+    let existing: unknown;
+    try { existing = JSON.parse(await readFile(filename, 'utf8')); }
+    catch (readError: unknown) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Mutation logical identity claim is invalid', { cause: readError }); }
+    if (!isRecord(existing) || existing.schemaVersion !== 1 || existing.logicalFingerprint !== logicalFingerprint || typeof existing.requestId !== 'string' || typeof existing.fingerprint !== 'string') {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Mutation logical identity claim is invalid');
+    }
+    if (existing.requestId !== requestId) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation logical identity is already bound to another durable request');
+  }
 }
