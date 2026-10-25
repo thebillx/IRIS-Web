@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { RuntimeError, type ProjectReference } from '@iris/domain';
+import { RuntimeError, type ProjectReference, type RuntimeSessionSnapshot } from '@iris/domain';
 import { inspectPrivateRegularFile } from './private-fs.js';
 import type { SafetyWriterGate } from './production-safety.js';
 
@@ -17,9 +17,26 @@ interface RuntimeIdDocument {
 }
 
 export interface FoundationStateDocument {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 1 | 2;
   readonly projects: readonly ProjectReference[];
   readonly defaultProjectId: string | null;
+  readonly sessions?: readonly DurableSessionRecord[];
+}
+
+export interface SessionMutationReceipt {
+  readonly operation: 'ensure' | 'select' | 'resume' | 'detach' | 'close';
+  readonly requestId: string;
+  readonly digest: string;
+  readonly result: RuntimeSessionSnapshot;
+}
+export interface DurableSessionRecord {
+  readonly snapshot: RuntimeSessionSnapshot;
+  readonly receipts: readonly SessionMutationReceipt[];
+  readonly submissions: readonly { readonly submissionId: string; readonly digest: string; readonly state: 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'UNCERTAIN' }[];
+}
+
+export function readRuntimeIdentity(dataRoot: string): Promise<string | null> {
+  return readRuntimeId(path.join(dataRoot, RUNTIME_ID_FILE));
 }
 
 export interface EndpointDocument {
@@ -210,6 +227,8 @@ async function writeJsonAtomic(filename: string, value: unknown): Promise<void> 
     await handle.close();
     handle = undefined;
     await rename(temporary, filename);
+    const directory = await open(path.dirname(filename), 'r');
+    try { await directory.sync(); } finally { await directory.close(); }
   } catch (error) {
     await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
@@ -220,16 +239,55 @@ async function writeJsonAtomic(filename: string, value: unknown): Promise<void> 
 
 function isStateDocument(value: unknown): value is FoundationStateDocument {
   if (!isRecord(value)
-    || value.schemaVersion !== 1
+    || (value.schemaVersion !== 1 && value.schemaVersion !== 2)
     || !Array.isArray(value.projects)
     || !value.projects.every(isProjectReference)
     || (value.defaultProjectId !== null && typeof value.defaultProjectId !== 'string')) return false;
   const projects = value.projects as ProjectReference[];
   const ids = new Set(projects.map((project) => project.id));
   const roots = new Set(projects.map((project) => project.rootPath));
+  if (value.schemaVersion === 2) {
+    if (!Array.isArray(value.sessions) || !value.sessions.every(isDurableSession)) return false;
+    const sessions = value.sessions as DurableSessionRecord[];
+    if (new Set(sessions.map((record) => record.snapshot.id)).size !== sessions.length
+      || new Set(sessions.map(({ snapshot }) => JSON.stringify([snapshot.machineId, snapshot.clientId, snapshot.conversationId]))).size !== sessions.length) return false;
+    const receiptIds = sessions.flatMap((record) => record.receipts.map((receipt) => receipt.requestId));
+    if (new Set(receiptIds).size !== receiptIds.length) return false;
+  } else if (value.sessions !== undefined) return false;
   return ids.size === projects.length
     && roots.size === projects.length
     && (value.defaultProjectId === null || ids.has(value.defaultProjectId));
+}
+
+function boundedIdentity(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 200 && !value.includes('\0'); }
+function isSessionSnapshot(value: unknown): value is RuntimeSessionSnapshot {
+  if (!isRecord(value) || !isUuid(value.id) || !isUuid(value.machineId)
+    || !boundedIdentity(value.clientId) || !boundedIdentity(value.conversationId) || !boundedIdentity(value.agentId)
+    || !['owner', 'planner', 'implementer', 'reviewer', 'security', 'explorer', 'other'].includes(String(value.agentRole))
+    || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt))
+    || (value.currentProjectId !== null && !isUuid(value.currentProjectId))
+    || (value.currentWorkspaceId !== null && !isUuid(value.currentWorkspaceId))
+    || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1
+    || !['ATTACHED', 'DETACHED', 'CLOSED'].includes(String(value.attachmentState))
+    || !['READY', 'WORKING', 'FAILED'].includes(String(value.executionState))
+    || !Array.isArray(value.interactions) || value.interactions.length > 200) return false;
+  return value.interactions.every((event) => isRecord(event) && isUuid(event.id) && boundedIdentity(event.submissionId)
+    && isUuid(event.executionId) && ['user', 'assistant', 'error'].includes(String(event.kind))
+    && typeof event.text === 'string' && event.text.length <= 12000
+    && typeof event.timestamp === 'string' && Number.isFinite(Date.parse(event.timestamp)));
+}
+function isDurableSession(value: unknown): value is DurableSessionRecord {
+  if (!isRecord(value) || !isSessionSnapshot(value.snapshot) || !Array.isArray(value.receipts) || value.receipts.length > 400
+    || !Array.isArray(value.submissions) || value.submissions.length > 400) return false;
+  const snapshot = value.snapshot;
+  return value.receipts.every((receipt) => isRecord(receipt) && ['ensure', 'select', 'resume', 'detach', 'close'].includes(String(receipt.operation)) && boundedIdentity(receipt.requestId)
+    && typeof receipt.digest === 'string' && /^[a-f0-9]{64}$/.test(receipt.digest) && isSessionSnapshot(receipt.result)
+    && receipt.result.id === snapshot.id && receipt.result.clientId === snapshot.clientId
+    && receipt.result.machineId === snapshot.machineId && receipt.result.conversationId === snapshot.conversationId)
+    && value.submissions.every((entry) => isRecord(entry) && boundedIdentity(entry.submissionId)
+      && typeof entry.digest === 'string' && /^[a-f0-9]{64}$/.test(entry.digest)
+      && ['RUNNING', 'SUCCEEDED', 'FAILED', 'UNCERTAIN'].includes(String(entry.state)))
+    && new Set(value.submissions.map((entry) => (entry as { submissionId: string }).submissionId)).size === value.submissions.length;
 }
 
 function isProjectReference(value: unknown): value is ProjectReference {

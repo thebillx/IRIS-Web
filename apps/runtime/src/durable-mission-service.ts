@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { RuntimeError } from '@iris/domain';
 import type { MissionEvidence } from '@iris/domain';
 import type { RuntimeState } from './state.js';
@@ -167,7 +168,7 @@ export class DurableMissionLifecycleService {
         workerBinding: bindWorker(workerType, normalizeWorkerStartReceipt(await this.workers.get(workerType).start({
           operationId: requestId, missionId: pending.missionId, projectId: pending.projectId, goal: pending.goal,
         })), pending),
-      }));
+      }), workerType);
   }
 
   public checkpoint(input: CheckpointMissionInput): Promise<DurableMissionLifecycleSnapshot> {
@@ -410,16 +411,21 @@ export class DurableMissionLifecycleService {
     pendingState: DurableMissionLifecycleState,
     assertEligible: (record: DurableMissionLifecycleSnapshot) => void,
     execute: (pending: DurableMissionLifecycleSnapshot, original: DurableMissionLifecycleSnapshot) => Promise<WorkerOperationResult>,
+    workerType?: string,
   ): Promise<DurableMissionLifecycleSnapshot> {
     return this.serialize(async () => {
       let document = await this.store.read();
       const original = await this.recordFrom(document, missionId);
+      const inputDigest = createHash('sha256').update(JSON.stringify({ missionId, expectedRevision, kind, workerType: workerType ?? null })).digest('hex');
       const duplicate = operationByRequest(original, requestId, kind);
-      if (duplicate !== null) return resolveDuplicateOperation(original, duplicate);
+      if (duplicate !== null) {
+        if (duplicate.inputDigest !== undefined ? duplicate.inputDigest !== inputDigest : (duplicate.basedOnRevision !== expectedRevision || (workerType !== undefined && original.workerBinding?.workerType !== workerType))) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle operation request is bound to different input');
+        return resolveDuplicateOperation(original, duplicate);
+      }
       ensureNoPendingOperation(original);
       assertExpectedRevision(original, expectedRevision);
       assertEligible(original);
-      let record = beginLifecycleOperation(original, requestId, kind, pendingState);
+      let record = beginLifecycleOperation(original, requestId, kind, pendingState, inputDigest);
       document = replaceLifecycleRecord(document, record);
       await this.store.write(document);
       try {

@@ -74,7 +74,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
     })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
   });
 
-  it('DT-M02 + DT-M05 runs project-tool without session/effect ceremony and enforces macOS workspace confinement', async () => {
+  it('DT-M02 + DT-M05 runs project-tool with explicit session correlation and enforces macOS workspace confinement', async () => {
     const fixture = await serviceFixture({ homeSource: true });
     const primary = await fixture.resources.primaryWorkspace(fixture.projectA.id);
     const inside = path.join(fixture.projectARoot, 'inside.txt');
@@ -100,7 +100,7 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
       "console.log(JSON.stringify(results));",
     ].join('\n') + '\n');
 
-    const request = new Request('http://127.0.0.1/mcp', { headers: { 'x-iris-client-id': 'phase3-direct-client' } });
+    const request = new Request('http://127.0.0.1/mcp', { headers: { 'x-iris-client-id': fixture.sessionA.clientId, 'x-iris-session-id': fixture.sessionA.id } });
     const outcome = await executePhase3GroupedTool('shell', {
       operation: 'run',
       projectId: fixture.projectA.id,
@@ -139,7 +139,8 @@ describe('IRIS vNext Phase 3 governed shell and durable jobs', () => {
       timeoutMs: 5000,
     }, request, fixture.service, fixture.state, 'tunnel-service'));
     expect(local.stdoutTail).toContain('PROJECT_LOCAL_TOOL_OK');
-    expect(fixture.state.listSessionsForClient('phase3-direct-client').filter((session) => session.agentId === 'iris-tunnel-service')).toHaveLength(1);
+    expect(fixture.state.listSessionsForClient(fixture.sessionA.clientId).filter((session) => session.id === fixture.sessionA.id)).toHaveLength(1);
+    expect(fixture.state.listSessionsForClient(fixture.sessionA.clientId).filter((session) => session.agentId === 'iris-tunnel-service')).toHaveLength(0);
 
     await expect(fixture.service.execute({
       capabilityId: 'shell.run', clientId: fixture.sessionA.clientId, sessionId: fixture.sessionA.id,

@@ -15,7 +15,8 @@ export async function resolveDirectSessionIdentity(
   request: Request,
   state: RuntimeState | undefined,
   projectId: string,
-  principal: McpPrincipal = 'owner',
+  _principal: McpPrincipal = 'owner',
+  capturedJobTarget = false,
 ): Promise<DirectSessionIdentity> {
   const clientId = requiredHeader(request, CLIENT_ID_HEADER);
   const argumentSessionId = optionalBoundedString(args, 'sessionId', 200);
@@ -27,27 +28,14 @@ export async function resolveDirectSessionIdentity(
 
   const explicitSessionId = argumentSessionId ?? headerSessionId;
   if (explicitSessionId !== undefined) {
-    const session = state.getSessionForClient(explicitSessionId, clientId);
-    if (session.currentProjectId !== projectId) {
+    const session = capturedJobTarget ? await state.validateCapturedJobSession(explicitSessionId, clientId) : await state.validateSessionAuthority(explicitSessionId, clientId);
+    if (!capturedJobTarget && session.currentProjectId !== projectId) {
       throw new RuntimeError('CAPABILITY_DENIED', 'Requested project does not match the live session project');
     }
     return { clientId, sessionId: explicitSessionId };
   }
 
-  if (principal !== 'tunnel-service') {
-    throw new RuntimeError('INVALID_REQUEST', 'IRIS session is required for non-connector callers; call session_open first.');
-  }
-  const project = (await state.listProjects()).find((candidate) => candidate.id === projectId);
-  if (project === undefined) throw new RuntimeError('PROJECT_NOT_FOUND', 'Requested project is not registered');
-
-  const reusable = state.listSessionsForClient(clientId)
-    .filter((session) => session.agentId === 'iris-tunnel-service' && session.currentProjectId === projectId)
-    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
-  if (reusable !== undefined) return { clientId, sessionId: reusable.id };
-
-  const created = state.createSession(clientId, 'iris-tunnel-service', 'other');
-  await state.setSessionCurrentProject(created.id, created.clientId, projectId);
-  return { clientId, sessionId: created.id };
+  throw new RuntimeError('INVALID_REQUEST', 'Explicit IRIS session is required; call session_open with the conversation identity first.');
 }
 
 function requiredHeader(request: Request, name: string): string {

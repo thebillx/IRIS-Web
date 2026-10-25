@@ -52,6 +52,7 @@ export interface DurableSupervisorDirective {
 }
 
 export interface LifecycleOperationReceipt {
+  readonly inputDigest?: string;
   readonly requestId: string;
   readonly kind: LifecycleOperationKind;
   readonly basedOnRevision: number;

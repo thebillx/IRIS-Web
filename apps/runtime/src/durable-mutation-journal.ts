@@ -6,6 +6,41 @@ import { privateDirectoryProblem } from './private-fs.js';
 
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
+export interface WorkloadMutationContract {
+  readonly contractId: string;
+  readonly requestId: string;
+  readonly requiresSession: boolean;
+}
+
+export function workloadMutationContract(name: string, args: Record<string, unknown>): WorkloadMutationContract | null {
+  const session = { session_open: 'ensure', workspace_select: 'select', session_resume: 'resume', session_detach: 'detach', session_close: 'close' } as const;
+  let contractId: string | undefined;
+  let id: unknown = args.requestId;
+  let requiresSession = true;
+  if (Object.hasOwn(session, name)) {
+    contractId = `session.${session[name as keyof typeof session]}.v1`;
+    requiresSession = name !== 'session_open';
+    if (requiresSession && (typeof args.expectedRevision !== 'number' || !Number.isSafeInteger(args.expectedRevision) || args.expectedRevision < 1)) throw new RuntimeError('INVALID_REQUEST', 'Session transition requires the observed expectedRevision');
+    if (name === 'session_open' && (typeof args.conversationId !== 'string' || !REQUEST_ID.test(args.conversationId))) throw new RuntimeError('INVALID_REQUEST', 'session_open requires explicit conversationId');
+  } else if (name === 'mission_checkpoint') { contractId = 'mission.checkpoint.v1'; id = args.checkpointId; }
+  else if (name === 'mission_orchestrator_handoff') { contractId = 'mission.handoff.v1'; id = args.handoffId; }
+  else if (name === 'mission_directive') { contractId = 'mission.directive.v1'; id = args.directiveId; }
+  else if (['mission_create', 'mission_start', 'mission_resume', 'mission_rebind', 'mission_cancel', 'mission_complete'].includes(name)) contractId = `${name.replace('_', '.')}.v1`;
+  else {
+    const grouped: Record<string, readonly string[]> = {
+      workspace: ['create_scratch', 'revoke_scratch'], fs: ['write', 'edit', 'mkdir', 'delete'],
+      artifact: ['register_existing', 'release'], shell: ['run', 'start'], job: ['cancel'],
+      git: ['branch_create', 'worktree_add', 'worktree_remove', 'add', 'commit', 'fetch', 'push'],
+    };
+    if (typeof args.operation === 'string' && grouped[name]?.includes(args.operation)) contractId = `${name}.${args.operation}.v1`;
+    else if (['project_validation_start', 'git_local', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete'].includes(name)) contractId = `${name}.v1`;
+  }
+  if (contractId === undefined) return null;
+  if (typeof id !== 'string' || !REQUEST_ID.test(id)) throw new RuntimeError('INVALID_REQUEST', `${contractId} requires its bounded durable operation ID`);
+  if (args.requestId !== undefined && args.requestId !== id) throw new RuntimeError('INVALID_REQUEST', 'requestId disagrees with the operation identity');
+  return { contractId, requestId: id, requiresSession };
+}
+
 type MutationState = 'PREPARED' | 'APPLYING' | 'COMMITTED' | 'FAILED' | 'RECONCILIATION_REQUIRED';
 export interface MutationBinding {
   readonly operation: string;
@@ -111,7 +146,7 @@ export class DurableMutationJournal {
       const code = error instanceof RuntimeError ? error.code : 'PERSISTENCE_FAILURE';
       await writeRecord(filename, {
         ...prepared,
-        state: code === 'AUTHORITY_INDETERMINATE' ? 'RECONCILIATION_REQUIRED' : 'FAILED',
+        state: ['AUTHORITY_INDETERMINATE', 'PERSISTENCE_FAILURE', 'PROCESS_OWNERSHIP_AMBIGUOUS'].includes(code) ? 'RECONCILIATION_REQUIRED' : 'FAILED',
         errorCode: code,
         updatedAt: new Date().toISOString(),
       }).catch(() => undefined);
@@ -166,7 +201,7 @@ export class DurableMutationJournal {
     if (existing === null) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation evidence is unavailable for reconciliation');
     assertRecordBinding(existing, requestId, fingerprint, binding);
     if (existing.state === state) return existing;
-    if (existing.state !== 'RECONCILIATION_REQUIRED') {
+    if (!['PREPARED', 'APPLYING', 'RECONCILIATION_REQUIRED'].includes(existing.state)) {
       throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation record is not awaiting reconciliation');
     }
     const settled: MutationRecord = {

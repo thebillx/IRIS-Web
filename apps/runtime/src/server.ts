@@ -63,6 +63,7 @@ export function requireLoopbackAddress(address: string): typeof LOOPBACK_ADDRESS
 
 export async function startRuntimeServer(context: RuntimeServerContext, preferredPort: number): Promise<RuntimeServerHandle> {
   requirePort(preferredPort);
+  await context.state.initializeSessions();
   const server = createServer((request, response) => {
     void routeRequest(request, response, context).catch((error: unknown) => writeError(response, error));
   });
@@ -429,6 +430,14 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   }
   if (request.method === 'POST' && url.pathname === '/sessions') {
     const body = await readJsonBody(request, true);
+    if (body !== null && body.conversationId !== undefined) {
+      writeJson(response, 201, await context.state.ensureSession({
+        clientId: stringField(body, 'clientId'), conversationId: stringField(body, 'conversationId'), requestId: stringField(body, 'requestId'),
+        ...(optionalStringField(body, 'agentId') === undefined ? {} : { agentId: optionalStringField(body, 'agentId')! }),
+        ...(optionalAgentRoleField(body, 'agentRole') === undefined ? {} : { agentRole: optionalAgentRoleField(body, 'agentRole')! }),
+      }));
+      return;
+    }
     await writeCapabilityOutcome(response, await context.capabilities.execute({
       capabilityId: 'session.create',
       clientId: body === null ? undefined : optionalStringField(body, 'clientId'),
@@ -447,9 +456,22 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
       return;
     }
     if (request.method === 'DELETE') {
+      const session = await context.state.validateSessionAuthority(sessionId, clientId, true);
+      if (session.machineId !== undefined) {
+        const body = await readJsonBody(request);
+        writeJson(response, 200, await context.state.mutateSession({ operation: 'close', sessionId, clientId, requestId: stringField(body, 'requestId') }));
+        return;
+      }
       await writeCapabilityOutcome(response, await context.capabilities.execute({ capabilityId: 'session.delete', sessionId, clientId }));
       return;
     }
+  }
+
+  const attachmentMatch = /^\/sessions\/([^/]+)\/(resume|detach)$/.exec(url.pathname);
+  if (attachmentMatch !== null && request.method === 'POST') {
+    const body = await readJsonBody(request);
+    writeJson(response, 200, await context.state.mutateSession({ operation: attachmentMatch[2] as 'resume' | 'detach', sessionId: decodeURIComponent(attachmentMatch[1]!), clientId: requiredClientId(request), requestId: stringField(body, 'requestId') }));
+    return;
   }
 
   const instructionMatch = /^\/sessions\/([^/]+)\/instructions$/.exec(url.pathname);
@@ -468,6 +490,12 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   const currentProjectMatch = /^\/sessions\/([^/]+)\/current-project$/.exec(url.pathname);
   if (currentProjectMatch !== null && request.method === 'PUT') {
     const body = await readJsonBody(request);
+    const sessionId = decodeURIComponent(currentProjectMatch[1]!);
+    const clientId = requiredClientId(request);
+    if ((await context.state.validateSessionAuthority(sessionId, clientId)).machineId !== undefined) {
+      writeJson(response, 200, await context.state.mutateSession({ operation: 'select', sessionId, clientId, requestId: stringField(body, 'requestId'), projectId: nullableStringField(body, 'projectId'), ...(typeof body?.workspaceId === 'string' ? { workspaceId: body.workspaceId } : {}) }));
+      return;
+    }
     await writeCapabilityOutcome(response, await context.capabilities.execute({
       capabilityId: 'session.current_project.set',
       sessionId: decodeURIComponent(currentProjectMatch[1]!),

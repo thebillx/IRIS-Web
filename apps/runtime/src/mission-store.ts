@@ -244,6 +244,7 @@ function isMissionLedgerDocument(value: unknown): value is MissionLedgerDocument
 function isMissionSnapshot(value: unknown): value is MissionSnapshot {
   if (!isRecord(value)
     || !isUuid(value.id)
+    || (value.creationRequest !== undefined && (!isRecord(value.creationRequest) || !boundedIdentity(value.creationRequest.requestId) || typeof value.creationRequest.digest !== 'string' || !/^[a-f0-9]{64}$/.test(value.creationRequest.digest)))
     || !boundedText(value.title, 240)
     || !missionState(value.state)
     || !orchestratorMode(value.orchestratorMode)
@@ -343,6 +344,7 @@ function isTimelineEvent(value: unknown): boolean {
 
 function isRebindAuditEvent(value: unknown): value is MissionRebindAuditEvent {
   return isRecord(value)
+    && (value.requestId === undefined || (boundedIdentity(value.requestId) && typeof value.requestDigest === 'string' && /^[a-f0-9]{64}$/.test(value.requestDigest)))
     && isUuid(value.id)
     && isUuid(value.missionId)
     && boundedIdentity(value.oldClientId)

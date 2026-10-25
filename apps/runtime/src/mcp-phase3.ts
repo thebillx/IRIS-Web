@@ -78,7 +78,7 @@ export async function executePhase3GroupedTool(
 ): Promise<CapabilityOutcome> {
   assertOnlyPhase3Keys(name, args);
   const projectId = requiredBoundedString(args, 'projectId', 200);
-  const identity = await resolveDirectSessionIdentity(args, request, state, projectId, principal);
+  const identity = await resolveDirectSessionIdentity(args, request, state, projectId, principal, name === 'job');
   const expectedEffects = optionalExpectedEffects(args);
   if (name === 'shell') return executeShell(args, identity, projectId, expectedEffects, capabilities);
   return executeJob(args, identity, projectId, expectedEffects, capabilities);

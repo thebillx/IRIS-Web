@@ -3,7 +3,7 @@ import type { CapabilityService } from './capability-service.js';
 import type { DurableMissionLifecycleService } from './durable-mission-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import { catalogIdentityPayload, catalogToolNames, type McpCatalogRuntimeContext } from './mcp-catalog.js';
-import { MCP_PROTOCOL_VERSION, fullMcpToolDefinitions, handleMcpRequest, type McpPrincipal } from './mcp.js';
+import { MCP_PROTOCOL_VERSION, fullMcpToolDefinitions, handleMcpRequest, executeWorkloadToolWithEvidence, type McpPrincipal } from './mcp.js';
 import type { DurableMutationJournal } from './durable-mutation-journal.js';
 import { executePhase2GroupedTool, isPhase2GroupedTool } from './mcp-phase2.js';
 import { executePhase3GroupedTool, isPhase3GroupedTool } from './mcp-phase3.js';
@@ -73,7 +73,7 @@ export async function handleMcpV21Request(
   if (toolHeader !== null && toolHeader !== name) return jsonRpcError(rpc.id ?? null, -32600, 'Mcp-Name does not match tool name', 400);
 
   try {
-    const result = catalogIdentity
+    const result = await executeWorkloadToolWithEvidence(name, args, request, state, principal, runtimeContext, mutationJournal, async () => catalogIdentity
       ? catalogIdentityPayload('FULL', fullMcpToolDefinitionsV21(), runtimeContext)
       : phase2Grouped
         ? await executePhase2GroupedTool(name, args, request, capabilities, state, principal)
@@ -87,7 +87,7 @@ export async function handleMcpV21Request(
                 ? await executeSecurityAuditTool(args, request, state, requireSecurityAudit(securityAudit), principal)
                 : adoTool
                 ? await executeAdoTool(name, args, request, capabilities, state)
-                : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal);
+                : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal));
     return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
   } catch (error) {
     const runtimeError = error instanceof RuntimeError

@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
 import { RuntimeError, type MissionCheckpoint, type MissionExecutionAssociation, type MissionState, type MissionTaskState, type MissionTimelineEvent, type OrchestratorMode, type SupervisorDecision, type SupervisorDirective, type SupervisorGateState } from '@iris/domain';
 import { catalogIdentityPayload, catalogToolNames, orderToolDefinitions, type McpCatalogRuntimeContext } from './mcp-catalog.js';
-import { DurableMutationJournal, type MutationBinding, type MutationRecord } from './durable-mutation-journal.js';
+import { DurableMutationJournal, workloadMutationContract, type MutationBinding, type MutationRecord } from './durable-mutation-journal.js';
 import type { CapabilityOutcome, CapabilityService } from './capability-service.js';
 import type { MissionBrokerService } from './mission-broker.js';
 import type { RuntimeState } from './state.js';
+import { DurableMissionLifecycleStore } from './durable-mission-store.js';
+import { VNextResourceRegistry } from './resource-registry.js';
 
 export const MCP_PROTOCOL_VERSION = '2026-07-28' as const;
 export const LEGACY_MCP_PROTOCOL_VERSION = '2025-11-25' as const;
@@ -155,6 +157,8 @@ export function proMcpToolDefinitions(): readonly Record<string, unknown>[] {
 const DURABLE_MUTATION_TOOLS = new Set([
   'project_validation_start', 'git_local', 'file_write', 'file_edit', 'file_delete',
   'directory_create', 'directory_delete', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git',
+  'session_open', 'workspace_select', 'session_resume', 'session_detach', 'session_close',
+  'mission_create', 'mission_start', 'mission_checkpoint', 'mission_resume', 'mission_rebind', 'mission_cancel', 'mission_complete', 'mission_directive', 'mission_orchestrator_handoff',
 ]);
 
 async function executeToolWithEvidence(
@@ -162,22 +166,40 @@ async function executeToolWithEvidence(
   state: RuntimeState | undefined, broker: MissionBrokerService | undefined, principal: McpPrincipal,
   runtimeContext: McpCatalogRuntimeContext, mutationJournal: DurableMutationJournal | undefined,
 ): Promise<CapabilityOutcome | unknown> {
-  if (mutationJournal === undefined || principal !== 'tunnel-service' || !DURABLE_MUTATION_TOOLS.has(name)) {
-    return executeTool(name, args, request, capabilities, state, broker, principal);
+  return executeWorkloadToolWithEvidence(name, args, request, state, principal, runtimeContext, mutationJournal,
+    () => executeTool(name, args, request, capabilities, state, broker, principal));
+}
+
+export async function executeWorkloadToolWithEvidence(
+  name: string, args: Record<string, unknown>, request: Request, state: RuntimeState | undefined,
+  principal: McpPrincipal, runtimeContext: McpCatalogRuntimeContext, mutationJournal: DurableMutationJournal | undefined,
+  execute: () => Promise<unknown>,
+): Promise<unknown> {
+  if (mutationJournal === undefined || principal !== 'tunnel-service') return execute();
+  const contract = workloadMutationContract(name, args);
+  if (contract === null) return execute();
+  const headerRequestId = optionalHeader(request, 'x-iris-request-id');
+  if (headerRequestId !== undefined && headerRequestId !== contract.requestId) throw new RuntimeError('INVALID_REQUEST', 'Transport requestId conflicts with operation identity');
+  const clientId = requiredHeader(request, CLIENT_ID_HEADER);
+  const { runtimeId, instanceId, deploymentEpoch } = runtimeContext;
+  if (!runtimeId || !instanceId || !deploymentEpoch || !Number.isSafeInteger(deploymentEpoch) || deploymentEpoch <= 0 || state === undefined) {
+    throw new RuntimeError('CONTROL_DENIED', 'Durable workload identity is unavailable');
   }
-  const requestId = typeof args.requestId === 'string' && args.requestId.length > 0 ? args.requestId : optionalHeader(request, 'x-iris-request-id');
-  const clientId = optionalHeader(request, CLIENT_ID_HEADER);
-  const runtimeId = runtimeContext.runtimeId;
-  const instanceId = runtimeContext.instanceId;
-  const deploymentEpoch = runtimeContext.deploymentEpoch;
-  if (requestId === undefined || clientId === undefined || runtimeId === undefined || runtimeId === null
-    || instanceId === undefined || instanceId === null || deploymentEpoch === undefined || deploymentEpoch === null
-    || !Number.isSafeInteger(deploymentEpoch) || deploymentEpoch <= 0) {
-    return executeTool(name, args, request, capabilities, state, broker, principal);
+  const headerSession = optionalHeader(request, SESSION_ID_HEADER);
+  if (headerSession !== undefined && args.sessionId !== undefined && args.sessionId !== headerSession) throw new RuntimeError('CONTROL_DENIED', 'Session argument conflicts with authenticated transport correlation');
+  const sessionId = typeof args.sessionId === 'string' ? args.sessionId : headerSession ?? null;
+  if (contract.requiresSession && sessionId === null) throw new RuntimeError('CONTROL_DENIED', 'Durable workload operation requires an explicit session');
+  if (sessionId !== null) {
+    const session = name === 'job' ? await state.validateCapturedJobSession(sessionId, clientId) : await state.validateSessionAuthority(sessionId, clientId, ['session_resume', 'session_detach', 'session_close'].includes(name));
+    if (session.attachmentState === 'CLOSED' && name !== 'session_close') throw new RuntimeError('CONTROL_DENIED', 'Session is closed');
+    if (typeof args.projectId === 'string' && !['job', 'workspace_select'].includes(name) && session.currentProjectId !== args.projectId) throw new RuntimeError('CONTROL_DENIED', 'Requested project is no longer selected');
+    if (typeof args.missionId === 'string' && name !== 'mission_rebind') {
+      const mission = await state.getMission(args.missionId);
+      if (mission.clientId !== clientId || mission.sessionId !== sessionId) throw new RuntimeError('CONTROL_DENIED', 'Mission control belongs to a different session');
+    }
   }
   const binding: MutationBinding = {
-    operation: name, clientId,
-    sessionId: typeof args.sessionId === 'string' ? args.sessionId : optionalHeader(request, SESSION_ID_HEADER) ?? null,
+    operation: name, clientId, sessionId,
     projectId: typeof args.projectId === 'string' ? args.projectId : null,
     workspaceId: typeof args.workspaceId === 'string' ? args.workspaceId : null,
     runtimeId, instanceId, deploymentEpoch,
@@ -187,7 +209,21 @@ async function executeToolWithEvidence(
     operation: binding.operation, clientId: binding.clientId, sessionId: binding.sessionId,
     projectId: binding.projectId, workspaceId: binding.workspaceId,
   } }));
-  return mutationJournal.execute(requestId, fingerprint, () => executeTool(name, args, request, capabilities, state, broker, principal), binding, logicalFingerprint);
+  const existing = await mutationJournal.inspectByLogicalIdentity(contract.requestId, logicalFingerprint, binding);
+  if (existing !== null) {
+    if (existing.binding?.runtimeId !== runtimeId || existing.binding.deploymentEpoch !== deploymentEpoch) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation belongs to a different deployment lineage');
+    if (name === 'session_open') {
+      const receipt = await state.sessionMutationEvidence(contract.requestId, clientId);
+      if (receipt !== null) await state.validateSessionAuthority(receipt.result.id, clientId);
+    }
+    if (existing.state === 'COMMITTED') return existing.result;
+    if (existing.state !== 'FAILED') {
+      const evidence = await operationSourceEvidence(existing, state);
+      if (evidence !== null && existing.binding !== undefined) return (await mutationJournal.reconcile(existing.requestId, existing.fingerprint, existing.binding, 'COMMITTED', evidence)).result;
+    }
+    throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation already has durable evidence; inspect mutation_status before any further action');
+  }
+  return mutationJournal.execute(contract.requestId, fingerprint, execute, binding, logicalFingerprint);
 }
 
 async function runtimeMutationStatus(
@@ -219,13 +255,47 @@ async function runtimeMutationStatus(
   }
   if (sessionId !== null && state === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence session validation is unavailable');
   if (state !== undefined && sessionId !== null) {
-    const session = state.getSessionForClient(sessionId, clientId);
-    if (projectId !== null && session.currentProjectId !== projectId) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence project is no longer authorized for the session');
+    const session = operation === 'job' ? await state.validateCapturedJobSession(sessionId, clientId) : await state.validateSessionAuthority(sessionId, clientId, ['session_resume', 'session_detach', 'session_close'].includes(operation));
+    if (projectId !== null && !['job', 'workspace_select'].includes(operation) && session.currentProjectId !== projectId) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence project is no longer authorized for the session');
   }
   const binding: MutationBinding = { operation, clientId, sessionId, projectId, workspaceId, runtimeId, instanceId, deploymentEpoch };
   const record = await mutationJournal.inspect(requestId, fingerprint, binding);
   if (record === null) return { requestId, operation, state: 'NOT_FOUND' };
+  if (state !== undefined && record.state !== 'COMMITTED' && record.state !== 'FAILED') {
+    const evidence = await operationSourceEvidence(record, state);
+    if (evidence !== null) return { ...mutationEvidence({ ...record, state: 'COMMITTED', result: evidence }), journalState: record.state, source: 'durable-operation-receipt' };
+  }
   return mutationEvidence(record);
+}
+
+async function operationSourceEvidence(record: MutationRecord, state: RuntimeState): Promise<unknown | null> {
+  const binding = record.binding;
+  if (binding === undefined) return null;
+  const sessionOperations: Record<string, string> = { session_open: 'ensure', workspace_select: 'select', session_resume: 'resume', session_detach: 'detach', session_close: 'close' };
+  if (sessionOperations[binding.operation] !== undefined) {
+    const receipt = await state.sessionMutationEvidence(record.requestId, binding.clientId);
+    if (receipt === null || receipt.operation !== sessionOperations[binding.operation]
+      || (binding.sessionId !== null && receipt.result.id !== binding.sessionId)) return null;
+    return binding.operation === 'session_open' ? { ...receipt.result, sessionId: receipt.result.id } : receipt.result;
+  }
+  if (!binding.operation.startsWith('mission_') || binding.sessionId === null) return null;
+  const missions = (await state.listMissions()).filter((mission) => mission.clientId === binding.clientId && mission.sessionId === binding.sessionId);
+  const lifecycleRecords = (await new DurableMissionLifecycleStore(state.dataRoot).read()).records;
+  const matches: unknown[] = [];
+  for (const mission of missions) {
+    if (mission.projectId === null) continue;
+    await new VNextResourceRegistry(state, state.dataRoot).primaryWorkspace(mission.projectId);
+    const lifecycle = lifecycleRecords.find((candidate) => candidate.missionId === mission.id);
+    if (binding.operation === 'mission_create' && mission.creationRequest?.requestId === record.requestId && lifecycle !== undefined) matches.push({ ...mission, lifecycle });
+    else if (binding.operation === 'mission_rebind' && mission.rebindAudit.some((entry) => entry.requestId === record.requestId && entry.newClientId === binding.clientId && entry.newSessionId === binding.sessionId)) matches.push(mission);
+    else if (binding.operation === 'mission_orchestrator_handoff' && mission.lastOrchestratorHandoff?.handoffId === record.requestId) matches.push({ mission, handoff: mission.lastOrchestratorHandoff });
+    else if (lifecycle !== undefined) {
+      const kinds: Record<string, string> = { mission_start: 'START', mission_checkpoint: 'CHECKPOINT', mission_resume: 'RESUME', mission_cancel: 'CANCEL', mission_complete: 'COMPLETE' };
+      if (lifecycle.operations.some((operation) => operation.requestId === record.requestId && operation.kind === kinds[binding.operation] && operation.status === 'SUCCEEDED')) matches.push(lifecycle);
+      else if (binding.operation === 'mission_directive' && lifecycle.directives.some((directive) => directive.directiveId === record.requestId)) matches.push(lifecycle);
+    }
+  }
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function mutationEvidence(record: MutationRecord): Record<string, unknown> {
@@ -234,7 +304,7 @@ function mutationEvidence(record: MutationRecord): Record<string, unknown> {
     fingerprint: record.fingerprint, logicalFingerprint: record.logicalFingerprint ?? null,
     binding: record.binding ?? null, errorCode: record.errorCode, updatedAt: record.updatedAt,
     ...(record.state === 'COMMITTED' ? { evidence: record.result } : {}),
-    ...(record.state === 'RECONCILIATION_REQUIRED' ? { reconciliationRequired: true } : {}),
+    ...(['PREPARED', 'APPLYING', 'RECONCILIATION_REQUIRED'].includes(record.state) ? { reconciliationRequired: true } : {}),
   };
 }
 
@@ -308,6 +378,23 @@ async function executeTool(
     capabilityId: 'file.read', clientId: requiredHeader(request, CLIENT_ID_HEADER), projectId: requiredString(args, 'projectId'), targetPath: requiredString(args, 'targetPath'),
   });
   if (name === 'mission_list') return capabilities.execute({ capabilityId: 'mission.list', clientId, sessionId });
+  if (name === 'session_open' && (principal === 'tunnel-service' || args.conversationId !== undefined)) {
+    if (state === undefined) throw new RuntimeError('CONTROL_DENIED', 'Session persistence is unavailable');
+    const session = await state.ensureSession({ clientId: requiredHeader(request, CLIENT_ID_HEADER), conversationId: requiredBoundedString(args, 'conversationId', 200), requestId: requiredBoundedString(args, 'requestId', 200), agentId: principal === 'tunnel-service' ? 'iris-tunnel-service' : 'chatgpt', agentRole: principal === 'tunnel-service' ? 'other' : 'owner' });
+    return { ...session, sessionId: session.id };
+  }
+  if (['session_resume', 'session_detach', 'session_close', 'workspace_select'].includes(name) && state !== undefined) {
+    const requestedSession = optionalString(args, 'sessionId') ?? optionalHeader(request, SESSION_ID_HEADER);
+    if (requestedSession !== undefined) {
+      const current = await state.validateSessionAuthority(requestedSession, requiredHeader(request, CLIENT_ID_HEADER), name !== 'workspace_select');
+      if (current.machineId !== undefined) return state.mutateSession({
+        operation: name === 'workspace_select' ? 'select' : name === 'session_close' ? 'close' : name === 'session_detach' ? 'detach' : 'resume',
+        sessionId: requestedSession, clientId: requiredHeader(request, CLIENT_ID_HEADER), requestId: requiredBoundedString(args, 'requestId', 200),
+        ...(args.expectedRevision === undefined ? {} : { expectedRevision: requiredPositiveInteger(args, 'expectedRevision') }),
+        ...(name === 'workspace_select' ? { projectId: requiredString(args, 'projectId'), ...(typeof args.workspaceId === 'string' ? { workspaceId: args.workspaceId } : {}) } : {}),
+      });
+    }
+  }
   if (name === 'session_open') {
     const outcome = await capabilities.execute({
       capabilityId: 'session.create',
@@ -382,6 +469,9 @@ async function executeTool(
   }
   if (name === 'mission_orchestrator_handoff') {
     const supervisor = requireBrokerContext(state, broker);
+    const identity = resolveSessionIdentity(args, request, state);
+    const mission = await supervisor.state.getMission(requiredString(args, 'missionId'));
+    if (mission.clientId !== identity.clientId || mission.sessionId !== identity.sessionId) throw new RuntimeError('CONTROL_DENIED', 'Mission is not controlled by this session');
     return supervisor.broker.changeOrchestrator({
       missionId: requiredString(args, 'missionId'),
       targetMode: orchestratorMode(args, 'targetMode'),
@@ -547,10 +637,11 @@ function toolDefinitions(): readonly Record<string, unknown>[] {
     { name: 'git_status', description: 'Inspect Git status for an explicitly selected registered project. Read-only and sessionless.', inputSchema: { type: 'object', required: ['projectId'], properties: explicitProjectProperty, additionalProperties: false } },
     { name: 'search', description: 'Search text in an explicitly selected registered project. Read-only and sessionless.', inputSchema: { type: 'object', required: ['projectId', 'query'], properties: { ...explicitProjectProperty, query: { type: 'string', minLength: 1, maxLength: 500 } }, additionalProperties: false } },
     { name: 'mission_list', description: 'List durable mission execution records visible to the local owner.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-    { name: 'session_open', description: 'Open a new IRIS runtime session for this MCP client. Call once per logical ChatGPT conversation before session-bound project or execution operations.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+    { name: 'session_open', description: 'Ensure the durable session for an explicit logical conversation. Correlation IDs do not grant authority.', inputSchema: { type: 'object', required: ['conversationId', 'requestId'], properties: { conversationId: { type: 'string', minLength: 1, maxLength: 200 }, requestId: { type: 'string', minLength: 1, maxLength: 200 } }, additionalProperties: false } },
     { name: 'session_get', description: 'Read the owned IRIS runtime session and its current project.', inputSchema: { type: 'object', properties: sessionProperty, additionalProperties: false } },
-    { name: 'session_close', description: 'Close the owned IRIS runtime session when the logical conversation no longer needs it.', inputSchema: { type: 'object', properties: sessionProperty, additionalProperties: false } },
-    { name: 'workspace_select', description: 'Select one registered project as the current workspace for this IRIS session only.', inputSchema: { type: 'object', required: ['projectId'], properties: { ...sessionProperty, projectId: { type: 'string', description: 'Registered project ID returned by list_projects.' } }, additionalProperties: false } },
+    ...(['session_resume', 'session_detach'] as const).map((name) => ({ name, description: name === 'session_resume' ? 'Resume the owned durable session after checking its current machine and workspace.' : 'Detach the conversation from its durable session without changing captured job ownership.', inputSchema: { type: 'object', required: ['sessionId', 'requestId', 'expectedRevision'], properties: { ...sessionProperty, requestId: { type: 'string', minLength: 1, maxLength: 200 }, expectedRevision: { type: 'integer', minimum: 1 } }, additionalProperties: false } })),
+    { name: 'session_close', description: 'Close the owned IRIS runtime session when the logical conversation no longer needs it.', inputSchema: { type: 'object', required: ['sessionId', 'requestId', 'expectedRevision'], properties: { ...sessionProperty, requestId: { type: 'string', minLength: 1, maxLength: 200 }, expectedRevision: { type: 'integer', minimum: 1 } }, additionalProperties: false } },
+    { name: 'workspace_select', description: 'Select one registered project as the current workspace for this IRIS session only.', inputSchema: { type: 'object', required: ['projectId', 'requestId', 'expectedRevision'], properties: { ...sessionProperty, requestId: { type: 'string', minLength: 1, maxLength: 200 }, workspaceId: { type: 'string' }, expectedRevision: { type: 'integer', minimum: 1 }, projectId: { type: 'string', description: 'Registered project ID returned by list_projects.' } }, additionalProperties: false } },
     { name: 'mission_list_waiting_supervisor', description: 'List broker-bound missions durably waiting for supervisor review. This is read-only supervisor transport and grants no execution permission.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
     { name: 'mission_get', description: 'Read one durable mission with tasks, governed actions, evidence, supervisor-gate representation, timeline, and broker checkpoint state when available.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },
     { name: 'mission_events', description: 'Read a bounded merged mission timeline containing governed mission events, supervisor checkpoints, and accepted directives.', inputSchema: { type: 'object', required: ['missionId'], properties: { missionId: { type: 'string' } }, additionalProperties: false } },

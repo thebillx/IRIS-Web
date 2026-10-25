@@ -23,6 +23,7 @@ export async function executeV21LifecycleTool(
   if (name === 'mission_rebind') {
     return state.rebindMissionSession({
       missionId,
+      ...(args.requestId === undefined ? {} : { requestId: requiredBoundedString(args, 'requestId', 200) }),
       principal,
       clientId: identity.clientId,
       sessionId: identity.sessionId,
@@ -121,6 +122,8 @@ async function createLifecycleMission(
   }
   const outcome = await capabilities.execute({
     capabilityId: 'mission.create',
+    ...(args.requestId === undefined ? {} : { requestId: requiredBoundedString(args, 'requestId', 200) }),
+    ...(args.goal === undefined ? {} : { goal: requiredBoundedString(args, 'goal', 4000) }),
     clientId: identity.clientId,
     sessionId: identity.sessionId,
     title: requiredBoundedString(args, 'title', 240),

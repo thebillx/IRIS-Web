@@ -51,7 +51,8 @@ function augmentExistingDefinition(candidate: unknown): unknown {
       description: 'Create one durable project-bound mission. V2.1 persists lifecycle identity immediately; goal is optional and orchestrator compatibility is preserved.',
       inputSchema: {
         ...candidate.inputSchema,
-        properties: { ...properties, goal: { type: 'string', minLength: 1, maxLength: 4000 } },
+        required: [...(Array.isArray(candidate.inputSchema.required) ? candidate.inputSchema.required : []), 'requestId'],
+        properties: { ...properties, requestId: { type: 'string', minLength: 1, maxLength: 200 }, goal: { type: 'string', minLength: 1, maxLength: 4000 } },
       },
     };
   }
@@ -99,7 +100,7 @@ function lifecycleToolDefinitions(): Record<string, unknown>[] {
           ...sessionId,
           missionId: { type: 'string', description: 'Stable durable mission UUID.' },
           projectId: { type: 'string', description: 'Must equal the mission’s already-bound registered project UUID.' },
-          expectedBindingRevision: { type: 'integer', minimum: 1 },
+          requestId: { type: 'string', minLength: 1, maxLength: 200 }, expectedBindingRevision: { type: 'integer', minimum: 1 },
           reason: { type: 'string', minLength: 1, maxLength: 500 },
         },
         additionalProperties: false,

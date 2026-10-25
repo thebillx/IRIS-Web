@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -18,9 +18,12 @@ import {
   type RuntimeClientState,
   type RuntimeSessionSnapshot,
   type SessionInteractionEvent,
+  type DurableSessionAuthority,
 } from '@iris/domain';
 import { LocalDevelopmentAgentExecutor, type AgentExecutor } from './agent-executor.js';
-import { FoundationStateStore } from './persistence.js';
+import { FoundationStateStore, type DurableSessionRecord, type SessionMutationReceipt } from './persistence.js';
+import { readMachineId } from './machine-identity.js';
+import { VNextResourceRegistry } from './resource-registry.js';
 import { MissionLedgerStore, missionArchiveEligible } from './mission-store.js';
 import { inspectRegistrationRoot } from './project-path.js';
 
@@ -28,7 +31,25 @@ const MAX_INSTRUCTION_CHARS = 8_000;
 const MAX_INTERACTION_EVENTS = 200;
 const MAX_EXECUTOR_OUTPUT_CHARS = 12_000;
 
+export interface EnsureSessionInput {
+  readonly clientId: string;
+  readonly conversationId: string;
+  readonly requestId: string;
+  readonly agentId?: string;
+  readonly agentRole?: AgentRole;
+}
+export interface SessionMutationInput {
+  readonly operation: 'select' | 'resume' | 'detach' | 'close';
+  readonly clientId: string;
+  readonly sessionId: string;
+  readonly requestId: string;
+  readonly expectedRevision?: number;
+  readonly projectId?: string | null;
+  readonly workspaceId?: string | null;
+}
+
 export interface MissionRebindInput {
+  readonly requestId?: string;
   readonly missionId: string;
   readonly clientId: string;
   readonly sessionId: string;
@@ -40,6 +61,8 @@ export interface MissionRebindInput {
 
 export class RuntimeState {
   private readonly sessions = new Map<string, RuntimeSessionSnapshot>();
+  private readonly durableSessions = new Map<string, DurableSessionRecord>();
+  private sessionInitialization: Promise<void> | null = null;
   private readonly clients = new Map<string, RuntimeClientState>();
   private readonly activeSubmissions = new Map<string, string>();
   private readonly submissionBindings = new Map<string, Map<string, string>>();
@@ -58,6 +81,168 @@ export class RuntimeState {
 
   public executorDescriptor() {
     return this.executor.descriptor;
+  }
+
+  public initializeSessions(): Promise<void> {
+    this.sessionInitialization ??= (async () => {
+      const document = await this.store.read();
+      const machineId = await readMachineId(this.dataRoot);
+      for (const stored of document.sessions ?? []) {
+        if (stored.snapshot.machineId !== machineId) throw new RuntimeError('CONTROL_DENIED', 'Durable session belongs to a different machine');
+        const record: DurableSessionRecord = {
+          ...stored,
+          snapshot: stored.snapshot.executionState === 'WORKING' ? { ...stored.snapshot, executionState: 'FAILED' } : stored.snapshot,
+          submissions: stored.submissions.map((submission) => submission.state === 'RUNNING' ? { ...submission, state: 'UNCERTAIN' as const } : submission),
+        };
+        this.durableSessions.set(record.snapshot.id, record);
+        this.sessions.set(record.snapshot.id, record.snapshot);
+      }
+    })();
+    return this.sessionInitialization;
+  }
+
+  public async ensureSession(input: EnsureSessionInput): Promise<RuntimeSessionSnapshot> {
+    await this.initializeSessions();
+    const clientId = normalizeClientId(input.clientId);
+    const conversationId = boundedSessionKey(input.conversationId, 'conversationId');
+    const requestId = boundedSessionKey(input.requestId, 'requestId');
+    const agentId = normalizeAgentId(input.agentId ?? clientId);
+    const agentRole = normalizeAgentRole(input.agentRole ?? 'other');
+    const digest = sessionDigest({ operation: 'ensure', clientId, conversationId, agentId, agentRole });
+    return this.serializeMachineMutation(async () => {
+      const machineId = await readMachineId(this.dataRoot);
+      if (machineId === null) throw new RuntimeError('CONTROL_DENIED', 'Durable session requires an enrolled machine identity');
+      const duplicate = this.findSessionReceipt(requestId, clientId, digest);
+      if (duplicate !== null) {
+        const current = this.durableSessions.get(duplicate.result.id)!.snapshot;
+        if (current.attachmentState === 'CLOSED') throw new RuntimeError('CONTROL_DENIED', 'Conversation session is closed');
+        await this.assertDurableSessionScope(current);
+        return duplicate.result;
+      }
+      const existing = [...this.durableSessions.values()].find(({ snapshot }) => snapshot.clientId === clientId && snapshot.conversationId === conversationId);
+      if (existing !== undefined) {
+        await this.assertDurableSessionScope(existing.snapshot);
+        if (existing.snapshot.attachmentState === 'CLOSED') throw new RuntimeError('CONTROL_DENIED', 'Conversation session is closed');
+        return this.commitSessionReceipt(existing, requestId, digest, existing.snapshot, 'ensure');
+      }
+      const snapshot: RuntimeSessionSnapshot = {
+        id: randomUUID(), machineId, clientId, conversationId, agentId, agentRole,
+        createdAt: new Date().toISOString(), currentProjectId: null, currentWorkspaceId: null,
+        revision: 1, attachmentState: 'ATTACHED', executionState: 'READY', interactions: [],
+      };
+      return this.commitSessionReceipt({ snapshot, receipts: [], submissions: [] }, requestId, digest, snapshot, 'ensure');
+    });
+  }
+
+  public async mutateSession(input: SessionMutationInput): Promise<RuntimeSessionSnapshot> {
+    await this.initializeSessions();
+    const clientId = normalizeClientId(input.clientId);
+    const sessionId = normalizeUuidIdentity(input.sessionId, 'sessionId');
+    const requestId = boundedSessionKey(input.requestId, 'requestId');
+    const digest = sessionDigest({ operation: input.operation, clientId, sessionId, expectedRevision: input.expectedRevision ?? null, projectId: input.projectId ?? null, workspaceId: input.workspaceId ?? null });
+    return this.serializeMachineMutation(async () => {
+      const record = this.durableSessions.get(sessionId);
+      if (record === undefined || record.snapshot.clientId !== clientId) throw new RuntimeError('CONTROL_DENIED', 'Durable session is not owned by this client');
+      const session = record.snapshot;
+      if (session.machineId !== await readMachineId(this.dataRoot)) throw new RuntimeError('CONTROL_DENIED', 'Durable session machine identity changed');
+      const duplicate = this.findSessionReceipt(requestId, clientId, digest);
+      if (duplicate !== null) {
+        if (session.attachmentState === 'CLOSED' && input.operation !== 'close') throw new RuntimeError('CONTROL_DENIED', 'Session is closed');
+        if (input.operation !== 'close') await this.assertDurableSessionScope(session);
+        return duplicate.result;
+      }
+      if (session.attachmentState === 'CLOSED') throw new RuntimeError('CONTROL_DENIED', 'Session is closed');
+      if (input.expectedRevision !== undefined && input.expectedRevision !== session.revision) throw new RuntimeError('PRECONDITION_FAILED', 'Session revision is stale');
+      if (input.operation === 'close' && this.activeSubmissions.has(sessionId)) throw new RuntimeError('SESSION_BUSY', 'Session instruction is executing');
+      let updated = { ...session, revision: session.revision! + 1 };
+      if (input.operation === 'select') {
+        if (session.attachmentState !== 'ATTACHED') throw new RuntimeError('CONTROL_DENIED', 'Resume the session before selecting its workspace');
+        const projectId = input.projectId === null ? null : normalizeUuidIdentity(input.projectId ?? '', 'projectId');
+        const workspace = projectId === null ? null : input.workspaceId == null
+          ? await new VNextResourceRegistry(this, this.dataRoot).primaryWorkspace(projectId)
+          : await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(projectId, input.workspaceId);
+        updated = { ...updated, currentProjectId: projectId, currentWorkspaceId: workspace?.workspaceId ?? null };
+      } else {
+        if (input.operation === 'resume') await this.assertDurableSessionScope(session);
+        updated = { ...updated, attachmentState: input.operation === 'resume' ? 'ATTACHED' : input.operation === 'detach' ? 'DETACHED' : 'CLOSED' };
+      }
+      return this.commitSessionReceipt(record, requestId, digest, updated, input.operation);
+    });
+  }
+
+  public async validateSessionAuthority(sessionId: string, clientId: string, allowInactive = false): Promise<RuntimeSessionSnapshot> {
+    await this.initializeSessions();
+    const session = this.sessions.get(sessionId);
+    if (session === undefined || session.clientId !== normalizeClientId(clientId)) throw new RuntimeError('CONTROL_DENIED', 'Session is not owned by this client');
+    if (!allowInactive && session.attachmentState !== undefined && session.attachmentState !== 'ATTACHED') throw new RuntimeError('CONTROL_DENIED', 'Resume the session before using its authority');
+    if (session.machineId !== undefined) await this.assertDurableSessionScope(session);
+    return session;
+  }
+
+  public async validateCapturedJobSession(sessionId: string, clientId: string): Promise<RuntimeSessionSnapshot> {
+    await this.initializeSessions();
+    const session = this.getSessionForClient(sessionId, clientId);
+    if (session.machineId !== undefined && session.machineId !== await readMachineId(this.dataRoot)) throw new RuntimeError('CONTROL_DENIED', 'Session machine binding is stale');
+    return session;
+  }
+
+  public getDurableSessionAuthority(sessionId: string, clientId: string): DurableSessionAuthority | undefined {
+    const session = this.getSessionForClient(sessionId, clientId);
+    if (session.machineId === undefined || session.conversationId === undefined || session.revision === undefined) return undefined;
+    return { machineId: session.machineId, clientId: session.clientId, conversationId: session.conversationId, sessionId: session.id, sessionRevision: session.revision };
+  }
+
+  public async sessionMutationEvidence(requestId: string, clientId: string): Promise<SessionMutationReceipt | null> {
+    await this.initializeSessions();
+    const receipt = [...this.durableSessions.values()].flatMap((record) => record.receipts).find((entry) => entry.requestId === requestId);
+    if (receipt === undefined) return null;
+    if (receipt.result.clientId !== clientId || receipt.result.machineId !== await readMachineId(this.dataRoot)) throw new RuntimeError('CONTROL_DENIED', 'Session receipt belongs to another authority');
+    await this.validateSessionAuthority(receipt.result.id, clientId, true);
+    return receipt;
+  }
+
+  private findSessionReceipt(requestId: string, clientId: string, digest: string): SessionMutationReceipt | null {
+    for (const record of this.durableSessions.values()) {
+      const receipt = record.receipts.find((candidate) => candidate.requestId === requestId);
+      if (receipt === undefined) continue;
+      if (receipt.result.clientId !== clientId || receipt.digest !== digest) throw new RuntimeError('AUTHORITY_CHANGED', 'Session requestId is bound to different arguments or owner');
+      return receipt;
+    }
+    return null;
+  }
+
+  private async assertDurableSessionScope(session: RuntimeSessionSnapshot): Promise<void> {
+    if (session.machineId !== await readMachineId(this.dataRoot)) throw new RuntimeError('CONTROL_DENIED', 'Session machine binding is stale');
+    if (session.currentProjectId !== null) {
+      if (session.currentWorkspaceId == null) throw new RuntimeError('CONTROL_DENIED', 'Session workspace binding is unavailable');
+      await new VNextResourceRegistry(this, this.dataRoot).getActiveWorkspace(session.currentProjectId, session.currentWorkspaceId);
+    }
+  }
+
+  private async commitSessionReceipt(record: DurableSessionRecord, requestId: string, digest: string, snapshot: RuntimeSessionSnapshot, operation: SessionMutationReceipt['operation']): Promise<RuntimeSessionSnapshot> {
+    if (record.receipts.length >= 400) throw new RuntimeError('CAPABILITY_DENIED', 'Session receipt capacity reached; existing evidence is retained');
+    await this.publishDurableSession({ ...record, snapshot, receipts: [...record.receipts, { requestId, digest, operation, result: snapshot }] });
+    return snapshot;
+  }
+
+  private async publishDurableSession(record: DurableSessionRecord): Promise<void> {
+    const document = await this.store.read();
+    await this.store.write({ ...document, schemaVersion: 2, sessions: [...(document.sessions ?? []).filter((entry) => entry.snapshot.id !== record.snapshot.id), record] });
+    this.durableSessions.set(record.snapshot.id, record);
+    this.sessions.set(record.snapshot.id, record.snapshot);
+  }
+
+  private persistSessionExecution(snapshot: RuntimeSessionSnapshot, submissionId: string, digest: string, state: DurableSessionRecord['submissions'][number]['state']): Promise<void> {
+    return this.serializeMachineMutation(async () => {
+      const record = this.durableSessions.get(snapshot.id);
+      if (record === undefined) { this.sessions.set(snapshot.id, snapshot); return; }
+      const previous = record.submissions.find((entry) => entry.submissionId === submissionId);
+      if (previous === undefined && record.submissions.length >= 400) throw new RuntimeError('CAPABILITY_DENIED', 'Session submission capacity reached; replay evidence is retained');
+      await this.publishDurableSession({ ...record,
+        snapshot: { ...record.snapshot, interactions: snapshot.interactions, executionState: snapshot.executionState },
+        submissions: [...record.submissions.filter((entry) => entry.submissionId !== submissionId), { submissionId, digest, state }],
+      });
+    });
   }
 
   public listSessions(): readonly RuntimeSessionSnapshot[] {
@@ -97,6 +282,8 @@ export class RuntimeState {
     const projectId = normalizeUuidIdentity(input.projectId, 'projectId');
     const reason = normalizeMissionText(input.reason, 'reason', 500);
     const principal = input.principal ?? 'owner';
+    const requestId = input.requestId === undefined ? undefined : boundedSessionKey(input.requestId, 'requestId');
+    const requestDigest = sessionDigest({ missionId, clientId, sessionId, projectId, reason, principal, expectedBindingRevision: input.expectedBindingRevision });
     if (!Number.isSafeInteger(input.expectedBindingRevision) || input.expectedBindingRevision <= 0) {
       throw new RuntimeError('INVALID_REQUEST', 'expectedBindingRevision is invalid');
     }
@@ -113,16 +300,22 @@ export class RuntimeState {
       if (mission.state === 'COMPLETED' || mission.state === 'FAILED' || mission.state === 'CANCELLED') {
         throw new RuntimeError('CAPABILITY_DENIED', 'Terminal missions cannot be rebound');
       }
+      const duplicate = requestId === undefined ? undefined : mission.rebindAudit.find((entry) => entry.requestId === requestId);
+      if (duplicate !== undefined) {
+        if (duplicate.requestDigest !== requestDigest || mission.clientId !== clientId || mission.sessionId !== sessionId) throw new RuntimeError('AUTHORITY_CHANGED', 'Mission rebind request conflicts with its durable receipt');
+        return mission;
+      }
       if (mission.bindingRevision !== input.expectedBindingRevision) {
         throw new RuntimeError('INVALID_REQUEST', 'Mission binding revision is stale');
       }
-      if (mission.clientId === clientId && mission.sessionId === sessionId) return mission;
+      if (requestId === undefined && mission.clientId === clientId && mission.sessionId === sessionId) return mission;
       if (this.activeSubmissions.has(mission.sessionId) || mission.tasks.some((task) => task.actions.some((action) => action.state === 'RUNNING' || action.state === 'OWNER_APPROVAL_REQUIRED'))) {
         throw new RuntimeError('SESSION_BUSY', 'Mission has active mutation authority and cannot be rebound yet');
       }
       const now = new Date().toISOString();
       const bindingRevision = mission.bindingRevision + 1;
       const audit: MissionRebindAuditEvent = {
+        ...(requestId === undefined ? {} : { requestId, requestDigest }),
         id: randomUUID(),
         missionId: mission.id,
         oldClientId: mission.clientId,
@@ -156,7 +349,7 @@ export class RuntimeState {
     const mission = await this.getMission(missionIdInput);
     const existing = this.sessions.get(mission.sessionId);
     if (existing !== undefined) {
-      if (existing.clientId !== mission.clientId || existing.currentProjectId !== mission.projectId) {
+      if (existing.clientId !== mission.clientId || (existing.machineId === undefined && existing.currentProjectId !== mission.projectId)) {
         throw new RuntimeError('CONTROL_DENIED', 'Persisted mission session identity conflicts with the live runtime session');
       }
       return existing;
@@ -184,13 +377,21 @@ export class RuntimeState {
     return session;
   }
 
-  public createMission(clientIdInput: string, sessionIdInput: string, titleInput: string, orchestratorMode: OrchestratorMode = 'HERMES'): Promise<MissionSnapshot> {
+  public createMission(clientIdInput: string, sessionIdInput: string, titleInput: string, orchestratorMode: OrchestratorMode = 'HERMES', requestIdInput?: string, goal?: string): Promise<MissionSnapshot> {
     const clientId = normalizeClientId(clientIdInput);
     const sessionId = normalizeUuidIdentity(sessionIdInput, 'sessionId');
     const title = normalizeMissionText(titleInput, 'mission title', 240);
+    const requestId = requestIdInput === undefined ? undefined : boundedSessionKey(requestIdInput, 'requestId');
     const session = this.getSessionForClient(sessionId, clientId);
     return this.serializeMissionMutation(async () => {
       let document = await this.missionStore.read();
+      const id = requestId === undefined ? randomUUID() : missionRequestIdentity(requestId);
+      const digest = sessionDigest({ clientId, sessionId, title, orchestratorMode, projectId: session.currentProjectId, goal: goal ?? null });
+      const duplicate = document.missions.find((candidate) => candidate.id === id) ?? (requestId === undefined ? null : await this.missionStore.readArchived(id));
+      if (duplicate != null) {
+        if (duplicate.creationRequest?.requestId !== requestId || duplicate.creationRequest?.digest !== digest) throw new RuntimeError('AUTHORITY_CHANGED', 'Mission creation request is bound to different input');
+        return duplicate;
+      }
       if (document.missions.length >= 100) {
         const candidate = [...document.missions]
           .filter(missionArchiveEligible)
@@ -209,7 +410,8 @@ export class RuntimeState {
       }
       const now = new Date().toISOString();
       const mission: MissionSnapshot = {
-        id: randomUUID(),
+        id,
+        ...(requestId === undefined ? {} : { creationRequest: { requestId, digest } }),
         title,
         state: 'PLANNED',
         orchestratorMode,
@@ -645,11 +847,13 @@ export class RuntimeState {
     const session = this.sessions.get(sessionId);
     if (session === undefined) throw new RuntimeError('SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
     if (session.clientId !== clientId) throw new RuntimeError('CONTROL_DENIED', 'Session does not belong to this client');
+    if (session.attachmentState === 'CLOSED' || session.attachmentState === 'DETACHED') throw new RuntimeError('CONTROL_DENIED', 'Session is detached or closed; resume before using its authority');
     this.touchClient(clientId);
     return session;
   }
 
   public deleteSession(sessionId: string, clientIdInput: string): void {
+    if (this.durableSessions.has(sessionId)) throw new RuntimeError('INVALID_REQUEST', 'Durable session close requires its requestId');
     const session = this.getSessionForClient(sessionId, clientIdInput);
     if (this.activeSubmissions.has(sessionId)) {
       throw new RuntimeError('SESSION_BUSY', 'Cannot delete a session while its instruction is executing');
@@ -675,6 +879,13 @@ export class RuntimeState {
     const submissionId = normalizeSubmissionId(submissionIdInput);
     const instruction = normalizeInstruction(instructionInput);
     const session = this.getSessionForClient(sessionId, clientId);
+    const instructionDigest = sessionDigest(instruction);
+    const durableSubmission = this.durableSessions.get(sessionId)?.submissions.find((entry) => entry.submissionId === submissionId);
+    if (durableSubmission !== undefined) {
+      if (durableSubmission.digest !== instructionDigest) throw new RuntimeError('AUTHORITY_CHANGED', 'submissionId is bound to different instruction content');
+      if (durableSubmission.state === 'RUNNING' || durableSubmission.state === 'UNCERTAIN') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Instruction outcome requires reconciliation; it will not be replayed');
+      return session;
+    }
     const bindings = this.submissionBindings.get(sessionId) ?? new Map<string, string>();
     const boundInstruction = bindings.get(submissionId);
     if (boundInstruction !== undefined) {
@@ -698,7 +909,9 @@ export class RuntimeState {
       executionId,
     };
     const working = appendInteraction({ ...session, executionState: 'WORKING' }, userEvent);
-    this.sessions.set(sessionId, working);
+    this.activeSubmissions.set(sessionId, submissionId);
+    try { await this.persistSessionExecution(working, submissionId, instructionDigest, 'RUNNING'); }
+    catch (error) { this.activeSubmissions.delete(sessionId); throw error; }
     bindings.set(submissionId, instruction);
     this.submissionBindings.set(sessionId, bindings);
     this.activeSubmissions.set(sessionId, submissionId);
@@ -724,7 +937,7 @@ export class RuntimeState {
         throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Agent execution failed', { cause: error });
       }
       const text = normalizeExecutorOutput(result.text);
-      const current = this.getSessionForClient(sessionId, clientId);
+      const current = this.sessions.get(sessionId)!;
       if (this.activeSubmissions.get(sessionId) !== submissionId) {
         throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Session execution ownership changed before completion');
       }
@@ -737,10 +950,10 @@ export class RuntimeState {
         executionId,
       };
       const completed = appendInteraction({ ...current, executionState: 'READY' }, assistantEvent);
-      this.sessions.set(sessionId, completed);
+      await this.persistSessionExecution(completed, submissionId, instructionDigest, 'SUCCEEDED');
       return completed;
     } catch (error) {
-      const current = this.getSessionForClient(sessionId, clientId);
+      const current = this.sessions.get(sessionId)!;
       const errorEvent: SessionInteractionEvent = {
         id: randomUUID(),
         timestamp: new Date().toISOString(),
@@ -749,7 +962,7 @@ export class RuntimeState {
         submissionId,
         executionId,
       };
-      this.sessions.set(sessionId, appendInteraction({ ...current, executionState: 'FAILED' }, errorEvent));
+      await this.persistSessionExecution(appendInteraction({ ...current, executionState: 'FAILED' }, errorEvent), submissionId, instructionDigest, 'UNCERTAIN');
       if (error instanceof RuntimeError && error.code === 'AGENT_EXECUTION_FAILED') throw error;
       throw new RuntimeError('AGENT_EXECUTION_FAILED', 'Agent execution failed', { cause: error });
     } finally {
@@ -810,6 +1023,7 @@ export class RuntimeState {
     clientIdInput: string,
     projectId: string | null,
   ): Promise<RuntimeSessionSnapshot> {
+    if (this.durableSessions.has(sessionId)) return this.mutateSession({ operation: 'select', sessionId, clientId: clientIdInput, projectId, requestId: randomUUID() });
     const session = this.getSessionForClient(sessionId, clientIdInput);
     if (projectId !== null && !(await this.listProjects()).some((project) => project.id === projectId)) {
       throw new RuntimeError('PROJECT_NOT_FOUND', 'Current project does not exist');
@@ -899,6 +1113,16 @@ function appendInteraction(session: RuntimeSessionSnapshot, event: SessionIntera
       : interactions,
   };
 }
+
+function boundedSessionKey(value: string, name: string): string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value)) throw new RuntimeError('INVALID_REQUEST', `${name} must be an explicit bounded identity`);
+  return value;
+}
+function missionRequestIdentity(requestId: string): string {
+  const hex = createHash('sha256').update(`iris-mission-create:${requestId}`).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+function sessionDigest(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 
 function missionHandoffSafety(mission: MissionSnapshot, externalHandoffSafe: boolean): { safe: boolean; reason: string } {
   if (!externalHandoffSafe) return { safe: false, reason: 'Mission has an active or uncheckpointed orchestrator continuation' };

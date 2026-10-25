@@ -103,6 +103,19 @@ export interface RuntimeSession {
   readonly agentRole: AgentRole;
   readonly createdAt: string;
   readonly currentProjectId: string | null;
+  readonly machineId?: string;
+  readonly conversationId?: string;
+  readonly currentWorkspaceId?: string | null;
+  readonly revision?: number;
+  readonly attachmentState?: 'ATTACHED' | 'DETACHED' | 'CLOSED';
+}
+
+export interface DurableSessionAuthority {
+  readonly machineId: string;
+  readonly clientId: string;
+  readonly conversationId: string;
+  readonly sessionId: string;
+  readonly sessionRevision: number;
 }
 
 export type SessionExecutionState = 'READY' | 'WORKING' | 'FAILED';
@@ -223,6 +236,8 @@ export interface MissionTimelineEvent {
 }
 
 export interface MissionRebindAuditEvent {
+  readonly requestId?: string;
+  readonly requestDigest?: string;
   readonly id: string;
   readonly missionId: string;
   readonly oldClientId: string;
@@ -238,6 +253,7 @@ export interface MissionRebindAuditEvent {
 }
 
 export interface MissionSnapshot {
+  readonly creationRequest?: { readonly requestId: string; readonly digest: string };
   readonly id: string;
   readonly title: string;
   readonly state: MissionState;

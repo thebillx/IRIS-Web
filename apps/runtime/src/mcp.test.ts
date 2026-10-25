@@ -213,7 +213,7 @@ describe('local MCP transport and permission boundary', () => {
     expect(listedBody.result.tools.map((tool) => tool.name)).toEqual([
       'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'mission_list', 'session_open', 'session_get', 'session_close', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_delegation_issue', 'mission_delegation_revoke', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete', 'catalog_identity',
     ]);
-    expect(listedBody.result.tools.find((tool) => tool.name === 'session_open')?.inputSchema.required).toBeUndefined();
+    expect(listedBody.result.tools.find((tool) => tool.name === 'session_open')?.inputSchema.required).toEqual(['conversationId', 'requestId']);
 
     const status = await handleMcpRequest(rpc('tools/call', 3, { name: 'runtime_status', arguments: {} }, true, 'runtime_status'), fixture.service);
     expect(await status.json()).toMatchObject({ result: { isError: false, structuredContent: { status: 'ready' } } });
@@ -396,7 +396,7 @@ describe('local MCP transport and permission boundary', () => {
     const handoffId = randomUUID();
     const handed = await handleMcpRequest(rpc('tools/call', 16, {
       name: 'mission_orchestrator_handoff', arguments: { missionId: mission.id, targetMode: 'CHATGPT', expectedVersion: 1, handoffId },
-    }, true, 'mission_orchestrator_handoff'), fixture.service, fixture.state, fixture.broker);
+    }, true, 'mission_orchestrator_handoff', fixture.session.clientId, fixture.session.id), fixture.service, fixture.state, fixture.broker);
     expect(await handed.json()).toMatchObject({ result: { isError: false, structuredContent: { orchestratorMode: 'CHATGPT', orchestratorVersion: 2 } } });
     const task = await handleMcpRequest(rpc('tools/call', 17, {
       name: 'mission_task_create', arguments: { missionId: mission.id, title: 'Now ChatGPT may orchestrate' },

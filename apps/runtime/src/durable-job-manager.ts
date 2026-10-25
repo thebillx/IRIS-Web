@@ -1,12 +1,12 @@
 import { spawn, execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { RuntimeError, type CapabilityEffect, type JobId, type MissionExecutionAssociation, type WorkspaceId } from '@iris/domain';
+import { RuntimeError, type CapabilityEffect, type DurableSessionAuthority, type JobId, type MissionExecutionAssociation, type WorkspaceId } from '@iris/domain';
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
 import { resolveExecutionProfile, resolveServerOwnedCodeReviewExecutionProfile, type ExecutionProfilePlan } from './execution-profiles.js';
 import { boundedTail, StreamingRedactor } from './output-redaction.js';
@@ -37,6 +37,7 @@ export interface ShellExecutionInput {
   readonly envOverrides: Readonly<Record<string, string>>;
   readonly timeoutMs: number;
   readonly stdinArtifactId?: string | undefined;
+  readonly authority?: DurableSessionAuthority | undefined;
 }
 
 export interface CodeReviewBinding {
@@ -69,6 +70,7 @@ export interface DurableJobRecord {
   readonly executableIdentity: string;
   readonly argvDigest: string;
   readonly requestFingerprint?: string | null;
+  readonly authority?: DurableSessionAuthority;
   readonly effectiveEffects: readonly CapabilityEffect[];
   readonly runnerIdentity: string;
   readonly runnerPid: number | null;
@@ -133,6 +135,7 @@ interface RunnerResult {
 
 export class DurableJobManager {
   private mutationTail: Promise<void> = Promise.resolve();
+  private readonly admissions = new Map<string, { fingerprint: string; result: Promise<Record<string, unknown>> }>();
 
   public constructor(private readonly dataRoot: string, private readonly resources: VNextResourceRegistry, private readonly safety?: SafetyWriterGate) {}
 
@@ -296,15 +299,30 @@ export class DurableJobManager {
   }
 
   public async start(prepared: PreparedShellExecution, requestId: string, effects: readonly CapabilityEffect[], mission?: MissionExecutionAssociation): Promise<Record<string, unknown>> {
+    if (!REQUEST_ID.test(requestId)) throw new RuntimeError('INVALID_REQUEST', 'requestId is invalid');
+    const fingerprint = durableRequestFingerprint(prepared, effects, mission);
+    const pending = this.admissions.get(requestId);
+    if (pending !== undefined) {
+      if (pending.fingerprint !== fingerprint) throw new RuntimeError('PRECONDITION_FAILED', 'requestId already belongs to a different execution request');
+      return pending.result;
+    }
+    const admit = () => this.startAdmitted(prepared, requestId, effects, mission);
+    const result = this.safety === undefined ? admit() : this.safety.runMutation('external-runners', admit);
+    this.admissions.set(requestId, { fingerprint, result });
+    try { return await result; } finally { this.admissions.delete(requestId); }
+  }
+
+  private async startAdmitted(prepared: PreparedShellExecution, requestId: string, effects: readonly CapabilityEffect[], mission?: MissionExecutionAssociation): Promise<Record<string, unknown>> {
     if (!REQUEST_ID.test(requestId)) {
       await cleanupServerOwnedPaths(prepared.plan.cleanupPaths);
       throw new RuntimeError('INVALID_REQUEST', 'requestId is invalid');
     }
     const digest = argvDigest(prepared.plan.argv);
     const requestFingerprint = durableRequestFingerprint(prepared, effects, mission);
-    const existing = (await this.readDocument()).jobs.find((job) => job.requestId === requestId && job.projectId === prepared.input.projectId);
+    const existing = (await this.readDocument()).jobs.find((job) => job.requestId === requestId);
     if (existing !== undefined) {
       const legacyCompatible = existing.requestFingerprint == null
+        && prepared.input.authority === undefined && existing.authority === undefined
         && prepared.plan.profileId !== 'codex-review'
         && existing.workspaceId === prepared.workspaceId
         && existing.executionProfile === prepared.plan.profileId
@@ -341,6 +359,7 @@ export class DurableJobManager {
       const startedAt = new Date().toISOString();
       queued = {
         jobId, requestId, projectId: prepared.input.projectId, workspaceId: prepared.workspaceId,
+        ...(prepared.input.authority === undefined ? {} : { authority: prepared.input.authority }),
         missionId: mission?.missionId ?? null, taskId: mission?.taskId ?? null, actionId: mission?.actionId ?? null,
         executionProfile: prepared.plan.profileId, executableIdentity: prepared.plan.executableIdentity, argvDigest: digest,
         requestFingerprint, effectiveEffects: [...effects], runnerIdentity, runnerPid: null, runnerStartMarker: null, pid: null,
@@ -398,9 +417,7 @@ export class DurableJobManager {
         }
         return { runnerPid: spawnedRunnerPid, claim };
       };
-      const admitted = this.safety === undefined
-        ? await admitRunner()
-        : await this.safety.runMutation('external-runners', admitRunner);
+      const admitted = await admitRunner();
       if ('terminal' in admitted) return startView(await this.finishFromRunner(queued, admitted.terminal));
       spawnedRunnerPid = admitted.runnerPid;
       const claim = admitted.claim;
@@ -432,14 +449,14 @@ export class DurableJobManager {
     }
   }
 
-  public async status(projectId: string, jobId: string): Promise<Record<string, unknown>> {
-    const job = await this.getOwnedNonReviewJob(projectId, jobId);
+  public async status(projectId: string, jobId: string, authority?: DurableSessionAuthority): Promise<Record<string, unknown>> {
+    const job = await this.getOwnedNonReviewJob(projectId, jobId, authority);
     return statusView(await this.reconcile(job));
   }
 
-  public async logs(projectId: string, jobId: string, stream: 'stdout' | 'stderr', cursor?: string, maxBytes = 16 * 1024): Promise<Record<string, unknown>> {
+  public async logs(projectId: string, jobId: string, stream: 'stdout' | 'stderr', cursor?: string, maxBytes = 16 * 1024, authority?: DurableSessionAuthority): Promise<Record<string, unknown>> {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > LOG_WINDOW_MAX) throw new RuntimeError('INVALID_REQUEST', 'maxBytes is outside the bounded log window');
-    const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId));
+    const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId, authority));
     const offset = decodeCursor(cursor, stream);
     const filename = stream === 'stdout' ? job.stdoutPath : job.stderrPath;
     const handle = await open(filename, 'r');
@@ -454,8 +471,8 @@ export class DurableJobManager {
     } finally { await handle.close(); }
   }
 
-  public async result(projectId: string, jobId: string): Promise<Record<string, unknown>> {
-    return resultView(await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId)));
+  public async result(projectId: string, jobId: string, authority?: DurableSessionAuthority): Promise<Record<string, unknown>> {
+    return resultView(await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId, authority)));
   }
 
   public async codeReviewStatusSnapshot(projectId: string, jobId: string): Promise<Readonly<{
@@ -601,8 +618,8 @@ export class DurableJobManager {
     };
   }
 
-  public async cancel(projectId: string, jobId: string): Promise<Record<string, unknown>> {
-    const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId));
+  public async cancel(projectId: string, jobId: string, authority?: DurableSessionAuthority): Promise<Record<string, unknown>> {
+    const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId, authority));
     if (job.state !== 'RUNNING') return { jobId, state: job.state, cancelRequested: false };
     const claim = await readClaim(job.claimPath);
     if (claim === null || !(await verifyClaim(claim, job.jobId, job.runnerIdentity)) || claim.targetPid !== job.pid || claim.targetStartMarker !== job.processStartMarker || claim.targetProcessGroupId !== job.processGroupId) {
@@ -614,10 +631,8 @@ export class DurableJobManager {
     });
     if (this.safety === undefined) await writeCancel();
     else await this.safety.runMutation('external-runners', writeCancel);
-    safeKillGroup(claim.targetProcessGroupId, 'SIGTERM');
-    setTimeout(() => {
-      void verifyClaim(claim, job.jobId, job.runnerIdentity).then((exact) => { if (exact) safeKillGroup(claim.targetProcessGroupId, 'SIGKILL'); });
-    }, 1000).unref();
+    // The verified runner consumes the durable cancel request and publishes CANCELLED.
+    // Signalling here races that receipt and can incorrectly publish FAILED.
     return { jobId, state: 'RUNNING', cancelRequested: true };
   }
 
@@ -693,16 +708,17 @@ export class DurableJobManager {
     return ids;
   }
 
-  private async getOwnedJob(projectId: string, jobId: string): Promise<DurableJobRecord> {
+  private async getOwnedJob(projectId: string, jobId: string, authority?: DurableSessionAuthority): Promise<DurableJobRecord> {
     const job = (await this.readDocument()).jobs.find((candidate) => candidate.jobId === jobId);
     if (job === undefined) throw new RuntimeError('INVALID_REQUEST', 'Job was not found');
     if (job.projectId !== projectId) throw new RuntimeError('CAPABILITY_DENIED', 'Job does not belong to the selected project');
+    if (!sameJobAuthority(job.authority, authority)) throw new RuntimeError('CONTROL_DENIED', 'Job authority belongs to a different session or legacy owner');
     await this.resources.getActiveWorkspace(projectId, job.workspaceId);
     return job;
   }
 
-  private async getOwnedNonReviewJob(projectId: string, jobId: string): Promise<DurableJobRecord> {
-    const job = await this.getOwnedJob(projectId, jobId);
+  private async getOwnedNonReviewJob(projectId: string, jobId: string, authority?: DurableSessionAuthority): Promise<DurableJobRecord> {
+    const job = await this.getOwnedJob(projectId, jobId, authority);
     if (job.executionProfile === 'codex-review') {
       throw new RuntimeError('CAPABILITY_DENIED', 'Native code-review jobs are observable only through the code_review surface');
     }
@@ -769,12 +785,78 @@ export class DurableJobManager {
   }
 }
 
+function sameJobAuthority(captured: DurableSessionAuthority | undefined, current: DurableSessionAuthority | undefined): boolean {
+  if (captured === undefined || current === undefined) return captured === current;
+  return captured.machineId === current.machineId && captured.clientId === current.clientId
+    && captured.conversationId === current.conversationId && captured.sessionId === current.sessionId
+    && Number.isSafeInteger(current.sessionRevision) && current.sessionRevision >= captured.sessionRevision;
+}
+
+/** Read-only safety evidence: no recovery, publication, adoption, or signal is performed. */
+export async function inspectDurableRunnerEvidence(dataRoot: string): Promise<{ active: number } | null> {
+  try {
+    const inspected = await inspectPrivateRegularFile(path.join(dataRoot, JOB_FILE), 'vNext job store');
+    if (inspected.state === 'invalid') return null;
+    const document: unknown = inspected.state === 'missing' ? { schemaVersion: 1, jobs: [] } : JSON.parse(inspected.content);
+    if (!validateDurableJobDocument(document)) return null;
+    const root = path.join(dataRoot, JOB_DIR);
+    let directories: string[];
+    try {
+      await lstat(root);
+      if (await privateDirectoryProblem(root, 'vNext job runtime') !== null || await realpath(root) !== root) return null;
+      directories = await readdir(root);
+    } catch (error) { if (isErrno(error, 'ENOENT')) directories = []; else return null; }
+    const seen = new Set<string>();
+    let active = 0;
+    for (const job of document.jobs) {
+      if (!isRecord(job) || typeof job.jobId !== 'string' || !UUID.test(job.jobId) || seen.has(job.jobId)
+        || typeof job.runnerIdentity !== 'string' || !UUID.test(job.runnerIdentity) || !DURABLE_JOB_STATES.has(job.state)) return null;
+      seen.add(job.jobId);
+      const directory = path.join(root, job.jobId);
+      if (job.claimPath !== path.join(directory, 'claim.json') || job.resultPath !== path.join(directory, 'result.json') || job.cancelPath !== path.join(directory, 'cancel.json')) return null;
+      const present = directories.includes(job.jobId);
+      if (!present) { if (!isTerminal(job.state)) return null; continue; }
+      if (await privateDirectoryProblem(directory, 'Durable job directory') !== null || await realpath(directory) !== directory) return null;
+      const presentFiles = new Set<string>();
+      for (const filename of ['runner-claim.json', 'claim.json', 'result.json', 'spec.json', 'start-permit.json', 'cancel.json']) {
+        const file = await inspectPrivateRegularFile(path.join(directory, filename), filename);
+        if (file.state === 'invalid') return null;
+        if (file.state === 'ok') presentFiles.add(filename);
+      }
+      const result = await readRunnerResult(job.resultPath);
+      const claim = await readClaim(job.claimPath);
+      const runner = await readRunnerClaim(path.join(directory, 'runner-claim.json'));
+      if ((presentFiles.has('result.json') && result === null) || (presentFiles.has('claim.json') && claim === null) || (presentFiles.has('runner-claim.json') && runner === null)) return null;
+      if (claim !== null && (claim.jobId !== job.jobId || claim.runnerIdentity !== job.runnerIdentity)) return null;
+      if (runner !== null && (runner.jobId !== job.jobId || runner.runnerIdentity !== job.runnerIdentity)) return null;
+      if (result !== null) {
+        if (result.jobId !== job.jobId || result.runnerIdentity !== job.runnerIdentity) return null;
+        // A terminal file cannot conceal a still-running target or pre-target runner.
+        if (runner !== null && observeProcessStart(runner.runnerPid).state !== 'dead') return null;
+        if (claim !== null && (observeProcessStart(claim.runnerPid).state !== 'dead' || observeProcessStart(claim.targetPid).state !== 'dead')) return null;
+        continue;
+      }
+      if (isTerminal(job.state)) {
+        if (claim !== null && (observeProcessStart(claim.runnerPid).state !== 'dead' || observeProcessStart(claim.targetPid).state !== 'dead')) return null;
+        if (runner !== null && observeProcessStart(runner.runnerPid).state !== 'dead') return null;
+        if (runner === null && claim === null && presentFiles.has('spec.json')) return null;
+        continue;
+      }
+      if (job.state !== 'RUNNING' || claim === null || !persistedIdentityMatchesClaim(job, claim) || !await verifyClaim(claim, job.jobId, job.runnerIdentity)) return null;
+      active += 1;
+    }
+    if (directories.some((directory) => !seen.has(directory))) return null;
+    return { active };
+  } catch { return null; }
+}
+
 function durableRequestFingerprint(
   prepared: PreparedShellExecution,
   effects: readonly CapabilityEffect[],
   mission?: MissionExecutionAssociation,
 ): string {
   const identity = {
+    authority: prepared.input.authority === undefined ? null : { ...prepared.input.authority, sessionRevision: undefined },
     projectId: prepared.input.projectId,
     workspaceId: prepared.workspaceId,
     executionProfile: prepared.plan.profileId,

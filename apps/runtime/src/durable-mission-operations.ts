@@ -29,10 +29,12 @@ export function beginLifecycleOperation(
   requestId: string,
   kind: LifecycleOperationKind,
   state: DurableMissionLifecycleState,
+  inputDigest?: string,
 ): DurableMissionLifecycleSnapshot {
   if (record.operations.length >= MAX_OPERATIONS) throw new RuntimeError('CAPABILITY_DENIED', 'Mission lifecycle operation capacity has been reached');
   const now = new Date().toISOString();
   const operation: LifecycleOperationReceipt = {
+    ...(inputDigest === undefined ? {} : { inputDigest }),
     requestId,
     kind,
     basedOnRevision: record.revision,

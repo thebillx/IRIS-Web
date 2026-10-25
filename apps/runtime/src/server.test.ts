@@ -40,7 +40,7 @@ describe('runtime listener safety', () => {
   it('serves health from a loopback listener and rejects a non-loopback browser origin', async () => {
     handle = await startRuntimeServer({
       identity,
-      state: {} as RuntimeState,
+      state: { initializeSessions: async () => undefined } as RuntimeState,
       capabilities: {} as CapabilityService,
       missionBroker: {} as MissionBrokerService,
       health: () => ({
@@ -79,7 +79,7 @@ describe('runtime listener safety', () => {
     const controlSecret = 'test-control-secret-that-is-not-public';
     handle = await startRuntimeServer({
       identity,
-      state: {} as RuntimeState,
+      state: { initializeSessions: async () => undefined } as RuntimeState,
       capabilities: {} as CapabilityService,
       missionBroker: {} as MissionBrokerService,
       health: () => ({
@@ -146,7 +146,7 @@ describe('runtime listener safety', () => {
     } as unknown as CapabilityService;
     handle = await startRuntimeServer({
       identity,
-      state: {} as RuntimeState,
+      state: { initializeSessions: async () => undefined } as RuntimeState,
       capabilities,
       missionBroker: {} as MissionBrokerService,
       health: () => ({
@@ -234,7 +234,7 @@ describe('runtime listener safety', () => {
     const ownerAccessSecret = 'test-owner-access-secret-that-is-not-public';
     handle = await startRuntimeServer({
       identity,
-      state: {} as RuntimeState,
+      state: { initializeSessions: async () => undefined } as RuntimeState,
       capabilities: {} as CapabilityService,
       missionBroker: {} as MissionBrokerService,
       health: () => ({
@@ -265,7 +265,7 @@ describe('runtime listener safety', () => {
     const tunnelServiceSecret = 'test-tunnel-service-secret-that-is-not-public';
     const execute = vi.fn(async () => ({ status: 'executed', value: { operation: 'repository_reconcile' } }));
     handle = await startRuntimeServer({
-      identity, state: {} as RuntimeState,
+      identity, state: { initializeSessions: async () => undefined } as RuntimeState,
       capabilities: { execute } as unknown as CapabilityService,
       missionBroker: {} as MissionBrokerService,
       health: () => { throw new Error('Not used'); },
@@ -322,7 +322,7 @@ describe('runtime listener safety', () => {
     } as unknown as CapabilityService;
     handle = await startRuntimeServer({
       identity,
-      state: {} as RuntimeState,
+      state: { initializeSessions: async () => undefined } as RuntimeState,
       capabilities,
       missionBroker: {} as MissionBrokerService,
       health: () => ({
@@ -360,7 +360,7 @@ describe('runtime listener safety', () => {
     const controlSecret = 'test-control-secret-that-is-not-public';
     const context: RuntimeServerContext = {
       identity,
-      state: {} as RuntimeState,
+      state: { initializeSessions: async () => undefined } as RuntimeState,
       capabilities: {} as CapabilityService,
       missionBroker: {} as MissionBrokerService,
       health: () => ({
