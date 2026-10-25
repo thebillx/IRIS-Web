@@ -15,7 +15,7 @@ export function isPhase2GroupedTool(name: string): name is Phase2GroupedToolName
 }
 
 export function phase2GroupedToolDefinitions(): readonly Record<string, unknown>[] {
-  const sessionId = { sessionId: { type: 'string', description: 'Optional explicit IRIS runtime session UUID. Authenticated tunnel connectors may omit it and use project-bound direct context.' } };
+  const sessionId = { sessionId: { type: 'string', description: 'Existing IRIS session UUID from session_open; required in arguments or the matching x-iris-session-id header.' } };
   const requestId = { requestId: { type: 'string', minLength: 1, maxLength: 200, description: 'Required for durable workspace mutations; retries return the original result or fail closed for reconciliation.' } };
   const projectId = { projectId: { type: 'string', description: 'Registered project UUID; direct context is isolated to this project.' } };
   const workspaceId = { workspaceId: { type: 'string', description: 'Opaque IRIS workspace UUID, never a raw path.' } };

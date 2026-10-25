@@ -18,7 +18,7 @@ const binding: LifecycleGrantBinding = {
   workloadSourceTree: 'd'.repeat(40),
 };
 
-afterEach(async () => {
+afterEach(async () => { vi.restoreAllMocks();
   vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -66,8 +66,8 @@ describe('owner-bound runtime lifecycle grants', () => {
     await f.store.revoke(revoked.grantId);
     await expect(f.store.reserve(binding, 'runtime_on', { grantId: revoked.grantId, requestId: revoked.requestId, operationId: 'op-revoked' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
 
-    const expired = await f.store.issue({ ...f.spec, requestId: '55555555-5555-4555-8555-555555555555', expiresAt: new Date(Date.now() + 1).toISOString() });
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    const expired = await f.store.issue({ ...f.spec, requestId: '55555555-5555-4555-8555-555555555555', expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse(expired.expiresAt) + 1);
     await expect(f.store.reserve(binding, 'runtime_on', { grantId: expired.grantId, requestId: expired.requestId, operationId: 'op-expired' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
   });
 

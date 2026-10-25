@@ -168,7 +168,7 @@ test('Supervisor writer registration rejects an unrelated active operation lock'
   await assert.rejects(controller.registerWriter('supervisor'), { code: 'PRECONDITION_FAILED' });
 });
 
-test('Supervisor writer registration accepts only the matching runtime startup operation', { skip: process.platform !== 'darwin' }, async () => {
+for (const operation of ['runtime-on', 'runtime-restart']) test(`Supervisor writer registration accepts only the matching ${operation} startup operation`, { skip: process.platform !== 'darwin' }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-supervisor-startup-'));
   roots.push(root);
   await chmod(root, 0o700);
@@ -178,13 +178,15 @@ test('Supervisor writer registration accepts only the matching runtime startup o
   assert.equal(observed.state, 'live');
   const startupId = randomUUID();
   await writeFile(path.join(dataRoot, 'supervisor', 'state.json'), JSON.stringify({ startupOperations: [{ id: startupId, component: 'runtime', state: 'SPAWNING', dataRoot, supervisorPid: process.pid, supervisorStartMarker: observed.marker, pid: null }] }), { mode: 0o600 });
-  await writeFile(path.join(dataRoot, 'supervisor', 'operation.lock'), JSON.stringify({ schemaVersion: 1, pid: process.pid, operation: 'runtime-on', processStartMarker: observed.marker }), { mode: 0o600 });
+  await writeFile(path.join(dataRoot, 'supervisor', 'operation.lock'), JSON.stringify({ schemaVersion: 1, pid: process.pid, operation, processStartMarker: observed.marker }), { mode: 0o600 });
   const controller = await ProductionSafetyController.open({
     dataRoot,
     identity: { runtimeId: 'r09-supervisor-runtime', instanceId: 'r09-supervisor-instance', dataRoot },
     ownerAccessSecret: 'r09-owner',
     writerVerifier: createRuntimeWriterVerifier(dataRoot, startupId),
   });
+  const unrelated = await ProductionSafetyController.open({ dataRoot, identity: { runtimeId: 'r09-supervisor-runtime', instanceId: 'r09-supervisor-instance', dataRoot }, ownerAccessSecret: 'r09-owner', writerVerifier: createRuntimeWriterVerifier(dataRoot, randomUUID()) });
+  await assert.rejects(unrelated.registerWriter('supervisor'), { code: 'PRECONDITION_FAILED' });
   await controller.registerWriter('supervisor');
 });
 

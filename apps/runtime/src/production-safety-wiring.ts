@@ -140,7 +140,7 @@ async function inspectSupervisorBinding(dataRoot: string, startupIdInput?: strin
     || typeof startup.supervisorStartMarker !== 'string'
     || startup.supervisorPid !== lockValue.pid
     || startup.supervisorStartMarker !== lockValue.processStartMarker
-    || !['up', 'restart', 'runtime-on', 'automatic-recovery', 'replace-workload-source'].includes(lockValue.operation as string)) return null;
+    || !['up', 'restart', 'runtime-on', 'runtime-restart', 'automatic-recovery', 'replace-workload-source'].includes(lockValue.operation as string)) return null;
   if (startup.pid !== null && startup.pid !== undefined) {
     const current = observeProcessStart(process.pid);
     if (current.state !== 'live' || startup.pid !== process.pid || startup.processStartMarker !== current.marker) return null;

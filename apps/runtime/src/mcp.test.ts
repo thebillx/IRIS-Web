@@ -24,7 +24,7 @@ const execFileAsync = promisify(execFile);
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('local MCP transport and permission boundary', () => {
-  it('exposes authenticated runtime-owned mutation evidence without exposing it to owner MCP', async () => {
+  it('denies mutation evidence without current Runtime authority and preserves deployment and principal checks', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'iris-runtime-evidence-'));
     roots.push(root);
     const journal = new DurableMutationJournal(root, 'runtime-mutations');
@@ -36,7 +36,7 @@ describe('local MCP transport and permission boundary', () => {
     await journal.execute('runtime-evidence-1', fingerprint, async () => ({ path: 'value.txt', sha256: 'b'.repeat(64) }), binding, 'c'.repeat(64));
     const requestBody = { name: 'mutation_status', arguments: { requestId: 'runtime-evidence-1', fingerprint, operation: 'file_write', clientId: binding.clientId, sessionId: null, projectId: null, workspaceId: null, runtimeId: binding.runtimeId, instanceId: binding.instanceId, deploymentEpoch: binding.deploymentEpoch } };
     const response = await handleMcpRequest(rpc('tools/call', 1, requestBody, true, 'mutation_status', binding.clientId), {} as CapabilityService, undefined, undefined, 'tunnel-service', { runtimeId: binding.runtimeId, instanceId: 'instance-b', deploymentEpoch: 3 }, journal);
-    expect(await response.json()).toMatchObject({ result: { isError: false, structuredContent: { requestId: 'runtime-evidence-1', state: 'COMMITTED', evidence: { path: 'value.txt' } } } });
+    expect(await response.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'CONTROL_DENIED', message: 'Mutation evidence authority is unavailable' } } });
     const staleRuntime = await handleMcpRequest(rpc('tools/call', 1.5, requestBody, true, 'mutation_status', binding.clientId), {} as CapabilityService, undefined, undefined, 'tunnel-service', { runtimeId: 'runtime-b', instanceId: 'instance-b', deploymentEpoch: 3 }, journal);
     expect(await staleRuntime.json()).toMatchObject({ result: { isError: true, structuredContent: { code: 'AUTHORITY_CHANGED' } } });
     const staleDeployment = await handleMcpRequest(rpc('tools/call', 1.6, requestBody, true, 'mutation_status', binding.clientId), {} as CapabilityService, undefined, undefined, 'tunnel-service', { runtimeId: binding.runtimeId, instanceId: 'instance-b', deploymentEpoch: 4 }, journal);

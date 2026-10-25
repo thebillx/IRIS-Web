@@ -32,7 +32,7 @@ export function phase4GroupedToolDefinitions(): readonly Record<string, unknown>
       type: 'object',
       required: ['operation','projectId','workspaceId'],
       properties: {
-        sessionId: { type: 'string', description: 'Optional explicit IRIS runtime session UUID. Authenticated tunnel connectors may omit it and use project-bound direct context.' },
+        sessionId: { type: 'string', description: 'Existing IRIS session UUID from session_open; required in arguments or the matching x-iris-session-id header.' },
         projectId: { type: 'string', description: 'Registered project UUID; direct context is isolated to this project.' },
         workspaceId: { type: 'string', description: 'Opaque ACTIVE IRIS PRIMARY or WORKTREE workspace UUID.' },
         missionId: { type: 'string', description: 'Optional prepared CHATGPT mission identity; missionId/taskId/actionId must be supplied together.' },

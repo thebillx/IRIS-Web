@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadOrCreateOwnerAccessSecret } from './persistence.js';
 import {
   finalizeRecoveryPolicyOperation,
@@ -46,7 +46,7 @@ async function fixture() {
   return root;
 }
 
-afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.useRealTimers(); vi.restoreAllMocks(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
 describe('recovery authorization policy', () => {
   it('requires a real terminal predecessor for explicit rollover', async () => {
@@ -239,9 +239,10 @@ describe('recovery authorization policy', () => {
       allowedOperations: ['SUPERVISOR_BOOTSTRAP'],
       machineId: expiredMachineId,
       maxOperationCount: 1,
-      expiresAt: new Date(Date.now() + 300).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.parse(expired.expiresAt) + 1);
     await expect(reserveRecoveryPolicyOperation({
       dataRoot: expiredRoot,
       policyId: expired.policyId,
@@ -253,6 +254,7 @@ describe('recovery authorization policy', () => {
       machineId: expiredMachineId,
     })).rejects.toThrow('expired or revoked');
 
+    vi.useRealTimers();
     const revokedRoot = await fixture();
     const revokedMachineId = crypto.randomUUID();
     const revoked = await issueRecoveryAuthorizationPolicy({

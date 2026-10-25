@@ -15,7 +15,7 @@ export async function resolveDirectSessionIdentity(
   request: Request,
   state: RuntimeState | undefined,
   projectId: string,
-  _principal: McpPrincipal = 'owner',
+  _principal?: McpPrincipal,
   capturedJobTarget = false,
 ): Promise<DirectSessionIdentity> {
   const clientId = requiredHeader(request, CLIENT_ID_HEADER);

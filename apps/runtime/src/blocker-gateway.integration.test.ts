@@ -25,7 +25,7 @@ vi.mock('./lifecycle.js', async (importOriginal) => {
 const sourceRoot = path.resolve(import.meta.dirname, '../../..');
 const evidenceRoot = process.env.IRIS_GATEWAY_EVIDENCE_ROOT ?? path.join(os.tmpdir(), 'iris-blocker-gateway-evidence');
 const fixtures: Array<{ root: string; dataRoot: string; supervisor?: Supervisor; gateway?: SupervisorNativeControlHandle; localTransport?: boolean }> = [];
-afterEach(async () => {
+afterEach(async ({ task }) => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   for (const f of fixtures.splice(0)) {
@@ -38,7 +38,10 @@ afterEach(async () => {
       }
       const observed = await runtimeStatus(f.dataRoot);
       if (observed.state !== 'stopped') throw new Error(`Fixture Runtime remains ${observed.state}`);
-      await rm(f.root, { recursive: true, force: true });
+      if (task.result?.state === 'fail') {
+        await mkdir(evidenceRoot, { recursive: true });
+        await writeFile(path.join(evidenceRoot, `${path.basename(f.root)}-failed.json`), JSON.stringify({ root: f.root, dataRoot: f.dataRoot, test: task.name, terminalRuntime: observed.state, cleanup: 'verified; diagnostic files preserved' }, null, 2));
+      } else await rm(f.root, { recursive: true, force: true });
     } catch (error) {
       await mkdir(evidenceRoot, { recursive: true });
       await writeFile(path.join(evidenceRoot, 'preserved-fixture.json'), JSON.stringify({ root: f.root, dataRoot: f.dataRoot, error: String(error) }, null, 2));
@@ -135,7 +138,42 @@ it('forwards authenticated gateway mutations into an adopted real Runtime and re
   const sessionId = String(session.sessionId);
   const selected = await success('workspace_select', { sessionId, projectId: project.id, expectedRevision: 1, requestId: randomUUID() }, sessionId);
   const workspaceId = String(selected.currentWorkspaceId);
-  const job = await success('shell', { operation: 'start', sessionId, projectId: project.id, workspaceId, executable: 'node', argv: ['job.mjs'], cwd: '.', executionProfile: 'node-script', envOverrides: {}, timeoutMs: 10_000, requestId: randomUUID() }, sessionId);
+  const start = { operation: 'start', sessionId, projectId: project.id, workspaceId, executable: 'node', argv: ['job.mjs'], cwd: '.', executionProfile: 'node-script', envOverrides: {}, timeoutMs: 10_000, requestId: randomUUID() };
+  const startResponse = await call('shell', start, sessionId);
+  let job = startResponse.structuredContent;
+  let jobStartReconciled = false;
+  if (startResponse.isError) {
+    expect(job).toMatchObject({ error: { code: 'AUTHORITY_INDETERMINATE' } });
+    const evidenceDeadline = Date.now() + 10_000;
+    let downstreamCommitted = false;
+    const observations: unknown[] = [];
+    while (Date.now() < evidenceDeadline) {
+      const status = await call('workload_mutation_status', { operation: 'shell', arguments: start }, sessionId);
+      observations.push(status);
+      if (status.isError) expect(status.structuredContent).toMatchObject({ error: { code: 'AUTHORITY_INDETERMINATE' } });
+      else {
+        expect(status.structuredContent.requestId).toBe(start.requestId);
+        expect(status.structuredContent.state).toBe('RECONCILIATION_REQUIRED');
+        downstreamCommitted = status.structuredContent.downstreamState === 'COMMITTED';
+        if (downstreamCommitted) break;
+        expect(['PREPARED', 'APPLYING', 'RECONCILIATION_REQUIRED']).toContain(status.structuredContent.downstreamState);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await mkdir(evidenceRoot, { recursive: true });
+    await writeFile(path.join(evidenceRoot, `job-start-${start.requestId}.json`), JSON.stringify({ requestId: start.requestId, startResponse, observations }, null, 2));
+    expect(downstreamCommitted, 'Job admission must have authenticated committed evidence before explicit reconciliation').toBe(true);
+    const settled = await success('workload_mutation_status', { operation: 'shell', arguments: { ...start, reconcile: true } }, sessionId);
+    expect(settled.state).toBe('COMMITTED');
+    const evidence = settled.evidence as { isError: boolean; structuredContent: Record<string, unknown> };
+    expect(evidence.isError).toBe(false);
+    job = evidence.structuredContent;
+    jobStartReconciled = true;
+  }
+  const durableJobs = JSON.parse(await readFile(path.join(dataRoot, 'vnext-jobs.json'), 'utf8')) as { jobs: Array<{ requestId: string; jobId: string }> };
+  const matchingJobs = durableJobs.jobs.filter((record) => record.requestId === start.requestId);
+  expect(matchingJobs).toHaveLength(1);
+  expect(matchingJobs[0]!.jobId).toBe(job.jobId);
   const jobId = String(job.jobId);
   await success('workspace_select', { sessionId, projectId: projectB.id, expectedRevision: 2, requestId: randomUUID() }, sessionId);
   expect((await success('job', { operation: 'status', sessionId, projectId: project.id, jobId }, sessionId)).state).toBe('RUNNING');
@@ -229,7 +267,7 @@ it('forwards authenticated gateway mutations into an adopted real Runtime and re
   await success('supervisor_status', {});
   await success('supervisor_doctor', {});
   await mkdir(evidenceRoot, { recursive: true });
-  await writeFile(path.join(evidenceRoot, 'gateway-positive.json'), JSON.stringify({ sourceRoot, runtimeId, initialInstance: started.endpoint?.instanceId, replacementInstance: activeEndpoint.instanceId, runtimePid: activeEndpoint.pid, sessionId, successorId, jobId, missionId, lostResponseRequestId: write.requestId, gatewayPort: gateway.port, terminalRuntime: (await runtimeStatus(dataRoot)).state, transport: 'authenticated localhost fixture; no public tunnel created', noMutationReplay: true, sourceCleanlinessClaimed: false }, null, 2));
+  await writeFile(path.join(evidenceRoot, 'gateway-positive.json'), JSON.stringify({ sourceRoot, runtimeId, initialInstance: started.endpoint?.instanceId, replacementInstance: activeEndpoint.instanceId, runtimePid: activeEndpoint.pid, sessionId, successorId, jobId, jobStartRequestId: start.requestId, jobStartReconciled, missionId, lostResponseRequestId: write.requestId, gatewayPort: gateway.port, terminalRuntime: (await runtimeStatus(dataRoot)).state, transport: 'authenticated localhost fixture; no public tunnel created', noMutationReplay: true, sourceCleanlinessClaimed: false }, null, 2));
 }, 90_000);
 
 

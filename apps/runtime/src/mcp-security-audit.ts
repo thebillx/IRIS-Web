@@ -16,7 +16,7 @@ export function securityAuditToolDefinitions(): readonly Record<string, unknown>
       required: ['operation','projectId'],
       properties: {
         operation: { enum: OPERATIONS },
-        sessionId: { type: 'string', description: 'Optional explicit IRIS session. Authenticated tunnel connectors may omit it and use project-bound direct context.' },
+        sessionId: { type: 'string', description: 'Existing IRIS session UUID from session_open; required in arguments or the matching x-iris-session-id header.' },
         projectId: { type: 'string' },
         workspaceId: { type: 'string' },
         missionId: { type: 'string' },
