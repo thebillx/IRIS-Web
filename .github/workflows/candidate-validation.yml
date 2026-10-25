@@ -27,9 +27,9 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: e4b579fb4597927c004130781058e0634c552c9b
-      APPROVED_TARGET_TREE: 256bf0fe0b4dcd11f2dd1fdc97bb9f6021a2362d
-      BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
+      APPROVED_TARGET_SHA: cdf8e08be47296812981451cf41b7b7bf3efc719
+      APPROVED_TARGET_TREE: e62d56aeca01b27de794d359db018f7620164883
+      BASELINE_SHA: cece3be9962019dcaa4e0669b8e1ccfabcbd07a5
     steps:
       - name: Validate the approved target
         run: |
@@ -40,10 +40,10 @@ jobs:
           test "$TARGET_SHA" = "$APPROVED_TARGET_SHA"
           test "$TARGET_TREE" = "$APPROVED_TARGET_TREE"
 
-      - name: Check out the published integration branch
+      - name: Check out the dedicated CI validation branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: refs/heads/codex/one-iris-r03-r09-completion
+          ref: refs/heads/codex/job-runner-helper-path-ci-validation
           fetch-depth: 0
           persist-credentials: false
 
@@ -51,7 +51,7 @@ jobs:
         id: source
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/codex/one-iris-r03-r09-completion
+          git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/codex/job-runner-helper-path-ci-validation
           git checkout --detach "$TARGET_SHA"
           actual_sha="$(git rev-parse 'HEAD^{commit}')"
           actual_tree="$(git rev-parse 'HEAD^{tree}')"
@@ -59,8 +59,13 @@ jobs:
           test "$actual_tree" = "$TARGET_TREE"
           test -z "$(git status --porcelain --untracked-files=no)"
           git rev-parse --verify 'HEAD^1^{commit}' >/dev/null
+          test "$(git rev-parse "$TARGET_SHA^1")" = "$BASELINE_SHA"
           test "$(git rev-parse "$BASELINE_SHA^{commit}")" = "$BASELINE_SHA"
+          test "$(git rev-parse "$BASELINE_SHA^{tree}")" = "ea9187c980a607dc1b721db39987fa16ec132e94"
           git merge-base --is-ancestor "$BASELINE_SHA" "$TARGET_SHA"
+          expected_files="$(printf '%s\n' apps/runtime/job-runner.mjs apps/runtime/src/job-admission.test.ts | LC_ALL=C sort)"
+          actual_files="$(git diff-tree --no-commit-id --name-only -r "$TARGET_SHA" | LC_ALL=C sort)"
+          test "$actual_files" = "$expected_files"
           printf 'Validated commit: `%s`\nValidated tree: `%s`\n' "$actual_sha" "$actual_tree" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Node.js 24
