@@ -138,3 +138,26 @@ Repeating an identical install or uninstall is safe and does not spawn a
 duplicate Supervisor. Build the runtime before installing the agent.
 Installation is never performed implicitly by `iris up`, and LaunchAgent
 KeepAlive never activates the workload.
+
+A fresh ONE installation first runs explicit credential migration and `iris
+setup --one-tunnel-id <id>`. Setup creates one machine-bound public connector;
+it does not install a LaunchAgent or initialize login authority. The owner then
+runs `iris launchd authorize-install --source-sha <sha> --source-tree <tree>
+--expires-at <time> --tunnel-executable <absolute-path>` with local confirmation
+and the existing private Owner credential. Enrollment signs a typed `ABSENT`
+binding with null before-images only after proving the exact service, metadata,
+and both plists are absent. It binds the current UID/domain, source Git identity,
+Node and runtime entrypoint bytes, machine, ONE tunnel/profile, tunnel executable
+bytes, and control-only login intent. It grants one Supervisor bootstrap.
+`iris launchd install --recovery-policy-id <id> --request-id <uuid>
+--source-sha <sha> --source-tree <tree>` consumes that authority. Login restoration
+keeps Runtime OFF and requires the authenticated committed enrollment.
+
+An uncertain initial bootstrap retains its signed operation and ownership
+artifacts. `iris launchd reconcile-install` with the same authorization arguments
+and local Owner authentication can record a proven matching success or proven
+absence; it does not bootstrap again. Conflicting or unknown evidence remains
+unresolved. Reinstall requires an absent owned service and fresh explicit
+policy rollover; machine, connector, credential, and signed historical records
+are preserved. Later source changes use the existing governed migration path
+and retain the immutable initial enrollment.

@@ -11,6 +11,8 @@ import {
   finalizeRecoveryPolicyOperation,
   issueRecoveryAuthorizationPolicy,
   readRecoveryAuthorizationPolicy,
+  readRecoveryPolicyOperation,
+  resolveInitialInstallOperation,
   reserveRecoveryPolicyOperation,
   reconcileRecoveryPolicyLock,
   resolveFailedAdminTunnelStart,
@@ -456,5 +458,55 @@ describe('recovery authorization policy', () => {
     holder.stdin?.end();
     if (holder.exitCode === null && holder.signalCode === null) await once(holder, 'exit');
     await expect(issueRecoveryAuthorizationPolicy(policyInput)).resolves.toMatchObject({ state: 'ISSUED' });
+  });
+});
+
+
+describe('typed absent-state recovery authority', () => {
+  async function initialPolicy() {
+    const dataRoot = await fixture();
+    const uid = process.getuid!();
+    const binding = { ...sourceBinding, executableSha256: 'e'.repeat(64) };
+    const initialInstall = { kind: 'ABSENT' as const, uid, domain: `gui/${uid}`, label: 'com.iris.supervisor' as const, registeredPlist: '/tmp/home/Library/LaunchAgents/com.iris.supervisor.plist', connectorId: 'iris-full' as const, tunnelId: 'tunnel_0123456789abcdef0123456789abcdef', managedProfilePath: '/tmp/root/managed/full.json', tunnelExecutable: '/tmp/tunnel', tunnelExecutableSha256: 'f'.repeat(64), startup: 'CONTROL_ONLY' as const };
+    const input = { dataRoot, sourceBindings: [binding], machineId: crypto.randomUUID(), initialInstall, beforeMetadataSha256: null, beforePlistSha256: null, allowedOperations: ['SUPERVISOR_BOOTSTRAP' as const], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    return { dataRoot, binding, initialInstall, input };
+  }
+
+  it('accepts null before-images only with exact absent bootstrap scope', async () => {
+    const f = await initialPolicy();
+    const untyped = { ...f.input };
+    Reflect.deleteProperty(untyped, 'initialInstall');
+    await expect(issueRecoveryAuthorizationPolicy(untyped)).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issueRecoveryAuthorizationPolicy({ ...f.input, beforeMetadataSha256: metadataSha })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issueRecoveryAuthorizationPolicy({ ...f.input, maxOperationCount: 2 })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issueRecoveryAuthorizationPolicy({ ...f.input, allowedOperations: ['SOURCE_MIGRATION'] })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    const policy = await issueRecoveryAuthorizationPolicy(f.input);
+    const operation = { dataRoot: f.dataRoot, policyId: policy.policyId, operation: 'SUPERVISOR_BOOTSTRAP' as const, requestId: crypto.randomUUID(), ...f.binding, machineId: f.input.machineId, initialInstall: f.initialInstall, beforeMetadataSha256: null, beforePlistSha256: null };
+    await expect(reserveRecoveryPolicyOperation({ ...operation, initialInstall: { ...f.initialInstall, tunnelExecutableSha256: 'a'.repeat(64) } })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(reserveRecoveryPolicyOperation({ ...operation, initialInstall: { ...f.initialInstall, uid: f.initialInstall.uid + 1, domain: `gui/${f.initialInstall.uid + 1}` } })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(reserveRecoveryPolicyOperation({ ...operation, operation: 'SOURCE_MIGRATION' })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    const reservation = await reserveRecoveryPolicyOperation(operation);
+    await finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'RECONCILIATION_REQUIRED' });
+    await expect(finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'COMMITTED' })).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+    await resolveInitialInstallOperation({ ...operation, ...reservation, state: 'COMMITTED' });
+    await expect(readRecoveryPolicyOperation({ ...operation, ...reservation })).resolves.toMatchObject({ state: 'COMMITTED' });
+  });
+
+  it('authenticates immutable initial provenance after a normal hashed-policy rollover', async () => {
+    const f = await initialPolicy();
+    const first = await issueRecoveryAuthorizationPolicy(f.input);
+    const operation = { dataRoot: f.dataRoot, policyId: first.policyId, operation: 'SUPERVISOR_BOOTSTRAP' as const, requestId: crypto.randomUUID(), ...f.binding, machineId: f.input.machineId, initialInstall: f.initialInstall, beforeMetadataSha256: null, beforePlistSha256: null };
+    const reservation = await reserveRecoveryPolicyOperation(operation);
+    await finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'COMMITTED' });
+    await revokeRecoveryAuthorizationPolicy(f.dataRoot);
+    const original = JSON.parse(await readFile(recoveryPolicyPath(f.dataRoot), 'utf8'));
+    await issueRecoveryAuthorizationPolicy({ dataRoot: f.dataRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: f.input.expiresAt, supersedesPolicyId: first.policyId });
+    const rolled = JSON.parse(await readFile(recoveryPolicyPath(f.dataRoot), 'utf8'));
+    expect(rolled.retiredPolicies[0]).toEqual(original);
+    expect(rolled.initialInstall).toBeUndefined();
+    await expect(readRecoveryPolicyOperation({ ...operation, ...reservation })).resolves.toMatchObject({ state: 'COMMITTED' });
+    rolled.retiredPolicies[0].initialInstall.startup = 'WORKLOAD';
+    await writeFile(recoveryPolicyPath(f.dataRoot), JSON.stringify(rolled), { mode: 0o600 });
+    await expect(readRecoveryPolicyOperation({ ...operation, ...reservation })).rejects.toThrow();
   });
 });

@@ -11,10 +11,12 @@ import { RUNTIME_DATA_ENV } from './data-root.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
 import { inspectRegistrationRoot } from './project-path.js';
 import { PROTECTED_REFERENCE_ROOT_ENV } from './permissions.js';
-import { readOwnerAccessSecret } from './persistence.js';
+import { loadOrCreateOwnerAccessSecret, readOwnerAccessSecret } from './persistence.js';
+import { readControlPlaneApiKey } from './credentials.js';
+import { readConnectorRegistry } from './connector-registry.js';
 import { readMachineId } from './machine-identity.js';
 import { observeProcessExecutable, observeProcessStart, type ProcessStartObservation } from './macos-safety.js';
-import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, reserveRecoveryPolicyOperation } from './recovery-policy.js';
+import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, readRecoveryPolicyOperation, resolveInitialInstallOperation, reserveRecoveryPolicyOperation, validInitialInstallBinding, type InitialInstallBinding, type RecoveryPolicyOperationInput, type RecoveryPolicyPublicRecord } from './recovery-policy.js';
 
 const execFileAsync = promisify(execFile);
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
@@ -202,6 +204,25 @@ interface LegacyMigrationEvidence {
   readonly disabledStateBeforeMigration?: DisabledState;
 }
 
+export interface InitialInstallProvenance extends RecoveryPolicyOperationInput {
+  readonly transactionId: string;
+  readonly initialInstall: InitialInstallBinding;
+}
+
+export interface InitialLaunchAgentPolicyInput {
+  readonly dataRoot: string;
+  readonly sourceRoot: string;
+  readonly controlScript: string;
+  readonly executable: string;
+  readonly executableArguments: readonly string[];
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly tunnelExecutable: string;
+  readonly expiresAt: string;
+  readonly protectedReferenceRoot?: string;
+  readonly supersedesPolicyId?: string;
+}
+
 interface LaunchAgentMetadata {
   readonly schemaVersion: 3;
   readonly label: typeof LAUNCH_AGENT_LABEL;
@@ -221,6 +242,7 @@ interface LaunchAgentMetadata {
   readonly processId?: number;
   readonly processStartMarker?: string;
   readonly legacyMigration?: LegacyMigrationEvidence;
+  readonly initialInstall?: InitialInstallProvenance;
 }
 
 interface LaunchAgentMetadataRecord {
@@ -782,7 +804,9 @@ async function migrateLaunchAgentSourceUnlocked(
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Legacy LaunchAgent binding does not match its durable metadata');
     }
   } else {
-    if (supersededMigration === undefined
+    if (currentRecord.metadata.plist !== paths.plist || currentRecord.metadata.registeredPlist !== paths.registeredPlist || currentRecord.metadata.plistSha256 !== sha256(privatePlist.content) || currentRecord.metadata.state === 'RECONCILIATION_REQUIRED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Schema-3 source binding before-images changed');
+    if (currentRecord.metadata.initialInstall !== undefined) await verifyInitialInstallProvenance(currentRecord.metadata, paths, uid);
+    else if (supersededMigration === undefined
       || supersededMigration.targetSourceRoot !== currentRecord.metadata.sourceRoot
       || supersededMigration.targetControlScript !== currentRecord.metadata.controlScript
       || supersededMigration.targetExecutable !== currentRecord.metadata.executable
@@ -791,8 +815,7 @@ async function migrateLaunchAgentSourceUnlocked(
       || supersededMigration.dataRoot !== canonicalDataRoot
       || currentRecord.metadata.plist !== paths.plist
       || currentRecord.metadata.registeredPlist !== paths.registeredPlist
-      || currentRecord.metadata.plistSha256 !== sha256(privatePlist.content)
-      || currentRecord.metadata.state === 'RECONCILIATION_REQUIRED') {
+      || currentRecord.metadata.plistSha256 !== sha256(privatePlist.content)) {
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Schema-3 source binding is not an exact committed migration target');
     }
   }
@@ -853,6 +876,7 @@ async function migrateLaunchAgentSourceUnlocked(
     disabledBeforeInstall: disabledStateBeforeMigration === 'EXPLICIT_DISABLED',
     disabledStateBeforeInstall: disabledStateBeforeMigration,
     unresolvedReason: null,
+    ...(currentRecord.metadata.schemaVersion === 3 && currentRecord.metadata.initialInstall !== undefined ? { initialInstall: currentRecord.metadata.initialInstall } : {}),
     ...(currentRecord.metadata.schemaVersion === 3
       ? currentRecord.metadata.legacyMigration === undefined ? {} : { legacyMigration: currentRecord.metadata.legacyMigration }
       : { legacyMigration: {
@@ -1029,6 +1053,189 @@ async function verifyCommittedMigration(paths: LaunchdPaths, record: LaunchAgent
   });
 }
 
+export async function issueInitialLaunchAgentPolicy(
+  input: InitialLaunchAgentPolicyInput,
+  ownerAuthorization: string,
+  dependencies: LaunchdDependencies = {},
+): Promise<RecoveryPolicyPublicRecord> {
+  const uid = launchdUid(dependencies);
+  const dataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(dataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, async () => {
+    const owner = await readControlPlaneApiKey(dataRoot);
+    const supplied = Buffer.from(ownerAuthorization);
+    const expected = Buffer.from(`Bearer ${owner ?? ''}`);
+    if (owner === null || supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new RuntimeError('CONTROL_DENIED', 'Initial installation requires the existing local Owner credential');
+    assertSupportedNodeVersion();
+    const sourceRoot = await requireCanonicalDirectory(input.sourceRoot, 'IRIS source root', uid, false);
+    const controlScript = await requireCanonicalFile(input.controlScript, 'IRIS control script', uid);
+    if (sourceRootForControlScript(controlScript) !== sourceRoot) throw new RuntimeError('CONTROL_DENIED', 'Control script is outside the authorized source');
+    const executable = await realpath(input.executable);
+    if (executable !== await realpath(canonicalNodeRuntime().path)) throw new RuntimeError('CONTROL_DENIED', 'Initial installation requires the supported Node executable');
+    await requireSourceGitIdentity(sourceRoot, input.sourceSha, input.sourceTree);
+    const entries = await requireTargetRuntimeEntries(input.executableArguments, uid);
+    const machineId = await readMachineId(dataRoot);
+    if (machineId === null) throw new RuntimeError('CONTROL_DENIED', 'Initial installation requires an explicitly initialized machine identity');
+    const initialInstall = await inspectInitialInstallBinding(dataRoot, input.tunnelExecutable, dependencies);
+    const protectedReferenceRoot = input.protectedReferenceRoot === undefined ? undefined : await requireCanonicalDirectory(input.protectedReferenceRoot, 'IRIS protected reference root', uid, false);
+    const executableSha256 = await hashCanonicalFile(executable, 'Reviewed control executable', uid);
+    // Only authenticated initial enrollment initializes the existing signing credential.
+    await loadOrCreateOwnerAccessSecret(dataRoot);
+    return issueRecoveryAuthorizationPolicy({
+      dataRoot, machineId, initialInstall, beforeMetadataSha256: null, beforePlistSha256: null,
+      sourceBindings: [{ sourceRoot, controlScript, executable, executableSha256, executableArguments: input.executableArguments, sourceSha: input.sourceSha, sourceTree: input.sourceTree, ...entries }],
+      allowedOperations: ['SUPERVISOR_BOOTSTRAP'], maxOperationCount: 1, expiresAt: input.expiresAt,
+      ...(protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot }),
+      ...(input.supersedesPolicyId === undefined ? {} : { supersedesPolicyId: input.supersedesPolicyId }),
+    });
+  });
+}
+
+async function inspectInitialInstallBinding(dataRoot: string, tunnelExecutableInput: string, dependencies: LaunchdDependencies): Promise<InitialInstallBinding> {
+  const uid = launchdUid(dependencies);
+  const paths = launchdPaths(dataRoot, dependencies.homeDirectory ?? os.homedir());
+  const domain = launchdDomain(dependencies);
+  const launchctl = dependencies.launchctl ?? systemLaunchctl;
+  await requireGuiDomain(domain, launchctl);
+  if ((await observeLaunchAgent(dependencies)).state !== 'ABSENT') throw new RuntimeError('CONTROL_DENIED', 'Initial installation requires an absent exact LaunchAgent service');
+  if (await observeDisabledState(domain, launchctl) === 'UNKNOWN') throw new RuntimeError('CONTROL_DENIED', 'Initial installation disabled state is unknown');
+  for (const filename of [paths.metadata, paths.plist, paths.registeredPlist]) {
+    if ((await inspectOwnedFile(filename, 'Initial installation before-image', uid)).state !== 'missing') throw new RuntimeError('CONTROL_DENIED', 'Initial installation requires absent metadata and private/registered plists');
+  }
+  const migration = await readSourceMigrationRecord(paths.sourceBindingMigration, uid);
+  if (migration !== null && migration.state !== 'COMMITTED') throw new RuntimeError('CONTROL_DENIED', 'Incomplete source migration requires reconciliation before initial installation');
+  const registry = await readConnectorRegistry(dataRoot);
+  const machineId = await readMachineId(dataRoot);
+  const connector = registry?.connectors[0];
+  if (registry === null || registry.admin !== null || registry.connectors.length !== 1 || connector?.connectorId !== 'iris-full' || connector.label !== 'IRIS' || machineId === null || connector.machineId !== machineId) throw new RuntimeError('CONTROL_DENIED', 'Initial installation requires one machine-bound ONE connector');
+  const tunnelExecutable = await requireCanonicalFile(tunnelExecutableInput, 'Reviewed tunnel executable', uid);
+  return { kind: 'ABSENT', uid, domain, label: LAUNCH_AGENT_LABEL, registeredPlist: paths.registeredPlist, connectorId: 'iris-full', tunnelId: connector.tunnelId, managedProfilePath: connector.managedProfilePath, tunnelExecutable, tunnelExecutableSha256: await hashCanonicalFile(tunnelExecutable, 'Reviewed tunnel executable', uid), startup: 'CONTROL_ONLY' };
+}
+
+export type InitialLaunchAgentEnrollmentState =
+  | { readonly state: 'ABSENT' }
+  | { readonly state: 'PENDING' }
+  | { readonly state: 'COMMITTED'; readonly enrollment: InitialInstallProvenance; readonly sourceBinding: { readonly sourceRoot: string; readonly controlScript: string; readonly executable: string; readonly executableArguments: readonly string[] } };
+
+export async function readInitialLaunchAgentEnrollmentState(dataRoot: string, dependencies: LaunchdDependencies = {}): Promise<InitialLaunchAgentEnrollmentState> {
+  const uid = launchdUid(dependencies);
+  const canonical = await requireCanonicalDirectory(dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonical, dependencies.homeDirectory ?? os.homedir());
+  const record = await readLaunchAgentMetadata(paths.metadata, uid);
+  if (record === null || record.metadata.schemaVersion !== 3 || record.metadata.initialInstall === undefined) return { state: 'ABSENT' };
+  const operation = await readRecoveryPolicyOperation(record.metadata.initialInstall);
+  if (operation.state === 'FAILED') throw new RuntimeError('CONTROL_DENIED', 'Initial installation was proven failed');
+  if (record.metadata.state !== 'READY' || operation.state !== 'COMMITTED') return { state: 'PENDING' };
+  await verifyInitialInstallProvenance(record.metadata, paths, uid);
+  const { sourceRoot, controlScript, executable, executableArguments } = record.metadata;
+  return { state: 'COMMITTED', enrollment: record.metadata.initialInstall, sourceBinding: { sourceRoot, controlScript, executable, executableArguments } };
+}
+
+export async function readInitialLaunchAgentEnrollment(dataRoot: string, dependencies: LaunchdDependencies = {}): Promise<InitialInstallProvenance | null> {
+  const result = await readInitialLaunchAgentEnrollmentState(dataRoot, dependencies);
+  return result.state === 'COMMITTED' ? result.enrollment : null;
+}
+
+async function verifyInitialInstallProvenance(metadata: LaunchAgentMetadata, paths: LaunchdPaths, uid: number): Promise<void> {
+  const proof = metadata.initialInstall;
+  if (proof === undefined || !validInitialInstallProvenance(proof) || proof.dataRoot !== metadata.dataRoot || proof.initialInstall.uid !== uid || proof.initialInstall.domain !== metadata.domain || proof.initialInstall.registeredPlist !== paths.registeredPlist) throw new RuntimeError('CONTROL_DENIED', 'Initial installation provenance does not match the current source binding');
+  await assertRecoveryPolicyOperationCommitted(proof);
+  const sameSource = proof.sourceRoot === metadata.sourceRoot && proof.controlScript === metadata.controlScript && proof.executable === metadata.executable && JSON.stringify(proof.executableArguments) === JSON.stringify(metadata.executableArguments);
+  if (metadata.executable !== proof.executable || await hashCanonicalFile(metadata.executable, 'Reviewed control executable', uid) !== proof.executableSha256) throw new RuntimeError('CONTROL_DENIED', 'Initial installation executable changed');
+  if (sameSource) {
+    await requireSourceGitIdentity(proof.sourceRoot, proof.sourceSha, proof.sourceTree);
+    const entries = await requireTargetRuntimeEntries(proof.executableArguments, uid);
+    if (entries.runtimePreflightSha256 !== proof.runtimePreflightSha256 || entries.runtimeLoaderSha256 !== proof.runtimeLoaderSha256) throw new RuntimeError('CONTROL_DENIED', 'Initial installation entrypoints changed');
+    const plist = renderLaunchAgent(metadata.dataRoot, proof.executable, proof.controlScript, proof.executableArguments, proof.protectedReferenceRoot);
+    requireMetadataBinding(metadata, { schemaVersion: 3, label: LAUNCH_AGENT_LABEL, domain: proof.initialInstall.domain, dataRoot: metadata.dataRoot, sourceRoot: proof.sourceRoot, executable: proof.executable, controlScript: proof.controlScript, executableArguments: proof.executableArguments, plist: paths.plist, registeredPlist: paths.registeredPlist, plistSha256: sha256(plist) });
+    await requirePublishedContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
+    const registered = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+    if (registered.state === 'invalid' || registered.state === 'ok' && registered.content !== plist) throw new RuntimeError('CONTROL_DENIED', 'Initial installation registered plist changed');
+  }
+  else {
+    const migration = await readSourceMigrationRecord(paths.sourceBindingMigration, uid);
+    if (migration === null || migration.state !== 'COMMITTED') throw new RuntimeError('CONTROL_DENIED', 'Initial installation source changed without committed migration');
+    const approval = await readSourceApprovalRecord(paths.sourceBindingApproval, uid);
+    const secret = await readOwnerAccessSecret(metadata.dataRoot);
+    if (approval === null || secret === null || approval.state !== 'CONSUMED' || approval.approvalId !== migration.approvalId || approval.requestId !== migration.requestId || !verifySourceApproval(approval, secret)
+      || !approvalMatches(approval, { sourceRoot: migration.targetSourceRoot, controlScript: migration.targetControlScript, executable: migration.targetExecutable, domain: migration.domain, beforeMetadataSha256: migration.beforeMetadataSha256, beforePlistSha256: migration.beforePlistSha256, runtimePreflightSha256: migration.runtimePreflightSha256, runtimeLoaderSha256: migration.runtimeLoaderSha256, ...(migration.protectedReferenceRoot === undefined ? {} : { protectedReferenceRoot: migration.protectedReferenceRoot }) }, { ...approval, dataRoot: metadata.dataRoot, requestId: migration.requestId, sourceSha: migration.targetSourceSha, sourceTree: migration.targetSourceTree, executableArguments: migration.targetExecutableArguments })) throw new RuntimeError('CONTROL_DENIED', 'Initial installation source migration is not authenticated');
+    await verifyCommittedMigration(paths, migration, uid);
+    await requireSourceGitIdentity(metadata.sourceRoot, migration.targetSourceSha, migration.targetSourceTree);
+  }
+  if (await readMachineId(metadata.dataRoot) !== proof.machineId) throw new RuntimeError('CONTROL_DENIED', 'Initial installation machine changed');
+  await verifyInitialTransport(metadata.dataRoot, proof.initialInstall, uid);
+}
+
+export async function reconcileInitialLaunchAgentInstall(dataRoot: string, authorization: LaunchAgentBootstrapAuthorization, ownerAuthorization: string, dependencies: LaunchdDependencies = {}): Promise<{ readonly state: 'COMMITTED' | 'FAILED' }> {
+  const uid = launchdUid(dependencies);
+  const canonical = await requireCanonicalDirectory(dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonical, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, async () => {
+    const owner = await readControlPlaneApiKey(canonical);
+    const expected = Buffer.from(`Bearer ${owner ?? ''}`);
+    const supplied = Buffer.from(ownerAuthorization);
+    if (owner === null || expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) throw new RuntimeError('CONTROL_DENIED', 'Initial installation reconciliation requires the local Owner credential');
+    const record = await readLaunchAgentMetadata(paths.metadata, uid);
+    const metadata = record?.metadata.schemaVersion === 3 ? record.metadata : null;
+    let proof = metadata?.initialInstall;
+    if (metadata === null) {
+      const policy = await readRecoveryAuthorizationPolicy(canonical);
+      const entry = policy?.policyId === authorization.recoveryPolicyId ? policy.operations.find((candidate) => candidate.requestId === authorization.requestId && candidate.operation === 'SUPERVISOR_BOOTSTRAP') : undefined;
+      if (entry?.initialInstall !== undefined && typeof entry.machineId === 'string' && typeof entry.executableSha256 === 'string') proof = { ...entry, dataRoot: canonical, policyId: authorization.recoveryPolicyId, initialInstall: entry.initialInstall, machineId: entry.machineId, executableSha256: entry.executableSha256, protectedReferenceRoot: entry.protectedReferenceRoot ?? undefined };
+    }
+    if (proof === undefined || proof.policyId !== authorization.recoveryPolicyId || proof.requestId !== authorization.requestId || proof.sourceSha !== authorization.sourceSha || proof.sourceTree !== authorization.sourceTree) throw new RuntimeError('CONTROL_DENIED', 'Initial installation reconciliation identity does not match');
+    const operation = await readRecoveryPolicyOperation(proof);
+    if (!['RESERVED', 'RECONCILIATION_REQUIRED', 'COMMITTED', 'FAILED'].includes(operation.state)) throw new RuntimeError('CONTROL_DENIED', 'Initial installation outcome is already terminal');
+    await requireSourceGitIdentity(proof.sourceRoot, proof.sourceSha, proof.sourceTree);
+    if (await readMachineId(canonical) !== proof.machineId) throw new RuntimeError('CONTROL_DENIED', 'Initial installation machine changed');
+    await verifyInitialTransport(canonical, proof.initialInstall, uid);
+    if (await hashCanonicalFile(proof.executable, 'Reviewed control executable', uid) !== proof.executableSha256) throw new RuntimeError('CONTROL_DENIED', 'Initial installation executable changed');
+    const entries = await requireTargetRuntimeEntries(proof.executableArguments, uid);
+    if (entries.runtimePreflightSha256 !== proof.runtimePreflightSha256 || entries.runtimeLoaderSha256 !== proof.runtimeLoaderSha256) throw new RuntimeError('CONTROL_DENIED', 'Initial installation entrypoints changed');
+    if (metadata === null) {
+      if (operation.state === 'COMMITTED') throw new RuntimeError('CONTROL_DENIED', 'Committed initial installation metadata is missing');
+      await inspectInitialInstallBinding(canonical, proof.initialInstall.tunnelExecutable, dependencies).then((observed) => {
+        if (JSON.stringify(observed) !== JSON.stringify(proof!.initialInstall)) throw new RuntimeError('CONTROL_DENIED', 'Initial installation absence binding changed');
+      });
+      if (operation.state !== 'FAILED') await resolveInitialInstallOperation({ ...proof, state: 'FAILED' });
+      return { state: 'FAILED' };
+    }
+    const plist = renderLaunchAgent(canonical, proof.executable, proof.controlScript, proof.executableArguments, proof.protectedReferenceRoot);
+    requireMetadataBinding(metadata, { schemaVersion: 3, label: LAUNCH_AGENT_LABEL, domain: proof.initialInstall.domain, dataRoot: canonical, sourceRoot: proof.sourceRoot, executable: proof.executable, controlScript: proof.controlScript, executableArguments: proof.executableArguments, plist: paths.plist, registeredPlist: paths.registeredPlist, plistSha256: sha256(plist) });
+    const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+    if (privatePlist.state === 'invalid' || privatePlist.state === 'ok' && privatePlist.content !== plist) throw new RuntimeError('CONTROL_DENIED', 'Initial installation private plist changed');
+    const observation = await observeLaunchAgent(dependencies);
+    const launchctl = dependencies.launchctl ?? systemLaunchctl;
+    if (observation.state === 'LOADED') {
+      if (operation.state === 'FAILED') throw new RuntimeError('CONTROL_DENIED', 'A failed installation cannot be reconciled as committed');
+      if (privatePlist.state !== 'ok') throw new RuntimeError('CONTROL_DENIED', 'Initial installation private plist is unavailable');
+      await requirePublishedContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
+      requireLiveLaunchAgentIdentity(observation.stdout, metadata);
+      const live = await requireLiveProcessIdentity(observation.stdout, metadata, dependencies);
+      const disabled = await observeDisabledState(metadata.domain, launchctl);
+      if (disabled === 'UNKNOWN' || disabled === 'EXPLICIT_DISABLED') throw new RuntimeError('CONTROL_DENIED', 'Initial installation persistence is not proven');
+      const stable = await observeLaunchAgent(dependencies);
+      if (stable.state !== 'LOADED') throw new RuntimeError('CONTROL_DENIED', 'Initial installation process exited during reconciliation');
+      requireLiveLaunchAgentIdentity(stable.stdout, metadata);
+      const stableProcess = await requireLiveProcessIdentity(stable.stdout, metadata, dependencies);
+      if (stableProcess.pid !== live.pid || stableProcess.processStartMarker !== live.processStartMarker) throw new RuntimeError('CONTROL_DENIED', 'Initial installation process changed during reconciliation');
+      await writeLaunchAgentMetadata(paths.metadata, { ...metadata, state: 'READY', unresolvedReason: null, processId: live.pid, processStartMarker: live.processStartMarker }, uid);
+      await resolveInitialInstallOperation({ ...proof, state: 'COMMITTED' });
+      return { state: 'COMMITTED' };
+    }
+    if (operation.state === 'COMMITTED') throw new RuntimeError('CONTROL_DENIED', 'A committed installation cannot be reconciled as failed');
+    const registered = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+    if (registered.state === 'invalid' || registered.state === 'ok' && registered.content !== plist) throw new RuntimeError('CONTROL_DENIED', 'Initial installation registration changed');
+    await restoreDisabledState(storedDisabledState(metadata), metadata.domain, `${metadata.domain}/${metadata.label}`, launchctl);
+    // Keep the signed outcome and original proof until exact owned artifacts are removed.
+    if (registered.state === 'ok') await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+    await removeOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+    if (operation.state !== 'FAILED') await resolveInitialInstallOperation({ ...proof, state: 'FAILED' });
+    await removeOwnedFile(paths.metadata, 'IRIS LaunchAgent metadata', uid);
+    return { state: 'FAILED' };
+  });
+}
+
 export async function installLaunchAgent(
   dataRoot: string,
   requestedExecutable: string,
@@ -1083,46 +1290,39 @@ async function installLaunchAgentUnlocked(
   const launchctl = dependencies.launchctl ?? systemLaunchctl;
   await requireGuiDomain(domain, launchctl);
 
-  const committedMigration = await readSourceMigrationRecord(paths.sourceBindingMigration, uid);
-  if (committedMigration === null) {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap requires a committed source migration');
-  }
-  if (committedMigration !== null) {
-    if (committedMigration.state !== 'COMMITTED') {
-      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An incomplete source migration requires reconciliation before installation');
-    }
-    const argumentsMatch = committedMigration.targetExecutableArguments.length === executableArguments.length
-      && committedMigration.targetExecutableArguments.every((argument, index) => argument === executableArguments[index]);
-    if (committedMigration.domain !== domain
-      || committedMigration.dataRoot !== canonicalDataRoot
-      || committedMigration.targetSourceRoot !== sourceRoot
-      || committedMigration.targetControlScript !== canonicalControlScript
-      || committedMigration.targetExecutable !== executable
-      || !argumentsMatch
-      || (committedMigration.protectedReferenceRoot ?? null) !== (canonicalProtectedReferenceRoot ?? null)) {
-      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration does not authorize the requested LaunchAgent binding');
-    }
-    if (committedMigration.targetSourceSha !== bootstrapAuthorization.sourceSha || committedMigration.targetSourceTree !== bootstrapAuthorization.sourceTree) {
-      throw new RuntimeError('CONTROL_DENIED', 'Supervisor bootstrap source identity does not match the committed migration');
-    }
-    await requireSourceGitIdentity(committedMigration.targetSourceRoot, committedMigration.targetSourceSha, committedMigration.targetSourceTree);
-    await verifyCommittedMigration(paths, committedMigration, uid);
-  }
-
-  const plist = renderLaunchAgent(canonicalDataRoot, executable, canonicalControlScript, executableArguments, canonicalProtectedReferenceRoot);
   const existingRecord = await readLaunchAgentMetadata(paths.metadata, uid);
-  if (existingRecord === null || existingRecord.metadata.schemaVersion !== 3) {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap requires a committed schema-3 source binding');
+  const existingMetadata = existingRecord?.metadata.schemaVersion === 3 ? existingRecord.metadata : null;
+  const policy = await readRecoveryAuthorizationPolicy(canonicalDataRoot);
+  const initialInstall = policy?.policyId === bootstrapAuthorization.recoveryPolicyId ? policy.initialInstall : undefined;
+  const initial = existingRecord === null && initialInstall !== undefined;
+  const plist = renderLaunchAgent(canonicalDataRoot, executable, canonicalControlScript, executableArguments, canonicalProtectedReferenceRoot);
+  let beforeMetadataSha256: string | null;
+  let beforePlistSha256: string | null;
+  if (initial) {
+    const observedBinding = await inspectInitialInstallBinding(canonicalDataRoot, initialInstall.tunnelExecutable, dependencies);
+    if (JSON.stringify(observedBinding) !== JSON.stringify(initialInstall)) throw new RuntimeError('CONTROL_DENIED', 'Initial installation binding changed after authorization');
+    beforeMetadataSha256 = null;
+    beforePlistSha256 = null;
+  } else {
+    if (existingMetadata === null) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap requires a committed source migration or explicit absent-state installation authority');
+    if (['UNINSTALLING', 'INSTALLING', 'RECONCILIATION_REQUIRED'].includes(existingMetadata.state)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An interrupted LaunchAgent operation requires reconciliation');
+    if (existingMetadata.initialInstall !== undefined) {
+      await verifyInitialInstallProvenance(existingMetadata, paths, uid);
+      const migration = await readSourceMigrationRecord(paths.sourceBindingMigration, uid);
+      const expectedSource = migration?.state === 'COMMITTED' && migration.targetSourceRoot === existingMetadata.sourceRoot ? { sha: migration.targetSourceSha, tree: migration.targetSourceTree } : { sha: existingMetadata.initialInstall.sourceSha, tree: existingMetadata.initialInstall.sourceTree };
+      if (expectedSource.sha !== bootstrapAuthorization.sourceSha || expectedSource.tree !== bootstrapAuthorization.sourceTree) throw new RuntimeError('CONTROL_DENIED', 'Bootstrap source identity does not match initial installation');
+    } else {
+      const committedMigration = await readSourceMigrationRecord(paths.sourceBindingMigration, uid);
+      if (committedMigration === null || committedMigration.state !== 'COMMITTED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap requires a committed source migration');
+      if (committedMigration.domain !== domain || committedMigration.dataRoot !== canonicalDataRoot || committedMigration.targetSourceRoot !== sourceRoot || committedMigration.targetControlScript !== canonicalControlScript || committedMigration.targetExecutable !== executable || JSON.stringify(committedMigration.targetExecutableArguments) !== JSON.stringify(executableArguments) || (committedMigration.protectedReferenceRoot ?? null) !== (canonicalProtectedReferenceRoot ?? null)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed source migration does not authorize the requested LaunchAgent binding');
+      if (committedMigration.targetSourceSha !== bootstrapAuthorization.sourceSha || committedMigration.targetSourceTree !== bootstrapAuthorization.sourceTree) throw new RuntimeError('CONTROL_DENIED', 'Supervisor bootstrap source identity does not match the committed migration');
+      await verifyCommittedMigration(paths, committedMigration, uid);
+    }
+    const existingPlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+    if (existingPlist.state !== 'ok') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap requires an exact protected LaunchAgent before-image');
+    beforeMetadataSha256 = sha256(existingRecord!.raw);
+    beforePlistSha256 = sha256(existingPlist.content);
   }
-  if (existingRecord.metadata.state === 'UNINSTALLING' || existingRecord.metadata.state === 'INSTALLING' || existingRecord.metadata.state === 'RECONCILIATION_REQUIRED') {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'An interrupted LaunchAgent operation requires reconciliation');
-  }
-  const existingPlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
-  if (existingPlist.state !== 'ok') {
-    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor bootstrap requires an exact protected LaunchAgent before-image');
-  }
-  const beforeMetadataSha256 = sha256(existingRecord.raw);
-  const beforePlistSha256 = sha256(existingPlist.content);
   const observationBefore = await observeLaunchAgent(dependencies);
   const bootstrapPolicyInput = {
     dataRoot: canonicalDataRoot,
@@ -1133,6 +1333,7 @@ async function installLaunchAgentUnlocked(
     sourceTree: bootstrapAuthorization.sourceTree,
     beforeMetadataSha256,
     beforePlistSha256,
+    ...(initial ? { initialInstall: initialInstall! } : {}),
     protectedReferenceRoot: canonicalProtectedReferenceRoot,
     machineId,
     sourceRoot,
@@ -1143,6 +1344,17 @@ async function installLaunchAgentUnlocked(
     runtimePreflightSha256: runtimeEntrypoints.runtimePreflightSha256,
     runtimeLoaderSha256: runtimeEntrypoints.runtimeLoaderSha256,
   };
+  const repeatedInitial = existingMetadata?.initialInstall;
+  if (existingMetadata !== null && repeatedInitial !== undefined && repeatedInitial.policyId === bootstrapAuthorization.recoveryPolicyId && repeatedInitial.requestId === bootstrapAuthorization.requestId) {
+    if (observationBefore.state !== 'LOADED') throw new RuntimeError('CONTROL_DENIED', 'Reinstalling a committed bootstrap requires fresh authorization');
+    await requirePublishedContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
+    await requirePublishedContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
+    requireLiveLaunchAgentIdentity(observationBefore.stdout, existingMetadata);
+    await requireLiveProcessIdentity(observationBefore.stdout, existingMetadata, dependencies);
+    const disabledState = await observeDisabledState(domain, launchctl);
+    if (disabledState === 'UNKNOWN' || disabledState === 'EXPLICIT_DISABLED') throw new RuntimeError('CONTROL_DENIED', 'Re-enabling a committed Supervisor bootstrap requires fresh authorization');
+    return paths;
+  }
   const bootstrapReservation = await reserveRecoveryPolicyOperation(bootstrapPolicyInput);
   const finalizeBootstrap = async (state: 'COMMITTED' | 'RECONCILIATION_REQUIRED'): Promise<void> => {
     if (bootstrapReservation === null) return;
@@ -1156,6 +1368,7 @@ async function installLaunchAgentUnlocked(
     if (currentEntrypoints.runtimePreflightSha256 !== runtimeEntrypoints.runtimePreflightSha256 || currentEntrypoints.runtimeLoaderSha256 !== runtimeEntrypoints.runtimeLoaderSha256) {
       throw new RuntimeError('CONTROL_DENIED', 'Reviewed runtime entrypoints changed after authorization');
     }
+    if (initialInstall !== undefined) await verifyInitialTransport(canonicalDataRoot, initialInstall, uid);
     const currentMachineId = await readMachineId(canonicalDataRoot);
     if (currentMachineId !== machineId) throw new RuntimeError('CONTROL_DENIED', 'Protected machine identity changed after authorization');
   };
@@ -1201,8 +1414,6 @@ async function installLaunchAgentUnlocked(
     registeredPlist: paths.registeredPlist,
     plistSha256: sha256(plist),
   };
-  const existingMetadata = existingRecord.metadata;
-
   if (existingMetadata?.legacyMigration !== undefined) {
     await completeLegacyPlistTransition(paths.plist, plist, existingMetadata.legacyMigration.plistSha256, uid);
   }
@@ -1244,7 +1455,7 @@ async function installLaunchAgentUnlocked(
     return paths;
   }
 
-  requireMetadataBinding(existingMetadata, desiredBinding);
+  if (existingMetadata !== null) requireMetadataBinding(existingMetadata, desiredBinding);
 
   await ensureOwnedDirectory(paths.directory, 'IRIS launchd directory', uid, true);
   await ensureOwnedDirectory(path.dirname(paths.stdout), 'IRIS log directory', uid, true);
@@ -1252,7 +1463,7 @@ async function installLaunchAgentUnlocked(
   await requireCompatibleContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
   await requireCompatibleContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
 
-  const disabledStateBeforeInstall = existingMetadata.disabledStateBeforeInstall ?? await observeDisabledState(domain, launchctl);
+  const disabledStateBeforeInstall = existingMetadata?.disabledStateBeforeInstall ?? await observeDisabledState(domain, launchctl);
   if (disabledStateBeforeInstall === 'UNKNOWN') {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', `The disabled state of ${LAUNCH_AGENT_LABEL} in ${domain} is unknown`);
   }
@@ -1262,10 +1473,12 @@ async function installLaunchAgentUnlocked(
     disabledBeforeInstall: disabledStateBeforeInstall === 'EXPLICIT_DISABLED',
     disabledStateBeforeInstall,
     unresolvedReason: null,
-    ...(existingMetadata.legacyMigration === undefined ? {} : { legacyMigration: existingMetadata.legacyMigration }),
+    ...(existingMetadata?.legacyMigration === undefined ? {} : { legacyMigration: existingMetadata.legacyMigration }),
+    ...(initial ? { initialInstall: { ...bootstrapPolicyInput, initialInstall: initialInstall!, transactionId: bootstrapReservation.transactionId } } : existingMetadata?.initialInstall === undefined ? {} : { initialInstall: existingMetadata.initialInstall }),
   };
+  if (initial) await publishOwnedFile(paths.metadata, metadataContent(preparedMetadata), 'IRIS LaunchAgent metadata', uid);
   await publishOwnedFile(paths.plist, plist, 'IRIS private LaunchAgent', uid);
-  await writeLaunchAgentMetadata(paths.metadata, preparedMetadata, uid);
+  if (!initial) await writeLaunchAgentMetadata(paths.metadata, preparedMetadata, uid);
   await publishOwnedFile(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
   await requirePublishedContent(paths.plist, plist, 'IRIS private LaunchAgent', uid);
   await requirePublishedContent(paths.registeredPlist, plist, 'IRIS registered LaunchAgent', uid);
@@ -2060,7 +2273,8 @@ async function inspectMigrationBinding(
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Schema-3 LaunchAgent binding is not an exact stopped source before-image');
     }
     const migration = await readSourceMigrationRecord(paths.sourceBindingMigration, uid);
-    if (migration === null || migration.state !== 'COMMITTED'
+    if (legacy.initialInstall !== undefined) await verifyInitialInstallProvenance(legacy, paths, uid);
+    else if (migration === null || migration.state !== 'COMMITTED'
       || migration.targetSourceRoot !== legacy.sourceRoot
       || migration.targetControlScript !== legacy.controlScript
       || migration.targetExecutable !== legacy.executable
@@ -2316,7 +2530,8 @@ function validLaunchAgentMetadata(value: unknown): value is LaunchAgentMetadata 
     && typeof metadata.disabledBeforeInstall === 'boolean'
     && (metadata.disabledStateBeforeInstall === undefined || ['EXPLICIT_ENABLED', 'EXPLICIT_DISABLED', 'NO_EXPLICIT_OVERRIDE', 'UNKNOWN'].includes(metadata.disabledStateBeforeInstall))
     && (metadata.unresolvedReason === null || ['BOOTSTRAP_OUTCOME_UNKNOWN', 'LIVE_IDENTITY_UNVERIFIED', 'PUBLISHED_STATE_CHANGED', 'DISABLED_STATE_UNKNOWN', 'BOOTOUT_OUTCOME_UNKNOWN'].includes(metadata.unresolvedReason))
-    && (metadata.legacyMigration === undefined || validLegacyMigrationEvidence(metadata.legacyMigration));
+    && (metadata.legacyMigration === undefined || validLegacyMigrationEvidence(metadata.legacyMigration))
+    && (metadata.initialInstall === undefined || validInitialInstallProvenance(metadata.initialInstall));
 }
 
 function validLegacyMigrationEvidence(value: unknown): value is LegacyMigrationEvidence {
@@ -2374,4 +2589,24 @@ function launchctlOutcomeUnknown(error: unknown): boolean {
 
 function xml(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
+}
+
+function validInitialInstallProvenance(value: unknown): value is InitialInstallProvenance {
+  if (typeof value !== 'object' || value === null) return false;
+  const proof = value as InitialInstallProvenance;
+  return proof.operation === 'SUPERVISOR_BOOTSTRAP' && validInitialInstallBinding(proof.initialInstall)
+    && [proof.policyId, proof.requestId, proof.transactionId, proof.machineId].every((item) => typeof item === 'string' && /^[a-f0-9-]{36}$/.test(item))
+    && [proof.sourceSha, proof.sourceTree].every((item) => typeof item === 'string' && /^[a-f0-9]{40}$/.test(item))
+    && [proof.executableSha256, proof.runtimePreflightSha256, proof.runtimeLoaderSha256].every((item) => typeof item === 'string' && /^[a-f0-9]{64}$/.test(item))
+    && [proof.dataRoot, proof.sourceRoot, proof.controlScript, proof.executable].every((item) => typeof item === 'string' && path.isAbsolute(item) && !item.includes('\0'))
+    && Array.isArray(proof.executableArguments) && proof.executableArguments.every((item) => typeof item === 'string' && !item.includes('\0'))
+    && proof.beforeMetadataSha256 === null && proof.beforePlistSha256 === null;
+}
+
+async function verifyInitialTransport(dataRoot: string, binding: InitialInstallBinding, uid: number): Promise<void> {
+  const registry = await readConnectorRegistry(dataRoot);
+  const machineId = await readMachineId(dataRoot);
+  const connector = registry?.connectors[0];
+  if (registry === null || registry.admin !== null || registry.connectors.length !== 1 || connector?.connectorId !== binding.connectorId || connector.label !== 'IRIS' || connector.tunnelId !== binding.tunnelId || connector.managedProfilePath !== binding.managedProfilePath || machineId === null || connector.machineId !== machineId) throw new RuntimeError('CONTROL_DENIED', 'Enrolled ONE transport binding changed');
+  if (await hashCanonicalFile(binding.tunnelExecutable, 'Reviewed tunnel executable', uid) !== binding.tunnelExecutableSha256) throw new RuntimeError('CONTROL_DENIED', 'Enrolled tunnel executable changed');
 }

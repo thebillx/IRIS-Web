@@ -51,11 +51,15 @@ test('setup creates one public ONE IRIS binding without legacy tunnel IDs', asyn
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-setup-unified-'));
   roots.push(dataRoot);
   await persistControlPlaneApiKey(dataRoot, 'fixture-control-plane-key-unified-123456');
-  const first = JSON.parse((await runSetup(dataRoot, '--one-tunnel-id', oneTunnelId)).stdout) as { status: string; repeated: boolean; connectors: Array<{ connectorId: string; tunnelId: string }>; adminTunnelId: string | null };
+  const first = JSON.parse((await runSetup(dataRoot, '--one-tunnel-id', oneTunnelId)).stdout) as { status: string; repeated: boolean; connectors: Array<{ connectorId: string; tunnelId: string }>; adminTunnelId: string | null; next: string[]; message: string };
   assert.equal(first.status, 'READY_TO_START');
   assert.equal(first.repeated, false);
   assert.deepEqual(first.connectors, [{ connectorId: 'iris-full', tunnelId: oneTunnelId }]);
   assert.equal(first.adminTunnelId, null);
+  assert.equal(first.next.some((command) => command.includes('launchd authorize-install')), true);
+  assert.match(first.message, /does not install or authorize login persistence/);
+  await assert.rejects(stat(path.join(dataRoot, 'launchd', 'com.iris.supervisor.plist.metadata.json')), { code: 'ENOENT' });
+  await assert.rejects(stat(path.join(dataRoot, 'owner-access.json')), { code: 'ENOENT' });
   const second = JSON.parse((await runSetup(dataRoot, '--one-tunnel-id', oneTunnelId)).stdout) as { repeated: boolean; connectors: Array<{ connectorId: string; tunnelId: string }> };
   assert.equal(second.repeated, true);
   assert.deepEqual(second.connectors, first.connectors);

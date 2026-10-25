@@ -7,6 +7,10 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   installLaunchAgent,
+  issueInitialLaunchAgentPolicy,
+  readInitialLaunchAgentEnrollment,
+  readInitialLaunchAgentEnrollmentState,
+  reconcileInitialLaunchAgentInstall,
   issueLaunchAgentSourceApproval,
   LAUNCH_AGENT_LABEL,
   launchAgentStatus,
@@ -22,7 +26,9 @@ import {
   type LaunchdDependencies,
 } from './launchd.js';
 import { canonicalNodeRuntime, node24Path } from './node-runtime.js';
-import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy } from './recovery-policy.js';
+import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, revokeRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation } from './recovery-policy.js';
+import { initializeConnectorRegistry, connectorRegistryPath } from './connector-registry.js';
+import { persistControlPlaneApiKey } from './credentials.js';
 import { promisify } from 'node:util';
 
 const roots: string[] = [];
@@ -387,6 +393,202 @@ async function reviewedSource(subject: Awaited<ReturnType<typeof fixture>>, name
     sourceTree,
   };
 }
+
+async function initialFixture() {
+  const subject = await fixture();
+  await rm(path.join(subject.dataRoot, 'owner-access.json'));
+  const owner = 'initial-install-owner-test-only-123456';
+  await persistControlPlaneApiKey(subject.dataRoot, owner);
+  await initializeConnectorRegistry(subject.dataRoot, { unified: true, fullTunnelId: 'tunnel_0123456789abcdef0123456789abcdef' });
+  const target = await reviewedSource(subject);
+  const tunnelExecutable = path.join(path.dirname(subject.dataRoot), 'fixture-tunnel');
+  await writeFile(tunnelExecutable, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  const input = { dataRoot: subject.dataRoot, sourceRoot: target.root, controlScript: target.controlScript, executable: await realpath(canonicalNodeRuntime().path), executableArguments: target.executableArguments, sourceSha: target.sourceSha, sourceTree: target.sourceTree, tunnelExecutable, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+  subject.fake.live.arguments = [input.executable, ...target.executableArguments, target.controlScript, 'supervisor'];
+  subject.fake.live.workingDirectory = target.root;
+  const ownerAuthorization = `Bearer ${owner}`;
+  const enroll = (supersedesPolicyId?: string) => issueInitialLaunchAgentPolicy({ ...input, ...(supersedesPolicyId === undefined ? {} : { supersedesPolicyId }) }, ownerAuthorization, subject.fake.dependencies);
+  const installInitial = async (authorization: { recoveryPolicyId: string; requestId: string; sourceSha: string; sourceTree: string }) => installLaunchAgent(subject.dataRoot, input.executable, target.controlScript, target.executableArguments, undefined, subject.fake.dependencies, authorization);
+  return { ...subject, input, target, ownerAuthorization, enroll, installInitial };
+}
+
+function bootstrapAuthorization(f: Awaited<ReturnType<typeof initialFixture>>, policyId: string) {
+  return { recoveryPolicyId: policyId, requestId: randomUUID(), sourceSha: f.target.sourceSha, sourceTree: f.target.sourceTree };
+}
+
+describe('ONE initial LaunchAgent installation', () => {
+  it('enrolls typed absence and installs without fabricated migration or metadata', async () => {
+    const f = await initialFixture();
+    const paths = launchdPaths(f.dataRoot, f.home);
+    await expect(readFile(paths.metadata)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(path.join(f.dataRoot, 'owner-access.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readInitialLaunchAgentEnrollmentState(f.dataRoot, f.fake.dependencies)).toEqual({ state: 'ABSENT' });
+    const policy = await f.enroll();
+    expect(policy).toMatchObject({ beforeMetadataSha256: null, beforePlistSha256: null, allowedOperations: ['SUPERVISOR_BOOTSTRAP'], maxOperationCount: 1, initialInstall: { kind: 'ABSENT', uid, domain: `gui/${uid}`, connectorId: 'iris-full', startup: 'CONTROL_ONLY' } });
+    const authorization = bootstrapAuthorization(f, policy.policyId);
+    await f.installInitial(authorization);
+    const enrollment = await readInitialLaunchAgentEnrollment(f.dataRoot, f.fake.dependencies);
+    expect(enrollment).toMatchObject({ policyId: policy.policyId, requestId: authorization.requestId, initialInstall: policy.initialInstall });
+    expect(f.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
+    await expect(readFile(paths.sourceBindingMigration)).rejects.toMatchObject({ code: 'ENOENT' });
+    const before = await readFile(paths.metadata, 'utf8');
+    const mutations = f.fake.calls.filter((call) => /^(bootstrap|enable|disable|bootout) /.test(call));
+    await f.installInitial(authorization);
+    expect(await readFile(paths.metadata, 'utf8')).toBe(before);
+    expect(f.fake.calls.filter((call) => /^(bootstrap|enable|disable|bootout) /.test(call))).toEqual(mutations);
+  });
+
+  it('retains initial provenance through an explicitly approved source migration', async () => {
+    const f = await initialFixture();
+    const policy = await f.enroll();
+    await f.installInitial(bootstrapAuthorization(f, policy.policyId));
+    const paths = launchdPaths(f.dataRoot, f.home);
+    const beforeMetadata = await readFile(paths.metadata, 'utf8');
+    const beforePlist = await readFile(paths.plist, 'utf8');
+    await stopLaunchAgentForMigration({ dataRoot: f.dataRoot, sourceRoot: f.target.root, beforeMetadataSha256: createHash('sha256').update(beforeMetadata).digest('hex'), beforePlistSha256: createHash('sha256').update(beforePlist).digest('hex') }, f.fake.dependencies);
+    const next = await reviewedSource(f, 'next-reviewed-source');
+    const requestId = randomUUID();
+    const approval = await approve(f, next, requestId);
+    const migrated = await migrateLaunchAgentSource({ dataRoot: f.dataRoot, sourceRoot: next.root, controlScript: next.controlScript, executable: f.input.executable, executableArguments: next.executableArguments, sourceSha: next.sourceSha, sourceTree: next.sourceTree, requestId, approvalId: approval.approvalId }, f.fake.dependencies);
+    expect(migrated.state).toBe('COMMITTED');
+    const metadata = JSON.parse(await readFile(paths.metadata, 'utf8'));
+    expect(metadata.initialInstall).toEqual(JSON.parse(beforeMetadata).initialInstall);
+    expect(metadata.sourceRoot).toBe(next.root);
+    // Migration prepares the new source; it does not itself authorize a new bootstrap.
+    expect(await readInitialLaunchAgentEnrollmentState(f.dataRoot, f.fake.dependencies)).toEqual({ state: 'PENDING' });
+    await revokeRecoveryAuthorizationPolicy(f.dataRoot);
+    const bootstrapPolicy = await issueRecoveryAuthorizationPolicy({ dataRoot: f.dataRoot, machineId: metadata.initialInstall.machineId, sourceBindings: [{ sourceRoot: next.root, controlScript: next.controlScript, executable: f.input.executable, executableSha256: metadata.initialInstall.executableSha256, executableArguments: next.executableArguments, sourceSha: next.sourceSha, sourceTree: next.sourceTree, runtimePreflightSha256: migrated.runtimePreflightSha256, runtimeLoaderSha256: migrated.runtimeLoaderSha256 }], beforeMetadataSha256: createHash('sha256').update(await readFile(paths.metadata)).digest('hex'), beforePlistSha256: createHash('sha256').update(await readFile(paths.plist)).digest('hex'), allowedOperations: ['SUPERVISOR_BOOTSTRAP'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(), supersedesPolicyId: policy.policyId });
+    f.fake.live.arguments = [f.input.executable, ...next.executableArguments, next.controlScript, 'supervisor'];
+    f.fake.live.workingDirectory = next.root;
+    await installLaunchAgent(f.dataRoot, f.input.executable, next.controlScript, next.executableArguments, undefined, f.fake.dependencies, { recoveryPolicyId: bootstrapPolicy.policyId, requestId: randomUUID(), sourceSha: next.sourceSha, sourceTree: next.sourceTree });
+    const state = await readInitialLaunchAgentEnrollmentState(f.dataRoot, f.fake.dependencies);
+    expect(state).toMatchObject({ state: 'COMMITTED', sourceBinding: { sourceRoot: next.root, controlScript: next.controlScript }, enrollment: { sourceRoot: f.target.root } });
+  });
+
+  it('rejects changed loader bytes when reading committed login enrollment', async () => {
+    const f = await initialFixture();
+    const policy = await f.enroll();
+    await f.installInitial(bootstrapAuthorization(f, policy.policyId));
+    await writeFile(f.target.executableArguments[1]!, 'module.exports = { changed: true };\n', { mode: 0o600 });
+    await expect(readInitialLaunchAgentEnrollmentState(f.dataRoot, f.fake.dependencies)).rejects.toThrow(/source|entrypoint/);
+  });
+
+  it('requires the existing private Owner credential before creating signing authority', async () => {
+    const f = await initialFixture();
+    await expect(issueInitialLaunchAgentPolicy(f.input, 'Bearer wrong', f.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(readFile(path.join(f.dataRoot, 'owner-access.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.fake.calls).toEqual([]);
+  });
+
+  it.each(['metadata', 'plist', 'registeredPlist'] as const)('rejects an existing %s before owner enrollment', async (field) => {
+    const f = await initialFixture();
+    const filename = launchdPaths(f.dataRoot, f.home)[field];
+    await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
+    await writeFile(filename, 'foreign installation', { mode: 0o600 });
+    await expect(f.enroll()).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect(await readFile(filename, 'utf8')).toBe('foreign installation');
+    await expect(readFile(path.join(f.dataRoot, 'owner-access.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.fake.calls.some((call) => /^(bootstrap|enable|bootout) /.test(call))).toBe(false);
+  });
+
+  it('rejects a loaded or unobservable service before owner enrollment', async () => {
+    const f = await initialFixture();
+    f.fake.loaded = true;
+    await expect(f.enroll()).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    f.fake.loaded = false;
+    f.fake.disabledOutput = 'malformed';
+    await expect(f.enroll()).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(readFile(path.join(f.dataRoot, 'owner-access.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('rejects changed absence and tunnel executable after enrollment', async () => {
+    const f = await initialFixture();
+    const policy = await f.enroll();
+    const paths = launchdPaths(f.dataRoot, f.home);
+    await mkdir(path.dirname(paths.registeredPlist), { recursive: true, mode: 0o700 });
+    await writeFile(paths.registeredPlist, 'foreign', { mode: 0o600 });
+    await expect(f.installInitial(bootstrapAuthorization(f, policy.policyId))).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await rm(paths.registeredPlist);
+    await writeFile(f.input.tunnelExecutable, 'changed', { mode: 0o700 });
+    await expect(f.installInitial(bootstrapAuthorization(f, policy.policyId))).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect(f.fake.calls.some((call) => /^(bootstrap|enable|bootout) /.test(call))).toBe(false);
+  });
+
+  it('preserves identities and immutable policy history across owned uninstall and reinstall', async () => {
+    const f = await initialFixture();
+    const first = await f.enroll();
+    await f.installInitial(bootstrapAuthorization(f, first.policyId));
+    const protectedFiles = [connectorRegistryPath(f.dataRoot), path.join(f.dataRoot, 'machine-id.json'), path.join(f.dataRoot, 'owner-access.json')];
+    const before = await Promise.all(protectedFiles.map((filename) => readFile(filename, 'utf8')));
+    await uninstallLaunchAgent(f.dataRoot, f.fake.dependencies);
+    await revokeRecoveryAuthorizationPolicy(f.dataRoot);
+    const second = await f.enroll(first.policyId);
+    await f.installInitial(bootstrapAuthorization(f, second.policyId));
+    expect(await Promise.all(protectedFiles.map((filename) => readFile(filename, 'utf8')))).toEqual(before);
+    expect(second.retiredPolicies?.[0]?.policyId).toBe(first.policyId);
+    expect(f.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(2);
+  });
+
+  it('does not re-enable a disabled service on an idempotent repeat', async () => {
+    const f = await initialFixture();
+    const policy = await f.enroll();
+    const authorization = bootstrapAuthorization(f, policy.policyId);
+    await f.installInitial(authorization);
+    f.fake.disabled = true;
+    const calls = f.fake.calls.length;
+    await expect(f.installInitial(authorization)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect(f.fake.calls.slice(calls).some((call) => /^(bootstrap|enable|bootout) /.test(call))).toBe(false);
+  });
+
+  it('reconciles an unknown matching successful bootstrap without repeating it', async () => {
+    const f = await initialFixture();
+    const policy = await f.enroll();
+    const authorization = bootstrapAuthorization(f, policy.policyId);
+    f.fake.afterBootstrap = async () => { f.fake.queryError = new Error('unknown observation'); };
+    await expect(f.installInitial(authorization)).rejects.toThrow(/reconciliation/);
+    expect((await readRecoveryAuthorizationPolicy(f.dataRoot))?.operations[0]?.state).toBe('RECONCILIATION_REQUIRED');
+    expect(await readInitialLaunchAgentEnrollmentState(f.dataRoot, f.fake.dependencies)).toEqual({ state: 'PENDING' });
+    f.fake.queryError = null;
+    await expect(reconcileInitialLaunchAgentInstall(f.dataRoot, authorization, f.ownerAuthorization, f.fake.dependencies)).resolves.toEqual({ state: 'COMMITTED' });
+    expect(f.fake.calls.filter((call) => call.startsWith('bootstrap '))).toHaveLength(1);
+    expect(await readInitialLaunchAgentEnrollment(f.dataRoot, f.fake.dependencies)).not.toBeNull();
+  });
+
+  it('reconciles an interrupted reservation before initial metadata publication', async () => {
+    const f = await initialFixture();
+    const policy = await f.enroll();
+    const authorization = bootstrapAuthorization(f, policy.policyId);
+    await reserveRecoveryPolicyOperation({ dataRoot: f.dataRoot, policyId: policy.policyId, requestId: authorization.requestId, operation: 'SUPERVISOR_BOOTSTRAP', ...policy.sourceBindings[0]!, machineId: policy.machineId!, initialInstall: policy.initialInstall!, beforeMetadataSha256: null, beforePlistSha256: null });
+    await expect(reconcileInitialLaunchAgentInstall(f.dataRoot, authorization, f.ownerAuthorization, f.fake.dependencies)).resolves.toEqual({ state: 'FAILED' });
+    await expect(reconcileInitialLaunchAgentInstall(f.dataRoot, authorization, f.ownerAuthorization, f.fake.dependencies)).resolves.toEqual({ state: 'FAILED' });
+    expect((await readRecoveryAuthorizationPolicy(f.dataRoot))?.operations[0]?.state).toBe('FAILED');
+    expect(f.fake.calls.some((call) => /^(bootstrap|enable|disable|bootout) /.test(call))).toBe(false);
+  });
+
+  it('reconciles a proven failed bootstrap and retains its signed outcome', async () => {
+    const f = await initialFixture();
+    const policy = await f.enroll();
+    const authorization = bootstrapAuthorization(f, policy.policyId);
+    f.fake.bootstrap = 'failure';
+    await expect(f.installInitial(authorization)).rejects.toThrow(/install|bootstrap/);
+    await expect(reconcileInitialLaunchAgentInstall(f.dataRoot, authorization, f.ownerAuthorization, f.fake.dependencies)).resolves.toEqual({ state: 'FAILED' });
+    expect((await readRecoveryAuthorizationPolicy(f.dataRoot))?.operations[0]?.state).toBe('FAILED');
+    await expect(readFile(launchdPaths(f.dataRoot, f.home).metadata)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('preserves an unknown outcome when a different live process appears', async () => {
+    const f = await initialFixture();
+    const policy = await f.enroll();
+    const authorization = bootstrapAuthorization(f, policy.policyId);
+    f.fake.afterBootstrap = async () => { f.fake.queryError = new Error('unknown observation'); };
+    await expect(f.installInitial(authorization)).rejects.toThrow(/reconciliation/);
+    f.fake.queryError = null;
+    f.fake.live.dataRoot = '/private/foreign-root';
+    await expect(reconcileInitialLaunchAgentInstall(f.dataRoot, authorization, f.ownerAuthorization, f.fake.dependencies)).rejects.toThrow(/identity|root|binding/);
+    expect((await readRecoveryAuthorizationPolicy(f.dataRoot))?.operations[0]?.state).toBe('RECONCILIATION_REQUIRED');
+    expect(f.fake.calls.filter((call) => call.startsWith('bootout '))).toHaveLength(0);
+  });
+});
 
 describe('IRIS LaunchAgent artifact', () => {
   it('resolves the pnpm tsx link only within the reviewed source dependency tree', async () => {

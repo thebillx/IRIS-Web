@@ -47,8 +47,14 @@ export async function guidedSetup(supervisor: Supervisor, dataRoot: string, opti
       legacyMigrationRequired: prepared.credentials.legacy.migrationRequired,
     },
     local: status === null ? { stack: 'DEGRADED' } : { stack: status.state, runtime: status.runtime, tunnel: status.tunnel, controlPlane: status.controlPlane },
-    next: options.start ? ['node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'] : ['node scripts/iris.mjs up', 'node scripts/iris.mjs doctor', 'node scripts/iris.mjs launchd install'],
-    message: 'Remote tunnel provisioning and ChatGPT connector selection remain owner-verifiable steps; this command does not claim either occurred.',
+    next: [
+      ...(options.start ? [] : ['node scripts/iris.mjs up']),
+      'node scripts/iris.mjs doctor',
+      ...(prepared.registry.admin === null && prepared.registry.connectors.length === 1
+        ? ['node scripts/iris.mjs launchd authorize-install --source-sha <sha> --source-tree <tree> --expires-at <time> --tunnel-executable <absolute-path>', 'node scripts/iris.mjs launchd install --recovery-policy-id <policy-id> --request-id <uuid> --source-sha <sha> --source-tree <tree>']
+        : ['node scripts/iris.mjs launchd install']),
+    ],
+    message: 'Setup does not install or authorize login persistence. Remote tunnel provisioning and ChatGPT connector selection remain owner-verifiable steps; this command does not claim either occurred.',
   };
 }
 
