@@ -5,8 +5,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolveRuntimeDataRoot, RUNTIME_DATA_ENV } from './data-root.js';
 import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
+import { readControlPlaneApiKey } from './credentials.js';
 import { createSupervisor } from './supervisor.js';
-import { installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, reconcileStoppedLaunchAgent, resolveReviewedRuntimeEntrypoints, stopLaunchAgentForMigration, uninstallLaunchAgent } from './launchd.js';
+import { issueInitialLaunchAgentPolicy, reconcileInitialLaunchAgentInstall, installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, reconcileStoppedLaunchAgent, resolveReviewedRuntimeEntrypoints, stopLaunchAgentForMigration, uninstallLaunchAgent } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, reconcileRecoveryPolicyLock, reconcileRecoveryPolicyOperation, revokeRecoveryAuthorizationPolicy } from './recovery-policy.js';
 import { readMachineId } from './machine-identity.js';
@@ -17,11 +18,12 @@ const legacyRuntimeControl = process.env.IRIS_STACK_CLI !== '1';
 
 try {
   assertSupportedNodeVersion();
-  const launchdInstallOptions = command === 'launchd' && process.argv[3] === 'install'
+  const launchdInstallOptions = command === 'launchd' && ['install', 'reconcile-install'].includes(process.argv[3] ?? '')
     ? parseLaunchdInstallOptions(process.argv.slice(4))
     : null;
   const setupOptions = command === 'setup' ? parseSetupOptions(process.argv.slice(3)) : null;
-  const configuredDataRoot = setupOptions?.runtimeDataRoot ?? launchdInstallOptions?.runtimeDataRoot;
+  const initialInstallOptions = command === 'launchd' && process.argv[3] === 'authorize-install' ? parseInitialInstallOptions(process.argv.slice(4)) : null;
+  const configuredDataRoot = setupOptions?.runtimeDataRoot ?? launchdInstallOptions?.runtimeDataRoot ?? initialInstallOptions?.runtimeDataRoot;
   const dataRoot = configuredDataRoot === undefined
     ? await resolveRuntimeDataRoot()
     : await resolveRuntimeDataRoot({ ...process.env, [RUNTIME_DATA_ENV]: configuredDataRoot });
@@ -145,6 +147,30 @@ try {
       process.stdout.write(`${JSON.stringify(await supervisor.migrateCredentials(profile), null, 2)}\n`);
     } else if (command === 'credentials' && process.argv[3] === 'rotate-tunnel') {
       process.stdout.write(`${JSON.stringify(await supervisor.rotateTunnelCredential(), null, 2)}\n`);
+    } else if (command === 'launchd' && process.argv[3] === 'authorize-install') {
+      if (!input.isTTY || !output.isTTY) throw new Error('Initial installation requires an interactive Owner-local Terminal');
+      const runtimeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+      const sourceRoot = path.resolve(runtimeDirectory, '../..');
+      const tsx = await resolveReviewedRuntimeEntrypoints(runtimeDirectory);
+      const ownerSecret = await readControlPlaneApiKey(dataRoot);
+      if (ownerSecret === null) throw new Error('Initial installation requires the existing local Owner credential');
+      const scope = { ...initialInstallOptions!, dataRoot, sourceRoot, controlScript: path.join(runtimeDirectory, 'src/control.ts'), executable: canonicalNodeRuntime().path,
+        executableArguments: ['--require', tsx.preflight, '--import', pathToFileURL(tsx.loader).href] };
+      process.stdout.write(`INITIAL_INSTALL_SCOPE=${JSON.stringify(scope)}\n`);
+      const prompt = createInterface({ input, output });
+      try {
+        if ((await prompt.question('Type AUTHORIZE IRIS INITIAL INSTALL to enroll control-only login restoration: ')).trim() !== 'AUTHORIZE IRIS INITIAL INSTALL') throw new Error('Owner initial installation was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await issueInitialLaunchAgentPolicy(scope, `Bearer ${ownerSecret}`), null, 2)}\n`);
+    } else if (command === 'launchd' && process.argv[3] === 'reconcile-install') {
+      if (!input.isTTY || !output.isTTY) throw new Error('Initial installation reconciliation requires an interactive Owner-local Terminal');
+      const ownerSecret = await readControlPlaneApiKey(dataRoot);
+      if (ownerSecret === null) throw new Error('Initial installation reconciliation requires the existing local Owner credential');
+      const prompt = createInterface({ input, output });
+      try {
+        if ((await prompt.question('Type RECONCILE IRIS INITIAL INSTALL to settle the verified installation: ')).trim() !== 'RECONCILE IRIS INITIAL INSTALL') throw new Error('Owner initial installation reconciliation was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await reconcileInitialLaunchAgentInstall(dataRoot, launchdInstallOptions!, `Bearer ${ownerSecret}`), null, 2)}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'install') {
       const runtimeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
       const tsx = await resolveReviewedRuntimeEntrypoints(runtimeDirectory);
@@ -780,4 +806,19 @@ function printStatus(status: Awaited<ReturnType<Awaited<ReturnType<typeof create
   process.stdout.write(`Control Plane  ${status.controlPlane.state}\n`);
   for (const connector of status.connectors) process.stdout.write(`${connector.label.padEnd(14)}${connector.state}\n`);
   process.stdout.write(`ChatGPT E2E    ${status.endToEnd.state}\n`);
+}
+
+function parseInitialInstallOptions(args: readonly string[]): { sourceSha: string; sourceTree: string; tunnelExecutable: string; expiresAt: string; runtimeDataRoot?: string; protectedReferenceRoot?: string; supersedesPolicyId?: string } {
+  const allowed = new Set(['--source-sha', '--source-tree', '--tunnel-executable', '--expires-at', '--runtime-data-root', '--protected-reference-root', '--supersedes-policy-id']);
+  const values = new Map<string, string>();
+  for (let index = 0; index < args.length; index += 2) {
+    const name = args[index]; const value = args[index + 1]?.trim();
+    if (name === undefined || !allowed.has(name) || values.has(name) || !value) throw new Error('Usage: iris launchd authorize-install --source-sha <sha> --source-tree <tree> --tunnel-executable <absolute-file> --expires-at <ISO> [--runtime-data-root <directory>]');
+    values.set(name, value);
+  }
+  const required = (name: string) => { const value = values.get(name); if (value === undefined) throw new Error(`Missing ${name}`); return value; };
+  return { sourceSha: required('--source-sha'), sourceTree: required('--source-tree'), tunnelExecutable: required('--tunnel-executable'), expiresAt: required('--expires-at'),
+    ...(values.has('--runtime-data-root') ? { runtimeDataRoot: values.get('--runtime-data-root')! } : {}),
+    ...(values.has('--protected-reference-root') ? { protectedReferenceRoot: values.get('--protected-reference-root')! } : {}),
+    ...(values.has('--supersedes-policy-id') ? { supersedesPolicyId: values.get('--supersedes-policy-id')! } : {}) };
 }

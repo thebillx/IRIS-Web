@@ -59,11 +59,25 @@ export interface LifecycleGrantOperation {
   readonly target?: LifecycleGrantTarget;
 }
 
+export interface LifecycleRestartRecord {
+  readonly requestId: string;
+  readonly grantId: string;
+  readonly offOperationId: string;
+  readonly onOperationId: string;
+  readonly capturedTarget: LifecycleGrantTarget | null;
+  readonly state: 'PENDING' | 'RUNNING' | 'FAILED' | 'RECONCILIATION_REQUIRED';
+  readonly phase: 'OFF_RESERVED' | 'ON_RESERVED' | 'COMPLETE' | 'UNKNOWN';
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly resultDigest?: string;
+}
+
 export interface LifecycleGrantRecord extends LifecycleGrantSpec {
   readonly grantId: string;
   readonly issuedAt: string;
   readonly revokedAt: string | null;
   readonly operations: readonly LifecycleGrantOperation[];
+  readonly restart?: LifecycleRestartRecord;
   readonly digest: string;
 }
 
@@ -79,7 +93,7 @@ export class LifecycleGrantStore {
   public constructor(private readonly dataRoot: string) {}
 
   public async issue(spec: LifecycleGrantSpec): Promise<LifecycleGrantRecord> {
-    validateSpec(spec);
+    validateSpec(spec, false);
     const secret = await this.requireSecret();
     let issued!: LifecycleGrantRecord;
     await this.mutate(async (document) => {
@@ -89,6 +103,7 @@ export class LifecycleGrantStore {
         issued = existing;
         return document;
       }
+      validateSpec(spec);
       if (document.grants.length >= MAX_GRANTS) throw new RuntimeError('PERSISTENCE_FAILURE', 'Lifecycle grant capacity is exhausted; revoke or reconcile an existing grant first');
       const issuedAt = new Date().toISOString();
       const base = { ...spec, grantId: randomUUID(), issuedAt, revokedAt: null, operations: [] };
@@ -123,6 +138,7 @@ export class LifecycleGrantStore {
     const secret = await this.requireSecret();
     let reserved!: LifecycleGrantRecord;
     await this.mutate(async (document) => {
+      assertNoPendingRestart(document);
       const index = document.grants.findIndex((grant) => grant.grantId === execution.grantId);
       if (index < 0) throw new RuntimeError('CONTROL_DENIED', 'Lifecycle grant was not found');
       const current = document.grants[index]!;
@@ -133,7 +149,7 @@ export class LifecycleGrantStore {
       if (!current.allowedOperations.includes(operation)) throw new RuntimeError('CONTROL_DENIED', 'Lifecycle operation is outside the grant scope');
       if (current.operations.some((entry) => entry.state === 'RESERVED' || entry.state === 'RECONCILIATION_REQUIRED')) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant has an unresolved operation; reconcile before retry');
       if (current.operations.some((entry) => entry.operationId === execution.operationId)) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle operation replay was rejected');
-      if (current.operations.filter((entry) => entry.state === 'COMMITTED').length >= current.maxOperationCount) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant execution limit was reached');
+      if (consumedBudget(current) >= current.maxOperationCount) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant execution limit was reached');
       const operationRecord: LifecycleGrantOperation = { operationId: execution.operationId, operation, state: 'RESERVED', reservedAt: new Date().toISOString(), ...(execution.target === undefined ? {} : { target: execution.target }) };
       const next = { ...current, operations: [...current.operations, operationRecord] };
       reserved = { ...next, digest: digest(next) };
@@ -151,6 +167,7 @@ export class LifecycleGrantStore {
       const index = document.grants.findIndex((grant) => grant.grantId === grantId);
       if (index < 0) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle grant was not found');
       const current = document.grants[index]!;
+      assertNotPairedOperation(current, operationId);
       const operationIndex = current.operations.findIndex((entry) => entry.operationId === operationId);
       if (operationIndex < 0) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle operation was not found');
       const operation = current.operations[operationIndex]!;
@@ -181,6 +198,7 @@ export class LifecycleGrantStore {
       const index = document.grants.findIndex((grant) => grant.grantId === grantId);
       if (index < 0) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle grant was not found');
       const current = document.grants[index]!;
+      assertNotPairedOperation(current, operationId);
       const operationIndex = current.operations.findIndex((entry) => entry.operationId === operationId);
       if (operationIndex < 0) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle operation was not found');
       const operation = current.operations[operationIndex]!;
@@ -201,6 +219,120 @@ export class LifecycleGrantStore {
     const grant = grants.find((entry) => entry.grantId === grantId);
     if (grant === undefined) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle grant was not found');
     return grant;
+  }
+
+  /** The caller holds the Supervisor operation lock until this newly created pair settles. */
+  public async beginRestart(binding: LifecycleGrantBinding, execution: LifecycleGrantExecution, capturedTarget: LifecycleGrantTarget | null): Promise<{ record: LifecycleRestartRecord; created: boolean }> {
+    validateRestartExecution(binding, execution);
+    if (capturedTarget !== null && !isTarget(capturedTarget)) throw new RuntimeError('INVALID_REQUEST', 'Restart target is invalid');
+    const secret = await this.requireSecret();
+    let outcome!: { record: LifecycleRestartRecord; created: boolean };
+    await this.mutate(async (document) => {
+      const current = boundGrant(document, binding, execution);
+      const existing = document.grants.find((grant) => grant.restart?.requestId === execution.operationId);
+      if (existing !== undefined) {
+        if (existing.grantId !== current.grantId || !sameTarget(existing.restart!.capturedTarget, capturedTarget)) throw new RuntimeError('AUTHORITY_CHANGED', 'Restart request is already bound to another grant or target');
+        outcome = { record: existing.restart!, created: false };
+        return document;
+      }
+      assertGrantActive(current);
+      if (current.restart !== undefined) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant already contains a restart');
+      assertNoPendingRestart(document);
+      if (document.grants.some((grant) => grant.operations.some(unresolvedOperation))) throw new RuntimeError('AUTHORITY_CHANGED', 'A lifecycle operation is unresolved');
+      if (!lifecycleOperations.every((operation) => current.allowedOperations.includes(operation)) || consumedBudget(current) + 2 > current.maxOperationCount) throw new RuntimeError('CONTROL_DENIED', 'Restart requires both lifecycle operations and two remaining uses');
+      const now = new Date().toISOString();
+      const record: LifecycleRestartRecord = { requestId: execution.operationId, grantId: current.grantId, offOperationId: randomUUID(), onOperationId: randomUUID(), capturedTarget, state: 'PENDING', phase: 'OFF_RESERVED', createdAt: now, updatedAt: now };
+      const operations: LifecycleGrantOperation[] = [
+        ...current.operations,
+        { operationId: record.offOperationId, operation: 'runtime_off', state: 'RESERVED', reservedAt: now, ...(capturedTarget === null ? {} : { target: capturedTarget }) },
+        { operationId: record.onOperationId, operation: 'runtime_on', state: 'RESERVED', reservedAt: now },
+      ];
+      outcome = { record, created: true };
+      return replaceGrant(document, { ...current, operations, restart: record });
+    }, secret);
+    return outcome;
+  }
+
+  public async advanceRestartOff(grantId: string, requestId: string, evidence: unknown): Promise<LifecycleRestartRecord> {
+    return this.updateRestart(grantId, requestId, evidence, (grant, restart, now) => {
+      if (restart.state !== 'PENDING' || restart.phase !== 'OFF_RESERVED') throw new RuntimeError('AUTHORITY_CHANGED', 'Restart OFF is not pending');
+      return { ...grant, operations: updateOperation(grant, restart.offOperationId, 'COMMITTED', evidence, now), restart: { ...restart, phase: 'ON_RESERVED', updatedAt: now } };
+    });
+  }
+
+  /** This authorizes only the ON half of the original uninterrupted, locked call. It never resumes a replay. */
+  public async authorizeRestartOn(binding: LifecycleGrantBinding, execution: LifecycleGrantExecution): Promise<LifecycleRestartRecord> {
+    validateRestartExecution(binding, execution);
+    const document = await this.readDocument(await this.requireSecret());
+    const grant = boundGrant(document, binding, execution);
+    assertGrantActive(grant);
+    const restart = grant.restart;
+    if (restart === undefined || restart.requestId !== execution.operationId || restart.state !== 'PENDING' || restart.phase !== 'ON_RESERVED') throw new RuntimeError('AUTHORITY_CHANGED', 'Restart ON is not pending');
+    return restart;
+  }
+
+  public async completeRestartOn(grantId: string, requestId: string, terminal: 'RUNNING' | 'FAILED', evidence: unknown): Promise<LifecycleRestartRecord> {
+    return this.updateRestart(grantId, requestId, evidence, (grant, restart, now) => {
+      if (restart.state !== 'PENDING' || restart.phase !== 'ON_RESERVED') throw new RuntimeError('AUTHORITY_CHANGED', 'Restart ON is not pending');
+      if (terminal !== 'RUNNING' && terminal !== 'FAILED') throw new RuntimeError('INVALID_REQUEST', 'Restart terminal result is invalid');
+      return { ...grant, operations: updateOperation(grant, restart.onOperationId, terminal === 'RUNNING' ? 'COMMITTED' : 'FAILED', evidence, now), restart: { ...restart, state: terminal, phase: 'COMPLETE', updatedAt: now, resultDigest: digest(evidence) } };
+    });
+  }
+
+  public async markRestartUnknown(grantId: string, requestId: string, evidence: unknown): Promise<LifecycleRestartRecord> {
+    return this.updateRestart(grantId, requestId, evidence, (grant, restart, now) => {
+      if (restart.state !== 'PENDING') throw new RuntimeError('AUTHORITY_CHANGED', 'Restart is not pending');
+      const operations = grant.operations.map((operation) => isPairedOperation(restart, operation.operationId) && operation.state === 'RESERVED'
+        ? { ...operation, state: 'RECONCILIATION_REQUIRED' as const, completedAt: now, resultDigest: digest(evidence) } : operation);
+      return { ...grant, operations, restart: { ...restart, state: 'RECONCILIATION_REQUIRED', phase: 'UNKNOWN', updatedAt: now, resultDigest: digest(evidence) } };
+    });
+  }
+
+  /** Reconciliation records authoritative observations supplied by the Supervisor; it never performs or resumes effects. */
+  public async reconcileRestart(grantId: string, requestId: string, terminal: 'RUNNING' | 'FAILED', evidence: { readonly off: 'COMMITTED' | 'FAILED'; readonly on: 'COMMITTED' | 'FAILED'; readonly observed: unknown }): Promise<LifecycleRestartRecord> {
+    if (evidence === undefined || evidence.observed === undefined || !['COMMITTED', 'FAILED'].includes(evidence.off) || !['COMMITTED', 'FAILED'].includes(evidence.on)
+      || (terminal !== 'RUNNING' && terminal !== 'FAILED') || (terminal === 'RUNNING' ? evidence.off !== 'COMMITTED' || evidence.on !== 'COMMITTED' : evidence.on !== 'FAILED')) throw new RuntimeError('INVALID_REQUEST', 'Restart reconciliation requires consistent OFF and ON evidence');
+    return this.updateRestart(grantId, requestId, evidence, (grant, restart, now) => {
+      if (restart.state !== 'PENDING' && restart.state !== 'RECONCILIATION_REQUIRED') throw new RuntimeError('AUTHORITY_CHANGED', 'Restart is not awaiting reconciliation');
+      const operations = grant.operations.map((operation) => {
+        if (!isPairedOperation(restart, operation.operationId)) return operation;
+        const state = operation.operationId === restart.offOperationId ? evidence.off : evidence.on;
+        if ((operation.state === 'COMMITTED' || operation.state === 'FAILED') && operation.state !== state) throw new RuntimeError('AUTHORITY_CHANGED', 'Reconciliation cannot replace a known lifecycle outcome');
+        return { ...operation, state, completedAt: now, resultDigest: digest(evidence) };
+      });
+      return { ...grant, operations, restart: { ...restart, state: terminal, phase: 'COMPLETE', updatedAt: now, resultDigest: digest(evidence) } };
+    });
+  }
+
+  public async getRestart(requestId: string): Promise<LifecycleRestartRecord | null> {
+    if (!UUID_PATTERN.test(requestId)) throw new RuntimeError('INVALID_REQUEST', 'Restart request identity is invalid');
+    return (await this.readRestartDocument())?.grants.find((grant) => grant.restart?.requestId === requestId)?.restart ?? null;
+  }
+
+  public async assertNoUnresolvedRestart(): Promise<void> {
+    const document = await this.readRestartDocument();
+    if (document !== null) assertNoPendingRestart(document);
+  }
+
+  private async readRestartDocument(): Promise<LifecycleGrantDocument | null> {
+    const inspected = await inspectPrivateRegularFile(path.join(this.dataRoot, FILE), 'Runtime lifecycle grant document');
+    if (inspected.state === 'missing') return null;
+    if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
+    return this.readDocument(await this.requireSecret());
+  }
+
+  private async updateRestart(grantId: string, requestId: string, evidence: unknown, transform: (grant: LifecycleGrantRecord, restart: LifecycleRestartRecord, now: string) => LifecycleGrantRecord): Promise<LifecycleRestartRecord> {
+    if (!UUID_PATTERN.test(grantId) || !UUID_PATTERN.test(requestId) || evidence === undefined) throw new RuntimeError('INVALID_REQUEST', 'Restart identity and evidence are required');
+    const secret = await this.requireSecret();
+    let updated!: LifecycleRestartRecord;
+    await this.mutate(async (document) => {
+      const grant = document.grants.find((entry) => entry.grantId === grantId);
+      if (grant?.restart === undefined || grant.restart.requestId !== requestId) throw new RuntimeError('INVALID_REQUEST', 'Restart was not found');
+      const next = transform(grant, grant.restart, new Date().toISOString());
+      updated = next.restart!;
+      return replaceGrant(document, next);
+    }, secret);
+    return updated;
   }
 
   public async read(): Promise<readonly LifecycleGrantRecord[]> {
@@ -230,6 +362,8 @@ export class LifecycleGrantStore {
     const operation = this.mutationTail.then(async () => {
       const current = await this.readDocument(secret);
       const next = await transform(current);
+      if (next === current) return;
+      if (!isDocument(next)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Refusing invalid lifecycle grant publication');
       await writeAtomic(path.join(this.dataRoot, FILE), { ...next, mac: mac(secret, payload(next)) });
     });
     this.mutationTail = operation.then(() => undefined, () => undefined);
@@ -237,10 +371,10 @@ export class LifecycleGrantStore {
   }
 }
 
-function validateSpec(spec: LifecycleGrantSpec): void {
+function validateSpec(spec: LifecycleGrantSpec, requireFuture = true): void {
   validateBinding(spec);
   if (!UUID_PATTERN.test(spec.requestId) || spec.allowedOperations.length === 0 || spec.allowedOperations.some((operation) => !lifecycleOperations.includes(operation)) || new Set(spec.allowedOperations).size !== spec.allowedOperations.length) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle grant scope is invalid');
-  if (!Number.isFinite(Date.parse(spec.expiresAt)) || Date.parse(spec.expiresAt) <= Date.now()) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle grant expiry must be in the future');
+  if (!Number.isFinite(Date.parse(spec.expiresAt)) || requireFuture && Date.parse(spec.expiresAt) <= Date.now()) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle grant expiry must be in the future');
   if (!Number.isSafeInteger(spec.maxOperationCount) || spec.maxOperationCount < 1 || spec.maxOperationCount > 8) throw new RuntimeError('INVALID_REQUEST', 'Lifecycle grant operation count is invalid');
 }
 
@@ -259,6 +393,45 @@ function sameBinding(left: LifecycleGrantBinding, right: LifecycleGrantBinding):
 
 function sameSpec(record: LifecycleGrantRecord, spec: LifecycleGrantSpec): boolean {
   return record.requestId === spec.requestId && sameBinding(record, spec) && JSON.stringify(record.allowedOperations) === JSON.stringify(spec.allowedOperations) && record.expiresAt === spec.expiresAt && record.maxOperationCount === spec.maxOperationCount;
+}
+
+function validateRestartExecution(binding: LifecycleGrantBinding, execution: LifecycleGrantExecution): void {
+  validateBinding(binding);
+  validateExecution(execution);
+  if (!UUID_PATTERN.test(execution.operationId)) throw new RuntimeError('INVALID_REQUEST', 'Restart request identity must be a UUID');
+}
+
+function boundGrant(document: LifecycleGrantDocument, binding: LifecycleGrantBinding, execution: LifecycleGrantExecution): LifecycleGrantRecord {
+  const grant = document.grants.find((entry) => entry.grantId === execution.grantId);
+  if (grant === undefined) throw new RuntimeError('CONTROL_DENIED', 'Lifecycle grant was not found');
+  if (grant.requestId !== execution.requestId || !sameBinding(grant, binding)) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant request or current binding does not match');
+  return grant;
+}
+
+function assertGrantActive(grant: LifecycleGrantRecord): void {
+  if (grant.revokedAt !== null) throw new RuntimeError('CONTROL_DENIED', 'Lifecycle grant was revoked');
+  if (Date.parse(grant.expiresAt) <= Date.now()) throw new RuntimeError('CONTROL_DENIED', 'Lifecycle grant has expired');
+}
+
+function unresolvedOperation(operation: LifecycleGrantOperation): boolean { return operation.state === 'RESERVED' || operation.state === 'RECONCILIATION_REQUIRED'; }
+function isPairedOperation(restart: LifecycleRestartRecord, operationId: string): boolean { return operationId === restart.offOperationId || operationId === restart.onOperationId; }
+function assertNotPairedOperation(grant: LifecycleGrantRecord, operationId: string): void {
+  if (grant.restart !== undefined && isPairedOperation(grant.restart, operationId)) throw new RuntimeError('AUTHORITY_CHANGED', 'Paired restart operations require paired completion or reconciliation');
+}
+function assertNoPendingRestart(document: LifecycleGrantDocument): void {
+  if (document.grants.some((grant) => grant.restart !== undefined && grant.restart.phase !== 'COMPLETE')) throw new RuntimeError('AUTHORITY_CHANGED', 'A workload restart requires completion or reconciliation');
+}
+function consumedBudget(grant: LifecycleGrantRecord): number {
+  return grant.operations.filter((operation) => operation.state === 'COMMITTED' || grant.restart !== undefined && isPairedOperation(grant.restart, operation.operationId)).length;
+}
+function sameTarget(left: LifecycleGrantTarget | null, right: LifecycleGrantTarget | null): boolean {
+  return left === null || right === null ? left === right : left.pid === right.pid && left.processStartMarker === right.processStartMarker && left.runtimeId === right.runtimeId && left.instanceId === right.instanceId;
+}
+function replaceGrant(document: LifecycleGrantDocument, next: LifecycleGrantRecord): LifecycleGrantDocument {
+  return { ...document, grants: document.grants.map((grant) => grant.grantId === next.grantId ? { ...next, digest: digest(next) } : grant) };
+}
+function updateOperation(grant: LifecycleGrantRecord, operationId: string, state: 'COMMITTED' | 'FAILED', evidence: unknown, now: string): readonly LifecycleGrantOperation[] {
+  return grant.operations.map((operation) => operation.operationId === operationId ? { ...operation, state, completedAt: now, resultDigest: digest(evidence) } : operation);
 }
 
 function digest(value: unknown): string { return mac('runtime-lifecycle-grant-digest', value); }
@@ -289,7 +462,9 @@ async function writeAtomic(filename: string, value: unknown): Promise<void> {
 
 function isDocument(value: unknown): value is LifecycleGrantDocument {
   if (!isRecord(value) || value.schemaVersion !== SCHEMA_VERSION || typeof value.mac !== 'string' || !Array.isArray(value.grants) || value.grants.length > MAX_GRANTS) return false;
-  return value.grants.every(isGrant);
+  if (!value.grants.every(isGrant)) return false;
+  const restartIds = value.grants.flatMap((grant) => grant.restart === undefined ? [] : [grant.restart.requestId]);
+  return new Set(restartIds).size === restartIds.length;
 }
 
 function isGrant(value: unknown): value is LifecycleGrantRecord {
@@ -309,7 +484,27 @@ function isGrant(value: unknown): value is LifecycleGrantRecord {
     || typeof candidate.issuedAt !== 'string' || !Number.isFinite(Date.parse(candidate.issuedAt))
     || (revokedAt !== null && typeof revokedAt !== 'string') || !Array.isArray(operations)
     || typeof candidate.digest !== 'string' || !/^[a-f0-9]{64}$/.test(candidate.digest)) return false;
-  return operations.every((operation) => isRecord(operation) && typeof operation.operationId === 'string' && OPERATION_ID_PATTERN.test(operation.operationId) && lifecycleOperations.includes(operation.operation as LifecycleOperation) && ['RESERVED', 'COMMITTED', 'FAILED', 'RECONCILIATION_REQUIRED'].includes(String(operation.state)) && typeof operation.reservedAt === 'string' && Number.isFinite(Date.parse(operation.reservedAt)) && (operation.completedAt === undefined || typeof operation.completedAt === 'string') && (operation.resultDigest === undefined || typeof operation.resultDigest === 'string' && /^[a-f0-9]{64}$/.test(operation.resultDigest)) && (operation.target === undefined || isTarget(operation.target)));
+  const validOperations = operations.every((operation) => isRecord(operation) && typeof operation.operationId === 'string' && OPERATION_ID_PATTERN.test(operation.operationId) && lifecycleOperations.includes(operation.operation as LifecycleOperation) && ['RESERVED', 'COMMITTED', 'FAILED', 'RECONCILIATION_REQUIRED'].includes(String(operation.state)) && typeof operation.reservedAt === 'string' && Number.isFinite(Date.parse(operation.reservedAt)) && (operation.completedAt === undefined || typeof operation.completedAt === 'string') && (operation.resultDigest === undefined || typeof operation.resultDigest === 'string' && /^[a-f0-9]{64}$/.test(operation.resultDigest)) && (operation.target === undefined || isTarget(operation.target)));
+  return validOperations && (candidate.restart === undefined || isRestart(candidate.restart, candidate as unknown as LifecycleGrantRecord));
+}
+
+function isRestart(value: unknown, grant: LifecycleGrantRecord): value is LifecycleRestartRecord {
+  if (!isRecord(value) || !UUID_PATTERN.test(String(value.requestId)) || value.grantId !== grant.grantId
+    || !UUID_PATTERN.test(String(value.offOperationId)) || !UUID_PATTERN.test(String(value.onOperationId)) || value.offOperationId === value.onOperationId
+    || (value.capturedTarget !== null && !isTarget(value.capturedTarget))
+    || !['PENDING', 'RUNNING', 'FAILED', 'RECONCILIATION_REQUIRED'].includes(String(value.state))
+    || !['OFF_RESERVED', 'ON_RESERVED', 'COMPLETE', 'UNKNOWN'].includes(String(value.phase))
+    || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) || typeof value.updatedAt !== 'string' || !Number.isFinite(Date.parse(value.updatedAt))
+    || (value.resultDigest !== undefined && (typeof value.resultDigest !== 'string' || !/^[a-f0-9]{64}$/.test(value.resultDigest)))
+    || !lifecycleOperations.every((operation) => grant.allowedOperations.includes(operation)) || consumedBudget(grant) > grant.maxOperationCount
+    || new Set(grant.operations.map((operation) => operation.operationId)).size !== grant.operations.length) return false;
+  const off = grant.operations.find((operation) => operation.operationId === value.offOperationId);
+  const on = grant.operations.find((operation) => operation.operationId === value.onOperationId);
+  if (off?.operation !== 'runtime_off' || on?.operation !== 'runtime_on' || !sameTarget(off.target ?? null, value.capturedTarget as LifecycleGrantTarget | null)) return false;
+  if (value.phase === 'OFF_RESERVED') return value.state === 'PENDING' && off.state === 'RESERVED' && on.state === 'RESERVED';
+  if (value.phase === 'ON_RESERVED') return value.state === 'PENDING' && off.state === 'COMMITTED' && on.state === 'RESERVED';
+  if (value.phase === 'UNKNOWN') return value.state === 'RECONCILIATION_REQUIRED' && ['COMMITTED', 'RECONCILIATION_REQUIRED'].includes(off.state) && on.state === 'RECONCILIATION_REQUIRED';
+  return value.state === 'RUNNING' ? off.state === 'COMMITTED' && on.state === 'COMMITTED' : value.state === 'FAILED' && ['COMMITTED', 'FAILED'].includes(off.state) && on.state === 'FAILED';
 }
 
 function isTarget(value: unknown): value is LifecycleGrantTarget {

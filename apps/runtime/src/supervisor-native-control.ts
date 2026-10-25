@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { RuntimeError } from '@iris/domain';
 import { readControlPlaneApiKey, readTunnelServiceSecret } from './credentials.js';
+import { readOwnerAccessSecret } from './persistence.js';
 import { LEGACY_MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION, TUNNEL_CLIENT_MCP_PROTOCOL_VERSION } from './mcp.js';
 import { adminToolDefinitions, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 
@@ -61,6 +62,11 @@ export interface SupervisorNativeOperations {
   runtimeOff?: () => Promise<unknown>;
   runtimeOnAuthorized?: (input: LifecycleGrantCall) => Promise<unknown>;
   runtimeOffAuthorized?: (input: LifecycleGrantCall) => Promise<unknown>;
+  runtimeRestart?: (requestId: string) => Promise<unknown>;
+  runtimeRestartAuthorized?: (input: LifecycleGrantCall) => Promise<unknown>;
+  runtimeRestartStatus?: (requestId: string, reconcile: boolean) => Promise<unknown>;
+  keepAwakeStatus?: () => Promise<unknown>;
+  setKeepAwakePreference?: (enabled: boolean) => Promise<unknown>;
   readonly listProjects?: () => Promise<unknown>;
   readonly projectInfo?: (projectId: string) => Promise<unknown>;
   readonly workloadToolDefinitions?: () => readonly Record<string, unknown>[];
@@ -90,9 +96,9 @@ export async function startSupervisorNativeControlServer(
   }
   const secret = await readTunnelServiceSecret(dataRoot);
   if (secret === null) throw new RuntimeError('CREDENTIAL_MISSING', 'Supervisor native control requires the persistent tunnel service credential');
-  const ownerSecret = await readControlPlaneApiKey(dataRoot);
+  const ownerSecrets = [await readControlPlaneApiKey(dataRoot), await readOwnerAccessSecret(dataRoot)].filter((value): value is string => value !== null);
   const server = createServer((request, response) => {
-    void handleRequest(request, response, secret, ownerSecret, operations).catch(() => {
+    void handleRequest(request, response, secret, ownerSecrets, operations).catch(() => {
       if (!response.headersSent) writeJson(response, 500, { error: 'internal_error' });
       else response.end();
     });
@@ -113,7 +119,7 @@ async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
   tunnelSecret: string,
-  ownerSecret: string | null,
+  ownerSecrets: readonly string[],
   operations: SupervisorNativeOperations,
 ): Promise<void> {
   if (request.method === 'GET' && isUnsupportedOAuthMetadataPath(request.url)) {
@@ -123,7 +129,7 @@ async function handleRequest(
   }
   const authorization = request.headers.authorization;
   const tunnelAuthenticated = authorization === `Bearer ${tunnelSecret}`;
-  const ownerAuthenticated = ownerSecret !== null && authorization === `Bearer ${ownerSecret}`;
+  const ownerAuthenticated = ownerSecrets.some((secret) => authorization === `Bearer ${secret}`);
   if (!tunnelAuthenticated && !ownerAuthenticated) {
     writeJson(response, 401, { error: 'unauthorized' });
     return;
@@ -229,6 +235,20 @@ async function handleRequest(
       writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeStatus()));
       return;
     }
+    if (name === 'keep_awake_status') {
+      requireNoArguments(args);
+      if (operations.keepAwakeStatus === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Keep-awake observation is unavailable');
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.keepAwakeStatus()));
+      return;
+    }
+    if (name === 'keep_awake_set') {
+      if (!ownerAuthenticated) throw new RuntimeError('CONTROL_DENIED', 'Keep-awake preference requires authenticated local Owner control');
+      assertAllowedKeys(args, ['enabled']);
+      if (typeof args.enabled !== 'boolean') throw new RuntimeError('INVALID_REQUEST', 'enabled must be a boolean');
+      if (operations.setKeepAwakePreference === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Keep-awake control is unavailable');
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.setKeepAwakePreference(args.enabled)));
+      return;
+    }
     if (name === 'runtime_on') {
       if (ownerAuthenticated) {
         requireNoArguments(args);
@@ -251,6 +271,25 @@ async function handleRequest(
         if (Object.keys(args).length === 0) throw new RuntimeError('CONTROL_DENIED', 'Runtime lifecycle requires an owner-bound lifecycle grant');
         writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeOffAuthorized(lifecycleGrantCall(args))));
       }
+      return;
+    }
+    if (name === 'runtime_restart') {
+      if (ownerAuthenticated) {
+        assertAllowedKeys(args, ['requestId']);
+        if (operations.runtimeRestart === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Workload restart is unavailable');
+        writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeRestart(restartRequestId(args))));
+      } else {
+        if (!tunnelAuthenticated || operations.runtimeRestartAuthorized === undefined || Object.keys(args).length === 0) throw new RuntimeError('CONTROL_DENIED', 'Restart requires a bounded OFF and ON lifecycle grant');
+        writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeRestartAuthorized(lifecycleGrantCall(args))));
+      }
+      return;
+    }
+    if (name === 'runtime_restart_status') {
+      if (!ownerAuthenticated) throw new RuntimeError('CONTROL_DENIED', 'Restart reconciliation requires authenticated local Owner control');
+      assertAllowedKeys(args, ['requestId', 'reconcile']);
+      if (args.reconcile !== undefined && typeof args.reconcile !== 'boolean') throw new RuntimeError('INVALID_REQUEST', 'reconcile must be a boolean');
+      if (operations.runtimeRestartStatus === undefined) throw new RuntimeError('PRECONDITION_FAILED', 'Restart evidence is unavailable');
+      writeJsonRpcResult(response, rpc.id ?? null, toolResult(await operations.runtimeRestartStatus(restartRequestId(args), args.reconcile === true)));
       return;
     }
     if (name === 'list_projects') {
@@ -367,6 +406,30 @@ export function nativeToolDefinitions(): readonly Record<string, unknown>[] {
       description: 'Stop only the governed workload Runtime; Supervisor and connector processes remain unchanged.',
       inputSchema: lifecycleGrantInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    {
+      name: 'runtime_restart',
+      description: 'Durably restart workload only using both bounded OFF and ON permissions. Replays return evidence and never repeat the restart.',
+      inputSchema: lifecycleGrantInputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    {
+      name: 'runtime_restart_status',
+      description: 'Owner-local restart evidence and explicit settlement from verified process journals. This never starts or stops a process.',
+      inputSchema: { type: 'object', properties: { requestId: { type: 'string', format: 'uuid' }, reconcile: { type: 'boolean' } }, required: ['requestId'], additionalProperties: false },
+      annotations: { readOnlyHint: false },
+    },
+    {
+      name: 'keep_awake_status',
+      description: 'Read persisted Owner preference separately from observed provider state; this does not start a provider or Runtime.',
+      inputSchema: noArgs,
+      annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'keep_awake_set',
+      description: 'Set the persistent Keep-awake preference through authenticated local Owner control. A tunnel service credential does not authorize this operation.',
+      inputSchema: { type: 'object', properties: { enabled: { type: 'boolean' } }, required: ['enabled'], additionalProperties: false },
+      annotations: { readOnlyHint: false },
     },
     {
       name: 'workload_mutation_status',
@@ -593,4 +656,9 @@ function writeEmptyNotFound(response: ServerResponse): void {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function restartRequestId(args: Record<string, unknown>): string {
+  if (typeof args.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(args.requestId)) throw new RuntimeError('INVALID_REQUEST', 'Restart requires an original UUID requestId');
+  return args.requestId;
 }

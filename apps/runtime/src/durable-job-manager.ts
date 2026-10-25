@@ -454,6 +454,10 @@ export class DurableJobManager {
     return statusView(await this.reconcile(job));
   }
 
+  public async inspectOwnedJob(projectId: string, jobId: string, authority?: DurableSessionAuthority): Promise<Record<string, unknown>> {
+    return statusView(await this.getOwnedNonReviewJob(projectId, jobId, authority));
+  }
+
   public async logs(projectId: string, jobId: string, stream: 'stdout' | 'stderr', cursor?: string, maxBytes = 16 * 1024, authority?: DurableSessionAuthority): Promise<Record<string, unknown>> {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > LOG_WINDOW_MAX) throw new RuntimeError('INVALID_REQUEST', 'maxBytes is outside the bounded log window');
     const job = await this.reconcile(await this.getOwnedNonReviewJob(projectId, jobId, authority));

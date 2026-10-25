@@ -125,6 +125,7 @@ function isOperation(value: unknown): value is LifecycleOperationReceipt {
   return isRecord(value) && isUuid(value.requestId) && operationKind(value.kind) && positiveInteger(value.basedOnRevision)
     && (value.resultRevision === null || positiveInteger(value.resultRevision))
     && (value.status === 'PENDING' || value.status === 'SUCCEEDED' || value.status === 'FAILED')
+    && (value.inputDigest === undefined || (typeof value.inputDigest === 'string' && /^[0-9a-f]{64}$/.test(value.inputDigest)))
     && timestamp(value.createdAt) && (value.completedAt === null || timestamp(value.completedAt));
 }
 

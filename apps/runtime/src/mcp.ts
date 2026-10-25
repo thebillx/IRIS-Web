@@ -121,7 +121,7 @@ async function handleMcpTransportRequest(
 
     try {
       if (params.name === 'mutation_status') {
-        return jsonRpcResult(rpc.id ?? null, toolResult(await runtimeMutationStatus(args, state, principal, runtimeContext, mutationJournal)));
+        return jsonRpcResult(rpc.id ?? null, toolResult(await runtimeMutationStatus(args, state, principal, runtimeContext, mutationJournal, capabilities)));
       }
       if (profile === 'full' && params.name === 'catalog_identity') {
         return jsonRpcResult(rpc.id ?? null, catalogIdentityPayload('FULL', toolDefinitions(), runtimeContext));
@@ -167,13 +167,14 @@ async function executeToolWithEvidence(
   runtimeContext: McpCatalogRuntimeContext, mutationJournal: DurableMutationJournal | undefined,
 ): Promise<CapabilityOutcome | unknown> {
   return executeWorkloadToolWithEvidence(name, args, request, state, principal, runtimeContext, mutationJournal,
-    () => executeTool(name, args, request, capabilities, state, broker, principal));
+    () => executeTool(name, args, request, capabilities, state, broker, principal), capabilities);
 }
 
 export async function executeWorkloadToolWithEvidence(
   name: string, args: Record<string, unknown>, request: Request, state: RuntimeState | undefined,
   principal: McpPrincipal, runtimeContext: McpCatalogRuntimeContext, mutationJournal: DurableMutationJournal | undefined,
   execute: () => Promise<unknown>,
+  capabilities?: CapabilityService,
 ): Promise<unknown> {
   if (mutationJournal === undefined || principal !== 'tunnel-service') return execute();
   const contract = workloadMutationContract(name, args);
@@ -191,7 +192,7 @@ export async function executeWorkloadToolWithEvidence(
   if (contract.requiresSession && sessionId === null) throw new RuntimeError('CONTROL_DENIED', 'Durable workload operation requires an explicit session');
   if (sessionId !== null) {
     const session = name === 'job' ? await state.validateCapturedJobSession(sessionId, clientId) : await state.validateSessionAuthority(sessionId, clientId, ['session_resume', 'session_detach', 'session_close'].includes(name));
-    if (session.attachmentState === 'CLOSED' && name !== 'session_close') throw new RuntimeError('CONTROL_DENIED', 'Session is closed');
+    if (session.attachmentState === 'CLOSED' && !['session_detach', 'session_close'].includes(name)) throw new RuntimeError('CONTROL_DENIED', 'Session is closed');
     if (typeof args.projectId === 'string' && !['job', 'workspace_select'].includes(name) && session.currentProjectId !== args.projectId) throw new RuntimeError('CONTROL_DENIED', 'Requested project is no longer selected');
     if (typeof args.missionId === 'string' && name !== 'mission_rebind') {
       const mission = await state.getMission(args.missionId);
@@ -212,24 +213,23 @@ export async function executeWorkloadToolWithEvidence(
   const existing = await mutationJournal.inspectByLogicalIdentity(contract.requestId, logicalFingerprint, binding);
   if (existing !== null) {
     if (existing.binding?.runtimeId !== runtimeId || existing.binding.deploymentEpoch !== deploymentEpoch) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation belongs to a different deployment lineage');
-    if (name === 'session_open') {
-      const receipt = await state.sessionMutationEvidence(contract.requestId, clientId);
-      if (receipt !== null) await state.validateSessionAuthority(receipt.result.id, clientId);
-    }
+    const evidence = existing.state !== 'COMMITTED' && existing.state !== 'FAILED' ? await operationSourceEvidence(existing, state) : null;
+    await authorizeMutationReceipt(evidence === null ? existing : { ...existing, result: evidence }, state, capabilities);
     if (existing.state === 'COMMITTED') return existing.result;
     if (existing.state !== 'FAILED') {
-      const evidence = await operationSourceEvidence(existing, state);
       if (evidence !== null && existing.binding !== undefined) return (await mutationJournal.reconcile(existing.requestId, existing.fingerprint, existing.binding, 'COMMITTED', evidence)).result;
     }
     throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation already has durable evidence; inspect mutation_status before any further action');
   }
-  return mutationJournal.execute(contract.requestId, fingerprint, execute, binding, logicalFingerprint);
+  return mutationJournal.execute(contract.requestId, fingerprint, execute, binding, logicalFingerprint, args,
+    (record) => authorizeMutationReceipt(record, state, capabilities));
 }
 
 async function runtimeMutationStatus(
   args: Record<string, unknown>, state: RuntimeState | undefined, principal: McpPrincipal,
   runtimeContext: McpCatalogRuntimeContext,
   mutationJournal: DurableMutationJournal | undefined,
+  capabilities: CapabilityService,
 ): Promise<Record<string, unknown>> {
   if (principal !== 'tunnel-service' || mutationJournal === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence is restricted to the authenticated Supervisor tunnel');
   const requestId = requiredBoundedString(args, 'requestId', 200);
@@ -261,11 +261,29 @@ async function runtimeMutationStatus(
   const binding: MutationBinding = { operation, clientId, sessionId, projectId, workspaceId, runtimeId, instanceId, deploymentEpoch };
   const record = await mutationJournal.inspect(requestId, fingerprint, binding);
   if (record === null) return { requestId, operation, state: 'NOT_FOUND' };
-  if (state !== undefined && record.state !== 'COMMITTED' && record.state !== 'FAILED') {
-    const evidence = await operationSourceEvidence(record, state);
-    if (evidence !== null) return { ...mutationEvidence({ ...record, state: 'COMMITTED', result: evidence }), journalState: record.state, source: 'durable-operation-receipt' };
-  }
+  if (state === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence authority is unavailable');
+  const evidence = record.state !== 'COMMITTED' && record.state !== 'FAILED' ? await operationSourceEvidence(record, state) : null;
+  await authorizeMutationReceipt(evidence === null ? record : { ...record, result: evidence }, state, capabilities);
+  if (evidence !== null) return { ...mutationEvidence({ ...record, state: 'COMMITTED', result: evidence }), journalState: record.state, source: 'durable-operation-receipt' };
   return mutationEvidence(record);
+}
+
+async function authorizeMutationReceipt(record: MutationRecord, state: RuntimeState, capabilities?: CapabilityService): Promise<void> {
+  const binding = record.binding;
+  if (binding === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt has no authenticated binding');
+  const sessionOperations: Record<string, string> = { session_open: 'ensure', workspace_select: 'select', session_resume: 'resume', session_detach: 'detach', session_close: 'close' };
+  if (sessionOperations[binding.operation] !== undefined) {
+    const receipt = await state.sessionMutationEvidence(record.requestId, binding.clientId);
+    if (receipt === null || receipt.operation !== sessionOperations[binding.operation]
+      || (binding.sessionId !== null && receipt.result.id !== binding.sessionId)) throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt has no matching owned session operation');
+    await state.validateSessionAuthority(receipt.result.id, binding.clientId, ['session_detach', 'session_close'].includes(binding.operation));
+    if (binding.operation === 'workspace_select' && receipt.result.currentProjectId !== null) await new VNextResourceRegistry(state, state.dataRoot).primaryWorkspace(receipt.result.currentProjectId);
+    return;
+  }
+  const args = record.originalArguments;
+  if (args === undefined || sha256(stableJson({ name: binding.operation, args, ...binding })) !== record.fingerprint) throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt lacks verifiable original intent');
+  if (capabilities === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt permission verification is unavailable');
+  await capabilities.authorizeMutationReceipt(binding, args, record.result);
 }
 
 async function operationSourceEvidence(record: MutationRecord, state: RuntimeState): Promise<unknown | null> {

@@ -217,17 +217,21 @@ export class PermissionPolicyEngine {
     }
     let session;
     try {
-      session = this.state.getSessionForClient(sessionId, clientId);
+      session = definition.id.startsWith('job.')
+        ? await this.state.validateCapturedJobSession(sessionId, clientId)
+        : await this.state.validateSessionAuthority(sessionId, clientId);
     } catch {
       return { valid: false, reason: 'Client/session identity does not own the requested session', projectId: null, target: normalizedDisplayTarget(input.targetPath) };
     }
-    if (session.currentProjectId === null) {
+    const capturedJobProject = definition.id.startsWith('job.') && input.projectId != null
+      && this.state.getDurableSessionAuthority(sessionId, clientId) !== undefined ? input.projectId : null;
+    if (session.currentProjectId === null && capturedJobProject === null) {
       return { valid: false, reason: 'Session has no current project', projectId: null, target: normalizedDisplayTarget(input.targetPath) };
     }
-    if (input.projectId !== undefined && input.projectId !== null && input.projectId !== session.currentProjectId) {
+    if (capturedJobProject === null && input.projectId !== undefined && input.projectId !== null && input.projectId !== session.currentProjectId) {
       return { valid: false, reason: 'Requested project does not match the live session project', projectId: session.currentProjectId, target: normalizedDisplayTarget(input.targetPath) };
     }
-    const project = await projectById(this.state, session.currentProjectId);
+    const project = await projectById(this.state, capturedJobProject ?? session.currentProjectId!);
     if (project === null) return { valid: false, reason: 'Session current project is not registered', projectId: session.currentProjectId, target: normalizedDisplayTarget(input.targetPath) };
 
     const targetKind = projectTargetKind(definition.id);

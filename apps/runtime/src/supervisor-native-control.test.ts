@@ -1,3 +1,4 @@
+import { loadOrCreateOwnerAccessSecret } from './persistence.js';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -51,7 +52,7 @@ describe('outer supervisor native control', () => {
         'Mcp-Method': 'tools/list',
       });
       expect(toolNames(listed)).toEqual([
-        'supervisor_status', 'supervisor_doctor', 'runtime_status', 'runtime_on', 'runtime_off', 'workload_mutation_status', 'list_projects', 'project_info', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
+        'supervisor_status', 'supervisor_doctor', 'runtime_status', 'runtime_on', 'runtime_off', 'runtime_restart', 'runtime_restart_status', 'keep_awake_status', 'keep_awake_set', 'workload_mutation_status', 'list_projects', 'project_info', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle',
         'activation_status', 'activation_prepare', 'activation_apply', 'activation_confirm', 'activation_rollback',
       ]);
       expect(catalogToolNames('FULL')).not.toContain('admin_tunnel_recycle');
@@ -103,7 +104,9 @@ describe('outer supervisor native control', () => {
         'supervisor_doctor',
         'runtime_status',
         'runtime_on',
-        'runtime_off',
+        'runtime_off', 'runtime_restart', 'runtime_restart_status',
+        'keep_awake_status',
+        'keep_awake_set',
         'workload_mutation_status',
         'list_projects',
         'project_info',
@@ -117,7 +120,7 @@ describe('outer supervisor native control', () => {
         'activation_confirm',
         'activation_rollback',
       ]);
-      for (const name of ['supervisor_status', 'supervisor_doctor', 'runtime_on', 'runtime_off', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
+      for (const name of ['supervisor_status', 'supervisor_doctor', 'runtime_on', 'runtime_off', 'runtime_restart', 'runtime_restart_status', 'admin_status', 'runtime_reconcile', 'admin_recycle', 'admin_tunnel_recycle']) {
         expect(catalogToolNames('FULL')).not.toContain(name);
         expect(catalogToolNames('PRO')).not.toContain(name);
       }
@@ -131,6 +134,17 @@ describe('outer supervisor native control', () => {
       const ownerHeaders = { authorization: `Bearer ${harness.ownerSecret}` };
       expect(structured(await rpcTool(harness, 'runtime_on', {}, ownerHeaders))).toMatchObject({ state: 'RUNNING', workloadOnly: true });
       expect(structured(await rpcTool(harness, 'runtime_off', {}, ownerHeaders))).toMatchObject({ state: 'STOPPED', workloadOnly: true });
+      const restartId = randomUUID();
+      const uiOwnerHeaders = { authorization: `Bearer ${harness.ownerAccessSecret}` };
+      expect(toolError(await rpcTool(harness, 'runtime_restart', { requestId: restartId }))).toMatchObject({ code: 'INVALID_REQUEST' });
+      expect(toolError(await rpcTool(harness, 'runtime_restart', { requestId: 'invalid' }, uiOwnerHeaders))).toMatchObject({ code: 'INVALID_REQUEST' });
+      expect(structured(await rpcTool(harness, 'runtime_restart', { requestId: restartId }, uiOwnerHeaders))).toMatchObject({ requestId: restartId, state: 'RUNNING', workloadOnly: true });
+      expect(toolError(await rpcTool(harness, 'runtime_restart_status', { requestId: restartId }))).toMatchObject({ code: 'CONTROL_DENIED' });
+      expect(structured(await rpcTool(harness, 'runtime_restart_status', { requestId: restartId, reconcile: true }, uiOwnerHeaders))).toMatchObject({ state: 'FAILED', workloadOnly: true });
+      expect(structured(await rpcTool(harness, 'keep_awake_status', {}))).toMatchObject({ preferenceEnabled: true, observed: 'ACTIVE' });
+      expect(toolError(await rpcTool(harness, 'keep_awake_set', { enabled: false }))).toMatchObject({ code: 'CONTROL_DENIED' });
+      expect(toolError(await rpcTool(harness, 'keep_awake_set', { enabled: 'false' }, ownerHeaders))).toMatchObject({ code: 'INVALID_REQUEST' });
+      expect(structured(await rpcTool(harness, 'keep_awake_set', { enabled: false }, ownerHeaders))).toMatchObject({ preferenceEnabled: false, observed: 'INACTIVE' });
       expect(structured(await rpcTool(harness, 'list_projects', {}))).toMatchObject({ defaultProjectId: null, projects: [{ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' }] });
       expect(structured(await rpcTool(harness, 'project_info', { projectId: '11111111-1111-4111-8111-111111111111' }))).toEqual({ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' });
       expect(toolError(await rpcTool(harness, 'project_info', { projectId: '../escape' }))).toMatchObject({ code: 'INVALID_REQUEST' });
@@ -322,6 +336,7 @@ async function startHarness(withWorkload = false) {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-native-supervisor-control-'));
   roots.push(dataRoot);
   const secret = await loadOrCreateTunnelServiceSecret(dataRoot);
+  const ownerAccessSecret = await loadOrCreateOwnerAccessSecret(dataRoot);
   await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
   const recycleInputs: AdminRecycleInput[] = [];
   const workloadCalls: string[] = [];
@@ -333,6 +348,11 @@ async function startHarness(withWorkload = false) {
     runtimeStatus: async () => ({ state: 'stopped', workloadOnly: true }),
     runtimeOn: async () => ({ state: 'RUNNING', workloadOnly: true }),
     runtimeOff: async () => ({ state: 'STOPPED', workloadOnly: true }),
+    runtimeRestart: async (requestId) => ({ requestId, state: 'RUNNING', workloadOnly: true }),
+    runtimeRestartAuthorized: async (input) => ({ requestId: input.operationId, state: 'RUNNING', workloadOnly: true }),
+    runtimeRestartStatus: async (requestId, reconcile) => ({ requestId, state: reconcile ? 'FAILED' : 'RECONCILIATION_REQUIRED', workloadOnly: true }),
+    keepAwakeStatus: async () => ({ preferenceEnabled: true, requested: true, observed: 'ACTIVE' }),
+    setKeepAwakePreference: async (enabled) => ({ preferenceEnabled: enabled, requested: enabled, observed: enabled ? 'ACTIVE' : 'INACTIVE' }),
     listProjects: async () => ({ defaultProjectId: null, projects: [{ id: '11111111-1111-4111-8111-111111111111', name: 'Project', rootPath: '/tmp/project-a' }] }),
     projectInfo: async (projectId) => {
       if (projectId !== '11111111-1111-4111-8111-111111111111') throw new Error('Registered project was not found');
@@ -366,6 +386,7 @@ async function startHarness(withWorkload = false) {
     dataRoot,
     secret,
     ownerSecret: 'control-plane-credential-for-test-only-12345',
+    ownerAccessSecret,
     recycleInputs,
     workloadCalls,
     workloadContexts,

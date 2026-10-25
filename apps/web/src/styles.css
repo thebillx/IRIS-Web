@@ -261,3 +261,13 @@ li + li { margin-top: .45rem; }
   .approval-header { padding-block: .65rem; }
   .approval-footer { padding-top: .55rem; padding-bottom: calc(.55rem + env(safe-area-inset-bottom)); }
 }
+
+.owner-control { margin-bottom: 1.25rem; padding: 1rem; border: 1px solid #40526f; border-radius: .8rem; background: #111722; }
+.owner-control h2 { margin: .2rem 0; }
+.owner-control-status { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .75rem; }
+.owner-control-status dt { color: #91a0b8; font-size: .8rem; }
+.owner-control-status dd { margin: .25rem 0 0; overflow-wrap: anywhere; }
+.owner-control-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+.owner-control-awake { margin-top: 1rem; }
+.owner-control-awake label { display: flex; align-items: center; gap: .5rem; }
+.owner-control details { margin-top: .75rem; color: #b2bdce; }

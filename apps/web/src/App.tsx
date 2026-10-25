@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
+import { OwnerControlPanel } from './owner-control.js';
 import { V21MissionLifecyclePanel, type V21MissionLifecycle } from './mission-control-v21.js';
 import { MultiWorkerObservabilityPanel, type MultiWorkerObservability } from './multi-worker-observability.js';
 
@@ -30,6 +31,9 @@ type SessionInteraction = {
 export type Session = {
   id: string;
   clientId: string;
+  machineId?: string;
+  conversationId?: string;
+  attachmentState?: 'ATTACHED' | 'DETACHED' | 'CLOSED';
   agentId: string;
   agentRole: string;
   createdAt: string;
@@ -130,6 +134,7 @@ type MissionLifecycleAction = 'resume' | 'cancel';
 
 const WEB_CLIENT_ID_KEY = 'iris.web.clientId';
 const WEB_OWNER_TOKEN_KEY = 'iris.web.ownerToken';
+const WEB_SESSION_CREATION_KEY = 'iris.web.pendingSessionCreation';
 const WEB_SELECTED_SESSION_KEY = 'iris.web.selectedSessionId';
 
 export function App(): ReactElement {
@@ -150,10 +155,11 @@ export function App(): ReactElement {
   const [submittingSessionIds, setSubmittingSessionIds] = useState<Set<string>>(() => new Set());
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const creatingSession = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
-      const healthResponse = await fetch('/health');
+      const healthResponse = await authorizedFetch(ownerAccessToken, '/health');
       if (!healthResponse.ok) throw new Error('Runtime unavailable');
       setHealth(await healthResponse.json() as Health);
       if (ownerAccessToken.length === 0) {
@@ -214,21 +220,22 @@ export function App(): ReactElement {
   }, [selectedSessionId]);
 
   const createSession = async () => {
-    const response = await authorizedFetch(ownerAccessToken, '/sessions', {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientId, agentId: 'owner-web', agentRole: 'owner' }),
-    });
-    if (response.status === 409) {
-      setNotice('Session creation requires an owner decision. It was queued without creating a session.');
-      setView('approvals');
+    if (creatingSession.current) return;
+    creatingSession.current = true;
+    try {
+      const intent = sessionCreationIntent(clientId);
+      const response = await authorizedFetch(ownerAccessToken, '/sessions', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...intent, agentId: 'owner-web', agentRole: 'owner' }),
+      });
+      if (!response.ok) throw new Error(await responseMessage(response, 'Session creation is unconfirmed. Retry New session to check the same saved request.'));
+      const created = await response.json() as Session;
+      if (typeof created.id !== 'string' || created.id.length === 0 || created.clientId !== clientId || created.conversationId !== intent.conversationId || typeof created.machineId !== 'string') throw new Error('Session creation returned an invalid identity. The original request is retained.');
+      persistSelectedSessionId(created.id);
+      setSelectedSessionId(created.id);
+      window.sessionStorage.removeItem(WEB_SESSION_CREATION_KEY);
+      setNotice('New session created and selected.');
       await refresh();
-      return;
-    }
-    if (!response.ok) throw new Error(await responseMessage(response, 'Could not create session'));
-    const created = await response.json() as Session;
-    persistSelectedSessionId(created.id);
-    setSelectedSessionId(created.id);
-    setNotice('New session created and selected.');
-    await refresh();
+    } finally { creatingSession.current = false; }
   };
 
   const registerProject = async () => {
@@ -253,15 +260,18 @@ export function App(): ReactElement {
     const response = await authorizedFetch(ownerAccessToken, `/sessions/${encodeURIComponent(selectedSession.id)}/current-project`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', 'x-iris-client-id': selectedSession.clientId },
-      body: JSON.stringify({ projectId: projectId || null }),
+      body: JSON.stringify({ projectId: projectId || null, requestId: crypto.randomUUID() }),
     });
-    if (response.status === 409) {
-      setNotice('Changing the session project requires an owner decision. The existing session was left unchanged.');
-      setView('approvals');
-      await refresh();
-      return;
+    if (!response.ok) {
+      const failure = await responseErrorDetails(response, 'Could not update current project');
+      if (failure.code === 'OWNER_DECISION_REQUIRED') {
+        setNotice('Changing the session project requires an owner decision. The existing session was left unchanged.');
+        setView('approvals');
+        await refresh();
+        return;
+      }
+      throw new Error(failure.message);
     }
-    if (!response.ok) throw new Error(await responseMessage(response, 'Could not update current project'));
     const updated = await response.json() as Session;
     setSessions((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
     await refresh();
@@ -272,6 +282,7 @@ export function App(): ReactElement {
     const text = instruction.trim();
     if (targetSession === null) throw new Error('Select or create a session before sending an instruction.');
     if (health === null) throw new Error('Runtime is unavailable. The instruction was not sent.');
+    if (targetSession.attachmentState !== undefined && targetSession.attachmentState !== 'ATTACHED') throw new Error('Resume this session before sending an instruction.');
     if (text.length === 0) return;
     if (targetSession.executionState === 'WORKING' || submittingSessionIds.has(targetSession.id)) return;
 
@@ -376,8 +387,18 @@ export function App(): ReactElement {
     await refresh();
   };
 
-  const selectSession = (sessionId: string) => {
-    if (!sessions.some((candidate) => candidate.id === sessionId)) return;
+  const selectSession = async (sessionId: string) => {
+    const session = sessions.find((candidate) => candidate.id === sessionId);
+    if (session === undefined) return;
+    if (session.machineId !== undefined) {
+      const response = await authorizedFetch(ownerAccessToken, `/sessions/${encodeURIComponent(sessionId)}/resume`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-iris-client-id': session.clientId }, body: JSON.stringify({ requestId: crypto.randomUUID() }),
+      });
+      if (!response.ok) throw new Error(await responseMessage(response, 'Session resume is unconfirmed.'));
+      const resumed = await response.json() as Session;
+      if (resumed.id !== session.id || resumed.clientId !== session.clientId || resumed.machineId !== session.machineId) throw new Error('Session resume returned a different identity.');
+      setSessions((current) => current.map((candidate) => candidate.id === resumed.id ? resumed : candidate));
+    }
     setSelectedApproval(null);
     persistSelectedSessionId(sessionId);
     setSelectedSessionId(sessionId);
@@ -423,6 +444,7 @@ export function App(): ReactElement {
     </header>
 
     <main>
+      <OwnerControlPanel ownerAccessToken={ownerAccessToken} />
       {error && <p className="error" role="alert">{error}</p>}
       {notice && <p className="notice" role="status">{notice}</p>}
       {view === 'runtime' && <RuntimePage
@@ -444,7 +466,7 @@ export function App(): ReactElement {
         setInstruction={setInstruction}
         onCreateSession={() => run(createSession)}
         onSubmitInstruction={() => run(submitInstruction)}
-        onSelectSession={selectSession}
+        onSelectSession={(sessionId) => run(() => selectSession(sessionId))}
         onRegisterProject={() => run(registerProject)}
         onSelectProject={(projectId) => run(() => selectProject(projectId))}
         onRequestMissionOrchestrator={(mission, targetMode) => run(() => requestMissionOrchestrator(mission, targetMode))}
@@ -487,8 +509,10 @@ export function RuntimePage(props: {
   onRequestMissionOrchestrator(mission: Mission, targetMode: OrchestratorMode): void;
   onRequestMissionLifecycleAction?(mission: Mission, action: MissionLifecycleAction): void;
 }): ReactElement {
+  const sessionAttached = props.selectedSession?.attachmentState === undefined || props.selectedSession.attachmentState === 'ATTACHED';
   const sessionState = props.health === null
     ? 'Disconnected'
+    : !sessionAttached ? 'Resume required'
     : props.pendingApprovalCount > 0
       ? 'Approval required'
       : props.selectedSession?.executionState === 'WORKING'
@@ -513,13 +537,13 @@ export function RuntimePage(props: {
         <section className="sessions-card" aria-labelledby="sessions-heading">
           <div className="section-title-row"><div><p className="section-label">Sessions</p><h2 id="sessions-heading">Your sessions</h2></div><button onClick={props.onCreateSession}>+ New</button></div>
           {props.sessions.length === 0
-            ? <div className="empty-state"><p>No sessions yet.</p><span>Start one to work with a project. Sessions live in the local daemon and resume across browser refreshes while that daemon is running.</span></div>
+            ? <div className="empty-state"><p>No sessions yet.</p><span>Start one to work with a project. Sessions are saved locally. Resume one when Runtime is available.</span></div>
             : <div className="session-list">{props.sessions.map((session, index) => {
               const selected = session.id === props.selectedSession?.id;
               const project = session.currentProjectId === null ? null : props.projects.find((candidate) => candidate.id === session.currentProjectId) ?? null;
               return <button key={session.id} className={`session-row ${selected ? 'is-selected' : ''}`} onClick={() => props.onSelectSession(session.id)} aria-pressed={selected}>
                 <span><strong>Session {index + 1}</strong><small>{session.agentRole} · {project?.name ?? 'No project'}</small></span>
-                <span className="session-action">{selected ? 'Current' : 'Resume'}</span>
+                <span className="session-action">{selected && session.attachmentState !== 'DETACHED' ? 'Current' : 'Resume'}</span>
               </button>;
             })}</div>}
         </section>
@@ -532,7 +556,8 @@ export function RuntimePage(props: {
             ? <div className="empty-state prominent"><p>Create a session or resume one from the list.</p><button onClick={props.onCreateSession}>Create session</button></div>
             : <>
               <div className="session-summary"><div><span>Role</span><strong>{props.selectedSession.agentRole}</strong></div><div><span>Agent</span><strong>{humanAgentName(props.selectedSession.agentId)}</strong></div><div><span>Started</span><strong><time dateTime={props.selectedSession.createdAt}>{formatSessionTime(props.selectedSession.createdAt)}</time></strong></div></div>
-              <label>Active project<select value={props.selectedSession.currentProjectId ?? ''} onChange={(event) => props.onSelectProject(event.target.value)}><option value="">No active project</option>{props.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+              {!sessionAttached && <p>Resume this session to continue. <button disabled={props.health === null} onClick={() => props.onSelectSession(props.selectedSession!.id)}>Resume session</button></p>}
+              <label>Active project<select disabled={!sessionAttached || props.health === null} value={props.selectedSession.currentProjectId ?? ''} onChange={(event) => props.onSelectProject(event.target.value)}><option value="">No active project</option>{props.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
               {props.health?.agentExecutorType === 'local-development-executor' && !props.health.productionModelConnected
                 ? <p className="executor-note">Development executor active · no production model connected.</p>
                 : null}
@@ -555,10 +580,10 @@ export function RuntimePage(props: {
                   maxLength={8000}
                   rows={3}
                   placeholder={props.health === null ? 'Runtime unavailable' : 'Tell IRIS what to do…'}
-                  disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting}
+                  disabled={!sessionAttached || props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting}
                   onChange={(event) => props.setInstruction(event.target.value)}
                 />
-                <div className="composer-actions"><span>{props.selectedSession.executionState === 'WORKING' ? 'Runtime is working on this session.' : 'Enter sends only when you choose Send.'}</span><button type="submit" disabled={props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting || props.instruction.trim().length === 0}>{props.isSubmitting ? 'Sending…' : 'Send'}</button></div>
+                <div className="composer-actions"><span>{props.selectedSession.executionState === 'WORKING' ? 'Runtime is working on this session.' : 'Enter sends only when you choose Send.'}</span><button type="submit" disabled={!sessionAttached || props.health === null || props.selectedSession.executionState === 'WORKING' || props.isSubmitting || props.instruction.trim().length === 0}>{props.isSubmitting ? 'Sending…' : 'Send'}</button></div>
               </form>
               <details className="session-runtime-activity"><summary>Runtime activity</summary>{props.sessionActivity.length === 0 ? <p>No recorded runtime activity in this session yet.</p> : <ul>{props.sessionActivity.map((event) => <li key={event.id}><strong>{humanCapability(event.capabilityId)}</strong><span>{event.result.toLowerCase()}</span></li>)}</ul>}</details>
             </>}
@@ -791,6 +816,19 @@ function authorizedFetch(token: string, input: RequestInfo | URL, init: RequestI
   const headers = new Headers(init.headers);
   headers.set('authorization', `Bearer ${token}`);
   return fetch(input, { ...init, headers });
+}
+
+function sessionCreationIntent(clientId: string): { clientId: string; conversationId: string; requestId: string } {
+  const existing = window.sessionStorage.getItem(WEB_SESSION_CREATION_KEY);
+  if (existing !== null) {
+    const intent = JSON.parse(existing) as { clientId?: unknown; conversationId?: unknown; requestId?: unknown };
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (intent.clientId !== clientId || typeof intent.conversationId !== 'string' || !uuid.test(intent.conversationId) || typeof intent.requestId !== 'string' || !uuid.test(intent.requestId)) throw new Error('The pending session request does not match this browser. It was not replaced.');
+    return { clientId, conversationId: intent.conversationId, requestId: intent.requestId };
+  }
+  const intent = { clientId, conversationId: crypto.randomUUID(), requestId: crypto.randomUUID() };
+  window.sessionStorage.setItem(WEB_SESSION_CREATION_KEY, JSON.stringify(intent));
+  return intent;
 }
 
 export function webClientId(): string {

@@ -200,6 +200,13 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return;
   }
   if (!publicObservation && !ownerMcp) authorizeOwnerAccess(request, context.ownerAccessSecret);
+  const expectedInstance = request.headers['x-iris-instance-id'];
+  const expectedRuntime = request.headers['x-iris-runtime-id'];
+  if (expectedInstance !== undefined && (expectedInstance !== context.identity.instanceId || expectedRuntime !== context.identity.runtimeId)
+    || expectedRuntime !== undefined && ownerAccessAllowed(request, context.ownerAccessSecret) && expectedRuntime !== context.identity.runtimeId) {
+    throw new RuntimeError('RUNTIME_IDENTITY_MISMATCH', 'Requested Runtime identity is no longer current');
+  }
+
 
   if ((request.method === 'POST' || request.method === 'PUT') && !ownerMcp) requireJsonContentType(request);
 

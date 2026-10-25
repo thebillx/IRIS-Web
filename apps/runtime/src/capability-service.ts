@@ -37,6 +37,7 @@ import type { RuntimeState } from './state.js';
 import type { MultiWorkerRoutingService } from './multi-worker/service.js';
 import type { AdoRequirementContextService } from './ado/runtime-context.js';
 import type { MissionDelegationStore, MissionDelegationSpec } from './mission-delegation.js';
+import type { MutationBinding } from './durable-mutation-journal.js';
 
 type Phase4GitCapabilityId = Exclude<Extract<CapabilityId, `git.${string}`>, 'git.local'>;
 type Phase4GitOperationCore = Phase4GitRequest & {
@@ -71,7 +72,7 @@ type CapabilityOperationCore =
   | { readonly capabilityId: 'remote.publish'; readonly clientId: string; readonly sessionId: string; readonly projectId?: string | undefined }
   | { readonly capabilityId: 'mission.list'; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
   | { readonly capabilityId: 'mission.get'; readonly missionId: string; readonly clientId?: string | undefined; readonly sessionId?: string | undefined }
-  | { readonly capabilityId: 'mission.create'; readonly clientId: string; readonly sessionId: string; readonly title: string; readonly orchestratorMode?: OrchestratorMode | undefined }
+  | { readonly capabilityId: 'mission.create'; readonly clientId: string; readonly sessionId: string; readonly title: string; readonly orchestratorMode?: OrchestratorMode | undefined; readonly requestId?: string; readonly goal?: string }
   | { readonly capabilityId: 'mission.state.set'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly state: MissionState }
   | { readonly capabilityId: 'mission.task.create'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly title: string }
   | { readonly capabilityId: 'mission.task.state.set'; readonly clientId: string; readonly sessionId: string; readonly missionId: string; readonly taskId: string; readonly state: MissionTaskState }
@@ -173,6 +174,69 @@ export class CapabilityService {
 
   public permissionSnapshot() {
     return this.policy.snapshot();
+  }
+
+  /** Authorize disclosure of an existing receipt without executing, auditing, reconciling, or consuming authority. */
+  public async authorizeMutationReceipt(binding: MutationBinding, args: Readonly<Record<string, unknown>>, result: unknown): Promise<void> {
+    if (binding.sessionId === null) throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt requires its original session');
+    const session = binding.operation === 'job'
+      ? await this.state.validateCapturedJobSession(binding.sessionId, binding.clientId)
+      : await this.state.validateSessionAuthority(binding.sessionId, binding.clientId);
+    const value = isPlainRecord(result) && result.status === 'executed' ? result.value : result;
+    if (binding.operation.startsWith('mission_')) {
+      const missionId = typeof args.missionId === 'string' ? args.missionId : isPlainRecord(value) && typeof value.id === 'string' ? value.id : null;
+      if (missionId === null) throw new RuntimeError('CONTROL_DENIED', 'Mission receipt identity is unavailable');
+      const mission = await this.state.getMission(missionId);
+      if (mission.clientId !== binding.clientId || mission.sessionId !== binding.sessionId || mission.projectId === null || mission.projectId !== session.currentProjectId) throw new RuntimeError('CONTROL_DENIED', 'Mission receipt scope is no longer owned');
+      await this.resourceRegistry().primaryWorkspace(mission.projectId);
+      // Other lifecycle tools use owned mission authority rather than a granular capability.
+      if (binding.operation !== 'mission_create') return;
+    }
+    const aliases: Readonly<Record<string, string>> = { file_write: 'file.write', file_edit: 'file.edit', file_delete: 'file.delete', directory_create: 'directory.create', directory_delete: 'directory.delete', git_local: 'git.local', project_validation_start: 'project.validation.start', mission_create: 'mission.create' };
+    const grouped = ['workspace', 'fs', 'artifact', 'shell', 'job', 'git'].includes(binding.operation);
+    const capabilityId = grouped && typeof args.operation === 'string' ? `${binding.operation}.${args.operation}` : aliases[binding.operation];
+    const definition = capabilityId === undefined ? null : capabilityDefinition(capabilityId);
+    if (capabilityId === undefined || definition === null) throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt capability is unavailable');
+    const effectiveEffects = deriveCapabilityEffects(capabilityId, {
+      operation: capabilityId === 'fs.write' ? typeof args.writeMode === 'string' ? args.writeMode : undefined : typeof args.operation === 'string' ? args.operation : undefined,
+      executionProfile: typeof args.executionProfile === 'string' ? args.executionProfile : undefined,
+    });
+    if (effectiveEffects === null) throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt effects are unavailable');
+    const projectId = binding.projectId ?? session.currentProjectId;
+    if (projectId === null) throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt project is unavailable');
+    if (binding.operation !== 'job') await this.authorizedProject({ capabilityId: capabilityId as CapabilityId, clientId: binding.clientId, sessionId: binding.sessionId, projectId });
+    const resources = this.resourceRegistry();
+    let workspaceId = binding.workspaceId ?? (isPlainRecord(value) && typeof value.workspaceId === 'string' ? value.workspaceId : null);
+    if (binding.operation === 'job') {
+      if (typeof args.jobId !== 'string') throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt job is unavailable');
+      const job = await this.jobManager().inspectOwnedJob(projectId, args.jobId, this.state.getDurableSessionAuthority(binding.sessionId, binding.clientId));
+      if (typeof job.workspaceId !== 'string') throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt job workspace is unavailable');
+      workspaceId = job.workspaceId;
+    } else if (binding.operation === 'artifact' && typeof args.artifactId === 'string') {
+      const artifact = (await resources.listArtifacts(projectId)).find((entry) => entry.artifactId === args.artifactId);
+      if (artifact === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation receipt artifact is unavailable');
+      workspaceId = artifact.workspaceId;
+    }
+    if (workspaceId !== null) {
+      if (capabilityId === 'workspace.revoke_scratch') {
+        await resources.getWorkspace(projectId, workspaceId);
+        await resources.primaryWorkspace(projectId);
+      } else await resources.getActiveWorkspace(projectId, workspaceId);
+    } else await resources.primaryWorkspace(projectId);
+    const decision = await this.policy.evaluate({ capabilityId, clientId: binding.clientId, sessionId: binding.sessionId, projectId, workspaceId,
+      targetPath: typeof args.targetPath === 'string' ? args.targetPath : undefined, effectiveEffects });
+    if (decision.decision === 'DENY') throw new RuntimeError('CONTROL_DENIED', `Mutation receipt is no longer authorized: ${decision.reason}`);
+    if (args.actionId !== undefined) {
+      if (typeof args.missionId !== 'string' || typeof args.actionId !== 'string') throw new RuntimeError('CONTROL_DENIED', 'Mission receipt action identity is unavailable');
+      const mission = await this.state.getMission(args.missionId);
+      if (mission.clientId !== binding.clientId || mission.sessionId !== binding.sessionId || mission.projectId !== projectId) throw new RuntimeError('CONTROL_DENIED', 'Mission action receipt is no longer owned');
+      const delegated = await this.delegations?.inspectReceipt({ missionId: args.missionId, operationId: args.actionId, clientId: binding.clientId, sessionId: binding.sessionId,
+        agentId: session.agentId, capabilityId, projectId, workspaceId, riskClass: definition.riskClass,
+        sourceSha: typeof args.sourceSha === 'string' ? args.sourceSha : undefined, sourceTree: typeof args.sourceTree === 'string' ? args.sourceTree : undefined });
+      if (delegated?.status === 'blocked') throw new RuntimeError('CONTROL_DENIED', delegated.reason);
+      if (delegated?.status === 'allowed') return;
+    }
+    if (decision.decision !== 'ALLOW_AUTO') throw new RuntimeError('CONTROL_DENIED', `Mutation receipt is no longer authorized: ${decision.reason}`);
   }
 
   public recentAudit(limit?: number) {
@@ -542,14 +606,16 @@ export class CapabilityService {
   private async phase3Preflight(operation: Phase3Operation): Promise<Phase2Preflight> {
     await this.authorizedProject(operation);
     if (operation.capabilityId === 'shell.run' || operation.capabilityId === 'shell.start') {
-      const prepared = await this.jobManager().prepare(shellExecutionInput(operation));
+      const prepared = await this.jobManager().prepare({ ...shellExecutionInput(operation), authority: this.state.getDurableSessionAuthority(operation.sessionId, operation.clientId) });
       return {
         workspaceId: prepared.workspaceId,
         resourceId: null,
         target: prepared.plan.executableIdentity,
       };
     }
-    return { workspaceId: null, resourceId: operation.jobId, target: null };
+    const job = await this.jobManager().status(operation.projectId, operation.jobId, this.state.getDurableSessionAuthority(operation.sessionId, operation.clientId));
+    if (typeof job.workspaceId !== 'string') throw new RuntimeError('CONTROL_DENIED', 'Captured job workspace identity is unavailable');
+    return { workspaceId: job.workspaceId, resourceId: operation.jobId, target: null };
   }
 
   private async phase4GitPreflight(operation: Phase4GitOperation): Promise<Phase2Preflight> {
@@ -738,7 +804,7 @@ export class CapabilityService {
     }
     if (operation.capabilityId === 'mission.list') return { missions: await this.state.listMissions() };
     if (operation.capabilityId === 'mission.get') return this.state.getMission(operation.missionId);
-    if (operation.capabilityId === 'mission.create') return this.state.createMission(operation.clientId, operation.sessionId, operation.title, operation.orchestratorMode ?? 'HERMES');
+    if (operation.capabilityId === 'mission.create') return this.state.createMission(operation.clientId, operation.sessionId, operation.title, operation.orchestratorMode ?? 'HERMES', operation.requestId, operation.goal);
     if (operation.capabilityId === 'mission.state.set') {
       if (operation.state === 'COMPLETED') {
         await this.state.assertMissionReviewActionsFinalized(operation.missionId);
@@ -835,16 +901,17 @@ export class CapabilityService {
 
   private async executePhase3(operation: Phase3Operation, decision: PermissionDecisionRecord): Promise<unknown> {
     const jobs = this.jobManager();
+    const authority = this.state.getDurableSessionAuthority(operation.sessionId, operation.clientId);
     if (operation.capabilityId === 'shell.run' || operation.capabilityId === 'shell.start') {
-      const prepared = await jobs.prepare(shellExecutionInput(operation));
+      const prepared = await jobs.prepare({ ...shellExecutionInput(operation), authority: this.state.getDurableSessionAuthority(operation.sessionId, operation.clientId) });
       const effects = decision.effectiveEffects ?? [];
       if (operation.capabilityId === 'shell.run') return jobs.run(prepared, effects, operation.mission);
       return jobs.start(prepared, operation.requestId, effects, operation.mission);
     }
-    if (operation.capabilityId === 'job.status') return jobs.status(operation.projectId, operation.jobId);
-    if (operation.capabilityId === 'job.logs') return jobs.logs(operation.projectId, operation.jobId, operation.stream, operation.cursor, operation.maxBytes);
-    if (operation.capabilityId === 'job.result') return jobs.result(operation.projectId, operation.jobId);
-    if (operation.capabilityId === 'job.cancel') return jobs.cancel(operation.projectId, operation.jobId);
+    if (operation.capabilityId === 'job.status') return jobs.status(operation.projectId, operation.jobId, authority);
+    if (operation.capabilityId === 'job.logs') return jobs.logs(operation.projectId, operation.jobId, operation.stream, operation.cursor, operation.maxBytes, authority);
+    if (operation.capabilityId === 'job.result') return jobs.result(operation.projectId, operation.jobId, authority);
+    if (operation.capabilityId === 'job.cancel') return jobs.cancel(operation.projectId, operation.jobId, authority);
     throw new RuntimeError('CAPABILITY_DENIED', 'Phase 3 capability execution is not implemented');
   }
 
@@ -964,7 +1031,15 @@ export class CapabilityService {
       if (project === undefined) throw new RuntimeError('PROJECT_NOT_FOUND', 'Requested project is not registered');
       return project;
     }
-    const session = this.state.getSessionForClient(operation.sessionId, operation.clientId);
+    const session = operation.capabilityId.startsWith('job.')
+      ? await this.state.validateCapturedJobSession(operation.sessionId, operation.clientId)
+      : await this.state.validateSessionAuthority(operation.sessionId, operation.clientId);
+    if (operation.capabilityId.startsWith('job.') && operation.projectId !== undefined
+      && this.state.getDurableSessionAuthority(operation.sessionId, operation.clientId) !== undefined) {
+      const project = (await this.state.listProjects()).find((entry) => entry.id === operation.projectId);
+      if (project === undefined) throw new RuntimeError('PROJECT_NOT_FOUND', 'Captured job project is no longer registered');
+      return project;
+    }
     if (session.currentProjectId === null) throw new RuntimeError('CAPABILITY_DENIED', 'Session has no current project');
     if ('projectId' in operation && operation.projectId !== undefined && operation.projectId !== session.currentProjectId) throw new RuntimeError('CAPABILITY_DENIED', 'Operation project no longer matches the live session project');
     const project = (await this.state.listProjects()).find((entry) => entry.id === session.currentProjectId);
@@ -1296,4 +1371,8 @@ function sameEffects(left: readonly CapabilityEffect[] | undefined, right: reado
   const a = left ?? [];
   const b = right ?? [];
   return a.length === b.length && a.every((effect, index) => effect === b[index]);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

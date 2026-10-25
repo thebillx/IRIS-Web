@@ -220,6 +220,9 @@ describe('Supervisor production failure boundaries', () => {
     await f.supervisor.runSupervisorDaemon(); expect(mocks.native).toHaveBeenCalledTimes(1);
     expect(await readFile(path.join(f.root, 'supervisor/state.json'), 'utf8')).not.toContain('synthetic-do-not-log');
     expect(log.mock.calls.flat().join(' ')).not.toContain('synthetic-do-not-log');
+    await f.supervisor.reconcileStartup();
+    await f.supervisor.runSupervisorDaemon();
+    expect(mocks.native).toHaveBeenCalledTimes(2);
   });
   it('does not overwrite workload state when a native-control listener has ambiguous ownership', async () => {
     const f = await fixture();
@@ -570,8 +573,12 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
     await expect(f.supervisor.runSupervisorDaemon()).resolves.toBeUndefined();
     expect(await readFile(filename)).toEqual(before);
   });
-  it('starts and stops only native Supervisor control without activating workload children', async () => {
+  it.each([false, true])('starts and stops native Control without workloads, including workload recovery gate=%s', async (workloadGate) => {
     const f = await fixture();
+    if (workloadGate) {
+      const state = await f.internal.readState();
+      await f.internal.writeState({ ...state, recovery: { ...state.recovery, terminal: true, lastFailureCode: 'PROCESS_OWNERSHIP_AMBIGUOUS' } }, true);
+    }
     const close = vi.fn().mockResolvedValue(undefined);
     mocks.native.mockResolvedValue({ port: f.ports[2]!, mcpUrl: 'http://127.0.0.1/mcp', healthUrl: 'http://127.0.0.1/healthz', close });
     const stateFile = path.join(f.root, 'supervisor/state.json');

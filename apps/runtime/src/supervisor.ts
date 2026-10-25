@@ -1,14 +1,14 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, existsSync, openSync, realpathSync } from 'node:fs';
-import { lstat, mkdir, open, readFile, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import { createConnection } from 'node:net';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { RuntimeError, type RuntimeFailureCode } from '@iris/domain';
-import { assertActivationSourceIdentity, assertActivationWorkloadReady, type ActivationSourceIdentity } from './activation-source-identity.js';
+import { inspectActivationSourceIdentity, assertActivationSourceIdentity, assertActivationWorkloadReady, type ActivationSourceIdentity } from './activation-source-identity.js';
 import { probeRuntimeAuthority } from './authority.js';
 import { bindAdminTunnelIdentity, bindConnectorRuntime, initializeConnectorRegistry, inspectConnectorRegistry, readConnectorRegistry, reconcileConnectorRegistry, replaceConnectorCatalogManifest, seedFromLegacyProfiles, type AdminConnectorBinding, type ConnectorBinding, type ConnectorCatalogManifest, type ConnectorRegistryDocument } from './connector-registry.js';
 import { credentialPaths, inspectCredentialStatus, loadOrCreateTunnelServiceSecret, readTunnelServiceSecret, rotateTunnelServiceSecret, type CredentialStatus } from './credentials.js';
@@ -23,13 +23,14 @@ import { runtimeStatus, startRuntime, stopRuntime, type RuntimeObservedStatus } 
 import { KeepAwakeLeaseManager, KeepAwakePreferenceStore, MacOSCaffeinateProvider, type KeepAwakeLease, type KeepAwakeProvider } from './keep-awake.js';
 import { readMachineId } from './machine-identity.js';
 import { readVerifiedSourceIdentity } from './mission-delegation.js';
+import { isCapabilityOutcome, toolOutcome, toolResult } from './mcp-v21-tools.js';
 import { LifecycleGrantStore, type LifecycleGrantBinding, type LifecycleGrantTarget, type LifecycleOperation } from './lifecycle-grant.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Environment } from './node-runtime.js';
 import { callSupervisorAdminTool, listSupervisorAdminToolNames, type SupervisorAdminToolCallResult } from './supervisor-admin.js';
 import { startSupervisorNativeControlServer, type AdminRecycleInput, type AdminTunnelRecycleInput, type LifecycleGrantCall, type SupervisorMutationStatusInput, type SupervisorWorkloadCallContext } from './supervisor-native-control.js';
 import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, readRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation, resolveFailedAdminTunnelStart, type RecoveryPolicyOperationInput } from './recovery-policy.js';
-import { resolveReviewedRuntimeEntrypoints } from './launchd.js';
-import { DurableMutationJournal, type MutationBinding } from './durable-mutation-journal.js';
+import { readInitialLaunchAgentEnrollmentState, resolveReviewedRuntimeEntrypoints } from './launchd.js';
+import { DurableMutationJournal, workloadMutationContract, type MutationBinding } from './durable-mutation-journal.js';
 import { ProductionSafetyController, withSafetyWriterAdmission, type SafetyIdentity } from './production-safety.js';
 
 import { confirmChildSpawn, DefiniteSpawnFailure } from './spawn-outcome.js';
@@ -56,7 +57,6 @@ const FORWARDED_READ_ONLY_TOOLS = new Set([
   'mission_list', 'session_get', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events',
   'project_validation_discover', 'project_validation_job', 'catalog_identity',
 ]);
-const FORWARDED_DURABLE_MUTATION_TOOLS = new Set(['project_validation_start']);
 
 const FORWARDED_GROUPED_READ_ONLY_TOOLS = new Set(['workspace', 'fs', 'artifact', 'job', 'git']);
 // Only validation/authority failures prove that the downstream mutation never started.
@@ -84,16 +84,6 @@ function groupedWorkloadReadOnly(name: string, args: Record<string, unknown>): b
   return false;
 }
 
-function groupedWorkloadDurableMutation(name: string, args: Record<string, unknown>): boolean {
-  if (typeof args.operation !== 'string') return false;
-  if (name === 'workspace') return args.operation === 'create_scratch' || args.operation === 'revoke_scratch';
-  if (name === 'fs') return ['write', 'edit', 'mkdir', 'delete'].includes(args.operation);
-  if (name === 'artifact') return args.operation === 'register_existing' || args.operation === 'release';
-  if (name === 'shell') return args.operation === 'run' || args.operation === 'start';
-  if (name === 'job') return args.operation === 'cancel';
-  if (name === 'git') return ['branch_create', 'worktree_add', 'worktree_remove', 'add', 'commit', 'fetch', 'push'].includes(args.operation);
-  return false;
-}
 
 export type StackState = 'READY' | 'DEGRADED' | 'FAILED' | 'UNKNOWN';
 
@@ -154,6 +144,7 @@ interface OwnedProcess {
 }
 
 interface RecoveryRecord {
+  readonly nativeStartupBlocked?: boolean;
   readonly attempts: number;
   readonly terminal: boolean;
   readonly lastFailureCode: string | null;
@@ -528,6 +519,7 @@ export class Supervisor {
   }
 
   private async upUnlocked(expectedSourceIdentity?: ActivationSourceIdentity): Promise<SupervisorStackStatus> {
+    await this.lifecycleGrants.assertNoUnresolvedRestart();
     await this.migrateHistoricalOwnership();
     await this.assertStartupReconciled();
     await this.keepAwakePreference.initialize();
@@ -543,6 +535,10 @@ export class Supervisor {
     const runtimeId = await loadOrCreateRuntimeId(this.dataRoot);
     const boundRegistry = await bindConnectorRuntime(this.dataRoot, runtimeId);
     const unified = isUnifiedConnectorRegistry(boundRegistry);
+    if (unified && !this.nativeControlActive
+      && await inspectSupervisorNativeOwner(this.dataRoot, this.supervisorControlPort, this.sourceRoot) !== 'verified') {
+      throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'ONE IRIS requires its installed persistent Supervisor gateway before workload startup');
+    }
     const registryChanged = registryResult.changed || boundRegistry.deploymentEpoch !== registryResult.registry.deploymentEpoch;
     let state = await this.readState();
     const started: Array<'runtime' | 'web' | 'admin' | 'full' | 'pro' | 'admin-tunnel'> = [];
@@ -621,7 +617,7 @@ export class Supervisor {
         );
       }
 
-      state = await this.ensureAdmin(state, started);
+      if (!unified) state = await this.ensureAdmin(state, started);
       const profiles = await this.writeManagedProfiles(boundRegistry, runtime.endpoint.apiUrl);
       if (this.nativeControlActive && !unified) {
         if (profiles.admin === null) throw new RuntimeError('PRECONDITION_FAILED', 'Persistent native supervisor control requires a dedicated ADMIN tunnel identity');
@@ -684,6 +680,7 @@ export class Supervisor {
   public async restart(): Promise<SupervisorStackStatus> {
     await this.prepareDirectories();
     return this.withOperationLock('restart', async () => {
+      await this.lifecycleGrants.assertNoUnresolvedRestart();
       await this.downUnlocked();
       return this.upUnlocked();
     });
@@ -893,15 +890,13 @@ export class Supervisor {
   }
 
   public async runtimeStatus(): Promise<RuntimeObservedStatus> {
-    await this.prepareDirectories();
     return runtimeStatus(this.dataRoot);
   }
 
   public async keepAwakeStatus(): Promise<Record<string, unknown>> {
-    await this.prepareDirectories();
     const preference = await this.keepAwakePreference.readOrDefault();
     const observed = await this.keepAwake.snapshot();
-    return { preferenceEnabled: preference.enabled, preferenceUpdatedAt: preference.updatedAt, ...observed };
+    return { preferenceEnabled: preference.enabled, preferenceUpdatedAt: preference.updatedAt, observedAt: new Date().toISOString(), ...observed };
   }
 
   public async setKeepAwakePreference(enabled: boolean): Promise<Record<string, unknown>> {
@@ -911,15 +906,26 @@ export class Supervisor {
       if (enabled) await this.ensureOwnerKeepAwake();
       else await this.releaseOwnerKeepAwake();
       const observed = await this.keepAwake.snapshot();
-      return { preferenceEnabled: preference.enabled, preferenceUpdatedAt: preference.updatedAt, ...observed };
+      return { preferenceEnabled: preference.enabled, preferenceUpdatedAt: preference.updatedAt, observedAt: new Date().toISOString(), ...observed };
     });
   }
 
   public async runtimeOn(expectedLifecycleBinding?: LifecycleGrantBinding, lifecycleOperationId?: string): Promise<Record<string, unknown>> {
     await this.prepareDirectories();
-    return this.withOperationLock('runtime-on', () => this.startupTransaction(async () => {
+    return this.withOperationLock('runtime-on', async () => {
+      await this.lifecycleGrants.assertNoUnresolvedRestart();
+      return this.runtimeOnUnlocked(expectedLifecycleBinding, lifecycleOperationId);
+    });
+  }
+
+  private async runtimeOnUnlocked(expectedLifecycleBinding?: LifecycleGrantBinding, lifecycleOperationId?: string): Promise<Record<string, unknown>> {
+    return this.startupTransaction(async () => {
       let state = await this.readState();
       if (expectedLifecycleBinding !== undefined) await this.assertCurrentLifecycleBinding(expectedLifecycleBinding);
+      const registry = await readConnectorRegistry(this.dataRoot);
+      if (registry !== null && isUnifiedConnectorRegistry(registry)) {
+        await bindConnectorRuntime(this.dataRoot, await loadOrCreateRuntimeId(this.dataRoot));
+      }
       const observed = await runtimeStatus(this.dataRoot);
       if (observed.state === 'indeterminate') throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Runtime authority is indeterminate');
       if (observed.state === 'stale') throw new RuntimeError('AUTHORITY_INDETERMINATE', observed.reason ?? 'Stale Runtime authority requires reconciliation');
@@ -946,12 +952,18 @@ export class Supervisor {
       await this.writeState({ ...state, runtime: verified });
       await this.ensureRuntimeKeepAwake();
       return { state: 'RUNNING', runtimeId: verified.runtimeId, instanceId: verified.instanceId, workloadOnly: true };
-    }));
+    });
   }
 
   public async runtimeOff(expectedLifecycleBinding?: LifecycleGrantBinding): Promise<Record<string, unknown>> {
     await this.prepareDirectories();
     return this.withOperationLock('runtime-off', async () => {
+      await this.lifecycleGrants.assertNoUnresolvedRestart();
+      return this.runtimeOffUnlocked(expectedLifecycleBinding);
+    });
+  }
+
+  private async runtimeOffUnlocked(expectedLifecycleBinding?: LifecycleGrantBinding): Promise<Record<string, unknown>> {
       await this.migrateHistoricalOwnership();
       await this.assertStartupReconciled();
       const state = await this.readState();
@@ -973,7 +985,6 @@ export class Supervisor {
         startupOperations: cleared.startupOperations.map((operation) => operation.component === 'runtime' && operation.state === 'RUNNING' ? { ...operation, state: 'STOPPED' as const } : operation),
       }, true);
       return { state: 'STOPPED', workloadOnly: true };
-    });
   }
 
   public async issueRuntimeLifecycleGrant(input: {
@@ -1054,17 +1065,19 @@ export class Supervisor {
 
   private async currentLifecycleGrantBinding(): Promise<LifecycleGrantBinding> {
     const state = await this.readState();
-    const tunnel = state.adminTunnel;
-    if (tunnel === null || tunnel.tunnelId === null || await inspectProcess(tunnel) !== 'running') throw new RuntimeError('CONTROL_DENIED', 'A verified ADMIN tunnel is required for lifecycle grant issuance');
-    const tunnelWorkingDirectory = tunnel.workingDirectory;
-    if (typeof tunnelWorkingDirectory !== 'string' || !sameSourceRoot(tunnelWorkingDirectory, this.sourceRoot)) throw new RuntimeError('AUTHORITY_CHANGED', 'ADMIN tunnel working directory is not bound to the Supervisor source');
     const registry = await readConnectorRegistry(this.dataRoot);
-    if (registry?.admin?.tunnelId !== tunnel.tunnelId) throw new RuntimeError('AUTHORITY_CHANGED', 'Current ADMIN tunnel is not bound to the registered ADMIN connector');
+    const unified = registry !== null && isUnifiedConnectorRegistry(registry);
+    const tunnel = unified ? state.tunnels.full : state.adminTunnel;
+    if (tunnel === null || tunnel.tunnelId === null || await inspectProcess(tunnel) !== 'running') throw new RuntimeError('CONTROL_DENIED', 'A verified registered control tunnel is required for lifecycle grant issuance');
+    const tunnelWorkingDirectory = tunnel.workingDirectory;
+    if (typeof tunnelWorkingDirectory !== 'string' || !sameSourceRoot(tunnelWorkingDirectory, this.sourceRoot)) throw new RuntimeError('AUTHORITY_CHANGED', 'Control tunnel working directory is not bound to the Supervisor source');
+    const binding = unified ? registry.connectors[0] : registry?.admin;
+    if (binding?.tunnelId !== tunnel.tunnelId) throw new RuntimeError('AUTHORITY_CHANGED', 'Current control tunnel is not bound to the registered connector');
     const machineId = await readMachineId(this.dataRoot);
     if (machineId === null) throw new RuntimeError('PERSISTENCE_FAILURE', 'Machine identity is unavailable');
-    if (registry.admin !== null && registry.admin.machineId !== null && registry.admin.machineId !== machineId) throw new RuntimeError('AUTHORITY_CHANGED', 'Current ADMIN connector is bound to a different machine');
-    const tunnelProbe = await this.probeAdminTunnel(state, tunnel);
-    if (!tunnelProbe.ownershipVerified || !tunnelProbe.listenerOwnershipVerified) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'ADMIN tunnel process or listener ownership is not verified');
+    if (binding.machineId !== machineId) throw new RuntimeError('AUTHORITY_CHANGED', 'Current control connector is bound to a different machine');
+    const tunnelProbe = unified ? await this.probeUnifiedTunnel(state, registry) : await this.probeAdminTunnel(state, tunnel);
+    if (!tunnelProbe.ownershipVerified || !tunnelProbe.listenerOwnershipVerified || tunnelProbe.status.state !== 'READY') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Control tunnel process, profile or listener ownership is not verified');
     let source;
     try { source = await readVerifiedSourceIdentity(this.sourceRoot); } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Current Supervisor source identity could not be verified', { cause: error }); }
     let canonicalSourceRoot: string;
@@ -1075,12 +1088,17 @@ export class Supervisor {
       canonicalWorkloadSourceRoot = realpathSync(state.workloadSourceRoot);
       workloadSource = await readVerifiedSourceIdentity(canonicalWorkloadSourceRoot);
     } catch (error) { throw new RuntimeError('PERSISTENCE_FAILURE', 'Current workload source identity could not be verified', { cause: error }); }
+    const controlBytes = await inspectActivationSourceIdentity(canonicalSourceRoot);
+    const workloadBytes = canonicalWorkloadSourceRoot === canonicalSourceRoot ? controlBytes : await inspectActivationSourceIdentity(canonicalWorkloadSourceRoot);
+    if (controlBytes.head !== source.sha || workloadBytes.head !== workloadSource.sha || controlBytes.trackedModifiedCount !== 0 || workloadBytes.trackedModifiedCount !== 0) {
+      throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant requires unchanged committed source bytes');
+    }
     return { machineId, tunnelId: tunnel.tunnelId, sourceRoot: canonicalSourceRoot, sourceSha: source.sha, sourceTree: source.tree, workloadSourceRoot: canonicalWorkloadSourceRoot, workloadSourceSha: workloadSource.sha, workloadSourceTree: workloadSource.tree };
   }
 
   private async executeRuntimeWithGrant(input: LifecycleGrantCall, operation: LifecycleOperation): Promise<Record<string, unknown>> {
     const binding = await this.currentLifecycleGrantBinding();
-    if (input.tunnelId !== binding.tunnelId) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant tunnel identity does not match the current ADMIN tunnel');
+    if (input.tunnelId !== binding.tunnelId) throw new RuntimeError('AUTHORITY_CHANGED', 'Lifecycle grant tunnel identity does not match the current control tunnel');
     const grant = await this.withOperationLock('runtime-lifecycle-grant-reserve', async () => {
       const target = operation === 'runtime_off' ? await this.lifecycleGrantRuntimeTarget() : undefined;
       return this.lifecycleGrants.reserve(binding, operation, { ...input, ...(target === undefined ? {} : { target }) });
@@ -1103,6 +1121,76 @@ export class Supervisor {
     return this.executeRuntimeWithGrant(input, 'runtime_off');
   }
 
+  public async runtimeRestart(requestId: string, authorized?: LifecycleGrantCall): Promise<Record<string, unknown>> {
+    await this.prepareDirectories();
+    return this.withOperationLock('runtime-restart', async () => {
+      const existing = await this.lifecycleGrants.getRestart(requestId);
+      const binding = await this.currentLifecycleGrantBinding();
+      if (authorized !== undefined && (authorized.operationId !== requestId || authorized.tunnelId !== binding.tunnelId)) throw new RuntimeError('AUTHORITY_CHANGED', 'Restart grant correlation does not match');
+      if (existing !== null) {
+        const grant = await this.lifecycleGrants.get(existing.grantId);
+        await this.assertCurrentLifecycleBinding(grant);
+        if (authorized !== undefined && (authorized.grantId !== grant.grantId || authorized.requestId !== grant.requestId)) throw new RuntimeError('AUTHORITY_CHANGED', 'Restart belongs to another lifecycle grant');
+        return { ...existing, workloadOnly: true };
+      }
+      const grant = authorized === undefined
+        ? (await this.lifecycleGrants.read()).find((entry) => entry.requestId === requestId)
+          ?? await this.lifecycleGrants.issue({ ...binding, requestId, allowedOperations: ['runtime_off', 'runtime_on'], maxOperationCount: 2, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() })
+        : await this.lifecycleGrants.get(authorized.grantId);
+      const execution = { grantId: grant.grantId, requestId: authorized?.requestId ?? requestId, operationId: requestId };
+      const capturedTarget = await this.lifecycleGrantRuntimeTarget() ?? null;
+      if (capturedTarget === null && (await runtimeStatus(this.dataRoot)).state !== 'stopped') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Restart workload absence is not verified');
+      const reserved = await this.lifecycleGrants.beginRestart(binding, execution, capturedTarget);
+      if (!reserved.created) return { ...reserved.record, workloadOnly: true };
+      try {
+        const off = await this.runtimeOffUnlocked(binding);
+        await this.lifecycleGrants.advanceRestartOff(grant.grantId, requestId, off);
+        await this.assertCurrentLifecycleBinding(binding);
+        await this.lifecycleGrants.authorizeRestartOn(binding, execution);
+        const on = await this.runtimeOnUnlocked(binding, reserved.record.onOperationId);
+        const settled = await this.lifecycleGrants.completeRestartOn(grant.grantId, requestId, 'RUNNING', on);
+        return { ...settled, workloadOnly: true };
+      } catch (error) {
+        await this.lifecycleGrants.markRestartUnknown(grant.grantId, requestId, { code: error instanceof RuntimeError ? error.code : 'UNKNOWN_OUTCOME' });
+        throw error;
+      }
+    });
+  }
+
+  public async runtimeRestartStatus(requestId: string, reconcile = false): Promise<Record<string, unknown>> {
+    if (!reconcile) {
+      const record = await this.lifecycleGrants.getRestart(requestId);
+      return record === null ? { requestId, state: 'NOT_FOUND', workloadOnly: true } : { ...record, workloadOnly: true };
+    }
+    return this.withOperationLock('runtime-restart-reconcile', async () => {
+      const record = await this.lifecycleGrants.getRestart(requestId);
+      if (record === null) return { requestId, state: 'NOT_FOUND', workloadOnly: true };
+      if (record.phase === 'COMPLETE') return { ...record, workloadOnly: true };
+      const grant = await this.lifecycleGrants.get(record.grantId);
+      await this.assertCurrentLifecycleBinding(grant);
+      const state = await this.readState();
+      if (state.startupOperations.some((entry) => entry.component === 'runtime' && unresolvedStartup(entry))) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime startup must be reconciled before restart settlement');
+      const observed = await runtimeStatus(this.dataRoot);
+      const on = state.startupOperations.find((entry) => entry.component === 'runtime' && entry.id === record.onOperationId);
+      const offProven = record.capturedTarget === null || state.startupOperations.some((entry) => entry.component === 'runtime' && entry.state === 'STOPPED' && entry.pid === record.capturedTarget?.pid && entry.processStartMarker === record.capturedTarget?.processStartMarker);
+      let terminal: 'RUNNING' | 'FAILED';
+      let off: 'COMMITTED' | 'FAILED';
+      if (observed.state === 'running' && observed.endpoint !== null && state.runtime !== null) {
+        assertRuntimeOwnership(state.runtime, observed);
+        await assertOwnedRuntimeProcess(state.runtime);
+        if (offProven && on?.state === 'RUNNING' && on.pid === state.runtime.pid && on.processStartMarker === state.runtime.processStartMarker) {
+          terminal = 'RUNNING'; off = 'COMMITTED';
+        } else if (on === undefined && record.capturedTarget?.pid === state.runtime.pid && record.capturedTarget.processStartMarker === state.runtime.processStartMarker) {
+          terminal = 'FAILED'; off = 'FAILED';
+        } else throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Observed Runtime is not correlated to this restart');
+      } else if (observed.state === 'stopped' && state.runtime === null && offProven && (on === undefined || ['SPAWN_FAILED', 'STOPPED'].includes(on.state))) {
+        terminal = 'FAILED'; off = 'COMMITTED';
+      } else throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Restart effect remains unknown; no retry is authorized');
+      const settled = await this.lifecycleGrants.reconcileRestart(grant.grantId, requestId, terminal, { off, on: terminal === 'RUNNING' ? 'COMMITTED' : 'FAILED', observed: { state: observed.state, instanceId: observed.endpoint?.instanceId ?? null, onTransactionId: on?.transactionId ?? null } });
+      return { ...settled, workloadOnly: true };
+    });
+  }
+
   private async assertCurrentLifecycleBinding(expected: LifecycleGrantBinding): Promise<void> {
     const current = await this.currentLifecycleGrantBinding();
     if (current.machineId !== expected.machineId || current.tunnelId !== expected.tunnelId || current.sourceRoot !== expected.sourceRoot || current.sourceSha !== expected.sourceSha || current.sourceTree !== expected.sourceTree || current.workloadSourceRoot !== expected.workloadSourceRoot || current.workloadSourceSha !== expected.workloadSourceSha || current.workloadSourceTree !== expected.workloadSourceTree) {
@@ -1120,11 +1208,15 @@ export class Supervisor {
 
   private async workloadMutationStatus(input: SupervisorMutationStatusInput): Promise<SupervisorAdminToolCallResult> {
     const { name, args, context } = input;
-    if (args.reconcile === true) return this.reconcileWorkloadMutation(input);
+    if (args.reconcile === true) {
+      const originalArgs = { ...args }; delete originalArgs.reconcile;
+      return this.reconcileWorkloadMutation({ ...input, args: originalArgs });
+    }
     if (context.clientId === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence requires a bounded client identity');
-    const durableMutation = FORWARDED_DURABLE_MUTATION_TOOLS.has(name) || groupedWorkloadDurableMutation(name, args);
+    const contract = workloadMutationContract(name, args);
+    const durableMutation = contract !== null;
     if (!durableMutation) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence is available only for durable workload mutations');
-    const requestId = typeof args.requestId === 'string' && args.requestId.length > 0 && args.requestId.length <= 200 ? args.requestId : undefined;
+    const requestId = contract?.requestId;
     if (requestId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation evidence requires the original durable requestId');
     if (name !== 'session_open' && context.sessionId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation evidence requires the original session identity');
     const state = await this.readState();
@@ -1146,20 +1238,6 @@ export class Supervisor {
       instanceId: runtime.instanceId,
       deploymentEpoch: registry.deploymentEpoch,
     };
-    // Revalidate the live runtime session before releasing cached mutation evidence.
-    // A durable record is not an authorization grant after its session is revoked.
-    if (context.sessionId !== undefined) {
-      const sessionCheck = await this.forwardWorkloadTool('session_get', { sessionId: context.sessionId }, context);
-      if (sessionCheck.isError) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence session is no longer authorized');
-    }
-    const projectId = typeof args.projectId === 'string' ? args.projectId : undefined;
-    const workspaceId = typeof args.workspaceId === 'string' ? args.workspaceId : undefined;
-    if (projectId !== undefined) {
-      const projectCheck = workspaceId === undefined
-        ? await this.forwardWorkloadTool('project_info', { projectId }, context)
-        : await this.forwardWorkloadTool('workspace', { operation: 'get', projectId, workspaceId }, context);
-      if (projectCheck.isError) throw new RuntimeError('CONTROL_DENIED', 'Mutation evidence project/workspace is no longer authorized');
-    }
     const logicalFingerprint = mutationLogicalFingerprint(name, args, context);
     const record = await this.workloadMutationJournal.inspectByLogicalIdentity(requestId, logicalFingerprint, binding);
     if (record === null) {
@@ -1169,28 +1247,15 @@ export class Supervisor {
       }
       return { structuredContent: { requestId, operation: name, state: 'NOT_FOUND', logicalFingerprint }, isError: false };
     }
-    return {
-      structuredContent: {
-        requestId,
-        operation: name,
-        logicalFingerprint,
-        executionFingerprint: record.fingerprint,
-        state: record.state,
-        errorCode: record.errorCode,
-        updatedAt: record.updatedAt,
-        binding: record.binding,
-        ...(record.state === 'COMMITTED' ? { evidence: record.result } : {}),
-        ...(record.state === 'RECONCILIATION_REQUIRED' ? { reconciliationRequired: true } : {}),
-      },
-      isError: false,
-    };
+    return this.reconcileWorkloadMutation(input, false);
   }
 
-  private async reconcileWorkloadMutation(input: SupervisorMutationStatusInput): Promise<SupervisorAdminToolCallResult> {
+  private async reconcileWorkloadMutation(input: SupervisorMutationStatusInput, settle = true): Promise<SupervisorAdminToolCallResult> {
     const { name, args, context } = input;
     if (context.clientId === undefined) throw new RuntimeError('CONTROL_DENIED', 'Mutation reconciliation requires a bounded client identity');
-    if (!FORWARDED_DURABLE_MUTATION_TOOLS.has(name) && !groupedWorkloadDurableMutation(name, args)) throw new RuntimeError('CONTROL_DENIED', 'Mutation reconciliation is available only for durable workload mutations');
-    const requestId = typeof args.requestId === 'string' && args.requestId.length > 0 && args.requestId.length <= 200 ? args.requestId : undefined;
+    const contract = workloadMutationContract(name, args);
+    if (contract === null) throw new RuntimeError('CONTROL_DENIED', 'Mutation reconciliation is available only for durable workload mutations');
+    const requestId = contract.requestId;
     if (requestId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation reconciliation requires the original durable requestId');
     if (name !== 'session_open' && context.sessionId === undefined) throw new RuntimeError('INVALID_REQUEST', 'Mutation reconciliation requires the original session identity');
     const state = await this.readState();
@@ -1213,12 +1278,9 @@ export class Supervisor {
     const record = await this.workloadMutationJournal.findByLogicalIdentity(logicalFingerprint, currentBinding);
     if (record === null) throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation reconciliation evidence is unavailable');
     if (record.requestId !== requestId) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation logical identity is bound to a different durable request');
-    if (record.state !== 'RECONCILIATION_REQUIRED') return {
-      structuredContent: { requestId, operation: name, state: record.state, evidence: record.result, errorCode: record.errorCode, binding: record.binding },
-      isError: false,
-    };
     const originalBinding = record.binding;
     if (originalBinding === undefined || record.logicalFingerprint !== logicalFingerprint) throw new RuntimeError('AUTHORITY_CHANGED', 'Mutation reconciliation record lacks its authenticated binding');
+    await assertOwnedRuntimeProcess(runtime);
     const response = await postJson(`${endpoint.apiUrl}/mcp`, {
       jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params: { name: 'mutation_status', arguments: {
         requestId: record.requestId, fingerprint: record.fingerprint, operation: name,
@@ -1236,9 +1298,12 @@ export class Supervisor {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime mutation evidence is unavailable; do not retry the mutation');
     }
     const evidence = response.result.structuredContent;
-    if (evidence.requestId !== record.requestId || evidence.fingerprint !== record.fingerprint || evidence.state === 'NOT_FOUND') {
+    if (evidence.requestId !== record.requestId || evidence.fingerprint !== record.fingerprint || stableJson(evidence.binding) !== stableJson(originalBinding) || evidence.state === 'NOT_FOUND') {
       throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime mutation evidence identity does not match the Supervisor record');
     }
+    if (!settle && record.state !== 'COMMITTED') return {
+      structuredContent: { requestId, operation: name, state: record.state, binding: record.binding, downstreamState: evidence.state, reconciliationRequired: record.state === 'RECONCILIATION_REQUIRED' }, isError: false,
+    };
     if (evidence.state === 'RECONCILIATION_REQUIRED' || evidence.state === 'PREPARED' || evidence.state === 'APPLYING') {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime mutation outcome remains unresolved; do not retry');
     }
@@ -1247,31 +1312,38 @@ export class Supervisor {
       && (typeof evidence.errorCode !== 'string' || !PRE_EFFECT_MUTATION_FAILURE_CODES.has(evidence.errorCode))) {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Runtime failure does not prove that the mutation had no effect');
     }
-    const settled = await this.workloadMutationJournal.reconcile(
-      record.requestId, record.fingerprint, originalBinding, evidence.state,
-      evidence.state === 'COMMITTED' ? evidence.evidence : null,
-      evidence.state === 'FAILED' && typeof evidence.errorCode === 'string' ? evidence.errorCode : null,
-    );
-    return { structuredContent: { requestId: settled.requestId, operation: name, state: settled.state, evidence: settled.result, errorCode: settled.errorCode, binding: settled.binding }, isError: false };
+    const converted = evidence.state === 'COMMITTED'
+      ? isCapabilityOutcome(evidence.evidence) ? toolOutcome(evidence.evidence) : toolResult(evidence.evidence)
+      : null;
+    const result = converted === null ? null : { structuredContent: converted.structuredContent, isError: converted.isError };
+    const settled = record.state === 'RECONCILIATION_REQUIRED' && settle
+      ? await this.workloadMutationJournal.reconcile(record.requestId, record.fingerprint, originalBinding, evidence.state, result, evidence.state === 'FAILED' && typeof evidence.errorCode === 'string' ? evidence.errorCode : null)
+      : record;
+    if (settled.state !== evidence.state) throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime and Supervisor outcomes conflict');
+    return { structuredContent: { requestId: settled.requestId, operation: name, state: settled.state, evidence: result, errorCode: settled.errorCode, binding: settled.binding }, isError: false };
   }
 
   private async forwardWorkloadTool(name: string, args: Record<string, unknown>, context: SupervisorWorkloadCallContext = {}): Promise<SupervisorAdminToolCallResult> {
     if (context.clientId === undefined) {
       throw new RuntimeError('CONTROL_DENIED', 'Unified workload calls require a bounded client identity');
     }
+    const clientId = context.clientId;
+    if (typeof args.sessionId === 'string') {
+      if (context.sessionId !== undefined && context.sessionId !== args.sessionId) throw new RuntimeError('CONTROL_DENIED', 'Session argument conflicts with transport identity');
+      context = { ...context, sessionId: args.sessionId };
+    }
     const groupedReadOnly = FORWARDED_GROUPED_READ_ONLY_TOOLS.has(name) && groupedWorkloadReadOnly(name, args);
-    const durableMutation = FORWARDED_DURABLE_MUTATION_TOOLS.has(name) || groupedWorkloadDurableMutation(name, args);
+    const contract = workloadMutationContract(name, args);
+    const durableMutation = contract !== null;
     const mutation = !FORWARDED_READ_ONLY_TOOLS.has(name) && !groupedReadOnly;
     if (mutation && !durableMutation) {
       throw new RuntimeError('CONTROL_DENIED', 'Unified workload mutation has no durable idempotency contract');
     }
-    const requestId = mutation
-      ? (typeof args.requestId === 'string' && args.requestId.length > 0 && args.requestId.length <= 200 ? args.requestId : undefined)
-      : undefined;
+    const requestId = mutation ? contract?.requestId : undefined;
     if (mutation && requestId === undefined) {
       throw new RuntimeError('INVALID_REQUEST', 'Unified workload mutation requires its durable requestId');
     }
-    if (mutation && name !== 'session_open' && context.sessionId === undefined) {
+    if (mutation && contract?.requiresSession !== false && context.sessionId === undefined) {
       throw new RuntimeError('INVALID_REQUEST', 'Unified workload mutations require a bounded session identity');
     }
     const state = await this.readState();
@@ -1296,7 +1368,7 @@ export class Supervisor {
       'x-iris-connector-profile': 'FULL',
       'x-iris-deployment-epoch': String(registry.deploymentEpoch),
       'x-iris-runtime-id': endpoint.runtimeId,
-      'x-iris-client-id': context.clientId,
+      'x-iris-client-id': clientId,
     };
     if (context.sessionId !== undefined) headers['x-iris-session-id'] = context.sessionId;
     if (requestId !== undefined) headers['x-iris-request-id'] = requestId;
@@ -1313,7 +1385,7 @@ export class Supervisor {
     if (!mutation || requestId === undefined) return call();
     const mutationBinding: MutationBinding = {
       operation: name,
-      clientId: context.clientId,
+      clientId,
       sessionId: context.sessionId ?? null,
       projectId: typeof args.projectId === 'string' ? args.projectId : null,
       workspaceId: typeof args.workspaceId === 'string' ? args.workspaceId : null,
@@ -1323,11 +1395,18 @@ export class Supervisor {
     };
     const fingerprint = createHash('sha256').update(stableJson({ name, args, ...mutationBinding })).digest('hex');
     const logicalFingerprint = mutationLogicalFingerprint(name, args, context);
-    const existing = await this.workloadMutationJournal.inspect(requestId, fingerprint, mutationBinding);
+    const existing = await this.workloadMutationJournal.inspectByLogicalIdentity(requestId, logicalFingerprint, mutationBinding);
+    if (existing?.state === 'COMMITTED') {
+      const checked = await this.reconcileWorkloadMutation({ name, args, context }, false);
+      if (!isRecord(checked.structuredContent) || !isRecord(checked.structuredContent.evidence) || typeof checked.structuredContent.evidence.isError !== 'boolean') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Cached mutation evidence is unavailable');
+      return { structuredContent: checked.structuredContent.evidence.structuredContent, isError: checked.structuredContent.evidence.isError };
+    }
     if (existing?.state === 'RECONCILIATION_REQUIRED') {
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Mutation request has an unresolved outcome; verify its downstream durable result before retrying');
     }
-    return this.workloadMutationJournal.execute(requestId, fingerprint, call, mutationBinding, logicalFingerprint);
+    return this.workloadMutationJournal.execute(requestId, fingerprint, call, mutationBinding, logicalFingerprint, args, async () => {
+      await this.reconcileWorkloadMutation({ name, args, context }, false);
+    });
   }
 
   public async doctor(): Promise<Record<string, unknown>> {
@@ -1493,14 +1572,19 @@ export class Supervisor {
     await this.prepareDirectories();
     await this.keepAwakePreference.initialize();
     const persisted = await this.readState();
-    if (persisted.recovery.terminal || persisted.startupOperations.some(unresolvedStartup)) {
-      // SuccessfulExit:false KeepAlive must not loop on a durable owner-decision gate.
-      console.error('Supervisor recovery suspended; durable failure requires owner reconciliation');
+    if (persisted.recovery.nativeStartupBlocked === true) {
+      console.error('Native Control startup requires Owner reconciliation; relaunch suppressed');
       return;
+    }
+    // Workload recovery gates must remain diagnosable through persistent Control.
+    if (persisted.recovery.terminal || persisted.startupOperations.some(unresolvedStartup)) {
+      console.error('Workload recovery suspended; persistent Control remains available for owner reconciliation');
     }
     await this.ensureOwnerKeepAwake();
     let nativeControl: Awaited<ReturnType<typeof startSupervisorNativeControlServer>> | undefined;
     let stopping = false;
+    let controlTransportAttempted = false;
+    let enrolledTransportRestored = false;
     const stop = () => { stopping = true; };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
@@ -1514,8 +1598,13 @@ export class Supervisor {
       runtimeStatus: () => this.runtimeStatus(),
       runtimeOn: () => this.runtimeOn(),
       runtimeOff: () => this.runtimeOff(),
+      runtimeRestart: (requestId) => this.runtimeRestart(requestId),
+      runtimeRestartAuthorized: (input) => this.runtimeRestart(input.operationId, input),
+      runtimeRestartStatus: (requestId, reconcile) => this.runtimeRestartStatus(requestId, reconcile),
       runtimeOnAuthorized: (input) => this.runtimeOnAuthorized(input),
       runtimeOffAuthorized: (input) => this.runtimeOffAuthorized(input),
+      keepAwakeStatus: () => this.keepAwakeStatus(),
+      setKeepAwakePreference: (enabled) => this.setKeepAwakePreference(enabled),
       workloadToolCall: (name, args, context) => this.forwardWorkloadTool(name, args, context),
       workloadMutationStatus: (input) => this.workloadMutationStatus(input),
       adminStatus: () => this.adminNativeStatus(),
@@ -1526,6 +1615,19 @@ export class Supervisor {
     });
       this.nativeControlActive = true;
       while (!stopping) {
+        if (!controlTransportAttempted) {
+          try {
+            const enrollment = await readInitialLaunchAgentEnrollmentState(this.dataRoot);
+            if (enrollment.state === 'COMMITTED') {
+              controlTransportAttempted = true;
+              await this.restoreEnrolledControlTransport(enrollment);
+              enrolledTransportRestored = true;
+            }
+          } catch {
+            controlTransportAttempted = true;
+            console.error('ONE transport restoration requires owner reconciliation; persistent Control remains available');
+          }
+        }
         await this.ensureOwnerKeepAwake();
         await delay(5_000);
       }
@@ -1551,15 +1653,54 @@ export class Supervisor {
         return;
       }
       const failure = await this.readState();
-      await this.writeState({ ...failure, recovery: { ...failure.recovery, terminal: true, lastFailureCode: runtimeErrorCode(error), nextAttemptAt: null } });
+      await this.writeState({ ...failure, recovery: { ...failure.recovery, nativeStartupBlocked: true, terminal: true, lastFailureCode: runtimeErrorCode(error), nextAttemptAt: null } });
       console.error('Supervisor startup or recovery failed; durable failure requires owner reconciliation');
     } finally {
       process.removeListener('SIGINT', stop);
       process.removeListener('SIGTERM', stop);
+      if (enrolledTransportRestored) {
+        try {
+          await this.withOperationLock('stop-one-control', async () => {
+            const current = await this.readState();
+            if (current.tunnels.full === null) return;
+            const operation = current.startupOperations.find((entry) => entry.state === 'RUNNING' && startupOperationOwns(entry, current.tunnels.full!));
+            if (operation === undefined) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'ONE transport shutdown has no exact ownership journal');
+            await this.cleanupStartupOperation(operation);
+          });
+        } catch { console.error('ONE transport shutdown remains unresolved; durable ownership preserved'); }
+      }
       this.nativeControlActive = false;
       await nativeControl?.close();
       await this.releaseOwnerKeepAwake().catch(() => undefined);
     }
+  }
+
+  private async restoreEnrolledControlTransport(enrollment: Extract<Awaited<ReturnType<typeof readInitialLaunchAgentEnrollmentState>>, { state: 'COMMITTED' }>): Promise<void> {
+    if (!this.nativeControlActive) throw new RuntimeError('CONTROL_PLANE_UNREACHABLE', 'Persistent native Control must be ready before ONE transport restoration');
+    await this.withOperationLock('restore-one-control', () => this.startupTransaction(async () => {
+      const confirmed = await readInitialLaunchAgentEnrollmentState(this.dataRoot);
+      if (confirmed.state !== 'COMMITTED' || JSON.stringify(confirmed) !== JSON.stringify(enrollment)) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'ONE installation enrollment changed before restoration');
+      }
+      const registry = await readConnectorRegistry(this.dataRoot);
+      if (registry === null || !isUnifiedConnectorRegistry(registry)) throw new RuntimeError('CONTROL_DENIED', 'Control-only restoration requires the enrolled ONE registry');
+      if (confirmed.sourceBinding.sourceRoot !== this.sourceRoot
+        || await realpath(confirmed.sourceBinding.executable) !== await realpath(process.execPath)) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'Running Supervisor source or executable differs from enrolled installation');
+      }
+      const transport = confirmed.enrollment.initialInstall;
+      const executable = transport.tunnelExecutable;
+      if (await fileSha256(executable) !== transport.tunnelExecutableSha256) throw new RuntimeError('AUTHORITY_CHANGED', 'Enrolled ONE transport executable changed');
+      let state = await this.readState();
+      if (state.tunnels.full !== null && await inspectProcess(state.tunnels.full) === 'stopped') {
+        const old = state.startupOperations.find((operation) => operation.state === 'RUNNING' && startupOperationOwns(operation, state.tunnels.full!));
+        if (old === undefined) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Stopped ONE transport lacks its exact durable ownership record');
+        await this.cleanupStartupOperation(old);
+        state = await this.readState();
+      }
+      const profiles = await this.writeManagedProfiles(registry, `http://127.0.0.1:${this.supervisorControlPort}`);
+      await this.ensureTunnel(state, 'full', registry, profiles.full, null, [], false, executable);
+    }));
   }
 
   private async automaticRecoveryTick(): Promise<void> {
@@ -1608,6 +1749,7 @@ export class Supervisor {
       this.runningOwnershipIsVerified(state, state.tunnels.pro, this.sourceRoot),
       this.probeAdminTunnel(state, state.adminTunnel),
     ]);
+    const unifiedTunnelProbe = unified && registry !== null ? await this.probeUnifiedTunnel(state, registry) : null;
     const runtimeOwnershipVerified = runtimeProbe.ownershipVerified;
     const runtimeListenerOwnershipVerified = runtimeProbe.listenerOwnershipVerified;
     const adminTunnelOwnershipVerified = adminTunnelProbe.ownershipVerified;
@@ -1649,9 +1791,9 @@ export class Supervisor {
         && binding.leaseGeneration > 0) === true
       && state.tunnels.full?.tunnelId === fullBinding.tunnelId
       && state.tunnels.full.profilePath === fullBinding.managedProfilePath
-      && state.tunnels.full.runtimeId === observed.endpoint.runtimeId
-      && state.tunnels.full.instanceId === observed.endpoint.instanceId
-      && state.tunnels.full.deploymentEpoch === registry.deploymentEpoch
+      && (unified ? unifiedTunnelProbe?.status.state === 'READY' : (state.tunnels.full.runtimeId === observed.endpoint.runtimeId
+        && state.tunnels.full.instanceId === observed.endpoint.instanceId
+        && state.tunnels.full.deploymentEpoch === registry.deploymentEpoch))
       && (unified || (state.tunnels.pro?.tunnelId === proBinding?.tunnelId
         && state.tunnels.pro?.profilePath === proBinding?.managedProfilePath
         && state.tunnels.pro?.runtimeId === observed.endpoint.runtimeId
@@ -1679,18 +1821,23 @@ export class Supervisor {
       [!runtimeListenerOwnershipVerified, 'RUNTIME_LISTENER_OWNERSHIP_UNVERIFIED'],
       [!connectorBindingCoherent, 'CONNECTOR_BINDING_MISMATCH'],
       [!fullTunnelOwnershipVerified || (!unified && !proTunnelOwnershipVerified), 'WORKLOAD_TUNNEL_OWNERSHIP_UNVERIFIED'],
-      [!adminOwnershipVerified, 'ADMIN_OWNERSHIP_UNVERIFIED'],
-      [!adminSourceCoherent, 'ADMIN_SOURCE_MISMATCH'],
-      [!adminListenerOwnershipVerified, 'ADMIN_LISTENER_OWNERSHIP_UNVERIFIED'],
-      [!adminEnvironmentCoherent, 'ADMIN_ENVIRONMENT_MISMATCH'],
-      [!adminAuthenticated, 'ADMIN_READINESS_UNVERIFIED'],
-      [!adminIdentityCoherent, 'ADMIN_IDENTITY_MISMATCH'],
+      [!unified && !adminOwnershipVerified, 'ADMIN_OWNERSHIP_UNVERIFIED'],
+      [!unified && !adminSourceCoherent, 'ADMIN_SOURCE_MISMATCH'],
+      [!unified && !adminListenerOwnershipVerified, 'ADMIN_LISTENER_OWNERSHIP_UNVERIFIED'],
+      [!unified && !adminEnvironmentCoherent, 'ADMIN_ENVIRONMENT_MISMATCH'],
+      [!unified && !adminAuthenticated, 'ADMIN_READINESS_UNVERIFIED'],
+      [!unified && !adminIdentityCoherent, 'ADMIN_IDENTITY_MISMATCH'],
       [!unified && !adminTunnelOwnershipVerified, 'ADMIN_TUNNEL_OWNERSHIP_UNVERIFIED'],
       [!unified && !adminTunnelListenerOwnershipVerified, 'ADMIN_TUNNEL_LISTENER_OWNERSHIP_UNVERIFIED'],
       [!unified && !adminTunnelBindingCoherent, 'ADMIN_TUNNEL_BINDING_MISMATCH'],
       [!unified && adminTunnelStatus.state !== 'READY', 'ADMIN_TUNNEL_NOT_READY'],
     ];
     const readinessCode = readinessFailures.find(([failed]) => failed)?.[1] ?? 'READY';
+    const controlReadinessCode = !authoritySnapshotCoherent ? 'AUTHORITY_CHANGED'
+      : !machineBindingCoherent ? 'MACHINE_IDENTITY_MISMATCH'
+      : registryStale ? 'CONNECTOR_REGISTRY_STALE'
+      : unified ? unifiedTunnelProbe?.status.code ?? 'TUNNEL_NOT_RUNNING'
+      : adminTunnelProbe.status.code;
     return {
       supervisorControlOwner: 'OUTER_SUPERVISOR_DAEMON',
       supervisorProcessId: process.pid,
@@ -1700,6 +1847,13 @@ export class Supervisor {
       protectedReferenceRoot: this.protectedReferenceRoot ?? null,
       readiness: readinessCode === 'READY' ? 'READY' : 'DEGRADED',
       readinessCode,
+      controlOnlyReadiness: controlReadinessCode === 'READY' ? 'READY' : 'DEGRADED',
+      controlOnlyReadinessCode: controlReadinessCode,
+      fullStackReadiness: readinessCode === 'READY' ? 'READY' : 'DEGRADED',
+      workloadState: observed.state,
+      oneTunnelId: unified ? registry?.connectors[0]?.tunnelId ?? null : null,
+      oneTunnelOwnershipVerified: unifiedTunnelProbe?.ownershipVerified ?? false,
+      oneTunnelListenerOwnershipVerified: unifiedTunnelProbe?.listenerOwnershipVerified ?? false,
       machineId,
       workloadRuntimeId: observed.endpoint?.runtimeId ?? null,
       workloadInstanceId: observed.endpoint?.instanceId ?? null,
@@ -1763,7 +1917,7 @@ export class Supervisor {
     try {
       if (!sameSourceRoot(journal.sourceRoot, expectedSourceRoot)
         || !sameSourceRoot(journal.dataRoot, this.dataRoot)) return false;
-      await this.assertStartupBinding(journal);
+      await this.assertStartupBinding(journal, true);
       return true;
     } catch {
       return false;
@@ -2216,7 +2370,8 @@ export class Supervisor {
     const webLayer = await this.probeWeb(state.web);
     const adminLayer = await this.probeAdmin(state.admin);
     const unified = isUnifiedConnectorRegistry(registry);
-    const fullTunnel = await this.probeTunnel(state.tunnels.full, registry.connectors.find((connector) => connector.connectorId === 'iris-full') ?? null);
+    const fullTunnel = unified ? (await this.probeUnifiedTunnel(durableState, registry, true)).status
+      : await this.probeTunnel(state.tunnels.full, registry.connectors.find((connector) => connector.connectorId === 'iris-full') ?? null);
     const proTunnel = unified ? layer('READY', 'UNIFIED_CONNECTOR', 'ONE IRIS uses one public connector') : await this.probeTunnel(state.tunnels.pro, registry.connectors.find((connector) => connector.connectorId === 'iris-pro') ?? null);
     const tunnelResults = [fullTunnel, proTunnel] as const;
     const tunnelLayer = unified
@@ -2226,11 +2381,11 @@ export class Supervisor {
     const adminTunnelLayer = isolatedAdminRequired
       ? (await this.probeAdminTunnel(durableState, durableState.adminTunnel, true)).status
       : layer('READY', 'LEGACY_ADMIN_TRANSPORT', 'Isolated admin tunnel is required only for the persistent native supervisor daemon');
-    const nativeControlLayer = isolatedAdminRequired
+    const nativeControlLayer = isolatedAdminRequired || unified
       ? await this.probeNativeControl()
       : layer('READY', 'LEGACY_ADMIN_TRANSPORT', 'Native supervisor control is required only for the persistent native supervisor daemon');
     const local = runtimeLayer.state === 'READY' ? await this.localReadiness() : { status: layer('FAILED', runtimeLayer.code, 'L1 requires a ready runtime'), connectors: [], catalogs: [] };
-    const controlPlaneParts = [...tunnelResults, adminLayer, adminTunnelLayer, nativeControlLayer];
+    const controlPlaneParts = unified ? [fullTunnel, nativeControlLayer] : [...tunnelResults, adminLayer, adminTunnelLayer, nativeControlLayer];
     const controlPlane = controlPlaneParts.every((result) => result.state === 'READY')
       ? layer('READY', 'READY', 'Workload tunnels, isolated admin tunnel, and persistent supervisor-admin endpoint are healthy')
       : combineLayers(controlPlaneParts, 'CONTROL_PLANE_UNREACHABLE', 'Control-plane readiness is not proven for workload and isolated admin transport');
@@ -2475,7 +2630,7 @@ export class Supervisor {
     const executable = path.join(state.workloadSourceRoot, 'apps/web/node_modules/.bin/vite');
     if (!existsSync(executable)) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Web executable is unavailable; run pnpm install before iris up');
     if (await endpointResponds(`http://127.0.0.1:${this.webPort}/`)) throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `Web port ${this.webPort} is occupied by an unowned process`);
-    const record = await this.spawnManaged('web', executable, ['--host', '127.0.0.1', '--port', String(this.webPort)], path.join(state.workloadSourceRoot, 'apps/web'), { IRIS_RUNTIME_URL: runtimeUrl }, null, this.logDirectory(), 'vite', null, null, null, null, null, [this.webPort]);
+    const record = await this.spawnManaged('web', executable, ['--host', '127.0.0.1', '--port', String(this.webPort)], path.join(state.workloadSourceRoot, 'apps/web'), { IRIS_RUNTIME_URL: runtimeUrl, IRIS_SUPERVISOR_URL: `http://127.0.0.1:${this.supervisorControlPort}` }, null, this.logDirectory(), 'vite', null, null, null, null, null, [this.webPort]);
     const next = { ...state, web: record };
     await this.writeState(next);
     started.push('web');
@@ -2488,11 +2643,13 @@ export class Supervisor {
     profile: 'full' | 'pro',
     registry: ConnectorRegistryDocument,
     profilePath: string,
-    runtimeInstanceId: string,
+    runtimeInstanceId: string | null,
     started: Array<'runtime' | 'web' | 'admin' | 'full' | 'pro' | 'admin-tunnel'>,
     runtimeReplaced: boolean,
+    enrolledExecutable?: string,
   ): Promise<SupervisorStateDocument> {
     const current = state.tunnels[profile];
+    const unified = isUnifiedConnectorRegistry(registry);
     const binding = registry.connectors.find((connector) => connector.connectorId === (profile === 'full' ? 'iris-full' : 'iris-pro'));
     if (binding === undefined) throw new RuntimeError('CONNECTOR_BINDING_MISMATCH', `Missing ${profile} connector binding`);
     const profileDigest = await fileSha256(profilePath);
@@ -2504,17 +2661,19 @@ export class Supervisor {
       if (inspected === 'running') {
         const deploymentChanged = current.profilePath !== profilePath
           || current.tunnelId !== binding.tunnelId
-          || current.deploymentEpoch !== registry.deploymentEpoch
-          || current.runtimeId !== binding.runtimeId
-          || current.instanceId !== runtimeInstanceId
+          || current.deploymentEpoch !== (unified ? null : registry.deploymentEpoch)
+          || current.runtimeId !== (unified ? null : binding.runtimeId)
+          || current.instanceId !== (unified ? null : runtimeInstanceId)
           || current.profileDigest !== profileDigest
           || current.workingDirectory !== this.sourceRoot
-          || runtimeReplaced;
+          || (!unified && runtimeReplaced);
+        if (unified && deploymentChanged) throw new RuntimeError('AUTHORITY_CHANGED', 'ONE transport binding changed; explicit transport reconciliation is required');
         if (!deploymentChanged) {
           try {
             await waitForTunnel(current.executable, binding.healthPort, 750);
             return state;
-          } catch {
+          } catch (error) {
+            if (unified) throw error;
             // A live process with failed readiness is still an owned process. Recycle it
             // only after the same positive process identity check used for shutdown.
           }
@@ -2526,8 +2685,8 @@ export class Supervisor {
       }
     }
     const pidFile = path.join(this.supervisorDirectory(), `${profile}.tunnel.pid`);
-    const executable = await resolveExecutable(this.tunnelClientPath);
-    const record = await this.spawnManaged(`tunnel-${profile}`, executable, ['run', '--profile-file', profilePath, '--pid.file', pidFile], this.sourceRoot, {}, profilePath, this.logDirectory(), 'tunnel-client', binding.tunnelId, registry.deploymentEpoch, runtimeInstanceId, binding.runtimeId, profileDigest, [binding.healthPort]);
+    const executable = enrolledExecutable ?? await resolveExecutable(this.tunnelClientPath);
+    const record = await this.spawnManaged(`tunnel-${profile}`, executable, ['run', '--profile-file', profilePath, '--pid.file', pidFile], this.sourceRoot, {}, profilePath, this.logDirectory(), 'tunnel-client', binding.tunnelId, unified ? null : registry.deploymentEpoch, unified ? null : runtimeInstanceId, unified ? null : binding.runtimeId, profileDigest, [binding.healthPort]);
     const next = { ...state, tunnels: { ...state.tunnels, [profile]: record } };
     await this.writeState(next);
     started.push(profile);
@@ -2546,6 +2705,13 @@ export class Supervisor {
     const expectedComponent = profile === 'full' ? 'tunnel-full' : 'tunnel-pro';
     if (record === null || binding === undefined || record.component !== expectedComponent) {
       throw new RuntimeError('PRECONDITION_FAILED', `${profile} tunnel ownership metadata is unavailable`);
+    }
+    if (isUnifiedConnectorRegistry(registry)) {
+      const proof = await this.probeUnifiedTunnel(await this.readState(), registry);
+      if (profile !== 'full' || proof.status.state !== 'READY' || !proof.ownershipVerified || !proof.listenerOwnershipVerified) {
+        throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'ONE transport ownership and native route are not verified');
+      }
+      return { record, binding };
     }
     if (await inspectProcess(record) !== 'running') {
       throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', `${profile} tunnel process identity is not live and verified`);
@@ -2672,6 +2838,42 @@ export class Supervisor {
     }
   }
 
+  private async probeUnifiedTunnel(
+    state: SupervisorStateDocument,
+    registry: ConnectorRegistryDocument,
+    allowVerifiedStartup = false,
+  ): Promise<{ readonly status: LayerStatus; readonly ownershipVerified: boolean; readonly listenerOwnershipVerified: boolean }> {
+    const denied = (code: string, detail: string) => ({ status: layer('FAILED', code, detail), ownershipVerified: false, listenerOwnershipVerified: false });
+    const binding = registry.connectors[0];
+    const record = state.tunnels.full;
+    if (!isUnifiedConnectorRegistry(registry) || binding === undefined || record === null) return denied('TUNNEL_NOT_RUNNING', 'ONE transport is not registered and owned');
+    if (record.component !== 'tunnel-full' || record.tunnelId !== binding.tunnelId
+      || record.profilePath !== binding.managedProfilePath || record.runtimeId !== null
+      || record.instanceId !== null || record.deploymentEpoch !== null
+      || record.workingDirectory !== this.sourceRoot
+      || binding.machineId !== await readMachineId(this.dataRoot)) {
+      return denied('CONNECTOR_BINDING_MISMATCH', 'ONE transport does not match its persistent machine binding');
+    }
+    const credentials = credentialPaths(this.dataRoot);
+    const expectedProfile = managedProfile(binding, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization,
+      this.logDirectory(), registry.deploymentEpoch, `http://127.0.0.1:${this.supervisorControlPort}`, null, true);
+    if (await readFile(binding.managedProfilePath, 'utf8').catch(() => null) !== expectedProfile
+      || await fileSha256(binding.managedProfilePath).catch(() => null) !== record.profileDigest
+      || !await this.ownershipIsVerified(state, record, this.sourceRoot, allowVerifiedStartup ? ['RUNNING', 'OWNERSHIP_VERIFIED'] : ['RUNNING'])) {
+      return denied('PROCESS_OWNERSHIP_AMBIGUOUS', 'ONE transport profile or durable process identity is unverified');
+    }
+    if (!await ownedProcessOwnsRecordedListeners(record, [binding.healthPort])) {
+      return { status: layer('FAILED', 'TUNNEL_LISTENER_OWNERSHIP_UNVERIFIED', 'ONE transport listener is unverified'), ownershipVerified: true, listenerOwnershipVerified: false };
+    }
+    try {
+      await waitForTunnel(record.executable, binding.healthPort, 2_000);
+      const listenerOwnershipVerified = await ownedProcessOwnsRecordedListeners(record, [binding.healthPort]);
+      return { status: layer(listenerOwnershipVerified ? 'READY' : 'FAILED', listenerOwnershipVerified ? 'READY' : 'TUNNEL_LISTENER_OWNERSHIP_UNVERIFIED', 'ONE transport health and ownership verified'), ownershipVerified: true, listenerOwnershipVerified };
+    } catch (error) {
+      return { status: layer('FAILED', runtimeErrorCode(error), 'ONE transport health is unavailable'), ownershipVerified: true, listenerOwnershipVerified: await ownedProcessOwnsRecordedListeners(record, [binding.healthPort]) };
+    }
+  }
+
   private async writeManagedProfiles(registry: ConnectorRegistryDocument, runtimeApiUrl: string): Promise<{ readonly full: string; readonly pro: string | null; readonly admin: string | null }> {
     const credentials = credentialPaths(this.dataRoot);
     const full = registry.connectors.find((connector) => connector.connectorId === 'iris-full');
@@ -2680,7 +2882,16 @@ export class Supervisor {
     const fullPath = full.managedProfilePath;
     const proPath = pro?.managedProfilePath ?? null;
     const adminPath = registry.admin?.managedProfilePath ?? null;
-    await writePrivateText(fullPath, managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
+    const unified = isUnifiedConnectorRegistry(registry);
+    const fullContent = managedProfile(full, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, unified ? `http://127.0.0.1:${this.supervisorControlPort}` : runtimeApiUrl, null, unified);
+    if (unified) {
+      const current = (await this.readState()).tunnels.full;
+      if (current !== null && await inspectProcess(current) !== 'stopped'
+        && await readFile(fullPath, 'utf8').catch(() => null) !== fullContent) {
+        throw new RuntimeError('AUTHORITY_CHANGED', 'An active ONE profile cannot be replaced by workload startup');
+      }
+    }
+    if (await readFile(fullPath, 'utf8').catch(() => null) !== fullContent) await writePrivateText(fullPath, fullContent);
     if (pro !== undefined && proPath !== null) {
       await writePrivateText(proPath, managedProfile(pro, credentials.controlPlaneApiKey, credentials.tunnelServiceAuthorization, this.logDirectory(), registry.deploymentEpoch, runtimeApiUrl, null));
     }
@@ -2714,11 +2925,15 @@ export class Supervisor {
     }
   }
 
-  private async assertStartupBinding(operation: StartupOperation): Promise<void> {
+  private async assertStartupBinding(operation: StartupOperation, readOnlyObservation = false): Promise<void> {
     const state = await this.readState();
     const owner = observeProcessStart(operation.supervisorPid);
-    if (owner.state === 'indeterminate' || owner.state === 'live' && owner.marker === operation.supervisorStartMarker && operation.supervisorPid !== process.pid) {
-      throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Original supervisor ownership is still live or indeterminate');
+    if (owner.state === 'indeterminate') throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Original Supervisor ownership is indeterminate');
+    if (owner.state === 'live' && owner.marker === operation.supervisorStartMarker && operation.supervisorPid !== process.pid) {
+      if (!readOnlyObservation || await loopbackListenerOwner(this.supervisorControlPort) !== operation.supervisorPid
+        || await inspectSupervisorNativeOwner(this.dataRoot, this.supervisorControlPort, this.sourceRoot) !== 'verified') {
+        throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Original Supervisor ownership is still live; mutation authority remains with that owner');
+      }
     }
     if (realpathSync(operation.sourceRoot) !== operation.sourceRoot || realpathSync(operation.dataRoot) !== operation.dataRoot) {
       throw new RuntimeError('PROCESS_OWNERSHIP_AMBIGUOUS', 'Startup physical binding changed');
@@ -2816,7 +3031,7 @@ export class Supervisor {
     await this.withOperationLock('startup-reconcile', async () => {
       await this.assertStartupReconciled();
       const state = await this.readState();
-      await this.writeState({ ...state, recovery: { ...state.recovery, attempts: 0, terminal: false, nextAttemptAt: null } });
+      await this.writeState({ ...state, recovery: { ...state.recovery, attempts: 0, nativeStartupBlocked: false, terminal: false, nextAttemptAt: null } });
     });
   }
 
@@ -3203,6 +3418,7 @@ function managedProfile(
   epoch: number,
   runtimeApiUrl: string,
   adminMcpUrl: string | null,
+  persistentControl = false,
 ): string {
   const controlRef = `file:${controlPlaneKey}`;
   const serviceRef = `file:${tunnelServiceAuthorization}`;
@@ -3210,8 +3426,10 @@ function managedProfile(
     `    Authorization: ${yamlString(serviceRef)}`,
     `    x-iris-client-id: ${yamlString(binding.mode === 'FULL' ? 'chatgpt' : 'chatgpt-pro')}`,
     `    x-iris-connector-profile: ${yamlString(binding.mode)}`,
-    `    x-iris-deployment-epoch: ${yamlString(String(epoch))}`,
-    `    x-iris-runtime-id: ${yamlString(binding.runtimeId ?? '')}`,
+    ...(persistentControl ? [] : [
+      `    x-iris-deployment-epoch: ${yamlString(String(epoch))}`,
+      `    x-iris-runtime-id: ${yamlString(binding.runtimeId ?? '')}`,
+    ]),
   ].join('\n');
   return [
     'config_version: 1',
@@ -4007,6 +4225,7 @@ function isState(value: unknown): value is SupervisorStateDocument {
     && (value.adminTunnel === undefined || value.adminTunnel === null || isOwnedProcess(value.adminTunnel))
     && (value.tunnels.full === null || isOwnedProcess(value.tunnels.full)) && (value.tunnels.pro === null || isOwnedProcess(value.tunnels.pro))
     && (value.recovery === undefined || (isNonNegativeSafeInteger(value.recovery.attempts) && typeof value.recovery.terminal === 'boolean'
+      && (value.recovery.nativeStartupBlocked === undefined || typeof value.recovery.nativeStartupBlocked === 'boolean')
       && (value.recovery.lastFailureCode === null || typeof value.recovery.lastFailureCode === 'string')
       && (value.recovery.nextAttemptAt === null || typeof value.recovery.nextAttemptAt === 'string')
       && (value.recovery.windowStartedAt === undefined || value.recovery.windowStartedAt === null || typeof value.recovery.windowStartedAt === 'string')));

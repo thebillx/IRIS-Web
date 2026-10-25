@@ -117,3 +117,18 @@ test('setup fails closed when a stale operation lock requires reconciliation', a
   assert.equal(results.every((result) => result.status === 'rejected'), true);
   await assert.rejects(stat(path.join(dataRoot, 'connector-registry.json')), { code: 'ENOENT' });
 });
+
+
+test('initial-install CLI requires typed inputs and a genuine Owner-local terminal before publication', async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-install-cli-boundary-'));
+  roots.push(dataRoot);
+  const call = (...args: string[]) => exec(process.execPath, ['scripts/iris.mjs', 'launchd', 'authorize-install', ...args], {
+    cwd: sourceRoot, env: { ...process.env, IRIS_RUNTIME_DATA_DIR: dataRoot }, timeout: 15_000,
+  });
+  await assert.rejects(call('--source-sha', 'a'.repeat(40)), /Missing --source-tree/);
+  await assert.rejects(call('--unknown', 'value'), /Usage:/);
+  await assert.rejects(call('--source-sha', 'a'.repeat(40), '--source-tree', 'b'.repeat(40), '--tunnel-executable', process.execPath,
+    '--expires-at', new Date(Date.now() + 60_000).toISOString(), '--runtime-data-root', dataRoot), /Owner-local.*[Tt]erminal|interactive.*[Tt]erminal|TTY/);
+  await assert.rejects(stat(path.join(dataRoot, 'launchd', 'com.iris.supervisor.recovery-policy.json')), { code: 'ENOENT' });
+  await assert.rejects(stat(path.join(dataRoot, 'launchd', 'com.iris.supervisor.plist')), { code: 'ENOENT' });
+});

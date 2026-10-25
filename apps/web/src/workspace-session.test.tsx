@@ -140,10 +140,12 @@ describe('daily workspace session experience', () => {
       if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
       if (url === '/sessions' && method === 'GET') return jsonResponse({ sessions: [...runtimeSessions] });
       if (url === '/sessions' && method === 'POST') {
-        const body = JSON.parse(String(init.body)) as { clientId: string };
+        const body = JSON.parse(String(init.body)) as { clientId: string; conversationId: string; requestId: string };
+        expect(body.requestId).toEqual(expect.any(String));
+        expect(body.conversationId).toEqual(expect.any(String));
         expect(body.clientId).toBe('web-client');
         const created: Session = {
-          id: 'session-c', clientId: body.clientId, agentId: 'owner-web', agentRole: 'owner',
+          id: 'session-c', clientId: body.clientId, machineId: 'fixture-machine', conversationId: body.conversationId, agentId: 'owner-web', agentRole: 'owner',
           createdAt: '2026-09-05T06:10:00.000Z', currentProjectId: null, executionState: 'READY', interactions: [],
         };
         runtimeSessions.push(created);
@@ -412,3 +414,88 @@ function approval(overrides: Partial<PendingApproval>): PendingApproval {
     ...overrides,
   };
 }
+
+describe('durable browser session intents', () => {
+  it('reuses a persisted creation intent after a lost response and gives the next New intent distinct IDs', async () => {
+    sessionStorage.setItem('iris.web.clientId', 'web-client');
+    sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    const sessions: Session[] = [];
+    const intents: Array<{ clientId: string; conversationId: string; requestId: string }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = String(input);
+      if (url === '/control/mcp') return new Response(null, { status: 503 });
+      if (url === '/health') return jsonResponse(health);
+      if (url === '/projects') return jsonResponse({ projects: [projectA], defaultProjectId: projectA.id });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === '/sessions' && (init.method ?? 'GET') === 'GET') return jsonResponse({ sessions });
+      if (url === '/sessions' && init.method === 'POST') {
+        const intent = JSON.parse(String(init.body));
+        intents.push(intent);
+        let session = sessions.find((candidate) => candidate.conversationId === intent.conversationId);
+        if (session === undefined) { session = { ...sessionA, id: `durable-${sessions.length}`, machineId: 'fixture-machine', conversationId: intent.conversationId }; sessions.push(session); }
+        if (intents.length === 1) throw new Error('response lost');
+        return jsonResponse(session, 201);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp(); await clickButton('+ New'); await settleApp();
+    const pending = sessionStorage.getItem('iris.web.pendingSessionCreation');
+    expect(pending).not.toBeNull();
+    expect(sessions).toHaveLength(1);
+    await act(async () => root?.unmount()); root = undefined;
+    await mountApp(); await settleApp();
+    expect(intents).toHaveLength(1);
+    await clickButton('+ New'); await settleApp();
+    expect(intents[1]).toEqual(intents[0]);
+    expect(sessions).toHaveLength(1);
+    expect(sessionStorage.getItem('iris.web.pendingSessionCreation')).toBeNull();
+    await clickButton('+ New'); await settleApp();
+    expect(sessions).toHaveLength(2);
+    expect(intents[2]?.conversationId).not.toBe(intents[0]?.conversationId);
+    expect(intents[2]?.requestId).not.toBe(intents[0]?.requestId);
+  });
+
+  it('explicitly resumes durable sessions and scopes project changes without sending instructions or canceling jobs', async () => {
+    sessionStorage.setItem('iris.web.clientId', 'web-client');
+    sessionStorage.setItem('iris.web.ownerToken', ownerToken);
+    sessionStorage.setItem('iris.web.selectedSessionId', sessionB.id);
+    let durable: Session = { ...sessionB, machineId: 'fixture-machine', conversationId: 'fixture-conversation', attachmentState: 'DETACHED' };
+    const mutations: Array<{ url: string; body: Record<string, unknown> }> = [];
+    let available = true;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = String(input);
+      if (url === '/control/mcp') return new Response(null, { status: 503 });
+      if (url === '/health') return available ? jsonResponse(health) : new Response(null, { status: 503 });
+      if (url === '/projects') return jsonResponse({ projects: [projectA, projectB], defaultProjectId: projectA.id });
+      if (url === '/missions') return jsonResponse({ missions: [] });
+      if (url === '/permissions') return jsonResponse(permissionSnapshot([]));
+      if (url === '/sessions') return jsonResponse({ sessions: [sessionA, durable] });
+      if (url === `/sessions/${durable.id}/resume` || url === `/sessions/${durable.id}/current-project`) {
+        expect(new Headers(init.headers).get('x-iris-client-id')).toBe('web-client');
+        const body = JSON.parse(String(init.body));
+        expect(body.requestId).toEqual(expect.any(String));
+        mutations.push({ url, body });
+        durable = { ...durable, attachmentState: 'ATTACHED', ...(url.endsWith('/current-project') ? { currentProjectId: body.projectId } : {}) };
+        return jsonResponse(durable);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    await mountApp(); await settleApp();
+    expect(mutations).toHaveLength(0);
+    expect((document.querySelector('textarea[aria-label="Session instruction"]') as HTMLTextAreaElement).disabled).toBe(true);
+    await clickButton('Resume session');
+    expect((document.querySelector('textarea[aria-label="Session instruction"]') as HTMLTextAreaElement).disabled).toBe(false);
+    expect(mutations).toHaveLength(1);
+    expect(sessionStorage.getItem('iris.web.selectedSessionId')).toBe(durable.id);
+    const projectSelect = [...document.querySelectorAll('select')].find((select) => select.closest('label')?.textContent?.startsWith('Active project'))!;
+    await act(async () => { projectSelect.value = projectA.id; projectSelect.dispatchEvent(new Event('change', { bubbles: true })); });
+    expect(mutations).toHaveLength(2);
+    expect(mutations[1]?.body.projectId).toBe(projectA.id);
+    expect(mutations[1]?.body.requestId).not.toBe(mutations[0]?.body.requestId);
+    available = false;
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(mutations).toHaveLength(2);
+    expect(sessionStorage.getItem('iris.web.selectedSessionId')).toBe(durable.id);
+  });
+});

@@ -87,7 +87,7 @@ export async function handleMcpV21Request(
                 ? await executeSecurityAuditTool(args, request, state, requireSecurityAudit(securityAudit), principal)
                 : adoTool
                 ? await executeAdoTool(name, args, request, capabilities, state)
-                : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal));
+                : await executeV21LifecycleTool(name, args, request, capabilities, state, lifecycle, principal), capabilities);
     return jsonRpcResult(rpc.id ?? null, isCapabilityOutcome(result) ? toolOutcome(result) : toolResult(result));
   } catch (error) {
     const runtimeError = error instanceof RuntimeError

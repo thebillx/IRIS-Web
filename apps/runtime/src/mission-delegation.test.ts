@@ -13,6 +13,36 @@ const roots: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('mission-scoped owner delegation', () => {
+  it('reads consumed receipt authority without spending or rewriting it and rejects revoked or mismatched scope', async () => {
+    const root = await temp('iris-delegation-receipt-');
+    await loadOrCreateOwnerAccessSecret(root);
+    const store = new MissionDelegationStore(root);
+    const spec = { requestId: randomUUID(), missionId: randomUUID(), ownerClientId: 'owner', ownerSessionId: randomUUID(), trustedAgentIds: ['agent'], allowedCapabilities: ['fs.write'], projectIds: ['project-a'], workspaceIds: ['workspace-a'], sourceSha: 'a'.repeat(40), sourceTree: 'b'.repeat(40), expiresAt: new Date(Date.now() + 60_000).toISOString(), maxExecutions: 1 };
+    const input = { missionId: spec.missionId, clientId: spec.ownerClientId, sessionId: spec.ownerSessionId, agentId: 'agent', capabilityId: 'fs.write', projectId: 'project-a', workspaceId: 'workspace-a', sourceSha: spec.sourceSha, sourceTree: spec.sourceTree, operationId: randomUUID(), riskClass: 'MODERATE' as const };
+    expect(await store.inspectReceipt(input)).toEqual({ status: 'none' });
+    await expect(readFile(path.join(root, 'mission-delegations.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const grant = await store.issue(spec);
+    expect((await store.inspectReceipt(input)).status).toBe('blocked');
+    expect((await store.authorize(input)).status).toBe('allowed');
+    const filename = path.join(root, 'mission-delegations.json');
+    const before = await readFile(filename);
+    expect((await store.inspectReceipt(input)).status).toBe('allowed');
+    expect((await store.inspectReceipt(input)).status).toBe('allowed');
+    for (const change of [{ workspaceId: 'other' }, { projectId: 'other' }, { agentId: 'other' }, { sourceSha: 'c'.repeat(40) }, { operationId: randomUUID() }, { riskClass: 'HIGH' as const }]) {
+      expect((await store.inspectReceipt({ ...input, ...change })).status).toBe('blocked');
+    }
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse(spec.expiresAt) + 1);
+    expect((await store.inspectReceipt(input)).status).toBe('blocked');
+    vi.restoreAllMocks();
+    expect(await readFile(filename)).toEqual(before);
+    await store.revoke(grant.delegationId, spec.ownerClientId, spec.ownerSessionId);
+    const revoked = await readFile(filename);
+    expect((await store.inspectReceipt(input)).status).toBe('blocked');
+    expect(await readFile(filename)).toEqual(revoked);
+    await store.issue({ ...spec, requestId: randomUUID(), missionId: randomUUID() });
+    expect((await store.inspectReceipt(input)).status).toBe('blocked');
+  });
+
   it('authorizes one bounded operation, rejects replay and preserves an authenticated audit document', async () => {
     const root = await temp('iris-delegation-');
     await loadOrCreateOwnerAccessSecret(root);

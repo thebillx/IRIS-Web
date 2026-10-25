@@ -197,7 +197,7 @@ describe('agent interaction conversation execution', () => {
     await settleApp();
 
     expect(document.body.textContent).toContain('Disconnected');
-    expect(document.querySelector('[role="alert"]')?.textContent).toContain('Runtime unavailable');
+    expect([...document.querySelectorAll('[role="alert"]')].map((alert) => alert.textContent)).toContainEqual(expect.stringContaining('Runtime unavailable'));
     expect(document.querySelector('textarea[aria-label="Session instruction"]')).toBeNull();
   });
 });

@@ -170,6 +170,26 @@ export class MissionDelegationStore {
     return { status: 'allowed', record: allowed, reason: `Mission-scoped owner delegation ${allowed.delegationId} authorized this operation` };
   }
 
+  /** Inspect authority for a consumed action receipt without consuming, renewing, or rewriting the grant. */
+  public async inspectReceipt(input: Parameters<MissionDelegationStore['authorize']>[0]): Promise<DelegationDecision> {
+    if (input.missionId === undefined || input.missionId === null) return { status: 'none' };
+    const document = await this.read(await this.requireSecret());
+    const source = await this.currentSourceIdentity();
+    const effective = source === null ? input : { ...input, sourceSha: source.sha, sourceTree: source.tree };
+    const candidates = document.delegations.filter((entry) => entry.missionId === effective.missionId);
+    if (candidates.length === 0) return (document.archivedDelegations?.length ?? 0) === 0
+      ? { status: 'none' } : { status: 'blocked', reason: 'Retired delegation history cannot prove receipt authority' };
+    if (effective.operationId === undefined || effective.operationId === null || !OPERATION_ID_PATTERN.test(effective.operationId)) return { status: 'blocked', reason: 'Delegation receipt requires an exact action identity' };
+    const active = candidates.filter((entry) => entry.revokedAt === null && Date.parse(entry.expiresAt) > Date.now());
+    if (active.length !== 1) return { status: 'blocked', reason: active.length === 0 ? 'Mission delegation is expired or revoked' : 'Multiple active delegations for one mission are ambiguous' };
+    const grant = active[0]!;
+    const mismatch = delegationMismatch(grant, effective);
+    if (mismatch !== null) return { status: 'blocked', reason: mismatch };
+    if (input.riskClass === 'HIGH' || input.riskClass === 'SYSTEM') return { status: 'blocked', reason: 'Delegation cannot bypass high-risk or system authority' };
+    if (!grant.consumedOperationIds.includes(effective.operationId)) return { status: 'blocked', reason: 'Action was not consumed by this delegation' };
+    return { status: 'allowed', record: grant, reason: `Existing action receipt is covered by active mission delegation ${grant.delegationId}` };
+  }
+
   private async bindCurrentSource(spec: MissionDelegationSpec): Promise<MissionDelegationSpec> {
     const source = await this.currentSourceIdentity();
     if (source === null) return spec;

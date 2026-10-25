@@ -171,7 +171,7 @@ describe('IRIS supervisor', () => {
     const forward = (supervisor as unknown as {
       forwardWorkloadTool(name: string, args: Record<string, unknown>, context: { clientId: string; sessionId: string }): Promise<unknown>;
     }).forwardWorkloadTool.bind(supervisor);
-    await expect(forward('file_write', {}, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(forward('file_write', {}, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
     await expect(forward('fs', { operation: 'write', requestId: randomUUID() }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'RUNTIME_NOT_RUNNING' });
     await expect(forward('git', { operation: 'commit', requestId: randomUUID() }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'RUNTIME_NOT_RUNNING' });
     await expect(forward('project_test_run', { requestId: randomUUID() }, { clientId: 'conversation-a', sessionId: 'session-a' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
@@ -190,6 +190,31 @@ describe('IRIS supervisor', () => {
     expect(status.state).toBe('FAILED');
     expect(status.localRuntime.code).toBe('MIGRATION_REQUIRED');
     await expect(import('node:fs/promises').then(({ access }) => access(path.join(dataRoot, 'supervisor')))).rejects.toThrow();
+  });
+
+  it('pins the sole ONE profile to persistent Control independently of Runtime deployment identity', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-one-control-profile-'));
+    roots.push(dataRoot);
+    const initialized = await initializeConnectorRegistry(dataRoot, { unified: true, fullTunnelId: 'tunnel_0123456789abcdef0123456789abcdef' });
+    await loadOrCreateTunnelServiceSecret(dataRoot);
+    await persistControlPlaneApiKey(dataRoot, 'fixture-control-key-not-a-production-secret');
+    const controlPort = await freePort();
+    const supervisor = await createSupervisor({ dataRoot, sourceRoot, supervisorControlPort: controlPort });
+    const internal = supervisor as unknown as { writeManagedProfiles(registry: NonNullable<Awaited<ReturnType<typeof readConnectorRegistry>>>, runtimeUrl: string): Promise<{full:string;pro:string|null;admin:string|null}> };
+    const profiles = await internal.writeManagedProfiles(initialized, 'http://127.0.0.1:12345');
+    expect(profiles.pro).toBeNull();
+    expect(profiles.admin).toBeNull();
+    const before = await readFile(profiles.full, 'utf8');
+    expect(before).toContain(`http://127.0.0.1:${controlPort}/mcp`);
+    expect(before).not.toContain('http://127.0.0.1:12345');
+    expect(before).not.toContain('x-iris-runtime-id');
+    expect(before).not.toContain('x-iris-deployment-epoch');
+    await bindConnectorRuntime(dataRoot, randomUUID());
+    await internal.writeManagedProfiles((await readConnectorRegistry(dataRoot))!, 'http://127.0.0.1:12346');
+    expect(await readFile(profiles.full, 'utf8')).toBe(before);
+    expect((await runtimeStatus(dataRoot)).state).toBe('stopped');
+    await expect(supervisor.up()).rejects.toMatchObject({ code: 'CONTROL_PLANE_UNREACHABLE' });
+    expect((await runtimeStatus(dataRoot)).state).toBe('stopped');
   });
 
   it('reports unified catalog status without requiring a legacy PRO binding', async () => {

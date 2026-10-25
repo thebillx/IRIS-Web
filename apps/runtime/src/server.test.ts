@@ -70,6 +70,13 @@ describe('runtime listener safety', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ status: 'ready', runtimeId: identity.runtimeId, instanceId: identity.instanceId });
 
+    const ownerHeaders = { authorization: 'Bearer test-owner-access-secret-that-is-not-public', 'x-iris-runtime-id': identity.runtimeId, 'x-iris-instance-id': identity.instanceId };
+    expect((await fetch(`${handle.apiUrl}/health`, { headers: ownerHeaders })).status).toBe(200);
+    const staleInstance = await fetch(`${handle.apiUrl}/health`, { headers: { ...ownerHeaders, 'x-iris-instance-id': randomUUID() } });
+    expect(staleInstance.ok).toBe(false);
+    expect(await staleInstance.json()).toMatchObject({ error: { code: 'RUNTIME_IDENTITY_MISMATCH' } });
+    expect((await fetch(`${handle.apiUrl}/health`, { headers: { ...ownerHeaders, 'x-iris-runtime-id': randomUUID() } })).ok).toBe(false);
+
     const rejected = await fetch(`${handle.apiUrl}/health`, { headers: { origin: 'https://example.test' } });
     expect(rejected.status).toBe(403);
   });
