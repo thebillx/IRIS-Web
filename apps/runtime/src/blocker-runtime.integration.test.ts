@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdtemp, realpath, rm, rename, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, realpath, rm, rename, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -12,6 +12,7 @@ import { DurableMissionLifecycleStore } from './durable-mission-store.js';
 import { WorkerAdapterRegistry } from './durable-mission-workers.js';
 import { loadOrCreateMachineId } from './machine-identity.js';
 import { MCP_PROTOCOL_VERSION } from './mcp.js';
+import { observeProcessStart } from './macos-safety.js';
 import { MissionBrokerService, MissionBrokerStore } from './mission-broker.js';
 import { PermissionSettingsStore } from './permission-store.js';
 import { PermissionPolicyEngine } from './permissions.js';
@@ -23,7 +24,40 @@ import { RuntimeState } from './state.js';
 
 const roots: string[] = [];
 const servers: RuntimeServerHandle[] = [];
-afterEach(async () => { await Promise.all(servers.splice(0).map((server) => server.close())); await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
+const jobGates: Array<{ dataRoot: string; jobId: string; releasePath: string; pid: number | null; processStartMarker: string | null }> = [];
+afterEach(async () => {
+  let gateCleanupError: string | null = null;
+  for (const gate of jobGates.splice(0)) {
+    await writeFile(gate.releasePath, 'release\n').catch(() => undefined);
+    if (gate.pid === null) {
+      try {
+        const document = JSON.parse(await readFile(path.join(gate.dataRoot, 'vnext-jobs.json'), 'utf8')) as { jobs: Array<Record<string, unknown>> };
+        const job = document.jobs.find((record) => record.jobId === gate.jobId);
+        if (typeof job?.pid === 'number' && typeof job.processStartMarker === 'string') {
+          gate.pid = job.pid;
+          gate.processStartMarker = job.processStartMarker;
+        }
+      } catch { /* The job may not have been durably admitted. */ }
+    }
+    if (gate.pid === null) continue;
+    const deadline = Date.now() + 5000;
+    let observed = observeProcessStart(gate.pid);
+    while (observed.state !== 'dead'
+      && !(observed.state === 'live' && gate.processStartMarker !== null && observed.marker !== gate.processStartMarker)
+      && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      observed = observeProcessStart(gate.pid);
+    }
+    if (observed.state !== 'dead'
+      && !(observed.state === 'live' && gate.processStartMarker !== null && observed.marker !== gate.processStartMarker)) {
+      gateCleanupError = `Test-owned durable job process did not exit after releasing its gate: ${JSON.stringify({ pid: gate.pid, processStartMarker: gate.processStartMarker, observed })}`;
+      break;
+    }
+  }
+  await Promise.all(servers.splice(0).map((server) => server.close()));
+  if (gateCleanupError !== null) throw new Error(gateCleanupError);
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 it('serves durable conversations, real filesystem journal evidence, and logical checkpoint/resume over authenticated Runtime HTTP', async () => {
   const dataRoot = await temp(); const projectRoot = await temp(); const legacyRoot = await temp();
@@ -49,10 +83,33 @@ it('serves durable conversations, real filesystem journal evidence, and logical 
   expect((await f.call('fs', { ...write, sessionId: undefined, requestId: randomUUID() })).isError).toBe(true);
   expect((await f.call('fs', write, 'other-client')).isError).toBe(true);
 
-  await writeFile(path.join(projectRoot, 'job.mjs'), "console.log('captured-job'); setTimeout(() => {}, 2500);\n");
-  const started = await f.call('shell', { operation: 'start', sessionId, projectId: project.id, workspaceId: workspace.workspaceId, executable: 'node', argv: ['job.mjs'], cwd: '.', executionProfile: 'node-script', envOverrides: {}, timeoutMs: 5000, requestId: randomUUID() });
+  const jobRequestId = randomUUID();
+  const readyPath = path.join(dataRoot, `job-${jobRequestId}.ready`);
+  const releasePath = path.join(dataRoot, `job-${jobRequestId}.release`);
+  await writeFile(path.join(projectRoot, 'job.mjs'), [
+    "import { existsSync, writeFileSync } from 'node:fs';",
+    `writeFileSync(${JSON.stringify(readyPath)}, 'ready\\n');`,
+    'const deadline = Date.now() + 60_000;',
+    `while (!existsSync(${JSON.stringify(releasePath)}) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));`,
+    `if (!existsSync(${JSON.stringify(releasePath)})) throw new Error('job gate expired before test release');`,
+    "console.log('captured-job-released');",
+  ].join('\n') + '\n');
+  const started = await f.call('shell', { operation: 'start', sessionId, projectId: project.id, workspaceId: workspace.workspaceId, executable: 'node', argv: ['job.mjs'], cwd: '.', executionProfile: 'node-script', envOverrides: {}, timeoutMs: 60_000, requestId: jobRequestId });
   expect(started.isError, JSON.stringify(started)).toBe(false);
   const jobId = String(started.structuredContent.jobId);
+  const jobGate = { dataRoot, jobId, releasePath, pid: null as number | null, processStartMarker: null as string | null };
+  jobGates.push(jobGate);
+  const startedStatus = await f.call('job', { operation: 'status', sessionId, projectId: project.id, jobId });
+  expect(startedStatus.isError, JSON.stringify(startedStatus)).toBe(false);
+  expect(startedStatus.structuredContent.state, JSON.stringify({ jobId, jobRequestId, status: startedStatus.structuredContent })).toBe('RUNNING');
+  expect(typeof startedStatus.structuredContent.pid).toBe('number');
+  expect(typeof startedStatus.structuredContent.processStartMarker).toBe('string');
+  const jobPid = Number(startedStatus.structuredContent.pid);
+  const processStartMarker = String(startedStatus.structuredContent.processStartMarker);
+  jobGate.pid = jobPid;
+  jobGate.processStartMarker = processStartMarker;
+  expect(observeProcessStart(jobPid)).toMatchObject({ state: 'live', marker: processStartMarker });
+  await waitForFile(readyPath, 5000, `Durable job ${jobId} did not signal child readiness`);
   const projectB = await f.state.registerProject('Second selection', await temp());
   expect((await f.call('workspace_select', { sessionId, projectId: projectB.id, expectedRevision: 2, requestId: randomUUID() })).isError).toBe(false);
   const movedB = `${projectB.rootPath}.moved`; roots.push(movedB);
@@ -63,16 +120,23 @@ it('serves durable conversations, real filesystem journal evidence, and logical 
   expect((await f.call('job', { operation: 'status', sessionId, projectId: project.id, jobId })).isError).toBe(true);
   await rename(movedA, projectRoot);
   expect((await f.call('job', { operation: 'logs', sessionId, projectId: project.id, jobId, stream: 'stdout' })).isError).toBe(false);
-  const cancelled = await f.call('job', { operation: 'cancel', sessionId, projectId: project.id, jobId, requestId: randomUUID() });
-  expect(cancelled.isError, JSON.stringify(cancelled)).toBe(false);
-  const deadline = Date.now() + 8000;
-  let jobResult = await f.call('job', { operation: 'result', sessionId, projectId: project.id, jobId });
-  while (jobResult.structuredContent.state === 'RUNNING' && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    jobResult = await f.call('job', { operation: 'result', sessionId, projectId: project.id, jobId });
-  }
-  expect(jobResult.isError).toBe(false);
-  expect(jobResult.structuredContent.state).toBe('CANCELLED');
+  const beforeCancel = await f.call('job', { operation: 'status', sessionId, projectId: project.id, jobId });
+  expect(beforeCancel.isError, JSON.stringify(beforeCancel)).toBe(false);
+  expect(beforeCancel.structuredContent.state, JSON.stringify({ jobId, jobRequestId, status: beforeCancel.structuredContent })).toBe('RUNNING');
+  expect(beforeCancel.structuredContent.pid).toBe(jobPid);
+  expect(beforeCancel.structuredContent.processStartMarker).toBe(processStartMarker);
+  expect(observeProcessStart(jobPid)).toMatchObject({ state: 'live', marker: processStartMarker });
+  const cancelRequestId = randomUUID();
+  const cancelled = await f.call('job', { operation: 'cancel', sessionId, projectId: project.id, jobId, requestId: cancelRequestId });
+  expect(cancelled.isError, JSON.stringify({ jobId, jobRequestId, cancelRequestId, beforeCancel: beforeCancel.structuredContent, cancelled })).toBe(false);
+  expect(cancelled.structuredContent).toMatchObject({ state: 'RUNNING', cancelRequested: true });
+  const jobResult = await waitForTerminalJob(f, sessionId, project.id, jobId, 8000);
+  const evidence = await readCancellationEvidence(dataRoot, jobId, jobRequestId, cancelRequestId, beforeCancel.structuredContent, cancelled.structuredContent, jobResult.structuredContent);
+  expect(jobResult.isError, JSON.stringify(evidence)).toBe(false);
+  expect(jobResult.structuredContent.state, JSON.stringify(evidence)).toBe('CANCELLED');
+  expect(jobResult.structuredContent.signal, JSON.stringify(evidence)).toBe('SIGTERM');
+  expect(observeProcessStart(jobPid).state, JSON.stringify(evidence)).toBe('dead');
+  console.info('CANCELLATION_FIXTURE_EVIDENCE', JSON.stringify({ jobId, jobRequestId, cancelRequestId, pid: jobPid, processStartMarker, beforeCancel: beforeCancel.structuredContent.state, cancel: cancelled.structuredContent, terminal: { state: jobResult.structuredContent.state, signal: jobResult.structuredContent.signal }, processAfter: observeProcessStart(jobPid).state }));
   await rename(movedB, projectB.rootPath);
   expect((await f.call('workspace_select', { sessionId, projectId: project.id, expectedRevision: 3, requestId: randomUUID() })).isError).toBe(false);
 
@@ -101,6 +165,59 @@ it('serves durable conversations, real filesystem journal evidence, and logical 
   expect(await readFile(file, 'utf8')).toBe(journalBeforeProbe);
 }, 15_000);
 
+it('preserves natural durable job completion when cancellation is requested after terminal success', async () => {
+  const dataRoot = await temp(); const projectRoot = await temp(); const legacyRoot = await temp();
+  await loadOrCreateMachineId(dataRoot);
+  const f = await fixture(dataRoot, projectRoot, legacyRoot);
+  const project = await f.state.registerProject('Natural completion fixture', projectRoot);
+  const session = await f.call('session_open', { conversationId: randomUUID(), requestId: randomUUID() });
+  const sessionId = String(session.structuredContent.sessionId);
+  const selected = await f.call('workspace_select', { sessionId, projectId: project.id, expectedRevision: 1, requestId: randomUUID() });
+  const workspaceId = String(selected.structuredContent.currentWorkspaceId);
+  const jobRequestId = randomUUID();
+  const readyPath = path.join(dataRoot, `job-${jobRequestId}.ready`);
+  const releasePath = path.join(dataRoot, `job-${jobRequestId}.release`);
+  await writeFile(path.join(projectRoot, 'job.mjs'), [
+    "import { existsSync, writeFileSync } from 'node:fs';",
+    `writeFileSync(${JSON.stringify(readyPath)}, 'ready\\n');`,
+    'const deadline = Date.now() + 60_000;',
+    `while (!existsSync(${JSON.stringify(releasePath)}) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));`,
+    `if (!existsSync(${JSON.stringify(releasePath)})) throw new Error('job gate expired before test release');`,
+    "console.log('natural-job-released');",
+  ].join('\n') + '\n');
+  const started = await f.call('shell', { operation: 'start', sessionId, projectId: project.id, workspaceId, executable: 'node', argv: ['job.mjs'], cwd: '.', executionProfile: 'node-script', envOverrides: {}, timeoutMs: 60_000, requestId: jobRequestId });
+  expect(started.isError, JSON.stringify(started)).toBe(false);
+  const jobId = String(started.structuredContent.jobId);
+  const gate = { dataRoot, jobId, releasePath, pid: null as number | null, processStartMarker: null as string | null };
+  jobGates.push(gate);
+  await waitForFile(readyPath, 5000, `Durable job ${jobId} did not signal child readiness`);
+  const beforeRelease = await f.call('job', { operation: 'status', sessionId, projectId: project.id, jobId });
+  expect(beforeRelease.structuredContent.state).toBe('RUNNING');
+  expect(typeof beforeRelease.structuredContent.pid).toBe('number');
+  expect(typeof beforeRelease.structuredContent.processStartMarker).toBe('string');
+  const pid = Number(beforeRelease.structuredContent.pid);
+  const processStartMarker = String(beforeRelease.structuredContent.processStartMarker);
+  gate.pid = pid;
+  gate.processStartMarker = processStartMarker;
+  expect(observeProcessStart(pid)).toMatchObject({ state: 'live', marker: processStartMarker });
+
+  await writeFile(releasePath, 'release\n');
+  const completed = await waitForTerminalJob(f, sessionId, project.id, jobId, 8000);
+  expect(completed.isError, JSON.stringify(completed)).toBe(false);
+  expect(completed.structuredContent).toMatchObject({ state: 'SUCCEEDED', exitCode: 0, signal: null });
+  expect(observeProcessStart(pid).state).toBe('dead');
+
+  const cancelRequestId = randomUUID();
+  const cancelAfterCompletion = await f.call('job', { operation: 'cancel', sessionId, projectId: project.id, jobId, requestId: cancelRequestId });
+  expect(cancelAfterCompletion.isError, JSON.stringify({ jobId, jobRequestId, cancelRequestId, completed: completed.structuredContent, cancelAfterCompletion })).toBe(false);
+  expect(cancelAfterCompletion.structuredContent).toMatchObject({ state: 'SUCCEEDED', cancelRequested: false });
+  expect(await f.call('job', { operation: 'result', sessionId, projectId: project.id, jobId })).toMatchObject({ isError: false, structuredContent: { state: 'SUCCEEDED', exitCode: 0, signal: null } });
+  console.info('NATURAL_COMPLETION_FIXTURE_EVIDENCE', JSON.stringify({ jobId, jobRequestId, cancelRequestId, pid, processStartMarker, terminal: { state: completed.structuredContent.state, exitCode: completed.structuredContent.exitCode, signal: completed.structuredContent.signal }, cancelAfterCompletion: cancelAfterCompletion.structuredContent }));
+  const jobsDocument = JSON.parse(await readFile(path.join(dataRoot, 'vnext-jobs.json'), 'utf8')) as { jobs: Array<Record<string, unknown>> };
+  const job = jobsDocument.jobs.find((record) => record.jobId === jobId)!;
+  await expectPathAbsent(String(job.cancelPath));
+}, 15_000);
+
 async function fixture(dataRoot: string, projectRoot: string, legacyRoot: string) {
   const state = new RuntimeState(new FoundationStateStore(dataRoot));
   const settings = new PermissionSettingsStore(dataRoot); await settings.initialize();
@@ -121,3 +238,44 @@ async function fixture(dataRoot: string, projectRoot: string, legacyRoot: string
   return { state, resources, server, call };
 }
 async function temp() { const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'iris-blocker-http-'))); roots.push(root); return root; }
+
+async function waitForFile(filename: string, timeoutMs: number, message: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { await access(filename); return; }
+    catch { await new Promise((resolve) => setTimeout(resolve, 20)); }
+  }
+  throw new Error(message);
+}
+
+async function waitForTerminalJob(f: Awaited<ReturnType<typeof fixture>>, sessionId: string, projectId: string, jobId: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let result = await f.call('job', { operation: 'result', sessionId, projectId, jobId });
+  while (result.structuredContent.state === 'RUNNING' && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    result = await f.call('job', { operation: 'result', sessionId, projectId, jobId });
+  }
+  if (result.structuredContent.state === 'RUNNING') throw new Error(`Durable job ${jobId} did not reach a terminal state within ${timeoutMs} ms`);
+  return result;
+}
+
+async function readCancellationEvidence(dataRoot: string, jobId: string, jobRequestId: string, cancelRequestId: string, beforeCancel: Record<string, unknown>, cancelled: Record<string, unknown>, result: Record<string, unknown>) {
+  const document = JSON.parse(await readFile(path.join(dataRoot, 'vnext-jobs.json'), 'utf8')) as { jobs: Array<Record<string, unknown>> };
+  const job = document.jobs.find((record) => record.jobId === jobId) ?? null;
+  const readJson = async (filename: unknown): Promise<unknown> => {
+    if (typeof filename !== 'string') return null;
+    try { return JSON.parse(await readFile(filename, 'utf8')); }
+    catch { return null; }
+  };
+  return {
+    jobId, jobRequestId, cancelRequestId, beforeCancel, cancelled, result, job,
+    process: typeof beforeCancel.pid === 'number' ? observeProcessStart(beforeCancel.pid) : null,
+    claim: await readJson(job?.claimPath), runnerResult: await readJson(job?.resultPath),
+  };
+}
+
+async function expectPathAbsent(filename: string): Promise<void> {
+  let exists = true;
+  try { await access(filename); } catch { exists = false; }
+  expect(exists).toBe(false);
+}
