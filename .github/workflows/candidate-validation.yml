@@ -27,29 +27,32 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: 1a7292a7ba1ee4c05e7288659dd9049b4e11515
+      APPROVED_TARGET_SHA: 1a7292a7ba1ee4c05e7288659dd9049b4e11515f
       APPROVED_TARGET_TREE: 21e71d4a0956bafede24ca808e0b00a7e1db4605
       BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
     steps:
       - name: Validate the approved target
         run: |
           set -euo pipefail
-          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$TARGET_TREE" =~ ^[0-9a-f]{40}$ ]]
+          # Bash 3.2 does not apply errexit to [[ ... ]]; reject explicitly.
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$TARGET_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
           test "$TARGET_SHA" = "$APPROVED_TARGET_SHA"
           test "$TARGET_TREE" = "$APPROVED_TARGET_TREE"
 
-      - name: Check out the immutable target
+      - name: Check out the published integration branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.target_sha }}
+          ref: refs/heads/codex/one-iris-r03-r09-completion
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify the exact checkout
+      - name: Detach and verify the exact checkout
         id: source
         run: |
           set -euo pipefail
+          git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/codex/one-iris-r03-r09-completion
+          git checkout --detach "$TARGET_SHA"
           actual_sha="$(git rev-parse 'HEAD^{commit}')"
           actual_tree="$(git rev-parse 'HEAD^{tree}')"
           test "$actual_sha" = "$TARGET_SHA"
