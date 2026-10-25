@@ -27,8 +27,8 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: 8b654b2c097f4bed967bc64c681d8dee66cb7b35
-      APPROVED_TARGET_TREE: 599a00db8704274493bedc4deafa6db6ddce7b04
+      APPROVED_TARGET_SHA: e4b579fb4597927c004130781058e0634c552c9b
+      APPROVED_TARGET_TREE: 256bf0fe0b4dcd11f2dd1fdc97bb9f6021a2362d
       BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
     steps:
       - name: Validate the approved target
