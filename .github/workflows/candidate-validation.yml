@@ -76,6 +76,12 @@ jobs:
       - name: Install frozen dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
 
+      - name: Verify Node.js and pnpm toolchain
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v24.20.0"
+          test "$(pnpm --version)" = "10.15.0"
+
       - name: Run Supervisor failure-stop and KeepAlive regressions
         run: |
           pnpm --filter @iris/runtime exec vitest run \
@@ -148,8 +154,12 @@ jobs:
 
       - name: Typecheck and build the workspace
         run: |
-          pnpm typecheck
-          pnpm build
+          set -euo pipefail
+          test "$(node --version)" = "v24.20.0"
+          test "$(pnpm --version)" = "10.15.0"
+          node scripts/node24.mjs scripts/mobile-contract.mjs typecheck
+          pnpm --recursive --if-present typecheck
+          pnpm --recursive --if-present build
 
       - name: Check the target diff and lint changed sources
         run: |
