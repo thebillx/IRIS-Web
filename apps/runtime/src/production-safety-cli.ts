@@ -1,6 +1,8 @@
-import { readFile } from 'node:fs/promises';
+import { timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
-import { readEndpoint, readOwnerAccessSecret } from './persistence.js';
+import { RuntimeError } from '@iris/domain';
+import { readOwnerAccessSecret, readRuntimeIdentity } from './persistence.js';
+import { probeRuntimeAuthority } from './authority.js';
 import { createRuntimeBackup, ProductionSafetyController, restoreRuntimeBackup, verifyRuntimeBackup, type SafetyIdentity } from './production-safety.js';
 import { createRuntimeWriterVerifier } from './production-safety-wiring.js';
 
@@ -14,7 +16,7 @@ async function main(argv: readonly string[]): Promise<void> {
   if (dataRoot === undefined || !path.isAbsolute(dataRoot)) throw new Error('--data-root must be an absolute path');
   if (args.has('writer')) throw new Error('--writer assertions are not authoritative and are no longer accepted');
   if (command === 'inspect' || command === 'readiness') {
-    const controller = await ProductionSafetyController.openReadOnly({ dataRoot });
+    const controller = await ProductionSafetyController.openReadOnly({ dataRoot, ...(command === 'readiness' ? { writerVerifier: createRuntimeWriterVerifier(dataRoot) } : {}) });
     const result = controller === null
       ? command === 'inspect'
         ? { status: 'NOT_INITIALIZED', fence: null }
@@ -29,14 +31,17 @@ async function main(argv: readonly string[]): Promise<void> {
     process.stdout.write(`${JSON.stringify(await verifyRuntimeBackup(backup), null, 2)}\n`);
     return;
   }
-  const identity = await loadIdentity(dataRoot);
+  const identity = await loadIdentity(dataRoot, command === 'recover');
   const ownerAccessSecret = await readOwnerAccessSecret(dataRoot);
   if (ownerAccessSecret === null) throw new Error('Owner access credential is unavailable');
-  const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret, writerVerifier: createRuntimeWriterVerifier(dataRoot) });
   const token = process.env[TOKEN_ENV];
+  if (token === undefined || token.length === 0) throw new Error(`${TOKEN_ENV} is required`);
+  const supplied = Buffer.from(token);
+  const expected = Buffer.from(ownerAccessSecret);
+  if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new RuntimeError('CONTROL_DENIED', 'Owner authorization is invalid');
+  const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret, writerVerifier: createRuntimeWriterVerifier(dataRoot) });
   let result: unknown;
   {
-    if (token === undefined || token.length === 0) throw new Error(`${TOKEN_ENV} is required`);
     if (command === 'quiesce') result = await controller.quiesce(token);
     else if (command === 'recover') result = await controller.recover(token, {});
     else if (command === 'unfence') result = await controller.unfence(token);
@@ -79,12 +84,17 @@ function parseArgs(argv: readonly string[]): Map<string, string> {
   return result;
 }
 
-async function loadIdentity(dataRoot: string): Promise<SafetyIdentity> {
-  const endpoint = await readEndpoint(dataRoot);
-  if (endpoint !== null) return { runtimeId: endpoint.runtimeId, instanceId: endpoint.instanceId, dataRoot: path.resolve(dataRoot) };
-  const document = JSON.parse(await readFile(path.join(dataRoot, 'production-safety.json'), 'utf8')) as { identity?: SafetyIdentity };
-  if (document.identity === undefined) throw new Error('Runtime endpoint and safety identity are unavailable');
-  return { ...document.identity, dataRoot: path.resolve(dataRoot) };
+async function loadIdentity(dataRoot: string, requireStopped: boolean): Promise<SafetyIdentity> {
+  const controller = await ProductionSafetyController.openReadOnly({ dataRoot });
+  if (controller === null) throw new RuntimeError('PRECONDITION_FAILED', 'Production safety state is not initialized');
+  const identity = controller.snapshot().identity;
+  const runtimeId = await readRuntimeIdentity(dataRoot);
+  if (runtimeId === null || identity.runtimeId !== runtimeId || identity.dataRoot !== path.resolve(dataRoot)) throw new RuntimeError('AUTHORITY_CHANGED', 'Persisted runtime and safety identity disagree');
+  const authority = await probeRuntimeAuthority(dataRoot);
+  if (authority.state === 'indeterminate') throw new RuntimeError('AUTHORITY_INDETERMINATE', authority.reason);
+  if (authority.state !== 'unowned' && (authority.identity.runtimeId !== runtimeId || authority.identity.instanceId !== identity.instanceId)) throw new RuntimeError('AUTHORITY_CHANGED', 'Runtime authority does not match the safety identity');
+  if (requireStopped && authority.state === 'live') throw new RuntimeError('PRECONDITION_FAILED', 'Recovery requires the Runtime owner to be stopped');
+  return identity;
 }
 
 main(process.argv.slice(2)).catch((error: unknown) => {

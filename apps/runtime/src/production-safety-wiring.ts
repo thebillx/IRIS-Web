@@ -3,6 +3,11 @@ import path from 'node:path';
 import type { SafetyWriterName, TrustedWriterVerification, TrustedWriterVerifier } from './production-safety.js';
 import { inspectPrivateRegularFile, privateDirectoryProblem } from './private-fs.js';
 import { observeProcessStart } from './macos-safety.js';
+import { validateLifecycleRecord } from './durable-mission-validation.js';
+import type { DurableMissionLifecycleSnapshot } from './durable-mission-lifecycle.js';
+import { validateMultiWorkerDocument } from './multi-worker/validation.js';
+import { validateSecurityAuditDocument } from './security-audit/validation.js';
+import { inspectDurableRunnerEvidence } from './durable-job-manager.js';
 
 type WriterBinding = readonly string[];
 
@@ -50,6 +55,7 @@ export function createRuntimeWriterVerifier(dataRootInput: string, supervisorSta
 
 async function inspectBinding(dataRoot: string, writer: SafetyWriterName, binding: WriterBinding, supervisorStartupId?: string): Promise<{ readonly active: number } | null> {
   if (writer === 'supervisor') return inspectSupervisorBinding(dataRoot, supervisorStartupId);
+  if (writer === 'external-runners') return inspectDurableRunnerEvidence(dataRoot);
   let active = 0;
   for (const relative of binding) {
     const filename = path.join(dataRoot, relative);
@@ -61,15 +67,6 @@ async function inspectBinding(dataRoot: string, writer: SafetyWriterName, bindin
       if (await privateDirectoryProblem(filename, `${writer} writer directory`) !== null) return null;
       const entries = await readdir(filename).catch(() => null);
       if (entries === null) return null;
-      if (writer === 'external-runners' && entries.length > 0) {
-        for (const entry of entries) {
-          const claim = await readJsonIfPrivate(path.join(filename, entry, 'claim.json'));
-          const result = await readJsonIfPrivate(path.join(filename, entry, 'result.json'));
-          if (claim.state === 'invalid' || result.state === 'invalid') return null;
-          if (claim.state === 'missing' && result.state === 'missing') return null;
-          if (claim.state === 'ok' && result.state === 'missing') active += 1;
-        }
-      }
       continue;
     }
     if (!metadata.isFile() || metadata.nlink !== 1) return null;
@@ -95,7 +92,18 @@ async function inspectBinding(dataRoot: string, writer: SafetyWriterName, bindin
     }
     const document = await readJsonIfPrivate(filename);
     if (document.state === 'invalid') return null;
-    if (document.state === 'ok') active += countActiveStates(document.value);
+    if (document.state === 'ok') {
+      try {
+        if (writer === 'mission-lifecycle') {
+          if (!isRecord(document.value) || document.value.schemaVersion !== 1 || !Array.isArray(document.value.records)
+            || document.value.records.length > 100) return null;
+          const records = document.value.records.map((record) => validateLifecycleRecord(record as DurableMissionLifecycleSnapshot));
+          if (new Set(records.map((record) => record.missionId)).size !== records.length) return null;
+        } else if (writer === 'multi-worker') validateMultiWorkerDocument(document.value);
+        else if (writer === 'security-audit') validateSecurityAuditDocument(document.value);
+      } catch { return null; }
+      active += countActiveStates(document.value);
+    }
   }
   return { active };
 }

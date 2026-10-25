@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
-import { ProductionSafetyController, createRuntimeBackup, restoreRuntimeBackup, verifyRuntimeBackup, type TrustedWriterVerifier } from './production-safety.js';
+import { ProductionSafetyController, createRuntimeBackup, restoreRuntimeBackup, verifyRuntimeBackup, type SafetySnapshot, type TrustedWriterVerifier } from './production-safety.js';
 
 const roots: string[] = [];
 const writers = [
@@ -193,7 +193,45 @@ test('M74 readiness freshly verifies non-instrumented writers before owner windo
   drift = true;
   const readiness = await fixture.controller.readiness();
   assert.equal(readiness.status, 'BLOCKED');
-  assert.match(readiness.reasons.join('; '), /writer mission-lifecycle could not be freshly verified|changed during readiness/);
+  assert.match(readiness.reasons.join('; '), /writer mission-lifecycle has observed activity/);
+});
+
+test('M74 invalid publication leaves existing state intact across transactions and rollover', async () => {
+  const fixture = await createFixture();
+  const filename = path.join(fixture.dataRoot, 'production-safety.json');
+  const before = await readFile(filename);
+  const internal = fixture.controller as unknown as {
+    transaction(operation: (current: SafetySnapshot) => { value: undefined; document: SafetySnapshot }): Promise<void>;
+  };
+  await assert.rejects(internal.transaction((current) => ({
+    value: undefined,
+    document: { ...current, writers: { ...current.writers, 'runtime-state': { ...current.writers['runtime-state']!, inFlight: 1 } } },
+  })), { code: 'PERSISTENCE_FAILURE' });
+  assert.deepEqual(await readFile(filename), before);
+  await assert.rejects(ProductionSafetyController.open({
+    dataRoot: fixture.dataRoot, identity: { ...fixture.identity, instanceId: undefined as never }, ownerAccessSecret: fixture.token, writerVerifier: fixture.verifier,
+  }), { code: 'PERSISTENCE_FAILURE' });
+  assert.deepEqual(await readFile(filename), before);
+  const fresh = path.join(fixture.root, 'fresh-invalid');
+  await mkdir(fresh, { mode: 0o700 });
+  await assert.rejects(ProductionSafetyController.open({
+    dataRoot: fresh, identity: { ...fixture.identity, runtimeId: undefined as never }, ownerAccessSecret: fixture.token,
+  }), { code: 'PERSISTENCE_FAILURE' });
+  await assert.rejects(readFile(path.join(fresh, 'production-safety.json')), { code: 'ENOENT' });
+});
+
+test('M74 malformed legacy lease evidence stays blocked and byte-identical', async () => {
+  const fixture = await createFixture();
+  const snapshot = await fixture.controller.inspect();
+  const filename = path.join(fixture.dataRoot, 'production-safety.json');
+  const malformed = { ...snapshot, state: 'BLOCKED', writers: { ...snapshot.writers, 'mission-lifecycle': { ...snapshot.writers['mission-lifecycle'], state: 'ACTIVE', inFlight: 1, leaseIds: [] } } };
+  await writeFile(filename, `${JSON.stringify(malformed)}\n`, { mode: 0o600 });
+  const before = await readFile(filename);
+  await assert.rejects(fixture.controller.inspect(), { code: 'PERSISTENCE_FAILURE' });
+  await assert.rejects(fixture.controller.recover(fixture.token, {}), { code: 'PERSISTENCE_FAILURE' });
+  await assert.rejects(ProductionSafetyController.open({ dataRoot: fixture.dataRoot, identity: fixture.identity, ownerAccessSecret: fixture.token, writerVerifier: fixture.verifier }), { code: 'PERSISTENCE_FAILURE' });
+  await assert.rejects(ProductionSafetyController.openReadOnly({ dataRoot: fixture.dataRoot }), { code: 'PERSISTENCE_FAILURE' });
+  assert.deepEqual(await readFile(filename), before);
 });
 
 async function createFixture(drift?: () => boolean): Promise<{

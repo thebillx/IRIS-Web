@@ -13,11 +13,119 @@ import { MissionLedgerStore } from './mission-store.js';
 import { RuntimeState } from './state.js';
 import { VNextResourceRegistry } from './resource-registry.js';
 import { createSupervisor } from './supervisor.js';
+import { DurableMissionLifecycleStore } from './durable-mission-store.js';
+import { DurableMissionLifecycleService } from './durable-mission-service.js';
 
 const roots: string[] = [];
 const writers = Object.keys(runtimeWriterBindings()) as SafetyWriterName[];
 
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
+
+test('R09 quiesce preserves lease accounting when a real logical mission is running', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-observed-activity-'));
+  roots.push(root);
+  await chmod(root, 0o700);
+  const dataRoot = path.join(root, 'runtime');
+  const projectRoot = path.join(root, 'project');
+  await mkdir(dataRoot, { mode: 0o700 });
+  await mkdir(projectRoot, { mode: 0o700 });
+  const identity = { runtimeId: randomUUID(), instanceId: randomUUID(), dataRoot };
+  const verifier = createRuntimeWriterVerifier(dataRoot);
+  const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret: 'r09-owner', writerVerifier: verifier });
+  for (const writer of writers) await controller.registerWriter(writer);
+  const state = new RuntimeState(new FoundationStateStore(dataRoot, controller), undefined, new MissionLedgerStore(dataRoot, controller));
+  const project = await state.registerProject('Safety regression', projectRoot);
+  const session = state.createSession('r09-client');
+  await state.setSessionCurrentProject(session.id, session.clientId, project.id);
+  const mission = await state.createMission(session.clientId, session.id, 'Observed logical activity', 'CHATGPT');
+  const store = new DurableMissionLifecycleStore(dataRoot, controller);
+  const lifecycle = new DurableMissionLifecycleService(state, store);
+  const created = await lifecycle.ensureMission(mission.id);
+  const running = await lifecycle.start({ missionId: mission.id, expectedRevision: created.revision, requestId: randomUUID(), workerType: 'IRIS_LOGICAL' });
+  assert.equal(running.state, 'RUNNING');
+  await store.write(await store.read());
+  assert.equal((await store.read()).records[0]!.state, 'RUNNING');
+  const before = await controller.inspect();
+  assert.equal(before.writers['mission-lifecycle']!.inFlight, 0);
+  assert.equal((await controller.quiesce('r09-owner')).state, 'BLOCKED');
+  const blocked = await controller.inspect();
+  assert.deepEqual(blocked.writers['mission-lifecycle'], before.writers['mission-lifecycle']);
+  const reopened = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret: 'r09-owner', writerVerifier: verifier });
+  await assert.rejects(reopened.recover('r09-owner', {}), { code: 'PRECONDITION_FAILED' });
+  assert.equal((await reopened.inspect()).state, 'BLOCKED');
+});
+
+test('R09 malformed logical activity and unknown runner directories deny admission without publishing', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-unknown-activity-'));
+  roots.push(root);
+  await chmod(root, 0o700);
+  const identity = { runtimeId: randomUUID(), instanceId: randomUUID(), dataRoot: root };
+  const controller = await ProductionSafetyController.open({ dataRoot: root, identity, ownerAccessSecret: 'r09-owner', writerVerifier: createRuntimeWriterVerifier(root) });
+  for (const writer of writers) await controller.registerWriter(writer);
+  for (const [writer, filename] of [['mission-lifecycle', 'mission-lifecycle.json'], ['multi-worker', 'multi-worker-orchestration.json'], ['security-audit', 'security-audit-engine.json']] as const) {
+    await writeFile(path.join(root, filename), JSON.stringify({ state: 'RUNNING' }), { mode: 0o600 });
+    const before = await readFile(path.join(root, 'production-safety.json'), 'utf8');
+    await assert.rejects(controller.beginMutation(writer), { code: 'PRECONDITION_FAILED' });
+    assert.equal(await readFile(path.join(root, 'production-safety.json'), 'utf8'), before);
+  }
+  await mkdir(path.join(root, 'vnext-job-runtime'), { mode: 0o700 });
+  await mkdir(path.join(root, 'vnext-job-runtime', randomUUID()), { mode: 0o700 });
+  const before = await readFile(path.join(root, 'production-safety.json'), 'utf8');
+  await assert.rejects(controller.beginMutation('external-runners'), { code: 'PRECONDITION_FAILED' });
+  assert.equal(await readFile(path.join(root, 'production-safety.json'), 'utf8'), before);
+});
+
+test('R09 idle observations never release a held lease and external admissions do not overlap', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-held-lease-'));
+  roots.push(root);
+  await chmod(root, 0o700);
+  const identity = { runtimeId: randomUUID(), instanceId: randomUUID(), dataRoot: root };
+  const controller = await ProductionSafetyController.open({ dataRoot: root, identity, ownerAccessSecret: 'r09-owner', writerVerifier: createRuntimeWriterVerifier(root) });
+  for (const writer of writers) await controller.registerWriter(writer);
+  const lease = await controller.beginMutation('external-runners');
+  const before = (await controller.inspect()).writers['external-runners'];
+  await assert.rejects(controller.beginMutation('external-runners'), { code: 'SUPERVISOR_BUSY' });
+  await assert.rejects(controller.quiesce('r09-owner', { 'external-runners': { state: 'IDLE' } }), { code: 'PRECONDITION_FAILED' });
+  assert.equal((await controller.quiesce('r09-owner')).state, 'BLOCKED');
+  await assert.rejects(controller.recover('r09-owner', {}), { code: 'PRECONDITION_FAILED' });
+  assert.deepEqual((await controller.inspect()).writers['external-runners'], before);
+  await lease.release();
+  assert.equal((await controller.recover('r09-owner', {})).state, 'ACTIVE');
+});
+
+test('R09 lifecycle archival admits before directory creation and keeps immutable archives', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-lifecycle-archive-'));
+  roots.push(root);
+  await chmod(root, 0o700);
+  const dataRoot = path.join(root, 'runtime');
+  const projectRoot = path.join(root, 'project');
+  await mkdir(dataRoot, { mode: 0o700 });
+  await mkdir(projectRoot, { mode: 0o700 });
+  const identity = { runtimeId: randomUUID(), instanceId: randomUUID(), dataRoot };
+  const controller = await ProductionSafetyController.open({ dataRoot, identity, ownerAccessSecret: 'r09-owner', writerVerifier: createRuntimeWriterVerifier(dataRoot) });
+  for (const writer of writers) await controller.registerWriter(writer);
+  const state = new RuntimeState(new FoundationStateStore(dataRoot, controller), undefined, new MissionLedgerStore(dataRoot, controller));
+  const project = await state.registerProject('Archive', projectRoot);
+  const session = state.createSession('r09-client');
+  await state.setSessionCurrentProject(session.id, session.clientId, project.id);
+  const mission = await state.createMission(session.clientId, session.id, 'Archive', 'CHATGPT');
+  const store = new DurableMissionLifecycleStore(dataRoot, controller);
+  const lifecycle = new DurableMissionLifecycleService(state, store);
+  const created = await lifecycle.ensureMission(mission.id);
+  await controller.quiesce('r09-owner');
+  await assert.rejects(store.archiveForCapacity(created), { code: 'PRECONDITION_FAILED' });
+  await assert.rejects(lstat(path.join(dataRoot, 'mission-lifecycle-archive')), { code: 'ENOENT' });
+  await controller.unfence('r09-owner');
+  await store.archiveForCapacity(created);
+  const filename = path.join(dataRoot, 'mission-lifecycle-archive', `${mission.id}.json`);
+  const bytes = await readFile(filename);
+  await store.archiveForCapacity(created);
+  assert.deepEqual(await readFile(filename), bytes);
+  await assert.rejects(store.archiveForCapacity({ ...created, title: 'conflicting content' }), { code: 'PRECONDITION_FAILED' });
+  await controller.quiesce('r09-owner');
+  await assert.rejects(store.archiveForCapacity(created), { code: 'PRECONDITION_FAILED' });
+  assert.deepEqual(await readFile(filename), bytes);
+});
 
 test('R09 real writer wiring fences all 13 stores and supports disposable backup/restore', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'iris-r09-wiring-'));

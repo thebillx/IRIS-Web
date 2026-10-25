@@ -93,31 +93,32 @@ export class DurableMissionLifecycleStore {
       throw new RuntimeError('CAPABILITY_DENIED', 'Mission lifecycle record is not eligible for capacity archival');
     }
     const directory = path.join(this.dataRoot, ARCHIVE_DIRECTORY);
-    await ensurePrivateArchiveDirectory(directory);
     const filename = path.join(directory, `${record.missionId}.json`);
-    const existing = await inspectPrivateRegularFile(filename, 'Archived mission lifecycle record');
-    if (existing.state === 'ok') {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(existing.content) as unknown;
-      } catch (error) {
-        throw new RuntimeError('PERSISTENCE_FAILURE', 'Archived mission lifecycle record is invalid JSON', { cause: error });
+    const publish = async (): Promise<void> => {
+      await ensurePrivateArchiveDirectory(directory);
+      const existing = await inspectPrivateRegularFile(filename, 'Archived mission lifecycle record');
+      if (existing.state === 'ok') {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(existing.content) as unknown;
+        } catch (error) {
+          throw new RuntimeError('PERSISTENCE_FAILURE', 'Archived mission lifecycle record is invalid JSON', { cause: error });
+        }
+        const archived = normalizeArchivedRecord(parsed);
+        if (archived === null
+          || archived.reason !== 'MISSION_ARCHIVED_FOR_CAPACITY'
+          || JSON.stringify(archived.lifecycle) !== JSON.stringify(record)) {
+          throw new RuntimeError('PRECONDITION_FAILED', 'Archived mission lifecycle identity is already bound to different content');
+        }
+        return;
       }
-      const archived = normalizeArchivedRecord(parsed);
-      if (archived === null
-        || archived.reason !== 'MISSION_ARCHIVED_FOR_CAPACITY'
-        || JSON.stringify(archived.lifecycle) !== JSON.stringify(record)) {
-        throw new RuntimeError('PRECONDITION_FAILED', 'Archived mission lifecycle identity is already bound to different content');
-      }
-      return;
-    }
-    if (existing.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', existing.reason);
+      if (existing.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', existing.reason);
 
-    const archived: ArchivedDurableMissionLifecycleRecord = {
-      schemaVersion: 1,
-      archivedAt: new Date().toISOString(),
-      reason: 'MISSION_ARCHIVED_FOR_CAPACITY',
-      lifecycle: record,
+      const archived: ArchivedDurableMissionLifecycleRecord = {
+        schemaVersion: 1,
+        archivedAt: new Date().toISOString(),
+        reason: 'MISSION_ARCHIVED_FOR_CAPACITY',
+        lifecycle: record,
     };
     const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
@@ -140,6 +141,9 @@ export class DurableMissionLifecycleStore {
       }
       throw new RuntimeError('PERSISTENCE_FAILURE', 'Immutable mission lifecycle archive publication failed', { cause: error });
     }
+    };
+    if (this.safety === undefined) await publish();
+    else await this.safety.runMutation('mission-lifecycle', publish);
   }
 }
 

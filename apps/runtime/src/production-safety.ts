@@ -17,6 +17,7 @@ const REQUIRED_WRITERS = [
   'permission-store', 'permission-audit', 'activation', 'supervisor', 'external-runners',
 ] as const;
 const INSTRUMENTED_WRITERS = ['runtime-state', 'mission-state', 'mission-broker', 'durable-jobs'] as const;
+const OBSERVED_ACTIVITY_WRITERS = ['mission-lifecycle', 'multi-worker', 'security-audit', 'external-runners'] as const;
 const WRITER_STATES = ['IDLE', 'ACTIVE', 'UNKNOWN'] as const;
 const FENCE_STATES = ['ACTIVE', 'QUIESCING', 'QUIESCED', 'BLOCKED', 'RECOVERY_REQUIRED'] as const;
 
@@ -170,6 +171,7 @@ export interface ReadinessReport {
 
 export interface ReadOnlySafetyControllerOptions {
   readonly dataRoot: string;
+  readonly writerVerifier?: TrustedWriterVerifier;
 }
 
 export interface BackupManifest {
@@ -256,7 +258,7 @@ export class ProductionSafetyController {
     if (inspected.state === 'missing') return null;
     if (inspected.state === 'invalid') throw new RuntimeError('PERSISTENCE_FAILURE', inspected.reason);
     const document = parseDocument(inspected.content);
-    return new ProductionSafetyController(dataRoot, document.identity, '', undefined, document);
+    return new ProductionSafetyController(dataRoot, document.identity, '', options.writerVerifier, document);
   }
 
   public snapshot(): SafetySnapshot { return structuredClone(this.document); }
@@ -317,9 +319,13 @@ export class ProductionSafetyController {
       if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Production writer fence is ${current.state}`);
       const record = current.writers[writer];
       if (record === undefined || record.state === 'UNKNOWN') throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} is not verified for mutation`);
+      if (record.ownerInstanceId !== this.identity.instanceId) throw new RuntimeError('AUTHORITY_CHANGED', `Writer ${writer} belongs to another runtime instance`);
+      if (writer === 'external-runners' && record.inFlight > 0) throw new RuntimeError('SUPERVISOR_BUSY', 'Another external runner admission is in progress');
       if (!INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) {
-        const verified = await verifyWriterEvidence(current, this.identity, this.writerVerifier, writer as SafetyWriterName);
-        if (verified === null || verified.state !== record.state || verified.inFlight !== record.inFlight) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} is not independently verified for mutation`);
+        const observed = await verifyWriterEvidence(current, this.identity, this.writerVerifier, writer as SafetyWriterName);
+        if (observed.state === 'ACTIVE' && !OBSERVED_ACTIVITY_WRITERS.includes(writer as typeof OBSERVED_ACTIVITY_WRITERS[number])) {
+          throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} has observed activity`);
+        }
       }
       const leaseId = randomUUID();
       const writers = { ...current.writers, [writer]: { ...record, state: 'ACTIVE' as const, inFlight: record.inFlight + 1, ownerInstanceId: this.identity.instanceId, leaseIds: [...record.leaseIds, leaseId] } };
@@ -328,7 +334,7 @@ export class ProductionSafetyController {
         value: {
           writer,
           release: async () => {
-          if (released) return;
+            if (released) return;
             try {
               await this.transaction(async (latest) => {
                 const active = latest.writers[writer];
@@ -360,13 +366,12 @@ export class ProductionSafetyController {
   public async quiesce(ownerAccessToken: string, observations: Readonly<Record<string, WriterObservation>> = {}): Promise<SafetySnapshot> {
     return this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      if (current.state === 'QUIESCED') return { value: current, document: current };
-      if (current.state !== 'ACTIVE') throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
-      const observed = await applyObservations(current, observations, this.identity, this.writerVerifier);
-      const verified = await reverifyNonInstrumentedWriters(observed, this.identity, this.writerVerifier);
-      const reasons = [...verified.reasons, ...quiescenceReasons(verified.document, observations, this.writerVerifier)];
+      if (current.state !== 'ACTIVE' && current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
+      await validateObservations(current, observations, this.identity, this.writerVerifier);
+      const reasons = [...await idleWriterVerificationReasons(current, this.identity, this.writerVerifier), ...quiescenceReasons(current, observations, this.writerVerifier)];
+      if (current.state === 'QUIESCED' && reasons.length === 0) return { value: current, document: current };
       const state: ProductionFenceState = reasons.length === 0 ? 'QUIESCED' : 'BLOCKED';
-      const next = { ...verified.document, state, blockedReason: reasons.length === 0 ? null : [...new Set(reasons)].join('; '), fenceEpoch: reasons.length === 0 ? verified.document.fenceEpoch + 1 : verified.document.fenceEpoch };
+      const next = { ...current, state, blockedReason: reasons.length === 0 ? null : [...new Set(reasons)].join('; '), fenceEpoch: reasons.length === 0 ? current.fenceEpoch + 1 : current.fenceEpoch };
       return { value: next, document: next };
     });
   }
@@ -376,11 +381,12 @@ export class ProductionSafetyController {
       this.authorize(current, ownerAccessToken);
       if (!['BLOCKED', 'RECOVERY_REQUIRED'].includes(current.state)) throw new RuntimeError('PRECONDITION_FAILED', `Production safety state is ${current.state}`);
       if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'Safety reservation outcome must be verified before recovery');
-      const observed = await applyObservations(current, observations, this.identity, this.writerVerifier);
-      const verified = await reverifyNonInstrumentedWriters(observed, this.identity, this.writerVerifier);
-      const reasons = [...verified.reasons, ...quiescenceReasons(verified.document, observations, this.writerVerifier)];
+      if (Object.values(current.writers).some((writer) => writer.inFlight > 0 || writer.leaseIds.length > 0)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery cannot release active mutation leases');
+      await validateObservations(current, observations, this.identity, this.writerVerifier);
+      const reasons = await idleWriterVerificationReasons(current, this.identity, this.writerVerifier, true);
       if (reasons.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Recovery is not verified: ${reasons.join('; ')}`);
-      const next = { ...verified.document, state: 'ACTIVE' as const, blockedReason: null, backup: null, restore: null, reservation: null };
+      const writers = Object.fromEntries(Object.entries(current.writers).map(([name, writer]) => [name, { ...writer, state: 'IDLE' as const, ownerInstanceId: this.identity.instanceId }]));
+      const next = { ...current, writers, state: 'ACTIVE' as const, blockedReason: null, backup: null, restore: null, reservation: null };
       return { value: next, document: next };
     });
   }
@@ -390,10 +396,9 @@ export class ProductionSafetyController {
       this.authorize(current, ownerAccessToken);
       if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'Only a verified QUIESCED fence can be released');
       if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A backup or restore reservation is active');
-      const verified = await reverifyNonInstrumentedWriters(current, this.identity, this.writerVerifier);
-      const reasons = [...verified.reasons, ...quiescenceReasons(verified.document, {}, this.writerVerifier)];
+      const reasons = [...await idleWriterVerificationReasons(current, this.identity, this.writerVerifier), ...quiescenceReasons(current, {}, this.writerVerifier)];
       if (reasons.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Cannot release fence: ${reasons.join('; ')}`);
-      const next = { ...verified.document, state: 'ACTIVE' as const, backup: null, restore: null };
+      const next = { ...current, state: 'ACTIVE' as const, backup: null, restore: null };
       return { value: next, document: next };
     });
   }
@@ -404,17 +409,7 @@ export class ProductionSafetyController {
     if (fence.state !== 'QUIESCED') reasons.push(`fence state is ${fence.state}`);
     if (fence.reservation !== null) reasons.push(`reservation ${fence.reservation.id} is ${fence.reservation.status.toLowerCase()}`);
     reasons.push(...quiescenceReasons(fence, {}, this.writerVerifier));
-    if (this.writerVerifier !== undefined) {
-      for (const writer of REQUIRED_WRITERS) {
-        if (INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) continue;
-        const record = fence.writers[writer];
-        if (record === undefined || record.state === 'UNKNOWN') continue;
-        try {
-          const verified = await verifyWriterEvidence(fence, this.identity, this.writerVerifier, writer);
-          if (verified.state !== record.state || verified.inFlight !== record.inFlight) reasons.push(`writer ${writer} changed since inventory verification`);
-        } catch { reasons.push(`writer ${writer} could not be freshly verified`); }
-      }
-    }
+    reasons.push(...await idleWriterVerificationReasons(fence, this.identity, this.writerVerifier));
     if (fence.backup === null) reasons.push('a verified backup is not recorded');
     if (fence.restore === null) reasons.push('a disposable restore drill is not recorded');
     if (fence.backup !== null) {
@@ -444,17 +439,7 @@ export class ProductionSafetyController {
       if (latest.state !== 'QUIESCED') reasons.push(`fence state changed to ${latest.state} during readiness evaluation`);
       if (latest.reservation !== null) reasons.push('a safety reservation became active during readiness evaluation');
       reasons.push(...quiescenceReasons(latest, {}, this.writerVerifier));
-      if (this.writerVerifier !== undefined) {
-        for (const writer of REQUIRED_WRITERS) {
-          if (INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) continue;
-          const record = latest.writers[writer];
-          if (record === undefined || record.state === 'UNKNOWN') continue;
-          try {
-            const verified = await verifyWriterEvidence(latest, this.identity, this.writerVerifier, writer);
-            if (verified.state !== record.state || verified.inFlight !== record.inFlight) reasons.push(`writer ${writer} changed during readiness recheck`);
-          } catch { reasons.push(`writer ${writer} could not be freshly verified during readiness recheck`); }
-        }
-      }
+      reasons.push(...await idleWriterVerificationReasons(latest, this.identity, this.writerVerifier));
     } catch {
       reasons.push('safety state could not be rechecked after artifact verification');
     }
@@ -464,9 +449,7 @@ export class ProductionSafetyController {
   public async requireQuiesced(ownerAccessToken: string): Promise<SafetySnapshot> {
     return this.transaction(async (current) => {
       this.authorize(current, ownerAccessToken);
-      if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'A verified QUIESCED fence is required');
-      if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A safety reservation is already active');
-      if (quiescenceReasons(current, {}, this.writerVerifier).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'Writer inventory is not idle and verified');
+      await this.assertQuiescedForReservation(current);
       return { value: current, document: current };
     });
   }
@@ -563,14 +546,8 @@ export class ProductionSafetyController {
   private async assertQuiescedForReservation(current: SafetyDocument): Promise<void> {
     if (current.state !== 'QUIESCED') throw new RuntimeError('PRECONDITION_FAILED', 'A verified QUIESCED fence is required');
     if (current.reservation !== null) throw new RuntimeError('PRECONDITION_FAILED', 'A safety reservation is already active');
-    if (quiescenceReasons(current, {}, this.writerVerifier).length > 0) throw new RuntimeError('PRECONDITION_FAILED', 'Writer inventory is not idle and verified');
-    for (const writer of REQUIRED_WRITERS) {
-      if (INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) continue;
-      const record = current.writers[writer];
-      if (record === undefined || record.state === 'UNKNOWN') throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} is not verified`);
-      const verified = await verifyWriterEvidence(current, this.identity, this.writerVerifier, writer);
-      if (verified.state !== record.state || verified.inFlight !== record.inFlight) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} verification does not match the fenced inventory`);
-    }
+    const reasons = [...quiescenceReasons(current, {}, this.writerVerifier), ...await idleWriterVerificationReasons(current, this.identity, this.writerVerifier)];
+    if (reasons.length > 0) throw new RuntimeError('PRECONDITION_FAILED', `Writer inventory is not idle and verified: ${reasons.join('; ')}`);
   }
 
   private assertReservation(current: SafetyDocument, reservationId: string, operation: SafetyReservation['operation']): SafetyReservation {
@@ -789,44 +766,41 @@ function emptyDocument(identity: SafetyIdentity): SafetyDocument {
   return { schemaVersion: 1, generation: 0, state: 'ACTIVE', identity, writers, blockedReason: null, fenceEpoch: 0, backup: null, restore: null, reservation: null, reservationHistory: [], updatedAt: new Date().toISOString() };
 }
 
-async function applyObservations(document: SafetyDocument, observations: Readonly<Record<string, WriterObservation>>, identity: SafetyIdentity, verifier: TrustedWriterVerifier | undefined): Promise<SafetyDocument> {
-  const writers = { ...document.writers };
+async function validateObservations(document: SafetyDocument, observations: Readonly<Record<string, WriterObservation>>, identity: SafetyIdentity, verifier: TrustedWriterVerifier | undefined): Promise<void> {
   for (const [name, observation] of Object.entries(observations)) {
     if (!REQUIRED_WRITERS.includes(name as SafetyWriterName)) throw new RuntimeError('INVALID_REQUEST', `Writer observation for ${name} is not supported`);
     if (!WRITER_STATES.includes(observation.state) || !Number.isSafeInteger(observation.inFlight ?? 0) || (observation.inFlight ?? 0) < 0) throw new RuntimeError('INVALID_REQUEST', `Writer observation for ${name} is invalid`);
     const candidate = observation as WriterObservation & Record<string, unknown>;
     if (Object.prototype.hasOwnProperty.call(candidate, 'verified') || Object.prototype.hasOwnProperty.call(candidate, 'runtimeId') || Object.prototype.hasOwnProperty.call(candidate, 'instanceId') || Object.prototype.hasOwnProperty.call(candidate, 'dataRoot') || Object.prototype.hasOwnProperty.call(candidate, 'fenceEpoch') || Object.prototype.hasOwnProperty.call(candidate, 'generation')) throw new RuntimeError('PRECONDITION_FAILED', `Writer observation for ${name} contains caller-supplied proof`);
-    const current = writers[name];
+    const current = document.writers[name];
     if (current !== undefined && (current.inFlight > 0 || current.leaseIds.length > 0)) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${name} has an active mutation lease that observations cannot reconcile`);
     const verified = await verifyWriterEvidence(document, identity, verifier, name as SafetyWriterName);
     if (verified === null || verified.state !== observation.state || verified.inFlight !== (observation.inFlight ?? 0)) throw new RuntimeError('PRECONDITION_FAILED', `Writer observation for ${name} is not independently verified`);
-    if (current !== undefined) writers[name] = { ...current, state: verified.state, inFlight: verified.inFlight, ownerInstanceId: identity.instanceId, leaseIds: [] };
   }
-  return { ...document, writers };
 }
 
-async function reverifyNonInstrumentedWriters(document: SafetyDocument, identity: SafetyIdentity, verifier: TrustedWriterVerifier | undefined): Promise<{ readonly document: SafetyDocument; readonly reasons: readonly string[] }> {
-  const writers = { ...document.writers };
+async function idleWriterVerificationReasons(document: SafetyDocument, identity: SafetyIdentity, verifier: TrustedWriterVerifier | undefined, includeInstrumented = false): Promise<string[]> {
   const reasons: string[] = [];
   for (const writer of REQUIRED_WRITERS) {
-    if (INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) continue;
-    const record = writers[writer];
-    if (record === undefined || record.state === 'UNKNOWN') {
+    if (!includeInstrumented && INSTRUMENTED_WRITERS.includes(writer as typeof INSTRUMENTED_WRITERS[number])) continue;
+    const record = document.writers[writer];
+    if (record === undefined || !includeInstrumented && record.state === 'UNKNOWN') {
       reasons.push(`writer ${writer} is unknown`);
       continue;
     }
     try {
       const verified = await verifyWriterEvidence(document, identity, verifier, writer);
-      writers[writer] = { ...record, state: verified.state, inFlight: verified.inFlight, ownerInstanceId: identity.instanceId, leaseIds: record.leaseIds };
-      if (verified.state !== record.state || verified.inFlight !== record.inFlight) reasons.push(`writer ${writer} changed since inventory verification`);
+      // Observed activity is not a controller-owned mutation lease.
+      if (verified.state !== 'IDLE' || verified.inFlight !== 0) reasons.push(`writer ${writer} has observed activity`);
     } catch (error) {
       reasons.push(error instanceof RuntimeError ? error.message : `writer ${writer} could not be freshly verified`);
     }
   }
-  return { document: { ...document, writers }, reasons };
+  return reasons;
 }
 
 async function verifyWriterEvidence(document: SafetyDocument, identity: SafetyIdentity, verifier: TrustedWriterVerifier | undefined, writer: SafetyWriterName): Promise<TrustedWriterVerification> {
+  if (!sameIdentity(document.identity, identity)) throw new RuntimeError('AUTHORITY_CHANGED', 'Writer verification runtime identity changed');
   if (verifier === undefined) throw new RuntimeError('PRECONDITION_FAILED', `Writer ${writer} has no trusted verifier`);
   let verified: TrustedWriterVerification | null;
   try {
@@ -839,6 +813,7 @@ async function verifyWriterEvidence(document: SafetyDocument, identity: SafetyId
     || !['IDLE', 'ACTIVE'].includes(verified.state)
     || !Number.isSafeInteger(verified.inFlight)
     || verified.inFlight < 0
+    || verified.state === 'IDLE' && verified.inFlight !== 0
     || typeof verified.runtimeId !== 'string'
     || typeof verified.instanceId !== 'string'
     || typeof verified.dataRoot !== 'string'
@@ -994,7 +969,10 @@ function safeJoin(root: string, relative: string): string {
   return candidate;
 }
 
-async function writeDocument(filename: string, document: SafetyDocument): Promise<void> { await writePrivateJson(filename, document); }
+async function writeDocument(filename: string, document: SafetyDocument): Promise<void> {
+  parseDocument(JSON.stringify(document));
+  await writePrivateJson(filename, document);
+}
 async function writePrivateJson(filename: string, value: unknown): Promise<void> {
   const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
   try {
@@ -1108,7 +1086,7 @@ function parseDocument(content: string): SafetyDocument {
       if (!REQUIRED_WRITERS.includes(name as SafetyWriterName)) throw new Error('writer name');
       if (!record || !WRITER_STATES.includes(record.state as SafetyWriterState) || !Number.isSafeInteger(record.inFlight) || record.inFlight < 0) throw new Error('writer schema');
       const leaseIds = record.leaseIds ?? [];
-      if (!Array.isArray(leaseIds) || leaseIds.some((id) => typeof id !== 'string') || leaseIds.length !== record.inFlight) throw new Error('lease schema');
+      if (!Array.isArray(leaseIds) || leaseIds.some((id) => typeof id !== 'string' || id.length === 0) || new Set(leaseIds).size !== leaseIds.length || leaseIds.length !== record.inFlight) throw new Error('lease schema');
       writers[name] = { state: record.state as SafetyWriterState, inFlight: record.inFlight, ownerInstanceId: typeof record.ownerInstanceId === 'string' ? record.ownerInstanceId : null, leaseIds };
     }
     return {
