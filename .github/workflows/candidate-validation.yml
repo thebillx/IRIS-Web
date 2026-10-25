@@ -27,8 +27,8 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: 1a7292a7ba1ee4c05e7288659dd9049b4e11515f
-      APPROVED_TARGET_TREE: 21e71d4a0956bafede24ca808e0b00a7e1db4605
+      APPROVED_TARGET_SHA: 8b654b2c097f4bed967bc64c681d8dee66cb7b35
+      APPROVED_TARGET_TREE: 599a00db8704274493bedc4deafa6db6ddce7b04
       BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
     steps:
       - name: Validate the approved target
@@ -98,13 +98,26 @@ jobs:
             src/server.test.ts \
             --testTimeout=180000
 
+      - name: Run Acceptance blocker Runtime integration regressions
+        run: |
+          pnpm --filter @iris/runtime exec vitest run \
+            src/blocker-gateway.integration.test.ts \
+            src/blocker-login.integration.test.ts \
+            src/blocker-runtime.integration.test.ts \
+            src/blocker-mutation-authority.test.ts \
+            src/durable-session.test.ts \
+            src/job-admission.test.ts \
+            src/lifecycle.integration.test.ts \
+            src/phase1-identity.test.ts \
+            src/phase8-catalog-compat.test.ts \
+            --testTimeout=180000
+
       - name: Run project isolation regressions
         run: |
           pnpm --filter @iris/runtime exec vitest run --testTimeout 30000 \
             src/activation-controller.test.ts \
             src/durable-mission-service.test.ts \
-            src/phase2-foundation.test.ts \
-            src/phase7-external-integration.test.ts
+            src/phase2-foundation.test.ts
 
       - name: Run security and redaction regressions
         run: |
@@ -127,13 +140,16 @@ jobs:
             if (output.includes(secret)) throw new Error("Synthetic redaction marker leaked");
           '
 
-      - name: Run production safety disposable regressions
-        run: pnpm --filter @iris/runtime exec tsx --test src/production-safety-m74.test.ts src/production-safety-wiring.test.ts
+      - name: Run production safety wiring, M74 and CLI regressions
+        run: pnpm --filter @iris/runtime exec tsx --test src/production-safety-wiring.test.ts src/production-safety-m74.test.ts src/production-safety-cli.test.ts
 
-      - name: Typecheck and build Runtime
+      - name: Run typed initial-install setup regressions
+        run: pnpm --filter @iris/runtime exec tsx --test src/control-setup.test.ts
+
+      - name: Typecheck and build the workspace
         run: |
-          pnpm --filter @iris/runtime typecheck
-          pnpm --filter @iris/runtime build
+          pnpm typecheck
+          pnpm build
 
       - name: Check the target diff and lint changed sources
         run: |
@@ -147,9 +163,7 @@ jobs:
           pnpm exec eslint "${changed_sources[@]}"
 
       - name: Run unified MCP workload routing regression
-        run: |
-          pnpm --filter @iris/runtime exec vitest run src/mcp.test.ts src/mcp-v21.test.ts src/supervisor-native-control.test.ts --testTimeout=60000
-          pnpm --filter @iris/runtime exec tsx src/control-setup.test.ts
+        run: pnpm --filter @iris/runtime exec vitest run src/mcp.test.ts src/mcp-v21.test.ts --testTimeout=60000
 
       - name: Run unified setup and durable mutation regressions
         run: |
@@ -158,3 +172,6 @@ jobs:
             src/durable-mutation-journal.test.ts \
             src/phase4-git-worktree.test.ts \
             --testTimeout=180000
+
+      - name: Run Web Owner controls and routing regressions
+        run: pnpm --filter @iris/web exec vitest run src --testTimeout=60000
