@@ -2201,7 +2201,7 @@ setInterval(() => undefined, 1000);
     const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-recovery-'));
     const fakeRoot = await mkdtemp(path.join(os.tmpdir(), 'iris-supervisor-recovery-fake-'));
     roots.push(dataRoot, fakeRoot);
-    await initializeConnectorRegistry(dataRoot, { fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', fullHealthPort: 50_821, proHealthPort: 50_822 });
+    await initializeConnectorRegistry(dataRoot, { fullTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', proTunnelId: 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', fullHealthPort: await freePort(), proHealthPort: await freePort() });
     await persistControlPlaneApiKey(dataRoot, 'control-plane-credential-for-test-only-12345');
     await loadOrCreateTunnelServiceSecret(dataRoot);
     const fakeTunnel = await fakeTunnelClient(fakeRoot);

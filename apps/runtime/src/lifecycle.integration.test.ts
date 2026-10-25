@@ -16,11 +16,17 @@ import { loadOrCreateRuntimeId, readEndpoint, readOwnerAccessSecret, readRuntime
 import { node24Path } from './node-runtime.js';
 
 const roots: string[] = [];
+const managedRuntimeRoots = new Set<string>();
 const sourceRoot = path.resolve(import.meta.dirname, '../../..');
 let occupiedServer: Server | undefined;
 let ownerAccessToken = '';
 
 afterEach(async () => {
+  for (const dataRoot of managedRuntimeRoots) {
+    if ((await runtimeStatus(dataRoot)).state === 'running') await stopRuntime(dataRoot, 15_000);
+    if ((await runtimeStatus(dataRoot)).state !== 'stopped') throw new Error('Fixture Runtime outcome is unresolved; preserve its data root');
+    managedRuntimeRoots.delete(dataRoot);
+  }
   if (occupiedServer?.listening) await new Promise<void>((resolve, reject) => occupiedServer!.close((error) => error ? reject(error) : resolve()));
   occupiedServer = undefined;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -234,6 +240,7 @@ describe('runtime lifecycle integration', () => {
 
   it('proves one daemon, safe port fallback, multi-session isolation, STOP_COMPLETE, persistence, and immediate restart', async () => {
     const dataRoot = await temp('iris-lifecycle-data-');
+    managedRuntimeRoots.add(dataRoot);
     const projectAPath = await temp('iris-lifecycle-project-a-');
     const projectBPath = await temp('iris-lifecycle-project-b-');
 
@@ -335,7 +342,7 @@ describe('runtime lifecycle integration', () => {
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
     expect(mcp.result.tools.map((tool) => tool.name)).toEqual([
-      'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'ado_discovery', 'ado_workitem_read', 'ado_hierarchy_read', 'ado_context_search', 'ado_backlog_list', 'mission_list', 'session_open', 'session_get', 'session_resume', 'session_detach', 'session_close', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_delegation_issue', 'mission_delegation_revoke', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete',
+      'runtime_status', 'list_projects', 'project_info', 'git_status', 'search', 'ado_discovery', 'ado_workitem_read', 'ado_hierarchy_read', 'ado_context_search', 'ado_backlog_list', 'mission_list', 'session_open', 'session_get', 'session_close', 'session_resume', 'session_detach', 'workspace_select', 'mission_list_waiting_supervisor', 'mission_get', 'mission_events', 'mission_directive', 'mission_orchestrator_handoff', 'mission_create', 'mission_state_set', 'mission_task_create', 'mission_task_state_set', 'mission_action_prepare', 'mission_delegation_issue', 'mission_delegation_revoke', 'owner_approval_resolve', 'mission_supervisor_gate_set', 'project_test_run', 'project_validation_run', 'project_validation_discover', 'project_validation_start', 'project_validation_job', 'git_local', 'remote_publish', 'file_read', 'file_write', 'file_edit', 'file_delete', 'directory_create', 'directory_delete',
       'mission_start', 'mission_checkpoint', 'mission_resume', 'mission_rebind', 'mission_cancel', 'mission_complete', 'mission_evidence', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git', 'code_review', 'security_audit', 'catalog_identity',
     ]);
 

@@ -31,8 +31,8 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     const fixture = await serviceFixture();
     const definitions = phase4GroupedToolDefinitions();
     expect(definitions.map((tool) => tool.name)).toEqual(['git']);
-    expect(catalogToolNames('FULL')).toHaveLength(58);
-    expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['git_status','git_local','remote_publish','workspace','fs','artifact','shell','job','git']));
+    expect(catalogToolNames('FULL')).toHaveLength(60);
+    expect(catalogToolNames('FULL')).toEqual(expect.arrayContaining(['git_status','git_local','remote_publish','workspace','fs','artifact','shell','job','git','session_resume','session_detach']));
     expect(catalogToolNames('PRO')).toEqual(['list_projects','project_info','git_status','file_read','search']);
 
     const schema = definitions[0]?.inputSchema as { properties: Record<string, unknown> };
@@ -302,7 +302,7 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     expect(JSON.stringify(audits)).not.toContain('SUPERSECRET');
   });
 
-  it('auto-executes direct safe feature push under FULL_LOCAL_OWNER without mission or effect ceremony', async () => {
+  it('executes safe feature push in an explicit session under FULL_LOCAL_OWNER without mission or effect ceremony', async () => {
     const fixture = await serviceFixture();
     const request = new Request('http://127.0.0.1/mcp', { headers: { 'x-iris-client-id': fixture.session.clientId } });
     const identity = await fixture.engine.inspectRepository(fixture.project.id, fixture.primary.workspaceId);
@@ -313,6 +313,13 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     await git(fixture.projectRoot, ['commit', '-m', 'direct tools']);
 
     const sessionsBefore = fixture.state.listSessionsForClient(fixture.session.clientId).length;
+    await expect(executePhase4GroupedTool('git', {
+      operation: 'push', projectId: fixture.project.id,
+      workspaceId: fixture.primary.workspaceId, repositoryId: identity.repositoryId,
+      remote: 'origin', branch: 'feature/direct-tools',
+    }, request, fixture.service, fixture.state, 'tunnel-service')).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    expect(fixture.state.listSessionsForClient(fixture.session.clientId)).toHaveLength(sessionsBefore);
+    request.headers.set('x-iris-session-id', fixture.session.id);
     const pushed = await executePhase4GroupedTool('git', {
       operation: 'push', projectId: fixture.project.id,
       workspaceId: fixture.primary.workspaceId, repositoryId: identity.repositoryId,
@@ -323,14 +330,14 @@ describe('IRIS vNext Phase 4 governed Git and worktree authorization', () => {
     expect(pushed.value).toMatchObject({ operation: 'push', branch: 'feature/direct-tools', remote: 'origin', verified: true });
     expect(fixture.service.listPendingApprovals()).toHaveLength(0);
     const tunnelSessions = fixture.state.listSessionsForClient(fixture.session.clientId).filter((session) => session.agentId === 'iris-tunnel-service');
-    expect(tunnelSessions).toHaveLength(1);
-    expect(fixture.state.listSessionsForClient(fixture.session.clientId)).toHaveLength(sessionsBefore + 1);
+    expect(tunnelSessions).toHaveLength(0);
+    expect(fixture.state.listSessionsForClient(fixture.session.clientId)).toHaveLength(sessionsBefore);
 
     const attached = await executePhase4GroupedTool('git', {
       operation: 'status', projectId: fixture.project.id, workspaceId: fixture.primary.workspaceId,
     }, request, fixture.service, fixture.state, 'tunnel-service');
     expect(attached.status).toBe('executed');
-    expect(fixture.state.listSessionsForClient(fixture.session.clientId).filter((session) => session.agentId === 'iris-tunnel-service')).toHaveLength(1);
+    expect(fixture.state.listSessionsForClient(fixture.session.clientId)).toHaveLength(sessionsBefore);
   });
 
   it('binds grouped git.push to one prepared CHATGPT mission action and originating owner approval in legacy ASK_EVERY_TIME mode', async () => {

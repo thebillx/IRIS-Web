@@ -132,11 +132,11 @@ describe('IRIS vNext Phase 1 identity and fencing', () => {
     expect(assessConnectorRegistryIdentity(registry, { machineId, runtimeId: 'runtime-b' }, []).state).toBe('SPLIT');
   });
 
-  it('AC-IRIS-006 preserves every legacy FULL tool, adds Phase 2/3/4 grouped tools, and keeps PRO at the exact read-only five', () => {
+  it('AC-IRIS-006 preserves every legacy FULL tool, adds durable-session and grouped tools, and keeps PRO at the exact read-only five', () => {
     const fullNames = catalogToolNames('FULL');
-    expect(fullNames).toHaveLength(58);
+    expect(fullNames).toHaveLength(60);
     for (const legacyName of LEGACY_FULL_TOOL_NAMES) expect(fullNames).toContain(legacyName);
-    expect(fullNames.filter((name) => !LEGACY_FULL_TOOL_NAMES.includes(name as (typeof LEGACY_FULL_TOOL_NAMES)[number]))).toEqual(['ado_discovery', 'ado_workitem_read', 'ado_hierarchy_read', 'ado_context_search', 'ado_backlog_list', 'mission_delegation_issue', 'mission_delegation_revoke', 'owner_approval_resolve', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git', 'code_review', 'security_audit']);
+    expect(fullNames.filter((name) => !LEGACY_FULL_TOOL_NAMES.includes(name as (typeof LEGACY_FULL_TOOL_NAMES)[number]))).toEqual(['ado_discovery', 'ado_workitem_read', 'ado_hierarchy_read', 'ado_context_search', 'ado_backlog_list', 'session_resume', 'session_detach', 'mission_delegation_issue', 'mission_delegation_revoke', 'owner_approval_resolve', 'workspace', 'fs', 'artifact', 'shell', 'job', 'git', 'code_review', 'security_audit']);
     expect(fullMcpToolDefinitionsV21().map((definition) => definition.name)).toEqual(fullNames);
     expect(catalogToolNames('PRO')).toEqual(['list_projects', 'project_info', 'git_status', 'file_read', 'search']);
     expect(proMcpToolDefinitions().map((definition) => definition.name)).toEqual(catalogToolNames('PRO'));
