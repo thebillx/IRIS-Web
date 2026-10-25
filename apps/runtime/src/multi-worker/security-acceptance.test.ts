@@ -212,7 +212,7 @@ describe('IRIS multi-worker M11 CapabilityService audit and security acceptance'
     });
   });
 
-  it('preserves durable worker authority across reload and rejects replay, revocation and closed owner sessions', async () => {
+  it('preserves durable worker authority across reload and rejects replay, revocation and deleted owner sessions', async () => {
     const f = await fixture();
     const reloaded = new MultiWorkerStore(f.dataRoot);
     const durable = await reloaded.read();
@@ -224,8 +224,14 @@ describe('IRIS multi-worker M11 CapabilityService audit and security acceptance'
     await expect(capabilities.execute(operation)).resolves.toMatchObject({ status: 'denied', reason: expect.stringContaining('replay') });
     await f.delegations.revoke(f.delegation.delegationId, f.session.clientId, f.session.id);
     await expect(capabilities.execute({ ...operation, worker: { ...f.association, operationId: randomUUID() } })).resolves.toMatchObject({ status: 'denied', reason: expect.stringContaining('revoked') });
+    const originalContent = await readFile(path.join(f.projectRoot, 'apps/runtime/visible.txt'), 'utf8');
     f.state.deleteSession(f.session.id, f.session.clientId);
-    await expect(capabilities.execute({ ...operation, worker: { ...f.association, operationId: randomUUID() } })).rejects.toMatchObject({ code: 'SESSION_NOT_FOUND' });
+    const auditBeforeDeniedOperations = await f.audit.recent(100);
+    const deletedOwnerOperation = { ...operation, worker: { ...f.association, operationId: randomUUID() } };
+    await expect(capabilities.execute(deletedOwnerOperation)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(capabilities.execute({ ...deletedOwnerOperation, clientId: 'unrelated-client', worker: { ...f.association, operationId: randomUUID() } })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect(await f.audit.recent(100)).toEqual(auditBeforeDeniedOperations);
+    expect(await readFile(path.join(f.projectRoot, 'apps/runtime/visible.txt'), 'utf8')).toBe(originalContent);
   });
 
   it('denies cross-path, forged digest, foreign workspace, and broad project search before execution', async () => {
