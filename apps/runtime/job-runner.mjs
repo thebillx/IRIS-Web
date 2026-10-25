@@ -4,8 +4,9 @@ import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { access, lstat, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HELPER = new URL('./macos-safety-helper.py', import.meta.url).pathname;
+const HELPER = fileURLToPath(new URL('./macos-safety-helper.py', import.meta.url));
 const args = process.argv.slice(2);
 const specPath = option('--spec');
 const expectedJobId = option('--job');

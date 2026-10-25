@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { access, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { access, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -52,6 +53,49 @@ it('holds admission from clean prelaunch through a verified runner and binds dup
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline && (await jobs.status(f.project.id, String(a.jobId), f.state.getDurableSessionAuthority(f.session.id, 'chatgpt'))).state === 'RUNNING') await new Promise((resolve) => setTimeout(resolve, 40));
   expect(await jobs.result(f.project.id, String(a.jobId), f.state.getDurableSessionAuthority(f.session.id, 'chatgpt'))).toMatchObject({ state: 'SUCCEEDED' });
+}, 15_000);
+
+it('starts the durable runner when its release path contains URL-encoded characters', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'iris runner %20 path-'))); roots.push(root);
+  const runtimeRoot = path.join(root, 'runtime with spaces');
+  const workRoot = path.join(root, 'workspace');
+  await Promise.all([mkdir(runtimeRoot), mkdir(workRoot)]);
+  const runnerPath = path.join(runtimeRoot, 'job-runner.mjs');
+  await Promise.all([
+    copyFile(new URL('../job-runner.mjs', import.meta.url), runnerPath),
+    copyFile(new URL('../macos-safety-helper.py', import.meta.url), path.join(runtimeRoot, 'macos-safety-helper.py')),
+  ]);
+
+  const jobId = randomUUID();
+  const runnerIdentity = randomUUID();
+  const specPath = path.join(root, 'runner-spec.json');
+  const runnerClaimPath = path.join(root, 'runner-claim.json');
+  const permitPath = path.join(root, 'permit.json');
+  const claimPath = path.join(root, 'claim.json');
+  const resultPath = path.join(root, 'result.json');
+  const stdoutPath = path.join(root, 'stdout.log');
+  const stderrPath = path.join(root, 'stderr.log');
+  const cancelPath = path.join(root, 'cancel');
+  await writeFile(specPath, JSON.stringify({
+    schemaVersion: 1, jobId, runnerIdentity, executableIdentity: process.execPath,
+    argv: ['-e', "process.stdout.write('runner-path-ok')"], cwd: workRoot,
+    environment: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+    stdoutPath, stderrPath, runnerClaimPath, permitPath, claimPath, resultPath, cancelPath,
+    redactionValues: [], cleanupPaths: [], timeoutMs: 5000, stdinPath: null, reviewOutputPath: null,
+  }));
+  await writeFile(permitPath, JSON.stringify({ jobId, runnerIdentity }));
+
+  const child = spawn(process.execPath, [runnerPath, '--spec', specPath, '--job', jobId, '--runner', runnerIdentity], { detached: true, stdio: 'ignore' });
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    const deadline = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('runner path regression timed out')); }, 10_000);
+    child.once('error', (error) => { clearTimeout(deadline); reject(error); });
+    child.once('exit', (code) => { clearTimeout(deadline); resolve(code ?? -1); });
+  });
+
+  const result = JSON.parse(await readFile(resultPath, 'utf8')) as { jobId: string; runnerIdentity: string; state: string; error?: string };
+  expect(exitCode, result.error).toBe(0);
+  expect(result).toMatchObject({ jobId, runnerIdentity, state: 'SUCCEEDED' });
+  expect(await readFile(stdoutPath, 'utf8')).toBe('runner-path-ok');
 }, 15_000);
 
 async function fixture() {
