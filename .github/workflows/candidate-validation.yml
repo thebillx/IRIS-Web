@@ -27,9 +27,10 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: cece3be9962019dcaa4e0669b8e1ccfabcbd07a5
-      APPROVED_TARGET_TREE: ea9187c980a607dc1b721db39987fa16ec132e94
-      BASELINE_SHA: 4bea901fb5d0819024ef449c87dba7c1461acf99
+      APPROVED_TARGET_SHA: 72a1e10e627d2c77c97e480420d330207b45b89a
+      APPROVED_TARGET_TREE: e6d875d7849b580e292bb77cda25050bc98b2160
+      BASELINE_SHA: 1dc935f2b4b0bde617a220a59c38c84d706d4a8c
+      BASELINE_TREE: eba2a06dc672856efd3dc6031343b125ca784949
     steps:
       - name: Validate the approved target
         run: |
@@ -40,10 +41,10 @@ jobs:
           test "$TARGET_SHA" = "$APPROVED_TARGET_SHA"
           test "$TARGET_TREE" = "$APPROVED_TARGET_TREE"
 
-      - name: Check out the published integration branch
+      - name: Check out the final integration CI validation branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: refs/heads/codex/one-iris-r03-r09-completion
+          ref: refs/heads/codex/one-iris-final-integration-ci-validation
           fetch-depth: 0
           persist-credentials: false
 
@@ -51,7 +52,7 @@ jobs:
         id: source
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/codex/one-iris-r03-r09-completion
+          git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/codex/one-iris-final-integration-ci-validation
           git checkout --detach "$TARGET_SHA"
           actual_sha="$(git rev-parse 'HEAD^{commit}')"
           actual_tree="$(git rev-parse 'HEAD^{tree}')"
@@ -59,8 +60,13 @@ jobs:
           test "$actual_tree" = "$TARGET_TREE"
           test -z "$(git status --porcelain --untracked-files=no)"
           git rev-parse --verify 'HEAD^1^{commit}' >/dev/null
+          test "$(git rev-parse "$TARGET_SHA^1")" = "$BASELINE_SHA"
           test "$(git rev-parse "$BASELINE_SHA^{commit}")" = "$BASELINE_SHA"
+          test "$(git rev-parse "$BASELINE_SHA^{tree}")" = "$BASELINE_TREE"
           git merge-base --is-ancestor "$BASELINE_SHA" "$TARGET_SHA"
+          expected_files="$(printf '%s\n' apps/runtime/job-runner.mjs apps/runtime/src/job-admission.test.ts | LC_ALL=C sort)"
+          actual_files="$(git diff-tree --no-commit-id --name-only -r "$TARGET_SHA" | LC_ALL=C sort)"
+          test "$actual_files" = "$expected_files"
           printf 'Validated commit: `%s`\nValidated tree: `%s`\n' "$actual_sha" "$actual_tree" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Node.js 24
@@ -76,11 +82,33 @@ jobs:
       - name: Install frozen dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
 
-      - name: Verify Node.js and pnpm toolchain
+      - name: Verify canonical Node and pnpm toolchain
         run: |
           set -euo pipefail
-          test "$(node --version)" = "v24.20.0"
-          test "$(pnpm --version)" = "10.15.0"
+          node_info="$(node scripts/node24.mjs --print)"
+          canonical_node="$(printf '%s\n' "$node_info" | node -e 'let input = ""; process.stdin.on("data", (chunk) => input += chunk).on("end", () => process.stdout.write(JSON.parse(input).path));')"
+          canonical_version="$(printf '%s\n' "$node_info" | node -e 'let input = ""; process.stdin.on("data", (chunk) => input += chunk).on("end", () => process.stdout.write(JSON.parse(input).version));')"
+          test "$canonical_version" = "v24.20.0"
+          test -x "$canonical_node"
+          test "$("$canonical_node" --version)" = "v24.20.0"
+          canonical_dir="$(dirname "$canonical_node")"
+          pnpm_path="$(command -v pnpm)"
+          test -n "$pnpm_path"
+          test -x "$pnpm_path"
+          test "$("$pnpm_path" --version)" = "10.15.0"
+          expected_pnpm="$canonical_dir/pnpm"
+          test ! -e "$expected_pnpm" && test ! -L "$expected_pnpm"
+          test -w "$canonical_dir"
+          (set -o noclobber; {
+            printf '#!/bin/bash\nexec '
+            printf '%q' "$pnpm_path"
+            printf ' "$@"\n'
+          } > "$expected_pnpm")
+          chmod 755 "$expected_pnpm"
+          test -f "$expected_pnpm"
+          test ! -L "$expected_pnpm"
+          test -x "$expected_pnpm"
+          test "$(node scripts/node24.mjs --pnpm --version)" = "10.15.0"
 
       - name: Run Supervisor failure-stop and KeepAlive regressions
         run: |
