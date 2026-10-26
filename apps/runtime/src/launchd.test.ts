@@ -22,6 +22,7 @@ import {
   renderLaunchAgent,
   resolveReviewedRuntimeEntrypoints,
   stopLaunchAgentForMigration,
+  stopLoadedLaunchAgentByServiceTarget,
   recordLoadedNoPidRecovery,
   acknowledgeLoadedNoPidRecovery,
   uninstallLaunchAgent,
@@ -53,6 +54,7 @@ interface FakeLaunchd {
   bootstrap: 'success' | 'failure' | 'unknown-success';
   bootout: 'success' | 'failure' | 'unknown-success' | 'delayed-success';
   bootoutDelay: number;
+  beforeBootout: (() => void) | null;
   enable: 'success' | 'failure' | 'unknown-success';
   disable: 'success' | 'failure' | 'unknown-success';
   queryError: Error | null;
@@ -81,6 +83,7 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
     bootstrap: 'success',
     bootout: 'success',
     bootoutDelay: 0,
+    beforeBootout: null,
     enable: 'success',
     disable: 'success',
     queryError: null,
@@ -155,6 +158,11 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
         return { stdout: '' };
       }
       if (command === 'bootout') {
+        if (argumentsList[1] === '--wait') {
+          if (argumentsList.length !== 3 || argumentsList[2] !== `gui/${uid}/${LAUNCH_AGENT_LABEL}`) throw new Error('unexpected service-target bootout arguments');
+          fake.beforeBootout?.();
+          fake.live.pid = null;
+        }
         if (fake.bootout === 'failure') throw new Error('bootout failed');
         if (fake.bootout === 'delayed-success') fake.bootoutDelay = 2;
         fake.loaded = false;
@@ -362,6 +370,38 @@ async function issueNoPidRecoveryPolicy(subject: Awaited<ReturnType<typeof fixtu
     beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
     recordedSourceRoot: metadata.sourceRoot,
     allowedOperations: ['SUPERVISOR_NO_PID_RECOVERY'],
+    machineId,
+    maxOperationCount: 1,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    ...(predecessor === null ? {} : { supersedesPolicyId: predecessor.policyId }),
+  });
+}
+
+async function issueServiceTargetStopPolicy(subject: Awaited<ReturnType<typeof fixture>>, machineIdOverride?: string) {
+  const paths = launchdPaths(subject.dataRoot, subject.home);
+  const metadataRaw = await readFile(paths.metadata, 'utf8');
+  const plistRaw = await readFile(paths.plist, 'utf8');
+  const migration = JSON.parse(await readFile(paths.sourceBindingMigration, 'utf8')) as { targetSourceRoot: string; targetSourceSha: string; targetSourceTree: string };
+  const current = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+  if (current?.state === 'ISSUED') await revokeRecoveryAuthorizationPolicy(subject.dataRoot);
+  const predecessor = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+  const executable = await realpath(canonicalNodeRuntime().path);
+  const runtime = await resolveReviewedRuntimeEntrypoints(path.join(sourceRoot, 'apps', 'runtime'));
+  const machineId = machineIdOverride ?? JSON.parse(await readFile(path.join(subject.dataRoot, 'machine-id.json'), 'utf8')).machineId as string;
+  const [sourceSha, sourceTree] = await Promise.all([
+    exec('/usr/bin/git', ['-C', sourceRoot, 'rev-parse', 'HEAD']),
+    exec('/usr/bin/git', ['-C', sourceRoot, 'rev-parse', 'HEAD^{tree}']),
+  ]);
+  return issueRecoveryAuthorizationPolicy({
+    dataRoot: subject.dataRoot,
+    sourceBindings: [{ sourceSha: sourceSha.stdout.trim(), sourceTree: sourceTree.stdout.trim(), sourceRoot, controlScript, executable, executableSha256: createHash('sha256').update(await readFile(executable)).digest('hex'), executableArguments: ['--require', runtime.preflight, '--import', pathToFileURL(runtime.loader).href], runtimePreflightSha256: createHash('sha256').update(await readFile(runtime.preflight)).digest('hex'), runtimeLoaderSha256: createHash('sha256').update(await readFile(runtime.loader)).digest('hex') }],
+    beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+    beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    recordedSourceRoot: migration.targetSourceRoot,
+    recordedSourceSha: migration.targetSourceSha,
+    recordedSourceTree: migration.targetSourceTree,
+    serviceTarget: { uid, domain: `gui/${uid}`, label: LAUNCH_AGENT_LABEL },
+    allowedOperations: ['SUPERVISOR_SERVICE_TARGET_STOP'],
     machineId,
     maxOperationCount: 1,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
@@ -912,6 +952,107 @@ describe('loaded/no-PID recovery evidence', () => {
     const result = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies);
     expect(result.disposition).toBe('ABSENT');
     expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+});
+
+describe('Owner-authorized service-target stop', () => {
+  async function loadedNoPidFixture() {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const metadata = JSON.parse(await readFile(paths.metadata, 'utf8')) as { sourceRoot: string };
+    await rm(metadata.sourceRoot, { recursive: true });
+    subject.fake.live.pid = null;
+    return { subject, paths, policy: await issueServiceTargetStopPolicy(subject) };
+  }
+
+  it('boots out only the exact loaded service target, journals success, and does not replay', async () => {
+    const { subject, paths, policy } = await loadedNoPidFixture();
+    const requestId = randomUUID();
+    const metadataBefore = await readFile(paths.metadata, 'utf8');
+    const plistBefore = await readFile(paths.plist, 'utf8');
+    const result = await stopLoadedLaunchAgentByServiceTarget({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies);
+    expect(result.state).toBe('STOPPED');
+    expect(subject.fake.calls).toContain(`bootout --wait gui/${uid}/${LAUNCH_AGENT_LABEL}`);
+    expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+    expect(await readFile(paths.metadata, 'utf8')).toBe(metadataBefore);
+    expect(await readFile(paths.plist, 'utf8')).toBe(plistBefore);
+    await expect(lstat(paths.registeredPlist)).rejects.toMatchObject({ code: 'ENOENT' });
+    const journal = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+    expect(journal?.operations).toContainEqual(expect.objectContaining({ operation: 'SUPERVISOR_SERVICE_TARGET_STOP', requestId, state: 'COMMITTED', recordedSourceRoot: policy.recordedSourceRoot, serviceTarget: { uid, domain: `gui/${uid}`, label: LAUNCH_AGENT_LABEL } }));
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies)).resolves.toEqual(result);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
+  });
+
+  it('lets launchd wait out a transient spawn and rejects an already verified live PID', async () => {
+    const transient = await loadedNoPidFixture();
+    transient.subject.fake.beforeBootout = () => { transient.subject.fake.live.pid = 9191; };
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: transient.subject.dataRoot, recoveryPolicyId: transient.policy.policyId, requestId: randomUUID() }, 'STOP IRIS SUPERVISOR SERVICE TARGET', transient.subject.fake.dependencies)).resolves.toMatchObject({ state: 'STOPPED' });
+    expect(transient.subject.fake.calls).toContain(`bootout --wait gui/${uid}/${LAUNCH_AGENT_LABEL}`);
+
+    const live = await fixture();
+    const livePaths = await install(live);
+    const liveMetadata = JSON.parse(await readFile(livePaths.metadata, 'utf8')) as { sourceRoot: string };
+    await rm(liveMetadata.sourceRoot, { recursive: true });
+    const livePolicy = await issueServiceTargetStopPolicy(live);
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: live.dataRoot, recoveryPolicyId: livePolicy.policyId, requestId: randomUUID() }, 'STOP IRIS SUPERVISOR SERVICE TARGET', live.fake.dependencies)).rejects.toThrow(/exact loaded\/no-PID/);
+    expect(live.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('rejects wrong machine identity and changed plist before any service command', async () => {
+    const wrongMachine = await loadedNoPidFixture();
+    const wrongPolicy = await issueServiceTargetStopPolicy(wrongMachine.subject, randomUUID());
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: wrongMachine.subject.dataRoot, recoveryPolicyId: wrongPolicy.policyId, requestId: randomUUID() }, 'STOP IRIS SUPERVISOR SERVICE TARGET', wrongMachine.subject.fake.dependencies)).rejects.toThrow(/machine identity/);
+    expect(wrongMachine.subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+
+    const drift = await loadedNoPidFixture();
+    await writeFile(drift.paths.plist, 'changed plist', { mode: 0o600 });
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: drift.subject.dataRoot, recoveryPolicyId: drift.policy.policyId, requestId: randomUUID() }, 'STOP IRIS SUPERVISOR SERVICE TARGET', drift.subject.fake.dependencies)).rejects.toThrow(/before-images changed/);
+    expect(drift.subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('rejects metadata and loaded-service identity drift before bootout', async () => {
+    const metadataDrift = await loadedNoPidFixture();
+    await writeFile(metadataDrift.paths.metadata, 'changed metadata', { mode: 0o600 });
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: metadataDrift.subject.dataRoot, recoveryPolicyId: metadataDrift.policy.policyId, requestId: randomUUID() }, 'STOP IRIS SUPERVISOR SERVICE TARGET', metadataDrift.subject.fake.dependencies)).rejects.toThrow();
+    expect(metadataDrift.subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+
+    const identityDrift = await loadedNoPidFixture();
+    identityDrift.subject.fake.live.label = 'com.foreign.supervisor';
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: identityDrift.subject.dataRoot, recoveryPolicyId: identityDrift.policy.policyId, requestId: randomUUID() }, 'STOP IRIS SUPERVISOR SERVICE TARGET', identityDrift.subject.fake.dependencies)).rejects.toThrow(/exact loaded\/no-PID|service definition/);
+    expect(identityDrift.subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('records a post-stop disabled-state race as unresolved without disabling the service', async () => {
+    const { subject, policy } = await loadedNoPidFixture();
+    subject.fake.beforeBootout = () => { subject.fake.disabled = true; };
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies)).rejects.toThrow(/do not retry/);
+    expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0]).toMatchObject({ operation: 'SUPERVISOR_SERVICE_TARGET_STOP', state: 'RECONCILIATION_REQUIRED' });
+    expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+  });
+
+  it('serializes concurrent requests and rejects stale policy and Owner confirmation', async () => {
+    const concurrent = await loadedNoPidFixture();
+    const requestId = randomUUID();
+    const stop = () => stopLoadedLaunchAgentByServiceTarget({ dataRoot: concurrent.subject.dataRoot, recoveryPolicyId: concurrent.policy.policyId, requestId }, 'STOP IRIS SUPERVISOR SERVICE TARGET', concurrent.subject.fake.dependencies);
+    const outcomes = await Promise.allSettled([stop(), stop()]);
+    expect(outcomes.some((outcome) => outcome.status === 'fulfilled')).toBe(true);
+    expect(concurrent.subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
+
+    const rejected = await loadedNoPidFixture();
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: rejected.subject.dataRoot, recoveryPolicyId: rejected.policy.policyId, requestId: randomUUID() }, 'wrong confirmation', rejected.subject.fake.dependencies)).rejects.toThrow(/Owner service-target stop confirmation/);
+    await expireRecoveryPolicy(rejected.subject);
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: rejected.subject.dataRoot, recoveryPolicyId: rejected.policy.policyId, requestId: randomUUID() }, 'STOP IRIS SUPERVISOR SERVICE TARGET', rejected.subject.fake.dependencies)).rejects.toThrow(/missing, expired/);
+    expect(rejected.subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('keeps an unknown bootout unresolved and prevents a duplicate stop', async () => {
+    const { subject, policy } = await loadedNoPidFixture();
+    subject.fake.bootout = 'unknown-success';
+    const requestId = randomUUID();
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies)).rejects.toThrow(/do not retry/);
+    expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0]).toMatchObject({ operation: 'SUPERVISOR_SERVICE_TARGET_STOP', state: 'RECONCILIATION_REQUIRED' });
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies)).rejects.toThrow(/must not be replayed/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
   });
 });
 

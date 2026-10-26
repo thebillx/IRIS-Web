@@ -5,7 +5,7 @@ import { access, link, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { RuntimeError } from '@iris/domain';
 import { RUNTIME_DATA_ENV } from './data-root.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
@@ -101,6 +101,12 @@ export interface LaunchAgentStopReconciliationInput {
 }
 
 export interface LaunchAgentNoPidRecoveryInput {
+  readonly dataRoot: string;
+  readonly recoveryPolicyId: string;
+  readonly requestId: string;
+}
+
+export interface LaunchAgentServiceTargetStopInput {
   readonly dataRoot: string;
   readonly recoveryPolicyId: string;
   readonly requestId: string;
@@ -605,6 +611,91 @@ export async function stopLaunchAgentForMigration(
   return withLaunchAgentLock(paths, uid, () => stopLaunchAgentForMigrationUnlocked({ ...input, dataRoot: canonicalDataRoot }, dependencies));
 }
 
+/** Stops only the Owner-authorized GUI service target; uncertainty is journaled and never retried. */
+export async function stopLoadedLaunchAgentByServiceTarget(
+  input: LaunchAgentServiceTargetStopInput,
+  ownerConfirmation: string,
+  dependencies: LaunchdDependencies = {},
+): Promise<{ readonly state: 'STOPPED'; readonly transactionId: string }> {
+  if (ownerConfirmation !== 'STOP IRIS SUPERVISOR SERVICE TARGET') throw new RuntimeError('CONTROL_DENIED', 'Explicit Owner service-target stop confirmation is required');
+  const uid = launchdUid(dependencies);
+  const domain = launchdDomain(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, async () => {
+    const policy = await readRecoveryAuthorizationPolicy(canonicalDataRoot);
+    if (policy === null || policy.policyId !== input.recoveryPolicyId || policy.state !== 'ISSUED' || Date.parse(policy.expiresAt) <= Date.now()
+      || policy.allowedOperations.length !== 1 || policy.allowedOperations[0] !== 'SUPERVISOR_SERVICE_TARGET_STOP' || policy.maxOperationCount !== 1
+      || policy.machineId === undefined || policy.machineId === null || policy.recordedSourceRoot === undefined || policy.recordedSourceSha === undefined || policy.recordedSourceTree === undefined
+      || policy.serviceTarget === undefined || policy.serviceTarget.uid !== uid || policy.serviceTarget.domain !== domain || policy.serviceTarget.label !== LAUNCH_AGENT_LABEL
+      || policy.sourceBindings.length !== 1 || policy.beforeMetadataSha256 === null || policy.beforePlistSha256 === null) {
+      throw new RuntimeError('CONTROL_DENIED', 'Service-target stop policy is missing, expired, or not bound to this Owner and service');
+    }
+    const machineId = await readMachineId(canonicalDataRoot);
+    if (machineId === null || machineId !== policy.machineId) throw new RuntimeError('CONTROL_DENIED', 'Service-target stop machine identity does not match');
+    const binding = policy.sourceBindings[0]!;
+    const operation: RecoveryPolicyOperationInput = {
+      dataRoot: canonicalDataRoot,
+      policyId: policy.policyId,
+      operation: 'SUPERVISOR_SERVICE_TARGET_STOP',
+      requestId: input.requestId,
+      ...binding,
+      beforeMetadataSha256: policy.beforeMetadataSha256,
+      beforePlistSha256: policy.beforePlistSha256,
+      recordedSourceRoot: policy.recordedSourceRoot,
+      recordedSourceSha: policy.recordedSourceSha,
+      recordedSourceTree: policy.recordedSourceTree,
+      serviceTarget: policy.serviceTarget,
+      machineId,
+      ...(policy.protectedReferenceRoot === null ? {} : { protectedReferenceRoot: policy.protectedReferenceRoot }),
+    };
+    const prior = policy.operations.find((entry) => entry.operation === operation.operation && entry.requestId === operation.requestId);
+    if (prior !== undefined) {
+      const journal = await readRecoveryPolicyOperation({ ...operation, transactionId: prior.transactionId });
+      if (journal.state !== 'COMMITTED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service-target stop is already reserved, failed, or unresolved; it must not be replayed');
+      if ((await observeLaunchAgentOnce(dependencies)).state !== 'ABSENT') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Committed service-target stop is not currently absent');
+      return { state: 'STOPPED', transactionId: prior.transactionId };
+    }
+
+    const disabledBefore = await verifyServiceTargetStopPreflight(operation, policy, paths, uid, domain, dependencies);
+    const reservation = await reserveRecoveryPolicyOperation(operation);
+    try {
+      const disabledImmediatelyBefore = await verifyServiceTargetStopPreflight(operation, policy, paths, uid, domain, dependencies);
+      if (disabledImmediatelyBefore !== disabledBefore) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service disabled state changed before stop invocation');
+      const currentPolicy = await readRecoveryAuthorizationPolicy(canonicalDataRoot);
+      if (currentPolicy?.policyId !== policy.policyId || currentPolicy.state !== 'ISSUED' || Date.parse(currentPolicy.expiresAt) <= Date.now()) {
+        throw new RuntimeError('CONTROL_DENIED', 'Service-target stop authorization expired before invocation');
+      }
+    } catch (error) {
+      await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId, state: 'FAILED' });
+      throw error;
+    }
+
+    // This durable marker is written before launchctl; a crash after it can never replay bootout.
+    await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId, state: 'RECONCILIATION_REQUIRED' });
+    const launchctl = dependencies.launchctl ?? systemLaunchctl;
+    try {
+      await launchctl(['bootout', '--wait', `${domain}/${LAUNCH_AGENT_LABEL}`]);
+      const after = await observeLaunchAgentOnce(dependencies);
+      const disabledAfter = await observeDisabledState(domain, launchctl);
+      if (after.state !== 'ABSENT' || disabledAfter === 'UNKNOWN' || disabledAfter !== disabledBefore) {
+        throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service-target stop postconditions are not verified');
+      }
+      await verifyStoppedMetadataProcess(operation, paths, uid, dependencies);
+      const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+      const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+      if (privatePlist.state !== 'ok' || registeredPlist.state !== 'ok' || privatePlist.content !== registeredPlist.content
+        || sha256(privatePlist.content) !== operation.beforePlistSha256) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent plist changed during service-target stop');
+      await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+      if ((await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid)).state !== 'missing') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Registered LaunchAgent removal requires reconciliation');
+      await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId, state: 'COMMITTED' });
+      return { state: 'STOPPED', transactionId: reservation.transactionId };
+    } catch (error) {
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service-target stop outcome requires reconciliation; do not retry the stop', { cause: error });
+    }
+  });
+}
+
 /** Reconciles a verified-absent Supervisor without issuing another bootout. */
 export async function reconcileStoppedLaunchAgent(
   input: LaunchAgentStopReconciliationInput,
@@ -793,6 +884,100 @@ async function requireMissingPhysicalPath(filename: string): Promise<void> {
     if (!stats.isDirectory()) throw new RuntimeError('CONTROL_DENIED', 'Recorded historical source path has a non-directory parent');
   }
   throw new RuntimeError('CONTROL_DENIED', 'Historical source path is not missing; recovery record is not applicable');
+}
+
+async function verifyServiceTargetStopPreflight(
+  operation: RecoveryPolicyOperationInput,
+  policy: RecoveryPolicyPublicRecord,
+  paths: LaunchdPaths,
+  uid: number,
+  domain: string,
+  dependencies: LaunchdDependencies,
+): Promise<DisabledState> {
+  const binding = policy.sourceBindings[0]!;
+  const sourceRoot = await requireCanonicalDirectory(binding.sourceRoot, 'Authorized control source root', uid, false);
+  const executingSourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+  const controlScript = await requireCanonicalFile(binding.controlScript, 'Authorized control script', uid);
+  if (sourceRoot !== executingSourceRoot || sourceRootForControlScript(controlScript) !== sourceRoot) throw new RuntimeError('CONTROL_DENIED', 'Service-target stop must run from its exact authorized source release');
+  await requireSourceGitIdentity(sourceRoot, binding.sourceSha, binding.sourceTree);
+  const executable = await realpath(binding.executable).catch((error) => { throw new RuntimeError('CONTROL_DENIED', 'Authorized Node executable cannot be resolved', { cause: error }); });
+  if (executable !== await realpath(canonicalNodeRuntime().path) || binding.executableSha256 === undefined || await hashCanonicalFile(executable, 'Authorized Node executable', uid) !== binding.executableSha256) throw new RuntimeError('CONTROL_DENIED', 'Authorized Node executable identity changed');
+  const runtime = await resolveReviewedRuntimeEntrypoints(path.join(sourceRoot, 'apps', 'runtime'));
+  const expectedArguments = ['--require', runtime.preflight, '--import', pathToFileURL(runtime.loader).href];
+  const runtimeDigests = await requireTargetRuntimeEntries(binding.executableArguments, uid);
+  if (JSON.stringify(binding.executableArguments) !== JSON.stringify(expectedArguments)
+    || runtimeDigests.runtimePreflightSha256 !== binding.runtimePreflightSha256 || runtimeDigests.runtimeLoaderSha256 !== binding.runtimeLoaderSha256) throw new RuntimeError('CONTROL_DENIED', 'Authorized Runtime entrypoint identity changed');
+  const machineId = await readMachineId(operation.dataRoot);
+  if (machineId === null || machineId !== operation.machineId || policy.serviceTarget?.uid !== uid || policy.serviceTarget.domain !== domain || policy.serviceTarget.label !== LAUNCH_AGENT_LABEL) throw new RuntimeError('CONTROL_DENIED', 'Authorized machine or service target changed');
+
+  await requireMissingPhysicalPath(operation.recordedSourceRoot!);
+  const migration = await readSourceMigrationRecord(paths.sourceBindingMigration, uid);
+  if (migration === null || migration.state !== 'COMMITTED' || migration.dataRoot !== operation.dataRoot || migration.domain !== domain || migration.label !== LAUNCH_AGENT_LABEL
+    || migration.targetSourceRoot !== operation.recordedSourceRoot || migration.targetSourceSha !== operation.recordedSourceSha || migration.targetSourceTree !== operation.recordedSourceTree) throw new RuntimeError('CONTROL_DENIED', 'Historical source identity is not backed by the committed migration record');
+
+  const metadataRecord = await readLaunchAgentMetadata(paths.metadata, uid);
+  const metadata = metadataRecord?.metadata;
+  if (metadataRecord === null || metadata === undefined || metadata.schemaVersion !== 3 || metadata.state !== 'READY'
+    || metadata.dataRoot !== operation.dataRoot || metadata.domain !== domain || metadata.label !== LAUNCH_AGENT_LABEL
+    || metadata.sourceRoot !== operation.recordedSourceRoot || metadata.plist !== paths.plist || metadata.registeredPlist !== paths.registeredPlist
+    || sha256(metadataRecord.raw) !== operation.beforeMetadataSha256) throw new RuntimeError('CONTROL_DENIED', 'LaunchAgent metadata before-image or service identity changed');
+  const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+  const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+  if (privatePlist.state !== 'ok' || registeredPlist.state !== 'ok' || privatePlist.content !== registeredPlist.content
+    || sha256(privatePlist.content) !== operation.beforePlistSha256 || metadata.plistSha256 !== operation.beforePlistSha256) throw new RuntimeError('CONTROL_DENIED', 'Private and registered LaunchAgent before-images changed');
+
+  await requireGuiDomain(domain, dependencies.launchctl ?? systemLaunchctl);
+  const observed = await observeLaunchAgentOnce(dependencies);
+  if (observed.state !== 'LOADED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service-target stop requires a currently loaded exact service target');
+  requireLoadedNoPidLaunchAgentIdentity(observed.stdout, metadata);
+  if ((metadata.processId === undefined) !== (metadata.processStartMarker === undefined)) throw new RuntimeError('CONTROL_DENIED', 'Stored Supervisor process identity is incomplete');
+  if (metadata.processId !== undefined) {
+    const process = (dependencies.observeProcessStart ?? observeProcessStart)(metadata.processId);
+    if (process.state !== 'dead') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Stored Supervisor PID is live or ambiguous; use the verified live-process stop path');
+  }
+  const disabled = await observeDisabledState(domain, dependencies.launchctl ?? systemLaunchctl);
+  if (disabled === 'UNKNOWN') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Supervisor disabled state is unknown');
+  return disabled;
+}
+
+async function verifyStoppedMetadataProcess(
+  operation: RecoveryPolicyOperationInput,
+  paths: LaunchdPaths,
+  uid: number,
+  dependencies: LaunchdDependencies,
+): Promise<void> {
+  const metadataRecord = await readLaunchAgentMetadata(paths.metadata, uid);
+  if (metadataRecord === null || metadataRecord.metadata.schemaVersion !== 3 || sha256(metadataRecord.raw) !== operation.beforeMetadataSha256) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent metadata changed during service-target stop');
+  const metadata = metadataRecord.metadata;
+  if (metadata.processId !== undefined && metadata.processStartMarker !== undefined) {
+    const process = (dependencies.observeProcessStart ?? observeProcessStart)(metadata.processId);
+    if (process.state !== 'dead') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Original Supervisor process identity is not proven dead after service-target stop');
+  }
+}
+
+function requireLoadedNoPidLaunchAgentIdentity(stdout: string, metadata: LaunchAgentMetadata): void {
+  const lines = stdout.split(/\r?\n/);
+  if (!lines.some((line) => line.trim() === `${metadata.domain}/${metadata.label} = {`)
+    || lines.filter((line) => /^\s*pid\s*=/.test(line)).length !== 0) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent is not the exact loaded/no-PID target');
+  const registeredPlist = launchctlScalar(lines, 'path');
+  const executable = launchctlScalar(lines, 'program');
+  const workingDirectory = launchctlScalar(lines, 'working directory');
+  const dataRoot = launchctlMapping(lines, 'environment', RUNTIME_DATA_ENV);
+  const argumentsList = launchctlList(lines, 'arguments');
+  const expectedArguments = [metadata.executable, ...metadata.executableArguments, metadata.controlScript, 'supervisor'];
+  if (registeredPlist !== metadata.registeredPlist || executable !== metadata.executable || workingDirectory !== metadata.sourceRoot || dataRoot !== metadata.dataRoot
+    || argumentsList === null || argumentsList.length !== expectedArguments.length || argumentsList.some((argument, index) => argument !== expectedArguments[index])) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Loaded service definition conflicts with recorded LaunchAgent identity');
+}
+
+async function observeLaunchAgentOnce(dependencies: LaunchdDependencies): Promise<LaunchAgentObservation> {
+  const domain = launchdDomain(dependencies);
+  try {
+    const { stdout } = await (dependencies.launchctl ?? systemLaunchctl)(['print', `${domain}/${LAUNCH_AGENT_LABEL}`]);
+    return { state: 'LOADED', stdout };
+  } catch (error) {
+    if (launchAgentAbsent(error, domain)) return { state: 'ABSENT' };
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent state is unknown', { cause: error });
+  }
 }
 
 async function reconcileStoppedLaunchAgentUnlocked(
@@ -2131,7 +2316,8 @@ function parseLaunchAgentDisabled(stdout: string): DisabledState {
 
 async function systemLaunchctl(argumentsList: readonly string[]): Promise<{ readonly stdout: string }> {
   try {
-    const result = await execFileAsync('/bin/launchctl', [...argumentsList], { encoding: 'utf8', timeout: 5_000 });
+    const timeout = argumentsList[0] === 'bootout' && argumentsList[1] === '--wait' ? 60_000 : 5_000;
+    const result = await execFileAsync('/bin/launchctl', [...argumentsList], { encoding: 'utf8', timeout });
     return { stdout: String(result.stdout) };
   } catch (error) {
     if (launchctlOutcomeUnknown(error)) throw new LaunchctlOutcomeUnknown('launchctl outcome is unknown', { cause: error });
