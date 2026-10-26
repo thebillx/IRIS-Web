@@ -29,7 +29,7 @@ import {
   type LaunchdDependencies,
 } from './launchd.js';
 import { canonicalNodeRuntime, node24Path } from './node-runtime.js';
-import { finalizeRecoveryPolicyOperation, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, revokeRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation } from './recovery-policy.js';
+import { finalizeRecoveryPolicyOperation, finalizeVerifiedServiceTargetStop, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, revokeRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation } from './recovery-policy.js';
 import { initializeConnectorRegistry, connectorRegistryPath } from './connector-registry.js';
 import { persistControlPlaneApiKey } from './credentials.js';
 import { promisify } from 'node:util';
@@ -989,6 +989,9 @@ describe('Owner-authorized service-target stop', () => {
     await finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'RECONCILIATION_REQUIRED' });
     await expect(finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'COMMITTED' }))
       .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(finalizeVerifiedServiceTargetStop({ ...operation, ...reservation }))
+      .rejects.toThrow(/No trusted service-target stop completion is active/);
+    expect(await readRecoveryAuthorizationPolicy(subject.dataRoot)).toMatchObject({ operations: [expect.objectContaining({ state: 'RECONCILIATION_REQUIRED' })] });
     expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
   });
 

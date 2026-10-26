@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { open, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { RuntimeError } from "@iris/domain";
+import { verifyServiceTargetStopCompletion } from "./launchd.js";
 import {
   inspectPrivateRegularFile,
   privateDirectoryProblem,
@@ -523,7 +524,6 @@ export async function finalizeRecoveryPolicyOperation(input: RecoveryPolicyOpera
 /** Completes the stop journal only after the trusted LaunchAgent lifecycle verifier succeeds. */
 export async function finalizeVerifiedServiceTargetStop(
   input: RecoveryPolicyOperationInput & { readonly transactionId: string },
-  verifyPostconditions: () => Promise<void>,
 ): Promise<RecoveryPolicyPublicRecord> {
   if (input.operation !== "SUPERVISOR_SERVICE_TARGET_STOP")
     throw new RuntimeError("INVALID_REQUEST", "Only a service-target stop can use verified stop completion");
@@ -532,7 +532,7 @@ export async function finalizeVerifiedServiceTargetStop(
     const existing = await readRecoveryPolicyOperation({ ...input, dataRoot });
     if (existing.state !== "RECONCILIATION_REQUIRED")
       throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Service-target stop is not awaiting verified completion");
-    await verifyPostconditions();
+    await verifyServiceTargetStopCompletion({ ...input, dataRoot });
     return finalizeRecoveryPolicyOperationUnlocked({ ...input, dataRoot, state: "COMMITTED" }, false, true);
   });
 }
