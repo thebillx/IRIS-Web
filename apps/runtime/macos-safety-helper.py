@@ -75,6 +75,24 @@ def process_start(pid_text):
 
 
 
+def process_owner_uid(pid_text):
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        fail('pid is invalid')
+    if pid <= 0:
+        fail('pid is invalid')
+    info = ProcBsdInfo()
+    libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+    size = ctypes.sizeof(info)
+    returned = libproc.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, ctypes.byref(info), size)
+    if returned != size or info.pbi_pid != pid:
+        fail('process owner identity is unavailable')
+    sys.stdout.write(f'{info.pbi_uid}\\n')
+
+
 def process_executable(pid_text):
     try:
         pid = int(pid_text)
@@ -566,6 +584,11 @@ def main():
         if len(sys.argv) != 3:
             fail('process-start requires pid')
         process_start(sys.argv[2])
+        return
+    if operation == 'process-owner-uid':
+        if len(sys.argv) != 3:
+            fail('process-owner-uid requires pid')
+        process_owner_uid(sys.argv[2])
         return
     if operation == 'process-executable':
         if len(sys.argv) != 3:

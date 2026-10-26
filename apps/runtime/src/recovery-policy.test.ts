@@ -12,6 +12,7 @@ import {
   issueRecoveryAuthorizationPolicy,
   readRecoveryAuthorizationPolicy,
   readRecoveryPolicyOperation,
+  reconcileRecoveryPolicyOperation,
   resolveInitialInstallOperation,
   reserveRecoveryPolicyOperation,
   reconcileRecoveryPolicyLock,
@@ -49,6 +50,62 @@ async function fixture() {
 afterEach(async () => { vi.useRealTimers(); vi.restoreAllMocks(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
 describe('recovery authorization policy', () => {
+  it('does not combine no-PID evidence authority with bootstrap or extra uses', async () => {
+    const dataRoot = await fixture();
+    await expect(issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [{ ...sourceBinding, executableSha256: 'e'.repeat(64) }],
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      recordedSourceRoot: '/private/tmp/iris-missing-historical-source',
+      allowedOperations: ['SUPERVISOR_NO_PID_RECOVERY', 'SUPERVISOR_BOOTSTRAP'],
+      machineId: crypto.randomUUID(),
+      maxOperationCount: 2,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+  });
+
+  it('keeps no-PID recovery unresolved and cannot finalize it as a service transition', async () => {
+    const dataRoot = await fixture();
+    const machineId = crypto.randomUUID();
+    const operationBinding = { ...sourceBinding, executableSha256: 'e'.repeat(64) };
+    const recordedSourceRoot = '/private/tmp/iris-missing-historical-source';
+    const policy = await issueRecoveryAuthorizationPolicy({
+      dataRoot,
+      sourceBindings: [operationBinding],
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      recordedSourceRoot,
+      allowedOperations: ['SUPERVISOR_NO_PID_RECOVERY'],
+      machineId,
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const operation = {
+      dataRoot,
+      policyId: policy.policyId,
+      operation: 'SUPERVISOR_NO_PID_RECOVERY' as const,
+      requestId: crypto.randomUUID(),
+      ...operationBinding,
+      beforeMetadataSha256: metadataSha,
+      beforePlistSha256: plistSha,
+      recordedSourceRoot,
+      machineId,
+    };
+    const reservation = await reserveRecoveryPolicyOperation(operation);
+    await expect(finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'COMMITTED' }))
+      .rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+    const unresolved = await reconcileRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId });
+    expect(unresolved.operations[0]).toMatchObject({
+      operation: 'SUPERVISOR_NO_PID_RECOVERY',
+      recordedSourceRoot,
+      recoveryDisposition: 'OBSERVATION_UNKNOWN',
+      state: 'RECONCILIATION_REQUIRED',
+    });
+    await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID() }))
+      .rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+  });
+
   it('requires a real terminal predecessor for explicit rollover', async () => {
     const dataRoot = await fixture();
     await expect(issueRecoveryAuthorizationPolicy({

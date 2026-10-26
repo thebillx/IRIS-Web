@@ -7,7 +7,7 @@ vi.mock('node:child_process', async () => {
   return { ...actual, spawnSync: spawnSyncMock };
 });
 
-import { observeProcessStart } from './macos-safety.js';
+import { observeProcessOwnerUid, observeProcessStart } from './macos-safety.js';
 
 describe('macOS process identity observation', () => {
   it('retries a transient helper failure but still requires a valid live marker', () => {
@@ -17,5 +17,14 @@ describe('macOS process identity observation', () => {
 
     expect(observeProcessStart(process.pid)).toEqual({ state: 'live', marker: '123:456789' });
     expect(spawnSyncMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('accepts only a numeric process owner UID from the isolated helper', () => {
+    spawnSyncMock.mockReset();
+    spawnSyncMock.mockReturnValueOnce({ status: 0, stdout: '502\n', stderr: '' });
+    expect(observeProcessOwnerUid(4242)).toBe(502);
+    expect(spawnSyncMock.mock.calls.some(([, args]) => Array.isArray(args) && args.includes('process-owner-uid') && args.includes('4242'))).toBe(true);
+    spawnSyncMock.mockReturnValueOnce({ status: 0, stdout: '502x\n', stderr: '' });
+    expect(observeProcessOwnerUid(4242)).toBeNull();
   });
 });

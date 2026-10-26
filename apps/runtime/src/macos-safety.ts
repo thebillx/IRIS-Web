@@ -51,6 +51,18 @@ export function observeProcessExecutable(pid: number): string | null {
   return executable.length > 0 && path.isAbsolute(executable) ? executable : null;
 }
 
+export function observeProcessOwnerUid(pid: number): number | null {
+  const result = spawnSync(PYTHON, ['-I', '-S', HELPER, 'process-owner-uid', String(pid)], {
+    encoding: 'utf8',
+    timeout: 2_000,
+    maxBuffer: 16 * 1024,
+    env: { PATH: '/usr/bin:/bin' },
+  });
+  if (result.status !== 0) return null;
+  const uid = result.stdout.trim();
+  return /^\d+$/.test(uid) && Number.isSafeInteger(Number(uid)) ? Number(uid) : null;
+}
+
 export async function secureProjectFileRead(projectRoot: string, targetPath: string): Promise<string> {
   const parsed = await runJsonHelper(['read-file', projectRoot, targetPath]);
   if (!isRecord(parsed) || typeof parsed.content !== 'string' || Object.keys(parsed).length !== 1) {

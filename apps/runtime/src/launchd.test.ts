@@ -22,6 +22,7 @@ import {
   renderLaunchAgent,
   resolveReviewedRuntimeEntrypoints,
   stopLaunchAgentForMigration,
+  recordLoadedNoPidRecovery,
   uninstallLaunchAgent,
   type LaunchdDependencies,
 } from './launchd.js';
@@ -58,7 +59,7 @@ interface FakeLaunchd {
   beforeProcessObservation: ((count: number) => void) | null;
   processObservationCount: number;
   readonly live: {
-    pid: number;
+    pid: number | null;
     processStartMarker: string;
     label: string;
     registeredPlist: string;
@@ -106,6 +107,7 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
       return pid === fake.live.pid ? { state: 'live', marker: fake.live.processStartMarker } : { state: 'dead' };
     },
     observeProcessExecutable: (pid) => pid === fake.live.pid ? fake.live.executable : null,
+    observeProcessOwnerUid: (pid) => pid === fake.live.pid ? uid : null,
     launchctl: async (argumentsList) => {
       fake.calls.push(argumentsList.join(' '));
       const [command, target] = argumentsList;
@@ -175,7 +177,7 @@ function missingServiceError(): Error {
 function renderLiveService(fake: FakeLaunchd): string {
   return [
     `gui/${uid}/${fake.live.label} = {`,
-    `\tpid = ${fake.live.pid}`,
+    ...(fake.live.pid === null ? [] : [`\tpid = ${fake.live.pid}`]),
     `\tpath = ${fake.live.registeredPlist}`,
     `\tprogram = ${fake.live.executable}`,
     '\targuments = {',
@@ -338,6 +340,32 @@ async function issueBootstrapAuthorization(
     sourceSha: prepared.target.sourceSha,
     sourceTree: prepared.target.sourceTree,
   } as const;
+}
+
+async function issueNoPidRecoveryPolicy(subject: Awaited<ReturnType<typeof fixture>>, target: Awaited<ReturnType<typeof reviewedSource>>) {
+  const paths = launchdPaths(subject.dataRoot, subject.home);
+  const metadata = JSON.parse(await readFile(paths.metadata, 'utf8')) as { sourceRoot: string };
+  const metadataRaw = await readFile(paths.metadata, 'utf8');
+  const plistRaw = await readFile(paths.plist, 'utf8');
+  const previous = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+  if (previous?.state === 'ISSUED') await revokeRecoveryAuthorizationPolicy(subject.dataRoot);
+  const predecessor = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+  const executable = await realpath(canonicalNodeRuntime().path);
+  const entrypoints = await resolveReviewedRuntimeEntrypoints(path.join(target.root, 'apps', 'runtime'));
+  const executableArguments = ['--require', entrypoints.preflight, '--import', pathToFileURL(entrypoints.loader).href];
+  const machineId = JSON.parse(await readFile(path.join(subject.dataRoot, 'machine-id.json'), 'utf8')).machineId as string;
+  return issueRecoveryAuthorizationPolicy({
+    dataRoot: subject.dataRoot,
+    sourceBindings: [{ sourceSha: target.sourceSha, sourceTree: target.sourceTree, sourceRoot: target.root, controlScript: target.controlScript, executable, executableSha256: createHash('sha256').update(await readFile(executable)).digest('hex'), executableArguments, runtimePreflightSha256: createHash('sha256').update(await readFile(entrypoints.preflight)).digest('hex'), runtimeLoaderSha256: createHash('sha256').update(await readFile(entrypoints.loader)).digest('hex') }],
+    beforeMetadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+    beforePlistSha256: createHash('sha256').update(plistRaw).digest('hex'),
+    recordedSourceRoot: metadata.sourceRoot,
+    allowedOperations: ['SUPERVISOR_NO_PID_RECOVERY'],
+    machineId,
+    maxOperationCount: 1,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    ...(predecessor === null ? {} : { supersedesPolicyId: predecessor.policyId }),
+  });
 }
 
 async function writeLegacyLaunchAgent(subject: Awaited<ReturnType<typeof fixture>>): Promise<{ readonly metadata: string; readonly plist: string }> {
@@ -587,6 +615,186 @@ describe('ONE initial LaunchAgent installation', () => {
     await expect(reconcileInitialLaunchAgentInstall(f.dataRoot, authorization, f.ownerAuthorization, f.fake.dependencies)).rejects.toThrow(/identity|root|binding/);
     expect((await readRecoveryAuthorizationPolicy(f.dataRoot))?.operations[0]?.state).toBe('RECONCILIATION_REQUIRED');
     expect(f.fake.calls.filter((call) => call.startsWith('bootout '))).toHaveLength(0);
+  });
+});
+
+describe('loaded/no-PID recovery evidence', () => {
+  it('records the exact missing-source case as unresolved without disable or bootout and retries idempotently', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-recovery-target');
+    await rm(oldSourceRoot, { recursive: true });
+    subject.fake.live.pid = null;
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    const requestId = randomUUID();
+    const result = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, subject.fake.dependencies);
+    expect(result).toMatchObject({ state: 'RECONCILIATION_REQUIRED', disposition: 'LOADED_NO_VERIFIED_PID' });
+    const journal = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+    expect(journal?.operations).toContainEqual(expect.objectContaining({
+      transactionId: result.transactionId,
+      requestId,
+      operation: 'SUPERVISOR_NO_PID_RECOVERY',
+      recordedSourceRoot: oldSourceRoot,
+      recoveryDisposition: 'LOADED_NO_VERIFIED_PID',
+      state: 'RECONCILIATION_REQUIRED',
+      machineId: policy.machineId,
+      beforeMetadataSha256: policy.beforeMetadataSha256,
+      beforePlistSha256: policy.beforePlistSha256,
+    }));
+    const callsBeforeRetry = subject.fake.calls.length;
+    await expect(recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, subject.fake.dependencies)).resolves.toEqual(result);
+    expect(subject.fake.calls.slice(callsBeforeRetry)).toEqual([`print gui/${uid}`]);
+    expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot).toBe(oldSourceRoot);
+  });
+
+  it('does not treat a PID appearing after the no-PID snapshot as proof that stopping is safe', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-race-target');
+    await rm(oldSourceRoot, { recursive: true });
+    subject.fake.live.pid = null;
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    const originalLaunchctl = subject.fake.dependencies.launchctl!;
+    subject.fake.dependencies = { ...subject.fake.dependencies, launchctl: async (argumentsList: readonly string[]) => {
+      const result = await originalLaunchctl(argumentsList);
+      if (argumentsList[0] === 'print' && argumentsList[1] === `gui/${uid}/${LAUNCH_AGENT_LABEL}`) subject.fake.live.pid = 4242;
+      return result;
+    } };
+
+    const result = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies);
+
+    expect(result).toMatchObject({ state: 'RECONCILIATION_REQUIRED', disposition: 'LOADED_NO_VERIFIED_PID' });
+    expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0]?.state).toBe('RECONCILIATION_REQUIRED');
+    expect(subject.fake.live.pid).toBe(4242);
+    expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('classifies a verified live PID and never unloads it', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-live-target');
+    await rm(oldSourceRoot, { recursive: true });
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    const result = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies);
+    expect(result.disposition).toBe('LOADED_WITH_VERIFIED_LIVE_PROCESS');
+    expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+    expect(JSON.parse(await readFile(paths.metadata, 'utf8')).state).toBe('READY');
+  });
+
+  it('classifies a live PID owned by another UID as an identity conflict', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-foreign-owner-target');
+    await rm(oldSourceRoot, { recursive: true });
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    subject.fake.dependencies = { ...subject.fake.dependencies, observeProcessOwnerUid: () => uid + 1 };
+    const result = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies);
+    expect(result).toMatchObject({ state: 'RECONCILIATION_REQUIRED', disposition: 'IDENTITY_CONFLICT' });
+    expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('records unknown launchd observations without treating them as absence', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-unknown-target');
+    await rm(oldSourceRoot, { recursive: true });
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    subject.fake.queryError = new Error('launchd query unavailable');
+    const result = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies);
+    expect(result.disposition).toBe('OBSERVATION_UNKNOWN');
+    expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('records a foreign launchd label as identity conflict without making a service change', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-foreign-label-target');
+    await rm(oldSourceRoot, { recursive: true });
+    subject.fake.live.label = 'com.example.foreign';
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    const result = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies);
+    expect(result.disposition).toBe('IDENTITY_CONFLICT');
+    expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('rejects machine and registered-plist drift before reserving recovery authority', async () => {
+    for (const mode of ['machine', 'registered-plist'] as const) {
+      const subject = await fixture();
+      const paths = await install(subject);
+      const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+      const target = await reviewedSource(subject, `no-pid-${mode}-drift-target`);
+      await rm(oldSourceRoot, { recursive: true });
+      const policy = await issueNoPidRecoveryPolicy(subject, target);
+      if (mode === 'machine') {
+        const machinePath = path.join(subject.dataRoot, 'machine-id.json');
+        const machine = JSON.parse(await readFile(machinePath, 'utf8')) as { machineId: string };
+        await writeFile(machinePath, `${JSON.stringify({ ...machine, machineId: randomUUID() })}\n`, { mode: 0o600 });
+      } else {
+        await chmod(paths.registeredPlist, 0o600);
+        await writeFile(paths.registeredPlist, 'changed registered binding', { mode: 0o600 });
+      }
+      await expect(recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies)).rejects.toThrow();
+      expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations).toHaveLength(0);
+      expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
+      expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+    }
+  });
+
+  it('refuses no-PID evidence capture while another lifecycle operation owns the lock', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-lock-target');
+    await rm(oldSourceRoot, { recursive: true });
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    await writeFile(paths.operationLock, '{"schemaVersion":1}\n', { mode: 0o600 });
+
+    await expect(recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies))
+      .rejects.toThrow(/lifecycle operation is active/);
+    expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations).toHaveLength(0);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('rejects a substituted historical path and revoked authority without writing an operation', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-substitution-target');
+    await rm(oldSourceRoot, { recursive: true });
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    await symlink(target.root, oldSourceRoot);
+    await expect(recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies)).rejects.toThrow(/symlink/);
+    await rm(oldSourceRoot);
+    await revokeRecoveryAuthorizationPolicy(subject.dataRoot);
+    await expect(recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations).toHaveLength(0);
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
+
+  it('records an absent service as unresolved evidence without attempting bootout', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-absent-target');
+    await rm(oldSourceRoot, { recursive: true });
+    subject.fake.loaded = false;
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    const result = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies);
+    expect(result.disposition).toBe('ABSENT');
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
   });
 });
 

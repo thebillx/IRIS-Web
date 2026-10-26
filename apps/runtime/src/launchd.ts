@@ -15,8 +15,8 @@ import { loadOrCreateOwnerAccessSecret, readOwnerAccessSecret } from './persiste
 import { readControlPlaneApiKey } from './credentials.js';
 import { readConnectorRegistry } from './connector-registry.js';
 import { readMachineId } from './machine-identity.js';
-import { observeProcessExecutable, observeProcessStart, type ProcessStartObservation } from './macos-safety.js';
-import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, readRecoveryPolicyOperation, resolveInitialInstallOperation, reserveRecoveryPolicyOperation, validInitialInstallBinding, type InitialInstallBinding, type RecoveryPolicyOperationInput, type RecoveryPolicyPublicRecord } from './recovery-policy.js';
+import { observeProcessExecutable, observeProcessOwnerUid, observeProcessStart, type ProcessStartObservation } from './macos-safety.js';
+import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, readRecoveryPolicyOperation, resolveInitialInstallOperation, reserveRecoveryPolicyOperation, validInitialInstallBinding, type InitialInstallBinding, type NoPidRecoveryDisposition, type RecoveryPolicyOperationInput, type RecoveryPolicyPublicRecord } from './recovery-policy.js';
 
 const execFileAsync = promisify(execFile);
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
@@ -56,6 +56,7 @@ export interface LaunchdDependencies {
   readonly syncDirectory?: (directory: string) => Promise<void>;
   readonly observeProcessStart?: (pid: number) => ProcessStartObservation;
   readonly observeProcessExecutable?: (pid: number) => string | null;
+  readonly observeProcessOwnerUid?: (pid: number) => number | null;
 }
 
 export interface LaunchAgentBootstrapAuthorization {
@@ -97,6 +98,12 @@ export interface LaunchAgentStopReconciliationInput {
   readonly sourceRoot: string;
   readonly beforeMetadataSha256: string;
   readonly beforePlistSha256: string;
+}
+
+export interface LaunchAgentNoPidRecoveryInput {
+  readonly dataRoot: string;
+  readonly recoveryPolicyId: string;
+  readonly requestId: string;
 }
 
 export interface MalformedLegacyApprovalReconciliationInput {
@@ -607,6 +614,157 @@ export async function reconcileStoppedLaunchAgent(
   const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
   const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
   return withLaunchAgentLock(paths, uid, () => reconcileStoppedLaunchAgentUnlocked({ ...input, dataRoot: canonicalDataRoot }, dependencies));
+}
+
+/** Records a narrowly authorized no-PID observation; it never disables or unloads launchd. */
+export async function recordLoadedNoPidRecovery(
+  input: LaunchAgentNoPidRecoveryInput,
+  dependencies: LaunchdDependencies = {},
+): Promise<{ readonly state: 'RECONCILIATION_REQUIRED'; readonly transactionId: string; readonly disposition: NoPidRecoveryDisposition }> {
+  const uid = launchdUid(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, () => recordLoadedNoPidRecoveryUnlocked({ ...input, dataRoot: canonicalDataRoot }, dependencies));
+}
+
+async function recordLoadedNoPidRecoveryUnlocked(
+  input: LaunchAgentNoPidRecoveryInput,
+  dependencies: LaunchdDependencies,
+): Promise<{ readonly state: 'RECONCILIATION_REQUIRED'; readonly transactionId: string; readonly disposition: NoPidRecoveryDisposition }> {
+  const uid = launchdUid(dependencies);
+  const domain = launchdDomain(dependencies);
+  await requireGuiDomain(domain, dependencies.launchctl ?? systemLaunchctl);
+  const paths = launchdPaths(input.dataRoot, dependencies.homeDirectory ?? os.homedir());
+  const policy = await readRecoveryAuthorizationPolicy(input.dataRoot);
+  if (policy === null || policy.policyId !== input.recoveryPolicyId || policy.state !== 'ISSUED'
+    || policy.allowedOperations.length !== 1 || policy.allowedOperations[0] !== 'SUPERVISOR_NO_PID_RECOVERY'
+    || policy.maxOperationCount !== 1 || policy.machineId === undefined || policy.machineId === null || policy.recordedSourceRoot === undefined
+    || policy.sourceBindings.length !== 1 || policy.beforeMetadataSha256 === null || policy.beforePlistSha256 === null) {
+    throw new RuntimeError('CONTROL_DENIED', 'Loaded/no-PID recovery policy is missing or not narrowly bound');
+  }
+  const binding = policy.sourceBindings[0]!;
+  const machineId = await readMachineId(input.dataRoot);
+  if (machineId === null || machineId !== policy.machineId || domain !== `gui/${uid}`) {
+    throw new RuntimeError('CONTROL_DENIED', 'Loaded/no-PID recovery machine or Owner identity does not match');
+  }
+  if (policy.recordedSourceRoot !== path.normalize(policy.recordedSourceRoot)) {
+    throw new RuntimeError('CONTROL_DENIED', 'Recorded historical source path is not canonical');
+  }
+  const metadataRecord = await readLaunchAgentMetadata(paths.metadata, uid);
+  if (metadataRecord === null || metadataRecord.metadata.schemaVersion !== 3 || metadataRecord.metadata.state !== 'READY') {
+    throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Loaded/no-PID recovery requires ready Schema-3 ownership metadata');
+  }
+  const metadata = metadataRecord.metadata;
+  if (sha256(metadataRecord.raw) !== policy.beforeMetadataSha256 || metadata.sourceRoot !== policy.recordedSourceRoot
+    || metadata.domain !== domain || metadata.label !== LAUNCH_AGENT_LABEL || metadata.dataRoot !== input.dataRoot
+    || metadata.plist !== paths.plist || metadata.registeredPlist !== paths.registeredPlist) {
+    throw new RuntimeError('CONTROL_DENIED', 'Loaded/no-PID recovery metadata binding does not match');
+  }
+  await requireMissingPhysicalPath(policy.recordedSourceRoot);
+  const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+  const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+  if (privatePlist.state !== 'ok' || registeredPlist.state !== 'ok'
+    || privatePlist.content !== registeredPlist.content
+    || sha256(privatePlist.content) !== policy.beforePlistSha256
+    || metadata.plistSha256 !== policy.beforePlistSha256) {
+    throw new RuntimeError('CONTROL_DENIED', 'Loaded/no-PID recovery requires matching private and registered plist before-images');
+  }
+  const canonicalSourceRoot = await requireCanonicalDirectory(binding.sourceRoot, 'IRIS recovery target source root', uid, false);
+  const canonicalControlScript = await requireCanonicalFile(binding.controlScript, 'IRIS recovery target control script', uid);
+  if (canonicalSourceRoot !== binding.sourceRoot || sourceRootForControlScript(canonicalControlScript) !== canonicalSourceRoot) {
+    throw new RuntimeError('CONTROL_DENIED', 'Loaded/no-PID recovery target source identity does not match');
+  }
+  const executable = await realpath(binding.executable);
+  if (executable !== binding.executable || executable !== await realpath(canonicalNodeRuntime().path) || binding.executableSha256 !== await hashCanonicalFile(executable, 'IRIS recovery target executable', uid)) {
+    throw new RuntimeError('CONTROL_DENIED', 'Loaded/no-PID recovery executable identity does not match');
+  }
+  const runtimeEntrypoints = await requireTargetRuntimeEntries(binding.executableArguments, uid);
+  if (runtimeEntrypoints.runtimePreflightSha256 !== binding.runtimePreflightSha256 || runtimeEntrypoints.runtimeLoaderSha256 !== binding.runtimeLoaderSha256) {
+    throw new RuntimeError('CONTROL_DENIED', 'Loaded/no-PID recovery runtime entrypoint identity does not match');
+  }
+  await requireSourceGitIdentity(canonicalSourceRoot, binding.sourceSha, binding.sourceTree);
+  const operation: RecoveryPolicyOperationInput = {
+    dataRoot: input.dataRoot,
+    policyId: policy.policyId,
+    operation: 'SUPERVISOR_NO_PID_RECOVERY',
+    requestId: input.requestId,
+    sourceSha: binding.sourceSha,
+    sourceTree: binding.sourceTree,
+    sourceRoot: binding.sourceRoot,
+    recordedSourceRoot: policy.recordedSourceRoot,
+    controlScript: binding.controlScript,
+    executable: binding.executable,
+    executableSha256: binding.executableSha256,
+    executableArguments: binding.executableArguments,
+    runtimePreflightSha256: binding.runtimePreflightSha256,
+    runtimeLoaderSha256: binding.runtimeLoaderSha256,
+    beforeMetadataSha256: policy.beforeMetadataSha256,
+    beforePlistSha256: policy.beforePlistSha256,
+    machineId,
+  };
+  const existing = policy.operations.find((entry) => entry.requestId === input.requestId && entry.operation === operation.operation);
+  if (existing !== undefined) {
+    const verified = await readRecoveryPolicyOperation({ ...operation, transactionId: existing.transactionId });
+    if (verified.state === 'RECONCILIATION_REQUIRED' && verified.recoveryDisposition !== undefined) {
+      return { state: 'RECONCILIATION_REQUIRED', transactionId: verified.transactionId, disposition: verified.recoveryDisposition };
+    }
+    if (verified.state !== 'RESERVED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Loaded/no-PID recovery request is already terminal');
+  }
+  const disposition = await classifyNoPidRecoveryObservation(metadata, dependencies);
+  const reservation = await reserveRecoveryPolicyOperation(operation);
+  await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId, state: 'RECONCILIATION_REQUIRED', recoveryDisposition: disposition });
+  return { state: 'RECONCILIATION_REQUIRED', transactionId: reservation.transactionId, disposition };
+}
+
+async function classifyNoPidRecoveryObservation(metadata: LaunchAgentMetadata, dependencies: LaunchdDependencies): Promise<NoPidRecoveryDisposition> {
+  let observation: LaunchAgentObservation;
+  try { observation = await observeLaunchAgent(dependencies); }
+  catch { return 'OBSERVATION_UNKNOWN'; }
+  if (observation.state === 'ABSENT') return 'ABSENT';
+  const lines = observation.stdout.split(/\r?\n/);
+  if (!lines.some((line) => line.trim() === `${metadata.domain}/${metadata.label} = {`)) return 'IDENTITY_CONFLICT';
+  const registeredPlist = launchctlScalar(lines, 'path');
+  const executable = launchctlScalar(lines, 'program');
+  const workingDirectory = launchctlScalar(lines, 'working directory');
+  const dataRoot = launchctlMapping(lines, 'environment', RUNTIME_DATA_ENV);
+  const argumentsList = launchctlList(lines, 'arguments');
+  const expectedArguments = [metadata.executable, ...metadata.executableArguments, metadata.controlScript, 'supervisor'];
+  if (registeredPlist === null || executable === null || workingDirectory === null || dataRoot === null || argumentsList === null) return 'OBSERVATION_UNKNOWN';
+  if (registeredPlist !== metadata.registeredPlist || executable !== metadata.executable || workingDirectory !== metadata.sourceRoot
+    || dataRoot !== metadata.dataRoot || argumentsList.length !== expectedArguments.length
+    || argumentsList.some((argument, index) => argument !== expectedArguments[index])) return 'IDENTITY_CONFLICT';
+  const pidLines = lines.map((line) => line.trim()).filter((line) => /^pid\b/.test(line));
+  if (pidLines.length === 0) return 'LOADED_NO_VERIFIED_PID';
+  if (pidLines.length !== 1 || !/^pid = [1-9]\d*$/.test(pidLines[0]!)) return 'OBSERVATION_UNKNOWN';
+  const pid = Number(pidLines[0]!.slice('pid = '.length));
+  const start = (dependencies.observeProcessStart ?? observeProcessStart)(pid);
+  if (start.state !== 'live') return 'OBSERVATION_UNKNOWN';
+  const actualExecutable = (dependencies.observeProcessExecutable ?? observeProcessExecutable)(pid);
+  const ownerUid = (dependencies.observeProcessOwnerUid ?? observeProcessOwnerUid)(pid);
+  return actualExecutable === metadata.executable
+    && ownerUid === Number(metadata.domain.slice('gui/'.length))
+    && metadata.processId === pid
+    && metadata.processStartMarker === start.marker
+    ? 'LOADED_WITH_VERIFIED_LIVE_PROCESS'
+    : 'IDENTITY_CONFLICT';
+}
+
+async function requireMissingPhysicalPath(filename: string): Promise<void> {
+  if (!path.isAbsolute(filename) || path.normalize(filename) !== filename) throw new RuntimeError('CONTROL_DENIED', 'Recorded historical source path is not canonical');
+  const parsed = path.parse(filename);
+  let current = parsed.root;
+  for (const segment of filename.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    let stats;
+    try { stats = await lstat(current); }
+    catch (error) {
+      if (isNotFound(error)) return;
+      throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Recorded historical source path cannot be safely inspected', { cause: error });
+    }
+    if (stats.isSymbolicLink()) throw new RuntimeError('CONTROL_DENIED', 'Recorded historical source path contains a symlink');
+    if (!stats.isDirectory()) throw new RuntimeError('CONTROL_DENIED', 'Recorded historical source path has a non-directory parent');
+  }
+  throw new RuntimeError('CONTROL_DENIED', 'Historical source path is not missing; recovery record is not applicable');
 }
 
 async function reconcileStoppedLaunchAgentUnlocked(

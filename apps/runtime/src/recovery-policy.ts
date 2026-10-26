@@ -11,10 +11,11 @@ import {
 import { readOwnerAccessSecret } from "./persistence.js";
 import { observeProcessStart } from "./macos-safety.js";
 
-export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP" | "ADMIN_TUNNEL_START";
+export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP" | "ADMIN_TUNNEL_START" | "SUPERVISOR_NO_PID_RECOVERY";
 export type RecoveryPolicyState = "ISSUED" | "REVOKED" | "EXPIRED";
 export type RecoveryPolicyOperationState =
   "RESERVED" | "COMMITTED" | "FAILED" | "RECONCILIATION_REQUIRED";
+export type NoPidRecoveryDisposition = "ABSENT" | "LOADED_NO_VERIFIED_PID" | "LOADED_WITH_VERIFIED_LIVE_PROCESS" | "IDENTITY_CONFLICT" | "OBSERVATION_UNKNOWN";
 
 const POLICY_FILE = "com.iris.supervisor.recovery-policy.json";
 const HASH40 = /^[a-f0-9]{40}$/;
@@ -22,8 +23,8 @@ const HASH64 = /^[a-f0-9]{64}$/;
 const MAX_OPERATIONS = 16;
 const MAX_ENTRIES = 32;
 const MAX_RETIRED_POLICIES = 8;
-const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START"];
-const HOST_BOUND_OPERATIONS: readonly RecoveryPolicyOperation[] = ["SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START"];
+const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START", "SUPERVISOR_NO_PID_RECOVERY"];
+const HOST_BOUND_OPERATIONS: readonly RecoveryPolicyOperation[] = ["SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START", "SUPERVISOR_NO_PID_RECOVERY"];
 const requiresHostBinding = (operation: RecoveryPolicyOperation): boolean => HOST_BOUND_OPERATIONS.includes(operation);
 
 interface RecoveryPolicyLockRecord {
@@ -67,6 +68,8 @@ export interface RecoveryPolicyIssueInput {
   readonly beforeMetadataSha256: string | null;
   readonly initialInstall?: InitialInstallBinding;
   readonly beforePlistSha256: string | null;
+  /** Historical source path identity for the narrowly scoped loaded/no-PID recovery record. */
+  readonly recordedSourceRoot?: string;
   readonly allowedOperations: readonly RecoveryPolicyOperation[];
   readonly maxOperationCount: number;
   readonly expiresAt: string;
@@ -84,6 +87,8 @@ export interface RecoveryPolicyOperationInput {
   readonly beforeMetadataSha256: string | null;
   readonly initialInstall?: InitialInstallBinding;
   readonly beforePlistSha256: string | null;
+  readonly recordedSourceRoot?: string;
+  readonly recoveryDisposition?: NoPidRecoveryDisposition;
   readonly protectedReferenceRoot?: string | undefined;
   readonly machineId?: string | undefined;
   readonly sourceRoot: string;
@@ -106,6 +111,7 @@ export interface RecoveryPolicyPublicRecord {
   readonly beforeMetadataSha256: string | null;
   readonly initialInstall?: InitialInstallBinding;
   readonly beforePlistSha256: string | null;
+  readonly recordedSourceRoot?: string;
   readonly allowedOperations: readonly RecoveryPolicyOperation[];
   readonly maxOperationCount: number;
   readonly expiresAt: string;
@@ -136,6 +142,8 @@ export interface RecoveryPolicyOperationJournal {
   readonly beforeMetadataSha256: string | null;
   readonly initialInstall?: InitialInstallBinding;
   readonly beforePlistSha256: string | null;
+  readonly recordedSourceRoot?: string;
+  readonly recoveryDisposition?: NoPidRecoveryDisposition;
   readonly protectedReferenceRoot: string | null;
   readonly machineId?: string | null;
   readonly state: RecoveryPolicyOperationState;
@@ -264,6 +272,7 @@ async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIss
     ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
     beforeMetadataSha256: input.beforeMetadataSha256,
     beforePlistSha256: input.beforePlistSha256,
+    ...(input.recordedSourceRoot === undefined ? {} : { recordedSourceRoot: input.recordedSourceRoot }),
     ...(input.initialInstall === undefined ? {} : { initialInstall: input.initialInstall }),
     allowedOperations: [...new Set(input.allowedOperations)],
     maxOperationCount: input.maxOperationCount,
@@ -359,6 +368,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
   if (
     current.beforeMetadataSha256 !== input.beforeMetadataSha256 ||
     current.beforePlistSha256 !== input.beforePlistSha256 ||
+    current.recordedSourceRoot !== input.recordedSourceRoot ||
     !sameInitialInstall(current.initialInstall, input.initialInstall)
   )
     throw new RuntimeError(
@@ -383,6 +393,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       existing.runtimeLoaderSha256 !== input.runtimeLoaderSha256 ||
       existing.beforeMetadataSha256 !== input.beforeMetadataSha256 ||
       existing.beforePlistSha256 !== input.beforePlistSha256 ||
+      existing.recordedSourceRoot !== input.recordedSourceRoot ||
       !sameInitialInstall(existing.initialInstall, input.initialInstall) ||
       existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) ||
       (existing.machineId ?? null) !== (input.machineId ?? null)
@@ -442,6 +453,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
     runtimeLoaderSha256: input.runtimeLoaderSha256,
     beforeMetadataSha256: input.beforeMetadataSha256,
     beforePlistSha256: input.beforePlistSha256,
+    ...(input.recordedSourceRoot === undefined ? {} : { recordedSourceRoot: input.recordedSourceRoot }),
     ...(input.initialInstall === undefined ? {} : { initialInstall: input.initialInstall }),
     protectedReferenceRoot: input.protectedReferenceRoot ?? null,
     ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
@@ -471,7 +483,7 @@ export async function finalizeRecoveryPolicyOperation(input: RecoveryPolicyOpera
 }
 
 export async function reconcileRecoveryPolicyOperation(input: RecoveryPolicyOperationInput & { readonly transactionId: string }): Promise<RecoveryPolicyPublicRecord> {
-  return finalizeRecoveryPolicyOperation({ ...input, state: "RECONCILIATION_REQUIRED" });
+  return finalizeRecoveryPolicyOperation({ ...input, ...(input.operation === "SUPERVISOR_NO_PID_RECOVERY" ? { recoveryDisposition: input.recoveryDisposition ?? "OBSERVATION_UNKNOWN" } : {}), state: "RECONCILIATION_REQUIRED" });
 }
 
 /** Terminally records a verified failed ADMIN tunnel start without implying success. */
@@ -502,7 +514,7 @@ export async function readRecoveryPolicyOperation(input: RecoveryPolicyOperation
       "Recovery policy identity does not match",
     );
   const entry = current.operations.find((candidate) => candidate.transactionId === input.transactionId && candidate.requestId === input.requestId && candidate.operation === input.operation);
-  if (entry === undefined || entry.sourceSha !== input.sourceSha || entry.sourceTree !== input.sourceTree || entry.sourceRoot !== input.sourceRoot || entry.controlScript !== input.controlScript || entry.executable !== input.executable || (entry.executableSha256 ?? null) !== (input.executableSha256 ?? null) || JSON.stringify(entry.executableArguments) !== JSON.stringify(input.executableArguments) || entry.runtimePreflightSha256 !== input.runtimePreflightSha256 || entry.runtimeLoaderSha256 !== input.runtimeLoaderSha256 || entry.beforeMetadataSha256 !== input.beforeMetadataSha256 || entry.beforePlistSha256 !== input.beforePlistSha256 || !sameInitialInstall(entry.initialInstall, input.initialInstall) || entry.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) || (entry.machineId ?? null) !== (input.machineId ?? null)) throw new RuntimeError("CONTROL_DENIED", "Recovery policy operation binding is not authenticated");
+  if (entry === undefined || entry.sourceSha !== input.sourceSha || entry.sourceTree !== input.sourceTree || entry.sourceRoot !== input.sourceRoot || entry.controlScript !== input.controlScript || entry.executable !== input.executable || (entry.executableSha256 ?? null) !== (input.executableSha256 ?? null) || JSON.stringify(entry.executableArguments) !== JSON.stringify(input.executableArguments) || entry.runtimePreflightSha256 !== input.runtimePreflightSha256 || entry.runtimeLoaderSha256 !== input.runtimeLoaderSha256 || entry.beforeMetadataSha256 !== input.beforeMetadataSha256 || entry.beforePlistSha256 !== input.beforePlistSha256 || entry.recordedSourceRoot !== input.recordedSourceRoot || !sameInitialInstall(entry.initialInstall, input.initialInstall) || entry.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) || (entry.machineId ?? null) !== (input.machineId ?? null)) throw new RuntimeError("CONTROL_DENIED", "Recovery policy operation binding is not authenticated");
   return entry;
 }
 
@@ -546,6 +558,7 @@ async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOper
     existing.runtimeLoaderSha256 !== input.runtimeLoaderSha256 ||
     existing.beforeMetadataSha256 !== input.beforeMetadataSha256 ||
     existing.beforePlistSha256 !== input.beforePlistSha256 ||
+    existing.recordedSourceRoot !== input.recordedSourceRoot ||
     !sameInitialInstall(existing.initialInstall, input.initialInstall) ||
     existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) ||
     (existing.machineId ?? null) !== (input.machineId ?? null)
@@ -556,6 +569,10 @@ async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOper
     );
   if (input.state === "FAILED" && !initialReconciliation && (existing.state !== "RECONCILIATION_REQUIRED" || existing.operation !== "ADMIN_TUNNEL_START"))
     throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Only a reconciliation-required ADMIN tunnel start may be resolved as failed");
+  if (input.operation === "SUPERVISOR_NO_PID_RECOVERY" && input.state !== "RECONCILIATION_REQUIRED")
+    throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Loaded/no-PID recovery evidence cannot authorize a service transition");
+  if (input.operation === "SUPERVISOR_NO_PID_RECOVERY" && input.state === "RECONCILIATION_REQUIRED" && input.recoveryDisposition === undefined)
+    throw new RuntimeError("INVALID_REQUEST", "Loaded/no-PID recovery reconciliation requires a recorded disposition");
   const resolvingFailedAdminTunnel = input.state === "FAILED" && existing.state === "RECONCILIATION_REQUIRED" && existing.operation === "ADMIN_TUNNEL_START";
   if (existing.state !== "RESERVED" && !resolvingFailedAdminTunnel && !(initialReconciliation && existing.state === "RECONCILIATION_REQUIRED")) {
     if (existing.state === input.state) return current;
@@ -566,7 +583,7 @@ async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOper
   }
   const finalizedAt = new Date().toISOString();
   const operations = current.operations.slice();
-  operations[index] = { ...existing, state: input.state, finalizedAt };
+  operations[index] = { ...existing, ...(input.recoveryDisposition === undefined ? {} : { recoveryDisposition: input.recoveryDisposition }), state: input.state, finalizedAt };
   const next: RecoveryPolicyPublicRecord = {
     ...current,
     operations,
@@ -901,6 +918,7 @@ function sameIssue(
     (existing.machineId ?? null) === (input.machineId ?? null) &&
     existing.beforeMetadataSha256 === input.beforeMetadataSha256 &&
     existing.beforePlistSha256 === input.beforePlistSha256 &&
+    existing.recordedSourceRoot === input.recordedSourceRoot &&
     sameInitialInstall(existing.initialInstall, input.initialInstall) &&
     existing.maxOperationCount === input.maxOperationCount &&
     existing.expiresAt === input.expiresAt &&
@@ -912,6 +930,8 @@ function sameIssue(
 }
 
 function validateIssue(input: RecoveryPolicyIssueInput): void {
+  if (input.allowedOperations.includes("SUPERVISOR_NO_PID_RECOVERY") !== (typeof input.recordedSourceRoot === "string" && path.isAbsolute(input.recordedSourceRoot) && path.normalize(input.recordedSourceRoot) === input.recordedSourceRoot))
+    throw new RuntimeError("INVALID_REQUEST", "Loaded/no-PID recovery policy requires an exact recorded source path");
   if (input.initialInstall !== undefined && (input.allowedOperations.length !== 1 || input.allowedOperations[0] !== "SUPERVISOR_BOOTSTRAP" || input.maxOperationCount !== 1))
     throw new RuntimeError("INVALID_REQUEST", "Initial installation authorizes one Supervisor bootstrap only");
   if (
@@ -956,6 +976,8 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
       "INVALID_REQUEST",
       "Recovery policy operations are invalid",
     );
+  if (input.allowedOperations.includes("SUPERVISOR_NO_PID_RECOVERY") && (input.allowedOperations.length !== 1 || input.maxOperationCount !== 1))
+    throw new RuntimeError("INVALID_REQUEST", "Loaded/no-PID recovery authorizes one operation only");
   if (input.machineId !== undefined && !isUuid(input.machineId))
     throw new RuntimeError("INVALID_REQUEST", "Recovery policy machine identity is invalid");
   if (input.supersedesPolicyId !== undefined && !isUuid(input.supersedesPolicyId))
@@ -973,6 +995,10 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
 }
 
 function validateOperation(input: RecoveryPolicyOperationInput): void {
+  if (input.operation === "SUPERVISOR_NO_PID_RECOVERY" !== (typeof input.recordedSourceRoot === "string" && path.isAbsolute(input.recordedSourceRoot) && path.normalize(input.recordedSourceRoot) === input.recordedSourceRoot))
+    throw new RuntimeError("INVALID_REQUEST", "Loaded/no-PID recovery operation requires an exact recorded source path");
+  if (input.recoveryDisposition !== undefined && (input.operation !== "SUPERVISOR_NO_PID_RECOVERY" || !["ABSENT", "LOADED_NO_VERIFIED_PID", "LOADED_WITH_VERIFIED_LIVE_PROCESS", "IDENTITY_CONFLICT", "OBSERVATION_UNKNOWN"].includes(input.recoveryDisposition)))
+    throw new RuntimeError("INVALID_REQUEST", "Loaded/no-PID recovery disposition is invalid");
   if (input.initialInstall !== undefined && input.operation !== "SUPERVISOR_BOOTSTRAP")
     throw new RuntimeError("INVALID_REQUEST", "Absent installation authority cannot authorize migration or tunnel recovery");
   if (
@@ -1011,16 +1037,18 @@ function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolic
     && (typeof record.protectedReferenceRoot === "string" || record.protectedReferenceRoot === null)
     && (record.machineId === undefined || record.machineId === null || isUuid(record.machineId))
     && validBeforeImage(record)
+    && (record.recordedSourceRoot === undefined || isCanonicalRecordedSourceRoot(record.recordedSourceRoot))
     && (record.initialInstall === undefined || record.allowedOperations?.length === 1 && record.allowedOperations[0] === "SUPERVISOR_BOOTSTRAP" && record.maxOperationCount === 1)
     && typeof record.maxOperationCount === "number"
     && Array.isArray(record.allowedOperations)
     && record.allowedOperations.length > 0
     && record.allowedOperations.every((operation) => POLICY_OPERATIONS.includes(operation as RecoveryPolicyOperation))
+    && (!record.allowedOperations.includes("SUPERVISOR_NO_PID_RECOVERY") || isCanonicalRecordedSourceRoot(record.recordedSourceRoot))
     && (!record.allowedOperations.some(requiresHostBinding) || (record.machineId !== undefined && record.machineId !== null))
     && (!record.allowedOperations.some(requiresHostBinding) || record.sourceBindings.every((binding) => binding.executableSha256 !== undefined))
     && Array.isArray(record.operations)
     && record.operations.length <= MAX_ENTRIES
-    && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && validBeforeImage(entry as RecoveryPolicyOperationJournal) && ((entry as RecoveryPolicyOperationJournal).initialInstall === undefined || (entry as RecoveryPolicyOperationJournal).operation === "SUPERVISOR_BOOTSTRAP") && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && (!requiresHostBinding((entry as RecoveryPolicyOperationJournal).operation) || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "FAILED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
+    && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && validBeforeImage(entry as RecoveryPolicyOperationJournal) && ((entry as RecoveryPolicyOperationJournal).recordedSourceRoot === undefined || isCanonicalRecordedSourceRoot((entry as RecoveryPolicyOperationJournal).recordedSourceRoot)) && ((entry as RecoveryPolicyOperationJournal).operation !== "SUPERVISOR_NO_PID_RECOVERY" || (entry as RecoveryPolicyOperationJournal).recordedSourceRoot !== undefined) && ((entry as RecoveryPolicyOperationJournal).recoveryDisposition === undefined || (entry as RecoveryPolicyOperationJournal).operation === "SUPERVISOR_NO_PID_RECOVERY" && isNoPidRecoveryDisposition((entry as RecoveryPolicyOperationJournal).recoveryDisposition)) && ((entry as RecoveryPolicyOperationJournal).state !== "RECONCILIATION_REQUIRED" || (entry as RecoveryPolicyOperationJournal).operation !== "SUPERVISOR_NO_PID_RECOVERY" || (entry as RecoveryPolicyOperationJournal).recoveryDisposition !== undefined) && ((entry as RecoveryPolicyOperationJournal).initialInstall === undefined || (entry as RecoveryPolicyOperationJournal).operation === "SUPERVISOR_BOOTSTRAP") && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && (!requiresHostBinding((entry as RecoveryPolicyOperationJournal).operation) || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "FAILED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
     && Array.isArray(record.audit)
     && typeof record.expiresAt === "string"
     && typeof record.issuedAt === "string"
@@ -1068,6 +1096,14 @@ function isRecoveryPolicyBinding(value: unknown): value is RecoveryPolicyBinding
     && binding.executableArguments.every((argument) => typeof argument === "string" && !argument.includes("\0"))
     && HASH64.test(binding.runtimePreflightSha256)
     && HASH64.test(binding.runtimeLoaderSha256);
+}
+
+function isCanonicalRecordedSourceRoot(value: unknown): value is string {
+  return typeof value === "string" && path.isAbsolute(value) && path.normalize(value) === value;
+}
+
+function isNoPidRecoveryDisposition(value: unknown): value is NoPidRecoveryDisposition {
+  return value === "ABSENT" || value === "LOADED_NO_VERIFIED_PID" || value === "LOADED_WITH_VERIFIED_LIVE_PROCESS" || value === "IDENTITY_CONFLICT" || value === "OBSERVATION_UNKNOWN";
 }
 
 function isUuid(value: unknown): value is string {
