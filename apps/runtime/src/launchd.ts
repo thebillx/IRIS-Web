@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFile } from 'node:child_process';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
@@ -25,6 +26,12 @@ interface ServiceTargetStopCompletionContext {
   readonly dependencies: LaunchdDependencies;
 }
 
+interface ServiceTargetStopMaintenanceContext {
+  readonly transactionId: string;
+  readonly operationIdentity: string;
+  readonly dependencies: LaunchdDependencies;
+}
+
 export interface ServiceTargetStopMaintenanceResolutionInput {
   readonly dataRoot: string;
   readonly recoveryPolicyId: string;
@@ -32,7 +39,7 @@ export interface ServiceTargetStopMaintenanceResolutionInput {
   readonly transactionId: string;
 }
 const serviceTargetStopCompletions = new Map<string, ServiceTargetStopCompletionContext>();
-const serviceTargetStopMaintenanceDependencies = new Map<string, LaunchdDependencies>();
+const serviceTargetStopMaintenanceContext = new AsyncLocalStorage<ServiceTargetStopMaintenanceContext>();
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
 export type LaunchAgentDisabledState = 'EXPLICIT_ENABLED' | 'EXPLICIT_DISABLED' | 'NO_EXPLICIT_OVERRIDE' | 'UNKNOWN';
 type DisabledState = LaunchAgentDisabledState;
@@ -760,9 +767,11 @@ export async function resolveUnknownLaunchAgentServiceTargetStopForMaintenance(
     const registered = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
     if (registered.state === 'ok') await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
     else if (registered.state !== 'missing') throw new RuntimeError('CONTROL_DENIED', 'Registered LaunchAgent plist is invalid or inaccessible');
-    serviceTargetStopMaintenanceDependencies.set(input.transactionId, dependencies);
-    try { await recordUnknownStopMaintenanceResolution(operation, ownerConfirmation); }
-    finally { serviceTargetStopMaintenanceDependencies.delete(input.transactionId); }
+    await serviceTargetStopMaintenanceContext.run({
+      transactionId: input.transactionId,
+      operationIdentity: serviceTargetStopIdentity({ ...operation, transactionId: input.transactionId }),
+      dependencies,
+    }, () => recordUnknownStopMaintenanceResolution(operation, ownerConfirmation));
     const resolved = await readRecoveryAuthorizationPolicy(dataRoot);
     if (!resolved?.operations.some((entry) => entry.transactionId === input.transactionId && entry.state === 'RECONCILIATION_REQUIRED' && entry.serviceTargetMaintenanceResolution !== undefined)) {
       throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance resolution receipt was not durable');
@@ -779,7 +788,12 @@ export async function verifyServiceTargetStopMaintenanceResolution(
   if (input.operation !== 'SUPERVISOR_SERVICE_TARGET_STOP' || existing.operation !== input.operation || existing.transactionId !== input.transactionId
     || existing.requestId !== input.requestId || existing.state !== 'RECONCILIATION_REQUIRED' || existing.serviceDisabledStateBefore === undefined
     || input.serviceDisabledStateBefore !== existing.serviceDisabledStateBefore) throw new RuntimeError('CONTROL_DENIED', 'Maintenance resolution is not bound to the unresolved stop record');
-  const dependencies = serviceTargetStopMaintenanceDependencies.get(input.transactionId) ?? {};
+  const context = serviceTargetStopMaintenanceContext.getStore();
+  if (context === undefined || context.transactionId !== input.transactionId
+    || context.operationIdentity !== serviceTargetStopIdentity(input)) {
+    throw new RuntimeError('CONTROL_DENIED', 'Service-target maintenance evidence requires its active Owner-local lifecycle context');
+  }
+  const dependencies = context.dependencies;
   const uid = launchdUid(dependencies);
   const domain = launchdDomain(dependencies);
   const paths = launchdPaths(input.dataRoot, dependencies.homeDirectory ?? os.homedir());
