@@ -103,7 +103,7 @@ describe('recovery authorization policy', () => {
       recoveryDisposition: 'OBSERVATION_UNKNOWN',
       state: 'RECONCILIATION_REQUIRED',
     });
-    await expect(acknowledgeNoPidRecoveryObservation({ ...operation, ...reservation, recoveryDisposition: 'OBSERVATION_UNKNOWN' }, { serviceState: 'ABSENT', domain: 'gui/502', label: 'com.iris.supervisor' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(acknowledgeNoPidRecoveryObservation({ ...operation, ...reservation, recoveryDisposition: 'OBSERVATION_UNKNOWN' }, { serviceState: 'ABSENT', domain: 'gui/502', label: 'com.iris.supervisor', ownerConfirmation: 'ACKNOWLEDGE IRIS NO-PID OBSERVATION' })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
     await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID() }))
       .rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
   });

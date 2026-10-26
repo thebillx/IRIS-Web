@@ -65,12 +65,16 @@ try {
       process.stdout.write(`${JSON.stringify(await reconcileRecoveryPolicyOperation({ ...recovery, dataRoot }), null, 2)}\n`);
     } else if (command === 'recovery-policy' && process.argv[3] === 'acknowledge-no-pid') {
       const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
+      if (!input.isTTY || !output.isTTY) throw new Error('No-PID observation acknowledgement requires an interactive Owner-local Terminal');
+      const policy = await readRecoveryAuthorizationPolicy(dataRoot);
+      if (policy?.policyId !== recovery.policyId) throw new Error('No-PID recovery policy identity does not match');
+      const confirmationPhrase = policy.state === 'EXPIRED' ? 'ACKNOWLEDGE EXPIRED IRIS NO-PID OBSERVATION' : 'ACKNOWLEDGE IRIS NO-PID OBSERVATION';
       const prompt = createInterface({ input, output });
       try {
-        const confirmation = await prompt.question('Type ACKNOWLEDGE IRIS NO-PID OBSERVATION to record the exact pending observation after verifying launchd is absent: ');
-        if (confirmation.trim() !== 'ACKNOWLEDGE IRIS NO-PID OBSERVATION') throw new Error('Owner no-PID observation acknowledgement was not confirmed');
+        const confirmation = await prompt.question(`Type ${confirmationPhrase} to record the exact pending observation after verifying launchd is absent: `);
+        if (confirmation.trim() !== confirmationPhrase) throw new Error('Owner no-PID observation acknowledgement was not confirmed');
       } finally { prompt.close(); }
-      process.stdout.write(`${JSON.stringify(await acknowledgeLoadedNoPidRecovery({ ...recovery, dataRoot }, 'ACKNOWLEDGE IRIS NO-PID OBSERVATION'), null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(await acknowledgeLoadedNoPidRecovery({ ...recovery, dataRoot }, confirmationPhrase), null, 2)}\n`);
     } else if (command === 'recovery-policy' && process.argv[3] === 'resolve-failed-admin-tunnel') {
       const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
       const prompt = createInterface({ input, output });

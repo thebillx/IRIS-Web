@@ -500,7 +500,7 @@ export async function resolveFailedAdminTunnelStart(input: RecoveryPolicyOperati
 /** Acknowledges evidence only; the caller must first verify launchd currently reports ABSENT. */
 export async function acknowledgeNoPidRecoveryObservation(
   input: RecoveryPolicyOperationInput & { readonly transactionId: string },
-  evidence: { readonly serviceState: "ABSENT"; readonly domain: string; readonly label: "com.iris.supervisor" },
+  evidence: { readonly serviceState: "ABSENT"; readonly domain: string; readonly label: "com.iris.supervisor"; readonly ownerConfirmation: string },
 ): Promise<void> {
   if (input.operation !== "SUPERVISOR_NO_PID_RECOVERY" || !/^gui\/\d+$/.test(evidence.domain))
     throw new RuntimeError("CONTROL_DENIED", "Only an exact no-PID observation can be acknowledged");
@@ -511,7 +511,10 @@ export async function acknowledgeNoPidRecoveryObservation(
     const secret = await ownerSecret(dataRoot);
     const filename = recoveryPolicyPath(dataRoot);
     const current = await requirePolicy(filename, secret);
-    if (current.policyId !== input.policyId || current.state !== "ISSUED" || current.expiresAt <= new Date().toISOString())
+    const ownerConfirmation = current.state === "EXPIRED"
+      ? "ACKNOWLEDGE EXPIRED IRIS NO-PID OBSERVATION"
+      : "ACKNOWLEDGE IRIS NO-PID OBSERVATION";
+    if (current.policyId !== input.policyId || (current.state !== "ISSUED" && current.state !== "EXPIRED") || current.state === "ISSUED" && current.expiresAt <= new Date().toISOString() || evidence.ownerConfirmation !== ownerConfirmation)
       throw new RuntimeError("CONTROL_DENIED", "No-PID recovery authorization is stale or expired");
     const index = current.operations.findIndex((entry) => entry.transactionId === input.transactionId && entry.requestId === input.requestId && entry.operation === input.operation);
     const existing = current.operations[index];
@@ -526,7 +529,9 @@ export async function acknowledgeNoPidRecoveryObservation(
     const now = new Date().toISOString();
     const operations = current.operations.slice();
     operations[index] = { ...existing, ownerAcknowledgement: { observationSha256: createHash("sha256").update(JSON.stringify(existing)).digest("hex"), serviceState: evidence.serviceState, domain: evidence.domain, label: evidence.label, acknowledgedAt: now } };
-    await writeSigned(filename, sign({ ...current, operations, audit: [...current.audit, { event: "NO_PID_OBSERVATION_ACKNOWLEDGED", operation: input.operation, requestId: input.requestId, transactionId: input.transactionId, state: existing.state, at: now }] }, secret));
+    // Expiration is derived from expiresAt; preserve the original signed payload form for retirement verification.
+    const next = { ...current, ...(current.state === "EXPIRED" ? { state: "ISSUED" as const } : {}), operations, audit: [...current.audit, { event: "NO_PID_OBSERVATION_ACKNOWLEDGED" as const, operation: input.operation, requestId: input.requestId, transactionId: input.transactionId, state: existing.state, at: now }] };
+    await writeSigned(filename, sign(next, secret));
   });
 }
 
@@ -934,7 +939,9 @@ function publicRecord(
   if (Array.isArray(record.retiredPolicies)) {
     publicValue.retiredPolicies = record.retiredPolicies.map((retired) => {
       const historical = publicRecord(retired);
-      return historical;
+      return historical.state === "ISSUED" && historical.expiresAt <= new Date().toISOString()
+        ? { ...historical, state: "EXPIRED" }
+        : historical;
     });
   }
   return publicValue as unknown as RecoveryPolicyPublicRecord;

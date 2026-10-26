@@ -369,6 +369,15 @@ async function issueNoPidRecoveryPolicy(subject: Awaited<ReturnType<typeof fixtu
   });
 }
 
+async function expireRecoveryPolicy(subject: Awaited<ReturnType<typeof fixture>>): Promise<void> {
+  const filename = launchdPaths(subject.dataRoot, subject.home).recoveryAuthorizationPolicy;
+  const record = JSON.parse(await readFile(filename, 'utf8')) as Record<string, unknown>;
+  const payload: Record<string, unknown> = { ...record, expiresAt: new Date(Date.now() - 1_000).toISOString() };
+  delete payload.signature;
+  const signature = createHmac('sha256', 'A'.repeat(43)).update(JSON.stringify(payload)).digest('hex');
+  await writeFile(filename, `${JSON.stringify({ ...payload, signature }, null, 2)}\n`, { mode: 0o600 });
+}
+
 async function writeLegacyLaunchAgent(subject: Awaited<ReturnType<typeof fixture>>): Promise<{ readonly metadata: string; readonly plist: string }> {
   const paths = launchdPaths(subject.dataRoot, subject.home);
   await mkdir(paths.directory, { recursive: true, mode: 0o700 });
@@ -699,6 +708,62 @@ describe('loaded/no-PID recovery evidence', () => {
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
       supersedesPolicyId: policy.policyId,
     })).resolves.toMatchObject({ allowedOperations: ['SOURCE_MIGRATION'], supersedesPolicyId: policy.policyId });
+    expect(subject.fake.calls.slice(callsBeforeAcknowledgement).some((call) => /^(disable|bootout|bootstrap|kickstart) /.test(call))).toBe(false);
+  });
+
+  it('resolves expired no-PID evidence only with fresh Owner confirmation and current ABSENT evidence', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'expired-no-pid-resolution-target');
+    await rm(oldSourceRoot, { recursive: true });
+    subject.fake.live.pid = null;
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    const requestId = randomUUID();
+    const recorded = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, subject.fake.dependencies);
+    await expireRecoveryPolicy(subject);
+    await expect(readRecoveryAuthorizationPolicy(subject.dataRoot)).resolves.toMatchObject({ state: 'EXPIRED' });
+    const operation = {
+      dataRoot: subject.dataRoot,
+      policyId: policy.policyId,
+      operation: 'SUPERVISOR_NO_PID_RECOVERY' as const,
+      requestId,
+      transactionId: recorded.transactionId,
+      ...policy.sourceBindings[0]!,
+      beforeMetadataSha256: policy.beforeMetadataSha256!,
+      beforePlistSha256: policy.beforePlistSha256!,
+      recordedSourceRoot: policy.recordedSourceRoot!,
+      machineId: policy.machineId!,
+    };
+    const callsBeforeAcknowledgement = subject.fake.calls.length;
+    await expect(acknowledgeLoadedNoPidRecovery(operation, 'ACKNOWLEDGE IRIS NO-PID OBSERVATION', subject.fake.dependencies)).rejects.toThrow(/Fresh Owner authorization/);
+    await expect(revokeRecoveryAuthorizationPolicy(subject.dataRoot)).rejects.toThrow(/unresolved operations/);
+    await expect(acknowledgeLoadedNoPidRecovery(operation, 'ACKNOWLEDGE EXPIRED IRIS NO-PID OBSERVATION', subject.fake.dependencies)).rejects.toThrow(/must verify ABSENT/);
+    subject.fake.queryError = new Error('launchd observation unavailable');
+    await expect(acknowledgeLoadedNoPidRecovery(operation, 'ACKNOWLEDGE EXPIRED IRIS NO-PID OBSERVATION', subject.fake.dependencies)).rejects.toThrow(/state remained unknown/);
+    subject.fake.queryError = null;
+    expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0]?.ownerAcknowledgement).toBeUndefined();
+    subject.fake.loaded = false;
+    await expect(acknowledgeLoadedNoPidRecovery(operation, 'ACKNOWLEDGE EXPIRED IRIS NO-PID OBSERVATION', subject.fake.dependencies)).resolves.toEqual({ state: 'ACKNOWLEDGED', transactionId: recorded.transactionId, serviceState: 'ABSENT' });
+    const acknowledged = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+    expect(acknowledged).toMatchObject({ state: 'EXPIRED', operations: [{ state: 'RECONCILIATION_REQUIRED', recoveryDisposition: 'LOADED_NO_VERIFIED_PID', ownerAcknowledgement: { serviceState: 'ABSENT', domain: `gui/${uid}`, label: LAUNCH_AGENT_LABEL } }] });
+    expect(acknowledged?.audit.at(-1)?.event).toBe('NO_PID_OBSERVATION_ACKNOWLEDGED');
+    await expect(acknowledgeLoadedNoPidRecovery(operation, 'ACKNOWLEDGE EXPIRED IRIS NO-PID OBSERVATION', subject.fake.dependencies)).rejects.toThrow(/pending Owner acknowledgement/);
+    await expect(recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    const replacement = await issueRecoveryAuthorizationPolicy({
+      dataRoot: subject.dataRoot,
+      sourceBindings: [policy.sourceBindings[0]!],
+      beforeMetadataSha256: policy.beforeMetadataSha256,
+      beforePlistSha256: policy.beforePlistSha256,
+      allowedOperations: ['SOURCE_MIGRATION'],
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      supersedesPolicyId: policy.policyId,
+    });
+    expect(replacement).toMatchObject({ state: 'ISSUED', supersedesPolicyId: policy.policyId });
+    const retired = (await readRecoveryAuthorizationPolicy(subject.dataRoot))?.retiredPolicies?.find((entry) => entry.policyId === policy.policyId);
+    expect(retired?.state).toBe('EXPIRED');
+    expect(retired?.operations).toContainEqual(expect.objectContaining({ state: 'RECONCILIATION_REQUIRED', recoveryDisposition: 'LOADED_NO_VERIFIED_PID', ownerAcknowledgement: expect.objectContaining({ serviceState: 'ABSENT' }) }));
     expect(subject.fake.calls.slice(callsBeforeAcknowledgement).some((call) => /^(disable|bootout|bootstrap|kickstart) /.test(call))).toBe(false);
   });
 

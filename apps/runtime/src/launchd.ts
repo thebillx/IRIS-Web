@@ -633,19 +633,22 @@ export async function acknowledgeLoadedNoPidRecovery(
   ownerConfirmation: string,
   dependencies: LaunchdDependencies = {},
 ): Promise<{ readonly state: 'ACKNOWLEDGED'; readonly transactionId: string; readonly serviceState: 'ABSENT' }> {
-  if (input.operation !== 'SUPERVISOR_NO_PID_RECOVERY' || ownerConfirmation !== 'ACKNOWLEDGE IRIS NO-PID OBSERVATION') throw new RuntimeError('CONTROL_DENIED', 'Explicit Owner acknowledgement is required for no-PID evidence');
+  if (input.operation !== 'SUPERVISOR_NO_PID_RECOVERY' || !['ACKNOWLEDGE IRIS NO-PID OBSERVATION', 'ACKNOWLEDGE EXPIRED IRIS NO-PID OBSERVATION'].includes(ownerConfirmation)) throw new RuntimeError('CONTROL_DENIED', 'Explicit Owner acknowledgement is required for no-PID evidence');
   const uid = launchdUid(dependencies);
   const domain = launchdDomain(dependencies);
   const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
   const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
   return withLaunchAgentLock(paths, uid, async () => {
     await requireGuiDomain(domain, dependencies.launchctl ?? systemLaunchctl);
-    const observed = await recordLoadedNoPidRecoveryUnlocked({ dataRoot: canonicalDataRoot, recoveryPolicyId: input.policyId, requestId: input.requestId }, dependencies);
+    const policy = await readRecoveryAuthorizationPolicy(canonicalDataRoot);
+    const requiredConfirmation = policy?.state === 'EXPIRED' ? 'ACKNOWLEDGE EXPIRED IRIS NO-PID OBSERVATION' : 'ACKNOWLEDGE IRIS NO-PID OBSERVATION';
+    if (policy?.policyId !== input.policyId || ownerConfirmation !== requiredConfirmation) throw new RuntimeError('CONTROL_DENIED', 'Fresh Owner authorization does not match the current no-PID policy state');
+    const observed = await recordLoadedNoPidRecoveryUnlocked({ dataRoot: canonicalDataRoot, recoveryPolicyId: input.policyId, requestId: input.requestId }, dependencies, policy.state === 'EXPIRED');
     if (observed.transactionId !== input.transactionId) throw new RuntimeError('CONTROL_DENIED', 'No-PID recovery transaction identity changed');
     const journal = await readRecoveryPolicyOperation({ ...input, dataRoot: canonicalDataRoot });
     if (journal.state !== 'RECONCILIATION_REQUIRED' || journal.ownerAcknowledgement !== undefined) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'No-PID recovery evidence is not pending Owner acknowledgement');
     if ((await observeLaunchAgent(dependencies)).state !== 'ABSENT') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'A fresh launchd observation must verify ABSENT before resolving no-PID evidence');
-    await acknowledgeNoPidRecoveryObservation({ ...input, dataRoot: canonicalDataRoot, ...(journal.recoveryDisposition === undefined ? {} : { recoveryDisposition: journal.recoveryDisposition }) }, { serviceState: 'ABSENT', domain, label: LAUNCH_AGENT_LABEL });
+    await acknowledgeNoPidRecoveryObservation({ ...input, dataRoot: canonicalDataRoot, ...(journal.recoveryDisposition === undefined ? {} : { recoveryDisposition: journal.recoveryDisposition }) }, { serviceState: 'ABSENT', domain, label: LAUNCH_AGENT_LABEL, ownerConfirmation });
     return { state: 'ACKNOWLEDGED', transactionId: input.transactionId, serviceState: 'ABSENT' };
   });
 }
@@ -653,13 +656,14 @@ export async function acknowledgeLoadedNoPidRecovery(
 async function recordLoadedNoPidRecoveryUnlocked(
   input: LaunchAgentNoPidRecoveryInput,
   dependencies: LaunchdDependencies,
+  allowExpiredForExistingEvidence = false,
 ): Promise<{ readonly state: 'RECONCILIATION_REQUIRED'; readonly transactionId: string; readonly disposition: NoPidRecoveryDisposition }> {
   const uid = launchdUid(dependencies);
   const domain = launchdDomain(dependencies);
   await requireGuiDomain(domain, dependencies.launchctl ?? systemLaunchctl);
   const paths = launchdPaths(input.dataRoot, dependencies.homeDirectory ?? os.homedir());
   const policy = await readRecoveryAuthorizationPolicy(input.dataRoot);
-  if (policy === null || policy.policyId !== input.recoveryPolicyId || policy.state !== 'ISSUED'
+  if (policy === null || policy.policyId !== input.recoveryPolicyId || policy.state !== 'ISSUED' && !(allowExpiredForExistingEvidence && policy.state === 'EXPIRED')
     || policy.allowedOperations.length !== 1 || policy.allowedOperations[0] !== 'SUPERVISOR_NO_PID_RECOVERY'
     || policy.maxOperationCount !== 1 || policy.machineId === undefined || policy.machineId === null || policy.recordedSourceRoot === undefined
     || policy.sourceBindings.length !== 1 || policy.beforeMetadataSha256 === null || policy.beforePlistSha256 === null) {
@@ -733,6 +737,7 @@ async function recordLoadedNoPidRecoveryUnlocked(
     }
     if (verified.state !== 'RESERVED') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Loaded/no-PID recovery request is already terminal');
   }
+  if (policy.state === 'EXPIRED') throw new RuntimeError('CONTROL_DENIED', 'Expired recovery authority cannot create a no-PID operation');
   const disposition = await classifyNoPidRecoveryObservation(metadata, dependencies);
   const reservation = await reserveRecoveryPolicyOperation(operation);
   await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId, state: 'RECONCILIATION_REQUIRED', recoveryDisposition: disposition });
