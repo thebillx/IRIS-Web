@@ -23,6 +23,7 @@ import {
   resolveReviewedRuntimeEntrypoints,
   stopLaunchAgentForMigration,
   recordLoadedNoPidRecovery,
+  acknowledgeLoadedNoPidRecovery,
   uninstallLaunchAgent,
   type LaunchdDependencies,
 } from './launchd.js';
@@ -648,6 +649,57 @@ describe('loaded/no-PID recovery evidence', () => {
     expect(subject.fake.calls.some((call) => call.startsWith('disable '))).toBe(false);
     expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
     expect(JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot).toBe(oldSourceRoot);
+  });
+
+  it('requires Owner acknowledgement plus a fresh ABSENT observation before policy rollover', async () => {
+    const subject = await fixture();
+    const paths = await install(subject);
+    const oldSourceRoot = JSON.parse(await readFile(paths.metadata, 'utf8')).sourceRoot as string;
+    const target = await reviewedSource(subject, 'no-pid-resolution-target');
+    await rm(oldSourceRoot, { recursive: true });
+    subject.fake.live.pid = null;
+    const policy = await issueNoPidRecoveryPolicy(subject, target);
+    const requestId = randomUUID();
+    const recorded = await recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, subject.fake.dependencies);
+    const operation = {
+      dataRoot: subject.dataRoot,
+      policyId: policy.policyId,
+      operation: 'SUPERVISOR_NO_PID_RECOVERY' as const,
+      requestId,
+      transactionId: recorded.transactionId,
+      ...policy.sourceBindings[0]!,
+      beforeMetadataSha256: policy.beforeMetadataSha256!,
+      beforePlistSha256: policy.beforePlistSha256!,
+      recordedSourceRoot: policy.recordedSourceRoot!,
+      machineId: policy.machineId!,
+    };
+    const callsBeforeAcknowledgement = subject.fake.calls.length;
+    await expect(acknowledgeLoadedNoPidRecovery(operation, '', subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    const originalPlist = await readFile(paths.plist, 'utf8');
+    await writeFile(paths.plist, `${originalPlist}\nchanged`);
+    await expect(acknowledgeLoadedNoPidRecovery(operation, 'ACKNOWLEDGE IRIS NO-PID OBSERVATION', subject.fake.dependencies)).rejects.toThrow(/before-images/);
+    await writeFile(paths.plist, originalPlist);
+    await expect(acknowledgeLoadedNoPidRecovery(operation, 'ACKNOWLEDGE IRIS NO-PID OBSERVATION', subject.fake.dependencies)).rejects.toThrow(/must verify ABSENT/);
+    expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0]?.ownerAcknowledgement).toBeUndefined();
+    subject.fake.loaded = false;
+    await expect(acknowledgeLoadedNoPidRecovery(operation, 'ACKNOWLEDGE IRIS NO-PID OBSERVATION', subject.fake.dependencies)).resolves.toEqual({ state: 'ACKNOWLEDGED', transactionId: recorded.transactionId, serviceState: 'ABSENT' });
+    const acknowledged = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+    expect(acknowledged?.operations[0]).toMatchObject({ state: 'RECONCILIATION_REQUIRED', recoveryDisposition: 'LOADED_NO_VERIFIED_PID', ownerAcknowledgement: { serviceState: 'ABSENT', domain: `gui/${uid}`, label: LAUNCH_AGENT_LABEL } });
+    expect(acknowledged?.audit.at(-1)?.event).toBe('NO_PID_OBSERVATION_ACKNOWLEDGED');
+    await expect(acknowledgeLoadedNoPidRecovery(operation, 'ACKNOWLEDGE IRIS NO-PID OBSERVATION', subject.fake.dependencies)).rejects.toThrow(/pending Owner acknowledgement/);
+    await expect(recordLoadedNoPidRecovery({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId: randomUUID() }, subject.fake.dependencies)).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await revokeRecoveryAuthorizationPolicy(subject.dataRoot);
+    await expect(issueRecoveryAuthorizationPolicy({
+      dataRoot: subject.dataRoot,
+      sourceBindings: [policy.sourceBindings[0]!],
+      beforeMetadataSha256: policy.beforeMetadataSha256,
+      beforePlistSha256: policy.beforePlistSha256,
+      allowedOperations: ['SOURCE_MIGRATION'],
+      maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      supersedesPolicyId: policy.policyId,
+    })).resolves.toMatchObject({ allowedOperations: ['SOURCE_MIGRATION'], supersedesPolicyId: policy.policyId });
+    expect(subject.fake.calls.slice(callsBeforeAcknowledgement).some((call) => /^(disable|bootout|bootstrap|kickstart) /.test(call))).toBe(false);
   });
 
   it('does not treat a PID appearing after the no-PID snapshot as proof that stopping is safe', async () => {

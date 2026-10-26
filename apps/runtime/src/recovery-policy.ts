@@ -1,4 +1,4 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { open, realpath, rename, rm } from "node:fs/promises";
@@ -149,10 +149,17 @@ export interface RecoveryPolicyOperationJournal {
   readonly state: RecoveryPolicyOperationState;
   readonly createdAt: string;
   readonly finalizedAt?: string;
+  readonly ownerAcknowledgement?: {
+    readonly observationSha256: string;
+    readonly serviceState: "ABSENT";
+    readonly domain: string;
+    readonly label: "com.iris.supervisor";
+    readonly acknowledgedAt: string;
+  };
 }
 
 export interface RecoveryPolicyAudit {
-  readonly event: "ISSUED" | "RESERVED" | "FINALIZED" | "REVOKED";
+  readonly event: "ISSUED" | "RESERVED" | "FINALIZED" | "NO_PID_OBSERVATION_ACKNOWLEDGED" | "REVOKED";
   readonly operation?: RecoveryPolicyOperation;
   readonly requestId?: string;
   readonly transactionId?: string;
@@ -222,7 +229,7 @@ async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIss
       return publicRecord(existing);
     if (
       input.supersedesPolicyId !== undefined &&
-      allPolicyOperations(existing).some((entry) => entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED")
+      allPolicyOperations(existing).some(isUnresolvedPolicyOperation)
     )
       throw new RuntimeError(
         "SUPERVISOR_NOT_RUNNING",
@@ -246,7 +253,7 @@ async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIss
         "CONTROL_DENIED",
         "Only a revoked or expired recovery policy may be superseded",
       );
-    if (allPolicyOperations(existing).some((entry) => entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED"))
+    if (allPolicyOperations(existing).some(isUnresolvedPolicyOperation))
       throw new RuntimeError(
         "SUPERVISOR_NOT_RUNNING",
         "Recovery policy has unresolved operations",
@@ -415,17 +422,14 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       "Recovery request identity is already present in retired policy history",
     );
   if (
-    allPolicyOperations(current).some(
-      (entry) =>
-        entry.state === "RECONCILIATION_REQUIRED" || entry.state === "RESERVED",
-    )
+    allPolicyOperations(current).some(isUnresolvedPolicyOperation)
   )
     throw new RuntimeError(
       "SUPERVISOR_NOT_RUNNING",
       "Recovery policy has an unresolved operation",
     );
   const count = current.operations.filter(
-    (entry) => entry.state === "COMMITTED",
+    (entry) => entry.state === "COMMITTED" || isResolvedNoPidObservation(entry),
   ).length;
   if (count >= current.maxOperationCount)
     throw new RuntimeError(
@@ -491,6 +495,39 @@ export async function resolveFailedAdminTunnelStart(input: RecoveryPolicyOperati
   if (input.operation !== "ADMIN_TUNNEL_START")
     throw new RuntimeError("INVALID_REQUEST", "Only an ADMIN_TUNNEL_START may be resolved as failed");
   return finalizeRecoveryPolicyOperation({ ...input, state: "FAILED" });
+}
+
+/** Acknowledges evidence only; the caller must first verify launchd currently reports ABSENT. */
+export async function acknowledgeNoPidRecoveryObservation(
+  input: RecoveryPolicyOperationInput & { readonly transactionId: string },
+  evidence: { readonly serviceState: "ABSENT"; readonly domain: string; readonly label: "com.iris.supervisor" },
+): Promise<void> {
+  if (input.operation !== "SUPERVISOR_NO_PID_RECOVERY" || !/^gui\/\d+$/.test(evidence.domain))
+    throw new RuntimeError("CONTROL_DENIED", "Only an exact no-PID observation can be acknowledged");
+  await withPolicyLock(await canonicalDataRoot(input.dataRoot), async () => {
+    validateOperation(input);
+    if (!isUuid(input.transactionId)) throw new RuntimeError("INVALID_REQUEST", "Recovery transaction ID is invalid");
+    const dataRoot = await canonicalDataRoot(input.dataRoot);
+    const secret = await ownerSecret(dataRoot);
+    const filename = recoveryPolicyPath(dataRoot);
+    const current = await requirePolicy(filename, secret);
+    if (current.policyId !== input.policyId || current.state !== "ISSUED" || current.expiresAt <= new Date().toISOString())
+      throw new RuntimeError("CONTROL_DENIED", "No-PID recovery authorization is stale or expired");
+    const index = current.operations.findIndex((entry) => entry.transactionId === input.transactionId && entry.requestId === input.requestId && entry.operation === input.operation);
+    const existing = current.operations[index];
+    if (existing === undefined || existing.state !== "RECONCILIATION_REQUIRED" || !["ABSENT", "LOADED_NO_VERIFIED_PID"].includes(existing.recoveryDisposition ?? "") || existing.ownerAcknowledgement !== undefined
+      || existing.sourceSha !== input.sourceSha || existing.sourceTree !== input.sourceTree || existing.sourceRoot !== input.sourceRoot || existing.controlScript !== input.controlScript || existing.executable !== input.executable
+      || (existing.executableSha256 ?? null) !== (input.executableSha256 ?? null) || JSON.stringify(existing.executableArguments) !== JSON.stringify(input.executableArguments)
+      || existing.runtimePreflightSha256 !== input.runtimePreflightSha256 || existing.runtimeLoaderSha256 !== input.runtimeLoaderSha256
+      || existing.beforeMetadataSha256 !== input.beforeMetadataSha256 || existing.beforePlistSha256 !== input.beforePlistSha256 || existing.recoveryDisposition !== input.recoveryDisposition
+      || existing.recordedSourceRoot !== input.recordedSourceRoot || existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null)
+      || (existing.machineId ?? null) !== (input.machineId ?? null))
+      throw new RuntimeError("CONTROL_DENIED", "No-PID observation identity or before-image changed");
+    const now = new Date().toISOString();
+    const operations = current.operations.slice();
+    operations[index] = { ...existing, ownerAcknowledgement: { observationSha256: createHash("sha256").update(JSON.stringify(existing)).digest("hex"), serviceState: evidence.serviceState, domain: evidence.domain, label: evidence.label, acknowledgedAt: now } };
+    await writeSigned(filename, sign({ ...current, operations, audit: [...current.audit, { event: "NO_PID_OBSERVATION_ACKNOWLEDGED", operation: input.operation, requestId: input.requestId, transactionId: input.transactionId, state: existing.state, at: now }] }, secret));
+  });
 }
 
 export async function assertRecoveryPolicyOperationCommitted(input: RecoveryPolicyOperationInput & { readonly transactionId: string }): Promise<void> {
@@ -613,10 +650,7 @@ async function revokeRecoveryAuthorizationPolicyUnlocked(dataRootInput: string):
   const filename = recoveryPolicyPath(dataRoot);
   const current = await requirePolicy(filename, secret);
   if (
-    allPolicyOperations(current).some(
-      (entry) =>
-        entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED",
-    )
+    allPolicyOperations(current).some(isUnresolvedPolicyOperation)
   )
     throw new RuntimeError(
       "SUPERVISOR_NOT_RUNNING",
@@ -1049,6 +1083,7 @@ function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolic
     && Array.isArray(record.operations)
     && record.operations.length <= MAX_ENTRIES
     && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && validBeforeImage(entry as RecoveryPolicyOperationJournal) && ((entry as RecoveryPolicyOperationJournal).recordedSourceRoot === undefined || isCanonicalRecordedSourceRoot((entry as RecoveryPolicyOperationJournal).recordedSourceRoot)) && ((entry as RecoveryPolicyOperationJournal).operation !== "SUPERVISOR_NO_PID_RECOVERY" || (entry as RecoveryPolicyOperationJournal).recordedSourceRoot !== undefined) && ((entry as RecoveryPolicyOperationJournal).recoveryDisposition === undefined || (entry as RecoveryPolicyOperationJournal).operation === "SUPERVISOR_NO_PID_RECOVERY" && isNoPidRecoveryDisposition((entry as RecoveryPolicyOperationJournal).recoveryDisposition)) && ((entry as RecoveryPolicyOperationJournal).state !== "RECONCILIATION_REQUIRED" || (entry as RecoveryPolicyOperationJournal).operation !== "SUPERVISOR_NO_PID_RECOVERY" || (entry as RecoveryPolicyOperationJournal).recoveryDisposition !== undefined) && ((entry as RecoveryPolicyOperationJournal).initialInstall === undefined || (entry as RecoveryPolicyOperationJournal).operation === "SUPERVISOR_BOOTSTRAP") && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && (!requiresHostBinding((entry as RecoveryPolicyOperationJournal).operation) || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "FAILED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
+    && record.operations.every((entry) => entry.ownerAcknowledgement === undefined || isResolvedNoPidObservation(entry))
     && Array.isArray(record.audit)
     && typeof record.expiresAt === "string"
     && typeof record.issuedAt === "string"
@@ -1063,6 +1098,22 @@ function allPolicyOperations(record: RecoveryPolicyPublicRecord): readonly Recov
     ...record.operations,
     ...(record.retiredPolicies ?? []).flatMap((retired) => allPolicyOperations(retired)),
   ];
+}
+
+function isUnresolvedPolicyOperation(entry: RecoveryPolicyOperationJournal): boolean {
+  return entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED" && !isResolvedNoPidObservation(entry);
+}
+
+function isResolvedNoPidObservation(entry: RecoveryPolicyOperationJournal): boolean {
+  const acknowledgement = entry.ownerAcknowledgement;
+  if (entry.operation !== "SUPERVISOR_NO_PID_RECOVERY" || acknowledgement === undefined) return false;
+  const observation = Object.fromEntries(Object.entries(entry).filter(([key]) => key !== "ownerAcknowledgement"));
+  return acknowledgement.serviceState === "ABSENT"
+    && acknowledgement.label === "com.iris.supervisor"
+    && /^gui\/\d+$/.test(acknowledgement.domain)
+    && Number.isFinite(Date.parse(acknowledgement.acknowledgedAt))
+    && HASH64.test(acknowledgement.observationSha256)
+    && acknowledgement.observationSha256 === createHash("sha256").update(JSON.stringify(observation)).digest("hex");
 }
 
 function retiredPolicyOperations(record: RecoveryPolicyPublicRecord): readonly RecoveryPolicyOperationJournal[] {

@@ -16,7 +16,7 @@ import { readControlPlaneApiKey } from './credentials.js';
 import { readConnectorRegistry } from './connector-registry.js';
 import { readMachineId } from './machine-identity.js';
 import { observeProcessExecutable, observeProcessOwnerUid, observeProcessStart, type ProcessStartObservation } from './macos-safety.js';
-import { assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, readRecoveryPolicyOperation, resolveInitialInstallOperation, reserveRecoveryPolicyOperation, validInitialInstallBinding, type InitialInstallBinding, type NoPidRecoveryDisposition, type RecoveryPolicyOperationInput, type RecoveryPolicyPublicRecord } from './recovery-policy.js';
+import { acknowledgeNoPidRecoveryObservation, assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, readRecoveryPolicyOperation, resolveInitialInstallOperation, reserveRecoveryPolicyOperation, validInitialInstallBinding, type InitialInstallBinding, type NoPidRecoveryDisposition, type RecoveryPolicyOperationInput, type RecoveryPolicyPublicRecord } from './recovery-policy.js';
 
 const execFileAsync = promisify(execFile);
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
@@ -625,6 +625,29 @@ export async function recordLoadedNoPidRecovery(
   const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
   const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
   return withLaunchAgentLock(paths, uid, () => recordLoadedNoPidRecoveryUnlocked({ ...input, dataRoot: canonicalDataRoot }, dependencies));
+}
+
+/** Closes only the evidence dead-end after Owner confirmation and a fresh read-only ABSENT observation. */
+export async function acknowledgeLoadedNoPidRecovery(
+  input: RecoveryPolicyOperationInput & { readonly transactionId: string },
+  ownerConfirmation: string,
+  dependencies: LaunchdDependencies = {},
+): Promise<{ readonly state: 'ACKNOWLEDGED'; readonly transactionId: string; readonly serviceState: 'ABSENT' }> {
+  if (input.operation !== 'SUPERVISOR_NO_PID_RECOVERY' || ownerConfirmation !== 'ACKNOWLEDGE IRIS NO-PID OBSERVATION') throw new RuntimeError('CONTROL_DENIED', 'Explicit Owner acknowledgement is required for no-PID evidence');
+  const uid = launchdUid(dependencies);
+  const domain = launchdDomain(dependencies);
+  const canonicalDataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(canonicalDataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, async () => {
+    await requireGuiDomain(domain, dependencies.launchctl ?? systemLaunchctl);
+    const observed = await recordLoadedNoPidRecoveryUnlocked({ dataRoot: canonicalDataRoot, recoveryPolicyId: input.policyId, requestId: input.requestId }, dependencies);
+    if (observed.transactionId !== input.transactionId) throw new RuntimeError('CONTROL_DENIED', 'No-PID recovery transaction identity changed');
+    const journal = await readRecoveryPolicyOperation({ ...input, dataRoot: canonicalDataRoot });
+    if (journal.state !== 'RECONCILIATION_REQUIRED' || journal.ownerAcknowledgement !== undefined) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'No-PID recovery evidence is not pending Owner acknowledgement');
+    if ((await observeLaunchAgent(dependencies)).state !== 'ABSENT') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'A fresh launchd observation must verify ABSENT before resolving no-PID evidence');
+    await acknowledgeNoPidRecoveryObservation({ ...input, dataRoot: canonicalDataRoot, ...(journal.recoveryDisposition === undefined ? {} : { recoveryDisposition: journal.recoveryDisposition }) }, { serviceState: 'ABSENT', domain, label: LAUNCH_AGENT_LABEL });
+    return { state: 'ACKNOWLEDGED', transactionId: input.transactionId, serviceState: 'ABSENT' };
+  });
 }
 
 async function recordLoadedNoPidRecoveryUnlocked(

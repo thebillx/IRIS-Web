@@ -7,7 +7,7 @@ import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
 import { readControlPlaneApiKey } from './credentials.js';
 import { createSupervisor } from './supervisor.js';
-import { issueInitialLaunchAgentPolicy, reconcileInitialLaunchAgentInstall, installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, reconcileStoppedLaunchAgent, resolveReviewedRuntimeEntrypoints, stopLaunchAgentForMigration, uninstallLaunchAgent, recordLoadedNoPidRecovery } from './launchd.js';
+import { issueInitialLaunchAgentPolicy, reconcileInitialLaunchAgentInstall, installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, reconcileStoppedLaunchAgent, resolveReviewedRuntimeEntrypoints, stopLaunchAgentForMigration, uninstallLaunchAgent, recordLoadedNoPidRecovery, acknowledgeLoadedNoPidRecovery } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, reconcileRecoveryPolicyLock, reconcileRecoveryPolicyOperation, revokeRecoveryAuthorizationPolicy } from './recovery-policy.js';
 import { readMachineId } from './machine-identity.js';
@@ -63,6 +63,14 @@ try {
     } else if (command === 'recovery-policy' && process.argv[3] === 'reconcile') {
       const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
       process.stdout.write(`${JSON.stringify(await reconcileRecoveryPolicyOperation({ ...recovery, dataRoot }), null, 2)}\n`);
+    } else if (command === 'recovery-policy' && process.argv[3] === 'acknowledge-no-pid') {
+      const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type ACKNOWLEDGE IRIS NO-PID OBSERVATION to record the exact pending observation after verifying launchd is absent: ');
+        if (confirmation.trim() !== 'ACKNOWLEDGE IRIS NO-PID OBSERVATION') throw new Error('Owner no-PID observation acknowledgement was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await acknowledgeLoadedNoPidRecovery({ ...recovery, dataRoot }, 'ACKNOWLEDGE IRIS NO-PID OBSERVATION'), null, 2)}\n`);
     } else if (command === 'recovery-policy' && process.argv[3] === 'resolve-failed-admin-tunnel') {
       const recovery = parseRecoveryPolicyOperationOptions(process.argv.slice(4));
       const prompt = createInterface({ input, output });
