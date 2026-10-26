@@ -515,7 +515,26 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
 }
 
 export async function finalizeRecoveryPolicyOperation(input: RecoveryPolicyOperationInput & { readonly transactionId: string; readonly state: Exclude<RecoveryPolicyOperationState, "RESERVED"> }): Promise<RecoveryPolicyPublicRecord> {
+  if (input.operation === "SUPERVISOR_SERVICE_TARGET_STOP" && input.state === "COMMITTED")
+    throw new RuntimeError("CONTROL_DENIED", "Service-target stop completion requires the verified lifecycle path");
   return withPolicyLock(await canonicalDataRoot(input.dataRoot), () => finalizeRecoveryPolicyOperationUnlocked(input));
+}
+
+/** Completes the stop journal only after the trusted LaunchAgent lifecycle verifier succeeds. */
+export async function finalizeVerifiedServiceTargetStop(
+  input: RecoveryPolicyOperationInput & { readonly transactionId: string },
+  verifyPostconditions: () => Promise<void>,
+): Promise<RecoveryPolicyPublicRecord> {
+  if (input.operation !== "SUPERVISOR_SERVICE_TARGET_STOP")
+    throw new RuntimeError("INVALID_REQUEST", "Only a service-target stop can use verified stop completion");
+  const dataRoot = await canonicalDataRoot(input.dataRoot);
+  return withPolicyLock(dataRoot, async () => {
+    const existing = await readRecoveryPolicyOperation({ ...input, dataRoot });
+    if (existing.state !== "RECONCILIATION_REQUIRED")
+      throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Service-target stop is not awaiting verified completion");
+    await verifyPostconditions();
+    return finalizeRecoveryPolicyOperationUnlocked({ ...input, dataRoot, state: "COMMITTED" }, false, true);
+  });
 }
 
 export async function reconcileRecoveryPolicyOperation(input: RecoveryPolicyOperationInput & { readonly transactionId: string }): Promise<RecoveryPolicyPublicRecord> {
@@ -592,7 +611,7 @@ export async function readRecoveryPolicyOperation(input: RecoveryPolicyOperation
   return entry;
 }
 
-async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOperationInput & { readonly transactionId: string; readonly state: Exclude<RecoveryPolicyOperationState, "RESERVED"> }, initialReconciliation = false): Promise<RecoveryPolicyPublicRecord> {
+async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOperationInput & { readonly transactionId: string; readonly state: Exclude<RecoveryPolicyOperationState, "RESERVED"> }, initialReconciliation = false, verifiedServiceTargetStop = false): Promise<RecoveryPolicyPublicRecord> {
   validateOperation(input);
   if (!isUuid(input.transactionId))
     throw new RuntimeError(
@@ -651,7 +670,7 @@ async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOper
   if (input.operation === "SUPERVISOR_NO_PID_RECOVERY" && input.state === "RECONCILIATION_REQUIRED" && input.recoveryDisposition === undefined)
     throw new RuntimeError("INVALID_REQUEST", "Loaded/no-PID recovery reconciliation requires a recorded disposition");
   const resolvingFailedAdminTunnel = input.state === "FAILED" && existing.state === "RECONCILIATION_REQUIRED" && existing.operation === "ADMIN_TUNNEL_START";
-  const committingVerifiedServiceTargetStop = input.state === "COMMITTED" && existing.state === "RECONCILIATION_REQUIRED" && existing.operation === "SUPERVISOR_SERVICE_TARGET_STOP";
+  const committingVerifiedServiceTargetStop = verifiedServiceTargetStop && input.state === "COMMITTED" && existing.state === "RECONCILIATION_REQUIRED" && existing.operation === "SUPERVISOR_SERVICE_TARGET_STOP";
   if (existing.state !== "RESERVED" && !resolvingFailedAdminTunnel && !committingVerifiedServiceTargetStop && !(initialReconciliation && existing.state === "RECONCILIATION_REQUIRED")) {
     if (existing.state === input.state) return current;
     throw new RuntimeError(

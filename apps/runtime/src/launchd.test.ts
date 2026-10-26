@@ -29,7 +29,7 @@ import {
   type LaunchdDependencies,
 } from './launchd.js';
 import { canonicalNodeRuntime, node24Path } from './node-runtime.js';
-import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, revokeRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation } from './recovery-policy.js';
+import { finalizeRecoveryPolicyOperation, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, revokeRecoveryAuthorizationPolicy, reserveRecoveryPolicyOperation } from './recovery-policy.js';
 import { initializeConnectorRegistry, connectorRegistryPath } from './connector-registry.js';
 import { persistControlPlaneApiKey } from './credentials.js';
 import { promisify } from 'node:util';
@@ -964,6 +964,33 @@ describe('Owner-authorized service-target stop', () => {
     subject.fake.live.pid = null;
     return { subject, paths, policy: await issueServiceTargetStopPolicy(subject) };
   }
+
+  it('blocks generic COMMITTED finalization from both reserved and unresolved states', async () => {
+    const { subject, policy } = await loadedNoPidFixture();
+    const binding = policy.sourceBindings[0]!;
+    const operation = {
+      dataRoot: subject.dataRoot,
+      policyId: policy.policyId,
+      operation: 'SUPERVISOR_SERVICE_TARGET_STOP' as const,
+      requestId: randomUUID(),
+      ...binding,
+      beforeMetadataSha256: policy.beforeMetadataSha256,
+      beforePlistSha256: policy.beforePlistSha256,
+      recordedSourceRoot: policy.recordedSourceRoot!,
+      recordedSourceSha: policy.recordedSourceSha!,
+      recordedSourceTree: policy.recordedSourceTree!,
+      serviceTarget: policy.serviceTarget!,
+      machineId: policy.machineId!,
+      protectedReferenceRoot: policy.protectedReferenceRoot ?? undefined,
+    };
+    const reservation = await reserveRecoveryPolicyOperation(operation);
+    await expect(finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'COMMITTED' }))
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'RECONCILIATION_REQUIRED' });
+    await expect(finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'COMMITTED' }))
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    expect(subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
+  });
 
   it('boots out only the exact loaded service target, journals success, and does not replay', async () => {
     const { subject, paths, policy } = await loadedNoPidFixture();

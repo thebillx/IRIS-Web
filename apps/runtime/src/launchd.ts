@@ -16,7 +16,7 @@ import { readControlPlaneApiKey } from './credentials.js';
 import { readConnectorRegistry } from './connector-registry.js';
 import { readMachineId } from './machine-identity.js';
 import { observeProcessExecutable, observeProcessOwnerUid, observeProcessStart, type ProcessStartObservation } from './macos-safety.js';
-import { acknowledgeNoPidRecoveryObservation, assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, readRecoveryPolicyOperation, resolveInitialInstallOperation, reserveRecoveryPolicyOperation, validInitialInstallBinding, type InitialInstallBinding, type NoPidRecoveryDisposition, type RecoveryPolicyOperationInput, type RecoveryPolicyPublicRecord } from './recovery-policy.js';
+import { acknowledgeNoPidRecoveryObservation, assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, finalizeVerifiedServiceTargetStop, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, readRecoveryPolicyOperation, resolveInitialInstallOperation, reserveRecoveryPolicyOperation, validInitialInstallBinding, type InitialInstallBinding, type NoPidRecoveryDisposition, type RecoveryPolicyOperationInput, type RecoveryPolicyPublicRecord } from './recovery-policy.js';
 
 const execFileAsync = promisify(execFile);
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
@@ -676,19 +676,20 @@ export async function stopLoadedLaunchAgentByServiceTarget(
     const launchctl = dependencies.launchctl ?? systemLaunchctl;
     try {
       await launchctl(['bootout', '--wait', `${domain}/${LAUNCH_AGENT_LABEL}`]);
-      const after = await observeLaunchAgentOnce(dependencies);
-      const disabledAfter = await observeDisabledState(domain, launchctl);
-      if (after.state !== 'ABSENT' || disabledAfter === 'UNKNOWN' || disabledAfter !== disabledBefore) {
-        throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service-target stop postconditions are not verified');
-      }
-      await verifyStoppedMetadataProcess(operation, paths, uid, dependencies);
-      const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
-      const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
-      if (privatePlist.state !== 'ok' || registeredPlist.state !== 'ok' || privatePlist.content !== registeredPlist.content
-        || sha256(privatePlist.content) !== operation.beforePlistSha256) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent plist changed during service-target stop');
-      await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
-      if ((await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid)).state !== 'missing') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Registered LaunchAgent removal requires reconciliation');
-      await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId, state: 'COMMITTED' });
+      await finalizeVerifiedServiceTargetStop({ ...operation, transactionId: reservation.transactionId }, async () => {
+        const after = await observeLaunchAgentOnce(dependencies);
+        const disabledAfter = await observeDisabledState(domain, launchctl);
+        if (after.state !== 'ABSENT' || disabledAfter === 'UNKNOWN' || disabledAfter !== disabledBefore) {
+          throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service-target stop postconditions are not verified');
+        }
+        await verifyStoppedMetadataProcess(operation, paths, uid, dependencies);
+        const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+        const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+        if (privatePlist.state !== 'ok' || registeredPlist.state !== 'ok' || privatePlist.content !== registeredPlist.content
+          || sha256(privatePlist.content) !== operation.beforePlistSha256) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'LaunchAgent plist changed during service-target stop');
+        await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+        if ((await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid)).state !== 'missing') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Registered LaunchAgent removal requires reconciliation');
+      });
       return { state: 'STOPPED', transactionId: reservation.transactionId };
     } catch (error) {
       throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service-target stop outcome requires reconciliation; do not retry the stop', { cause: error });
