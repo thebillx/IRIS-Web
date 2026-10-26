@@ -95,12 +95,17 @@ jobs:
           test -x "$pnpm_path"
           test "$("$pnpm_path" --version)" = "10.15.0"
           expected_pnpm="$canonical_dir/pnpm"
-          if [ -e "$expected_pnpm" ] || [ -L "$expected_pnpm" ]; then
-            test -x "$expected_pnpm"
-          else
-            test -w "$canonical_dir"
-            ln -s "$pnpm_path" "$expected_pnpm"
-          fi
+          test ! -e "$expected_pnpm" && test ! -L "$expected_pnpm"
+          test -w "$canonical_dir"
+          (set -o noclobber; {
+            printf '#!/bin/bash\nexec '
+            printf '%q' "$pnpm_path"
+            printf ' "$@"\n'
+          } > "$expected_pnpm")
+          chmod 755 "$expected_pnpm"
+          test -f "$expected_pnpm"
+          test ! -L "$expected_pnpm"
+          test -x "$expected_pnpm"
           test "$(node scripts/node24.mjs --pnpm --version)" = "10.15.0"
 
       - name: Run Supervisor failure-stop and KeepAlive regressions
