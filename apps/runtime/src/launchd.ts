@@ -16,7 +16,7 @@ import { readControlPlaneApiKey } from './credentials.js';
 import { readConnectorRegistry } from './connector-registry.js';
 import { readMachineId } from './machine-identity.js';
 import { observeProcessExecutable, observeProcessOwnerUid, observeProcessStart, type ProcessStartObservation } from './macos-safety.js';
-import { acknowledgeNoPidRecoveryObservation, assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, finalizeVerifiedServiceTargetStop, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, readRecoveryPolicyOperation, resolveInitialInstallOperation, reserveRecoveryPolicyOperation, validInitialInstallBinding, type InitialInstallBinding, type NoPidRecoveryDisposition, type RecoveryPolicyOperationInput, type RecoveryPolicyPublicRecord } from './recovery-policy.js';
+import { acknowledgeNoPidRecoveryObservation, assertRecoveryPolicyOperationCommitted, finalizeRecoveryPolicyOperation, finalizeVerifiedServiceTargetStop, issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, readRecoveryPolicyOperation, resolveInitialInstallOperation, resolveUnknownServiceTargetStopForMaintenance as recordUnknownStopMaintenanceResolution, reserveRecoveryPolicyOperation, validInitialInstallBinding, type InitialInstallBinding, type NoPidRecoveryDisposition, type RecoveryPolicyOperationInput, type RecoveryPolicyOperationJournal, type RecoveryPolicyPublicRecord } from './recovery-policy.js';
 
 const execFileAsync = promisify(execFile);
 interface ServiceTargetStopCompletionContext {
@@ -24,7 +24,15 @@ interface ServiceTargetStopCompletionContext {
   readonly disabledBefore: DisabledState;
   readonly dependencies: LaunchdDependencies;
 }
+
+export interface ServiceTargetStopMaintenanceResolutionInput {
+  readonly dataRoot: string;
+  readonly recoveryPolicyId: string;
+  readonly requestId: string;
+  readonly transactionId: string;
+}
 const serviceTargetStopCompletions = new Map<string, ServiceTargetStopCompletionContext>();
+const serviceTargetStopMaintenanceDependencies = new Map<string, LaunchdDependencies>();
 export const LAUNCH_AGENT_LABEL = 'com.iris.supervisor' as const;
 export type LaunchAgentDisabledState = 'EXPLICIT_ENABLED' | 'EXPLICIT_DISABLED' | 'NO_EXPLICIT_OVERRIDE' | 'UNKNOWN';
 type DisabledState = LaunchAgentDisabledState;
@@ -664,7 +672,9 @@ export async function stopLoadedLaunchAgentByServiceTarget(
     }
 
     const disabledBefore = await verifyServiceTargetStopPreflight(operation, policy, paths, uid, domain, dependencies);
-    const reservation = await reserveRecoveryPolicyOperation(operation);
+    if (disabledBefore === 'UNKNOWN') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service disabled state is unknown');
+    const reservedOperation = { ...operation, serviceDisabledStateBefore: disabledBefore };
+    const reservation = await reserveRecoveryPolicyOperation(reservedOperation);
     try {
       const disabledImmediatelyBefore = await verifyServiceTargetStopPreflight(operation, policy, paths, uid, domain, dependencies);
       if (disabledImmediatelyBefore !== disabledBefore) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Service disabled state changed before stop invocation');
@@ -673,16 +683,16 @@ export async function stopLoadedLaunchAgentByServiceTarget(
         throw new RuntimeError('CONTROL_DENIED', 'Service-target stop authorization expired before invocation');
       }
     } catch (error) {
-      await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId, state: 'FAILED' });
+      await finalizeRecoveryPolicyOperation({ ...reservedOperation, transactionId: reservation.transactionId, state: 'FAILED' });
       throw error;
     }
 
     // This durable marker is written before launchctl; a crash after it can never replay bootout.
-    await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId, state: 'RECONCILIATION_REQUIRED' });
+    await finalizeRecoveryPolicyOperation({ ...reservedOperation, transactionId: reservation.transactionId, state: 'RECONCILIATION_REQUIRED' });
     const launchctl = dependencies.launchctl ?? systemLaunchctl;
     try {
       await launchctl(['bootout', '--wait', `${domain}/${LAUNCH_AGENT_LABEL}`]);
-      const completionInput = { ...operation, transactionId: reservation.transactionId };
+      const completionInput = { ...reservedOperation, transactionId: reservation.transactionId };
       serviceTargetStopCompletions.set(reservation.transactionId, {
         identity: serviceTargetStopIdentity(completionInput),
         disabledBefore,
@@ -702,7 +712,7 @@ export async function verifyServiceTargetStopCompletion(
   input: RecoveryPolicyOperationInput & { readonly transactionId: string },
 ): Promise<void> {
   const context = serviceTargetStopCompletions.get(input.transactionId);
-  if (input.operation !== 'SUPERVISOR_SERVICE_TARGET_STOP' || context === undefined || context.identity !== serviceTargetStopIdentity(input)) {
+  if (input.operation !== 'SUPERVISOR_SERVICE_TARGET_STOP' || context === undefined || context.disabledBefore !== input.serviceDisabledStateBefore || context.identity !== serviceTargetStopIdentity(input)) {
     throw new RuntimeError('CONTROL_DENIED', 'No trusted service-target stop completion is active');
   }
   const uid = launchdUid(context.dependencies);
@@ -726,6 +736,63 @@ export async function verifyServiceTargetStopCompletion(
   if ((await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid)).state !== 'missing') {
     throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Registered LaunchAgent removal requires reconciliation');
   }
+}
+
+/** Owner-confirmed current-state resolution; it never replays or commits the historical bootout. */
+export async function resolveUnknownLaunchAgentServiceTargetStopForMaintenance(
+  input: ServiceTargetStopMaintenanceResolutionInput,
+  ownerConfirmation: string,
+  dependencies: LaunchdDependencies = {},
+): Promise<{ readonly state: 'MAINTENANCE_READY'; readonly transactionId: string }> {
+  if (ownerConfirmation !== 'RESOLVE IRIS SERVICE-TARGET STOP FOR MAINTENANCE') throw new RuntimeError('CONTROL_DENIED', 'Fresh Owner maintenance confirmation is required');
+  const uid = launchdUid(dependencies);
+  const domain = launchdDomain(dependencies);
+  const dataRoot = await requireCanonicalDirectory(input.dataRoot, 'IRIS data root', uid, true);
+  const paths = launchdPaths(dataRoot, dependencies.homeDirectory ?? os.homedir());
+  return withLaunchAgentLock(paths, uid, async () => {
+    const policy = await readRecoveryAuthorizationPolicy(dataRoot);
+    if (policy === null || policy.policyId !== input.recoveryPolicyId || policy.serviceTarget?.uid !== uid || policy.serviceTarget.domain !== domain || policy.serviceTarget.label !== LAUNCH_AGENT_LABEL
+      || policy.machineId === undefined || policy.machineId === null || await readMachineId(dataRoot) !== policy.machineId) throw new RuntimeError('CONTROL_DENIED', 'Maintenance resolution policy is not bound to this machine and service');
+    const existing = policy.operations.find((entry) => entry.operation === 'SUPERVISOR_SERVICE_TARGET_STOP' && entry.requestId === input.requestId && entry.transactionId === input.transactionId);
+    if (existing === undefined || existing.state !== 'RECONCILIATION_REQUIRED' || existing.serviceDisabledStateBefore === undefined || existing.serviceTargetMaintenanceResolution !== undefined) throw new RuntimeError('CONTROL_DENIED', 'Only an unacknowledged exact unresolved service-target stop can be maintenance-resolved');
+    const operation = serviceTargetStopOperationFromJournal(dataRoot, policy.policyId, existing);
+    await verifyServiceTargetStopMaintenanceState(operation, existing, paths, uid, domain, dependencies, false);
+    const registered = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+    if (registered.state === 'ok') await removeOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+    else if (registered.state !== 'missing') throw new RuntimeError('CONTROL_DENIED', 'Registered LaunchAgent plist is invalid or inaccessible');
+    serviceTargetStopMaintenanceDependencies.set(input.transactionId, dependencies);
+    try { await recordUnknownStopMaintenanceResolution(operation, ownerConfirmation); }
+    finally { serviceTargetStopMaintenanceDependencies.delete(input.transactionId); }
+    const resolved = await readRecoveryAuthorizationPolicy(dataRoot);
+    if (!resolved?.operations.some((entry) => entry.transactionId === input.transactionId && entry.state === 'RECONCILIATION_REQUIRED' && entry.serviceTargetMaintenanceResolution !== undefined)) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Maintenance resolution receipt was not durable');
+    }
+    return { state: 'MAINTENANCE_READY', transactionId: input.transactionId };
+  });
+}
+
+/** Trusted read-only proof consumed by the signed policy journal; operation state remains unresolved. */
+export async function verifyServiceTargetStopMaintenanceResolution(
+  input: RecoveryPolicyOperationInput & { readonly transactionId: string },
+  existing: RecoveryPolicyOperationJournal,
+): Promise<Omit<NonNullable<RecoveryPolicyOperationJournal['serviceTargetMaintenanceResolution']>, 'observationSha256' | 'resolvedAt'>> {
+  if (input.operation !== 'SUPERVISOR_SERVICE_TARGET_STOP' || existing.operation !== input.operation || existing.transactionId !== input.transactionId
+    || existing.requestId !== input.requestId || existing.state !== 'RECONCILIATION_REQUIRED' || existing.serviceDisabledStateBefore === undefined
+    || input.serviceDisabledStateBefore !== existing.serviceDisabledStateBefore) throw new RuntimeError('CONTROL_DENIED', 'Maintenance resolution is not bound to the unresolved stop record');
+  const dependencies = serviceTargetStopMaintenanceDependencies.get(input.transactionId) ?? {};
+  const uid = launchdUid(dependencies);
+  const domain = launchdDomain(dependencies);
+  const paths = launchdPaths(input.dataRoot, dependencies.homeDirectory ?? os.homedir());
+  await verifyServiceTargetStopMaintenanceState(input, existing, paths, uid, domain, dependencies, true);
+  return {
+    serviceState: 'ABSENT',
+    registeredPlistState: 'MISSING',
+    processState: 'DEAD',
+    metadataSha256: existing.beforeMetadataSha256!,
+    privatePlistSha256: existing.beforePlistSha256!,
+    disabledStateBefore: existing.serviceDisabledStateBefore,
+    disabledStateAfter: existing.serviceDisabledStateBefore,
+  };
 }
 
 /** Reconciles a verified-absent Supervisor without issuing another bootout. */
@@ -996,7 +1063,72 @@ function serviceTargetStopIdentity(input: RecoveryPolicyOperationInput & { reado
     input.recordedSourceSha ?? null, input.recordedSourceTree ?? null,
     input.serviceTarget?.uid ?? null, input.serviceTarget?.domain ?? null, input.serviceTarget?.label ?? null,
     input.machineId ?? null, input.protectedReferenceRoot ?? null,
+    input.serviceDisabledStateBefore ?? null,
   ]);
+}
+
+function serviceTargetStopOperationFromJournal(dataRoot: string, policyId: string, entry: RecoveryPolicyOperationJournal): RecoveryPolicyOperationInput & { readonly transactionId: string } {
+  return {
+    dataRoot, policyId, operation: entry.operation, requestId: entry.requestId, transactionId: entry.transactionId,
+    sourceSha: entry.sourceSha, sourceTree: entry.sourceTree, sourceRoot: entry.sourceRoot, controlScript: entry.controlScript,
+    executable: entry.executable, ...(entry.executableSha256 == null ? {} : { executableSha256: entry.executableSha256 }),
+    executableArguments: entry.executableArguments, runtimePreflightSha256: entry.runtimePreflightSha256,
+    runtimeLoaderSha256: entry.runtimeLoaderSha256, beforeMetadataSha256: entry.beforeMetadataSha256,
+    beforePlistSha256: entry.beforePlistSha256,
+    ...(entry.recordedSourceRoot === undefined ? {} : { recordedSourceRoot: entry.recordedSourceRoot }),
+    ...(entry.recordedSourceSha === undefined ? {} : { recordedSourceSha: entry.recordedSourceSha }),
+    ...(entry.recordedSourceTree === undefined ? {} : { recordedSourceTree: entry.recordedSourceTree }),
+    ...(entry.serviceTarget === undefined ? {} : { serviceTarget: entry.serviceTarget }),
+    ...(entry.serviceDisabledStateBefore === undefined ? {} : { serviceDisabledStateBefore: entry.serviceDisabledStateBefore }),
+    machineId: entry.machineId ?? undefined, protectedReferenceRoot: entry.protectedReferenceRoot ?? undefined,
+  };
+}
+
+async function verifyServiceTargetStopMaintenanceState(
+  input: RecoveryPolicyOperationInput & { readonly transactionId: string },
+  existing: RecoveryPolicyOperationJournal,
+  paths: LaunchdPaths,
+  uid: number,
+  domain: string,
+  dependencies: LaunchdDependencies,
+  requireRegistrationMissing: boolean,
+): Promise<void> {
+  if (input.operation !== 'SUPERVISOR_SERVICE_TARGET_STOP' || existing.state !== 'RECONCILIATION_REQUIRED'
+    || existing.transactionId !== input.transactionId || existing.requestId !== input.requestId
+    || existing.serviceDisabledStateBefore === undefined || input.machineId !== await readMachineId(input.dataRoot)
+    || input.serviceTarget?.uid !== uid || input.serviceTarget.domain !== domain || input.serviceTarget.label !== LAUNCH_AGENT_LABEL
+    || existing.recordedSourceRoot === undefined) throw new RuntimeError('CONTROL_DENIED', 'Maintenance resolution identity is incomplete or changed');
+
+  await requireMissingPhysicalPath(existing.recordedSourceRoot);
+  const sourceRoot = await requireCanonicalDirectory(input.sourceRoot, 'IRIS maintenance target source', uid, false);
+  const controlScript = await requireCanonicalFile(input.controlScript, 'IRIS maintenance target control script', uid);
+  if (sourceRoot !== input.sourceRoot || sourceRootForControlScript(controlScript) !== sourceRoot
+    || await realpath(input.executable) !== await realpath(canonicalNodeRuntime().path)
+    || await hashCanonicalFile(input.executable, 'IRIS maintenance target executable', uid) !== input.executableSha256) throw new RuntimeError('CONTROL_DENIED', 'Maintenance target source or executable identity changed');
+  await requireSourceGitIdentity(sourceRoot, input.sourceSha, input.sourceTree);
+  const entries = await requireTargetRuntimeEntries(input.executableArguments, uid);
+  if (entries.runtimePreflightSha256 !== input.runtimePreflightSha256 || entries.runtimeLoaderSha256 !== input.runtimeLoaderSha256) throw new RuntimeError('CONTROL_DENIED', 'Maintenance target runtime entrypoints changed');
+
+  const metadataRecord = await readLaunchAgentMetadata(paths.metadata, uid);
+  const metadata = metadataRecord?.metadata;
+  if (metadataRecord === null || metadata === undefined || metadata.schemaVersion !== 3 || metadata.state !== 'READY'
+    || metadata.dataRoot !== input.dataRoot || metadata.domain !== domain || metadata.label !== LAUNCH_AGENT_LABEL
+    || metadata.sourceRoot !== existing.recordedSourceRoot || metadata.plist !== paths.plist || metadata.registeredPlist !== paths.registeredPlist
+    || sha256(metadataRecord.raw) !== existing.beforeMetadataSha256
+    || metadata.processId === undefined || metadata.processStartMarker === undefined) throw new RuntimeError('CONTROL_DENIED', 'Maintenance metadata before-image or process identity is incomplete');
+  const process = (dependencies.observeProcessStart ?? observeProcessStart)(metadata.processId);
+  if (process.state !== 'dead') throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Recorded Supervisor process is live or indeterminate');
+  const privatePlist = await inspectOwnedFile(paths.plist, 'IRIS private LaunchAgent', uid);
+  const registeredPlist = await inspectOwnedFile(paths.registeredPlist, 'IRIS registered LaunchAgent', uid);
+  if (privatePlist.state !== 'ok' || sha256(privatePlist.content) !== existing.beforePlistSha256 || metadata.plistSha256 !== existing.beforePlistSha256
+    || registeredPlist.state === 'invalid' || registeredPlist.state === 'ok' && (registeredPlist.content !== privatePlist.content || sha256(registeredPlist.content) !== existing.beforePlistSha256)
+    || requireRegistrationMissing && registeredPlist.state !== 'missing') throw new RuntimeError('CONTROL_DENIED', 'Maintenance plist before-image changed or registration is not in the required state');
+
+  const launchctl = dependencies.launchctl ?? systemLaunchctl;
+  await requireGuiDomain(domain, launchctl);
+  const service = await observeLaunchAgentOnce(dependencies);
+  const disabled = await observeDisabledState(domain, launchctl);
+  if (service.state !== 'ABSENT' || disabled !== existing.serviceDisabledStateBefore) throw new RuntimeError('SUPERVISOR_NOT_RUNNING', 'Current LaunchAgent state is not safe for maintenance continuation');
 }
 
 function requireLoadedNoPidLaunchAgentIdentity(stdout: string, metadata: LaunchAgentMetadata): void {

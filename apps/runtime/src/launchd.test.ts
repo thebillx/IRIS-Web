@@ -23,6 +23,7 @@ import {
   resolveReviewedRuntimeEntrypoints,
   stopLaunchAgentForMigration,
   stopLoadedLaunchAgentByServiceTarget,
+  resolveUnknownLaunchAgentServiceTargetStopForMaintenance,
   recordLoadedNoPidRecovery,
   acknowledgeLoadedNoPidRecovery,
   uninstallLaunchAgent,
@@ -981,6 +982,7 @@ describe('Owner-authorized service-target stop', () => {
       recordedSourceTree: policy.recordedSourceTree!,
       serviceTarget: policy.serviceTarget!,
       machineId: policy.machineId!,
+      serviceDisabledStateBefore: 'EXPLICIT_ENABLED' as const,
       protectedReferenceRoot: policy.protectedReferenceRoot ?? undefined,
     };
     const reservation = await reserveRecoveryPolicyOperation(operation);
@@ -1083,6 +1085,46 @@ describe('Owner-authorized service-target stop', () => {
     expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0]).toMatchObject({ operation: 'SUPERVISOR_SERVICE_TARGET_STOP', state: 'RECONCILIATION_REQUIRED' });
     await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies)).rejects.toThrow(/must not be replayed/);
     expect(subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
+  });
+
+  it('records separate Owner-approved maintenance readiness after an unknown stop without committing or replaying it', async () => {
+    const { subject, paths, policy } = await loadedNoPidFixture();
+    subject.fake.bootout = 'unknown-success';
+    const requestId = randomUUID();
+    await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies)).rejects.toThrow(/do not retry/);
+    const before = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+    const stop = before!.operations[0]!;
+    expect(stop).toMatchObject({ state: 'RECONCILIATION_REQUIRED', serviceDisabledStateBefore: 'EXPLICIT_ENABLED' });
+    await expireRecoveryPolicy(subject);
+    await expect(resolveUnknownLaunchAgentServiceTargetStopForMaintenance({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId, transactionId: stop.transactionId }, 'wrong', subject.fake.dependencies)).rejects.toThrow(/Fresh Owner/);
+    await expect(resolveUnknownLaunchAgentServiceTargetStopForMaintenance({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId, transactionId: stop.transactionId }, 'RESOLVE IRIS SERVICE-TARGET STOP FOR MAINTENANCE', subject.fake.dependencies)).resolves.toEqual({ state: 'MAINTENANCE_READY', transactionId: stop.transactionId });
+    const resolved = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+    expect(resolved?.operations[0]).toMatchObject({ state: 'RECONCILIATION_REQUIRED', serviceTargetMaintenanceResolution: { serviceState: 'ABSENT', registeredPlistState: 'MISSING', processState: 'DEAD', metadataSha256: policy.beforeMetadataSha256, privatePlistSha256: policy.beforePlistSha256, disabledStateBefore: 'EXPLICIT_ENABLED', disabledStateAfter: 'EXPLICIT_ENABLED' } });
+    expect(resolved?.audit.at(-1)).toMatchObject({ event: 'SERVICE_TARGET_STOP_MAINTENANCE_RESOLVED', state: 'RECONCILIATION_REQUIRED', transactionId: stop.transactionId });
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
+    await expect(lstat(paths.registeredPlist)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(resolveUnknownLaunchAgentServiceTargetStopForMaintenance({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId, transactionId: stop.transactionId }, 'RESOLVE IRIS SERVICE-TARGET STOP FOR MAINTENANCE', subject.fake.dependencies)).rejects.toThrow(/unacknowledged exact unresolved/);
+    await revokeRecoveryAuthorizationPolicy(subject.dataRoot);
+    const next = await issueServiceTargetStopPolicy(subject);
+    expect(next.policyId).not.toBe(policy.policyId);
+    expect(next.retiredPolicies?.flatMap((retired) => retired.operations).find((entry) => entry.transactionId === stop.transactionId)).toMatchObject({ state: 'RECONCILIATION_REQUIRED', serviceTargetMaintenanceResolution: expect.objectContaining({ serviceState: 'ABSENT' }) });
+  });
+
+  it('rejects maintenance resolution for loaded service, disabled-state drift, or changed before-images', async () => {
+    for (const drift of ['loaded', 'disabled', 'plist'] as const) {
+      const { subject, paths, policy } = await loadedNoPidFixture();
+      subject.fake.bootout = 'unknown-success';
+      const requestId = randomUUID();
+      await expect(stopLoadedLaunchAgentByServiceTarget({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId }, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies)).rejects.toThrow(/do not retry/);
+      const stop = (await readRecoveryAuthorizationPolicy(subject.dataRoot))!.operations[0]!;
+      if (drift === 'loaded') subject.fake.loaded = true;
+      if (drift === 'disabled') subject.fake.disabled = true;
+      if (drift === 'plist') await writeFile(paths.plist, 'changed', { mode: 0o600 });
+      await expect(resolveUnknownLaunchAgentServiceTargetStopForMaintenance({ dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId, transactionId: stop.transactionId }, 'RESOLVE IRIS SERVICE-TARGET STOP FOR MAINTENANCE', subject.fake.dependencies)).rejects.toThrow();
+      expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0]).toMatchObject({ state: 'RECONCILIATION_REQUIRED' });
+      expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0]).not.toHaveProperty('serviceTargetMaintenanceResolution');
+      expect(subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
+    }
   });
 });
 

@@ -7,7 +7,7 @@ import { startRuntime, stopRuntime, runtimeStatus } from './lifecycle.js';
 import { readOwnerAccessSecret } from './persistence.js';
 import { readControlPlaneApiKey } from './credentials.js';
 import { createSupervisor } from './supervisor.js';
-import { issueInitialLaunchAgentPolicy, reconcileInitialLaunchAgentInstall, installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, reconcileStoppedLaunchAgent, resolveReviewedRuntimeEntrypoints, stopLaunchAgentForMigration, stopLoadedLaunchAgentByServiceTarget, uninstallLaunchAgent, recordLoadedNoPidRecovery, acknowledgeLoadedNoPidRecovery, LAUNCH_AGENT_LABEL } from './launchd.js';
+import { issueInitialLaunchAgentPolicy, reconcileInitialLaunchAgentInstall, installLaunchAgent, issueLaunchAgentSourceApproval, launchAgentStatus, migrateLaunchAgentSource, reconcileLaunchAgentSourceApproval, reconcileMalformedLegacyApproval, reconcileStoppedLaunchAgent, resolveReviewedRuntimeEntrypoints, stopLaunchAgentForMigration, stopLoadedLaunchAgentByServiceTarget, resolveUnknownLaunchAgentServiceTargetStopForMaintenance, uninstallLaunchAgent, recordLoadedNoPidRecovery, acknowledgeLoadedNoPidRecovery, LAUNCH_AGENT_LABEL } from './launchd.js';
 import { assertSupportedNodeVersion, canonicalNodeRuntime } from './node-runtime.js';
 import { issueRecoveryAuthorizationPolicy, readRecoveryAuthorizationPolicy, reconcileRecoveryPolicyLock, reconcileRecoveryPolicyOperation, revokeRecoveryAuthorizationPolicy } from './recovery-policy.js';
 import { readMachineId } from './machine-identity.js';
@@ -248,6 +248,15 @@ try {
         if (confirmation.trim() !== 'STOP IRIS SUPERVISOR SERVICE TARGET') throw new Error('Owner service-target stop was not confirmed');
       } finally { prompt.close(); }
       process.stdout.write(`${JSON.stringify(await stopLoadedLaunchAgentByServiceTarget({ ...stop, dataRoot }, 'STOP IRIS SUPERVISOR SERVICE TARGET'), null, 2)}\n`);
+    } else if (command === 'launchd' && process.argv[3] === 'resolve-service-target-stop-maintenance') {
+      const resolution = parseServiceTargetStopMaintenanceOptions(process.argv.slice(4));
+      if (!input.isTTY || !output.isTTY) throw new Error('Service-target maintenance resolution requires an interactive Owner-local Terminal');
+      const prompt = createInterface({ input, output });
+      try {
+        const confirmation = await prompt.question('Type RESOLVE IRIS SERVICE-TARGET STOP FOR MAINTENANCE to record current-state readiness without claiming the stop succeeded: ');
+        if (confirmation.trim() !== 'RESOLVE IRIS SERVICE-TARGET STOP FOR MAINTENANCE') throw new Error('Owner maintenance resolution was not confirmed');
+      } finally { prompt.close(); }
+      process.stdout.write(`${JSON.stringify(await resolveUnknownLaunchAgentServiceTargetStopForMaintenance({ ...resolution, dataRoot }, 'RESOLVE IRIS SERVICE-TARGET STOP FOR MAINTENANCE'), null, 2)}\n`);
     } else if (command === 'launchd' && process.argv[3] === 'reconcile-stop') {
       const reconciliation = parseLaunchdStopReconciliationOptions(process.argv.slice(4));
       const prompt = createInterface({ input, output });
@@ -558,6 +567,22 @@ function parseServiceTargetStopOptions(argumentsList: readonly string[]): { read
   return { recoveryPolicyId, requestId };
 }
 
+function parseServiceTargetStopMaintenanceOptions(argumentsList: readonly string[]): { readonly recoveryPolicyId: string; readonly requestId: string; readonly transactionId: string } {
+  const values = new Map<string, string>();
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const name = argumentsList[index];
+    const value = argumentsList[index + 1]?.trim();
+    if (name === undefined || value === undefined || value.length === 0 || values.has(name)) throw new Error(SERVICE_TARGET_STOP_MAINTENANCE_USAGE);
+    values.set(name, value);
+  }
+  if ([...values.keys()].some((name) => name !== '--recovery-policy-id' && name !== '--request-id' && name !== '--transaction-id')) throw new Error(SERVICE_TARGET_STOP_MAINTENANCE_USAGE);
+  const recoveryPolicyId = values.get('--recovery-policy-id');
+  const requestId = values.get('--request-id');
+  const transactionId = values.get('--transaction-id');
+  if (recoveryPolicyId === undefined || requestId === undefined || transactionId === undefined) throw new Error(SERVICE_TARGET_STOP_MAINTENANCE_USAGE);
+  return { recoveryPolicyId, requestId, transactionId };
+}
+
 function parseRecoveryPolicyLockOptions(argumentsList: readonly string[]): RecoveryPolicyLockOptions {
   const values = new Map<string, string>();
   for (let index = 0; index < argumentsList.length; index += 2) {
@@ -769,6 +794,7 @@ const RECOVERY_POLICY_USAGE = 'Usage: iris recovery-policy issue --source-sha <c
 const RECOVERY_POLICY_OPERATION_USAGE = 'Usage: iris recovery-policy reconcile --policy-id <uuid> --operation <MIGRATION_APPROVAL|SOURCE_MIGRATION|SUPERVISOR_BOOTSTRAP|ADMIN_TUNNEL_START|SUPERVISOR_NO_PID_RECOVERY> --request-id <uuid> --transaction-id <uuid> --source-sha <commit> --source-tree <tree> --source-root <directory> --control-script <file> --executable <file> [--executable-sha256 <digest>] --executable-arguments <json-array> --runtime-preflight-sha256 <digest> --runtime-loader-sha256 <digest> --before-metadata-sha256 <digest> --before-plist-sha256 <digest> [--protected-reference-root <directory>] [--machine-id <uuid>]';
 const NO_PID_RECOVERY_USAGE = 'Usage: iris launchd record-no-pid-recovery --recovery-policy-id <uuid> --request-id <uuid>';
 const SERVICE_TARGET_STOP_USAGE = 'Usage: iris launchd stop-service-target --recovery-policy-id <uuid> --request-id <uuid>';
+const SERVICE_TARGET_STOP_MAINTENANCE_USAGE = 'Usage: iris launchd resolve-service-target-stop-maintenance --recovery-policy-id <uuid> --request-id <uuid> --transaction-id <uuid>';
 const RECOVERY_POLICY_LOCK_USAGE = 'Usage: iris recovery-policy reconcile-lock --lock-id <uuid> --pid <pid> --process-start-marker <marker>';
 
 function parseLaunchdStopForMigrationOptions(argumentsList: readonly string[]): { readonly sourceRoot: string; readonly beforeMetadataSha256: string; readonly beforePlistSha256: string } {

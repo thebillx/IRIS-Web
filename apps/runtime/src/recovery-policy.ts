@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { open, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { RuntimeError } from "@iris/domain";
-import { verifyServiceTargetStopCompletion } from "./launchd.js";
+import { verifyServiceTargetStopCompletion, verifyServiceTargetStopMaintenanceResolution } from "./launchd.js";
 import {
   inspectPrivateRegularFile,
   privateDirectoryProblem,
@@ -101,6 +101,7 @@ export interface RecoveryPolicyOperationInput {
   readonly recordedSourceSha?: string;
   readonly recordedSourceTree?: string;
   readonly serviceTarget?: RecoveryPolicyServiceTarget;
+  readonly serviceDisabledStateBefore?: "EXPLICIT_ENABLED" | "EXPLICIT_DISABLED" | "NO_EXPLICIT_OVERRIDE";
   readonly recoveryDisposition?: NoPidRecoveryDisposition;
   readonly protectedReferenceRoot?: string | undefined;
   readonly machineId?: string | undefined;
@@ -162,6 +163,18 @@ export interface RecoveryPolicyOperationJournal {
   readonly recordedSourceSha?: string;
   readonly recordedSourceTree?: string;
   readonly serviceTarget?: RecoveryPolicyServiceTarget;
+  readonly serviceDisabledStateBefore?: "EXPLICIT_ENABLED" | "EXPLICIT_DISABLED" | "NO_EXPLICIT_OVERRIDE";
+  readonly serviceTargetMaintenanceResolution?: {
+    readonly observationSha256: string;
+    readonly serviceState: "ABSENT";
+    readonly registeredPlistState: "MISSING";
+    readonly processState: "DEAD";
+    readonly metadataSha256: string;
+    readonly privatePlistSha256: string;
+    readonly disabledStateBefore: "EXPLICIT_ENABLED" | "EXPLICIT_DISABLED" | "NO_EXPLICIT_OVERRIDE";
+    readonly disabledStateAfter: "EXPLICIT_ENABLED" | "EXPLICIT_DISABLED" | "NO_EXPLICIT_OVERRIDE";
+    readonly resolvedAt: string;
+  };
   readonly recoveryDisposition?: NoPidRecoveryDisposition;
   readonly protectedReferenceRoot: string | null;
   readonly machineId?: string | null;
@@ -178,7 +191,7 @@ export interface RecoveryPolicyOperationJournal {
 }
 
 export interface RecoveryPolicyAudit {
-  readonly event: "ISSUED" | "RESERVED" | "FINALIZED" | "NO_PID_OBSERVATION_ACKNOWLEDGED" | "REVOKED";
+  readonly event: "ISSUED" | "RESERVED" | "FINALIZED" | "NO_PID_OBSERVATION_ACKNOWLEDGED" | "SERVICE_TARGET_STOP_MAINTENANCE_RESOLVED" | "REVOKED";
   readonly operation?: RecoveryPolicyOperation;
   readonly requestId?: string;
   readonly transactionId?: string;
@@ -337,6 +350,8 @@ export async function reserveRecoveryPolicyOperation(input: RecoveryPolicyOperat
 
 async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOperationInput): Promise<{ readonly transactionId: string; readonly state: "RESERVED" }> {
   validateOperation(input);
+  if (input.operation === "SUPERVISOR_SERVICE_TARGET_STOP" && input.serviceDisabledStateBefore === undefined)
+    throw new RuntimeError("INVALID_REQUEST", "Service-target stop requires a durable disabled-state baseline");
   const dataRoot = await canonicalDataRoot(input.dataRoot);
   const secret = await ownerSecret(dataRoot);
   const filename = recoveryPolicyPath(dataRoot);
@@ -429,6 +444,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       existing.recordedSourceSha !== input.recordedSourceSha ||
       existing.recordedSourceTree !== input.recordedSourceTree ||
       JSON.stringify(existing.serviceTarget ?? null) !== JSON.stringify(input.serviceTarget ?? null) ||
+      existing.serviceDisabledStateBefore !== input.serviceDisabledStateBefore ||
       !sameInitialInstall(existing.initialInstall, input.initialInstall) ||
       existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) ||
       (existing.machineId ?? null) !== (input.machineId ?? null)
@@ -491,6 +507,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
     ...(input.recordedSourceSha === undefined ? {} : { recordedSourceSha: input.recordedSourceSha }),
     ...(input.recordedSourceTree === undefined ? {} : { recordedSourceTree: input.recordedSourceTree }),
     ...(input.serviceTarget === undefined ? {} : { serviceTarget: input.serviceTarget }),
+    ...(input.serviceDisabledStateBefore === undefined ? {} : { serviceDisabledStateBefore: input.serviceDisabledStateBefore }),
     ...(input.initialInstall === undefined ? {} : { initialInstall: input.initialInstall }),
     protectedReferenceRoot: input.protectedReferenceRoot ?? null,
     ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
@@ -534,6 +551,36 @@ export async function finalizeVerifiedServiceTargetStop(
       throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Service-target stop is not awaiting verified completion");
     await verifyServiceTargetStopCompletion({ ...input, dataRoot });
     return finalizeRecoveryPolicyOperationUnlocked({ ...input, dataRoot, state: "COMMITTED" }, false, true);
+  });
+}
+
+/** Records present-state maintenance readiness; the historical stop stays unresolved. */
+export async function resolveUnknownServiceTargetStopForMaintenance(
+  input: RecoveryPolicyOperationInput & { readonly transactionId: string },
+  ownerConfirmation: string,
+): Promise<RecoveryPolicyPublicRecord> {
+  if (input.operation !== "SUPERVISOR_SERVICE_TARGET_STOP" || ownerConfirmation !== "RESOLVE IRIS SERVICE-TARGET STOP FOR MAINTENANCE")
+    throw new RuntimeError("CONTROL_DENIED", "Fresh Owner maintenance confirmation is required");
+  const dataRoot = await canonicalDataRoot(input.dataRoot);
+  return withPolicyLock(dataRoot, async () => {
+    const secret = await ownerSecret(dataRoot);
+    const filename = recoveryPolicyPath(dataRoot);
+    const current = await requirePolicy(filename, secret);
+    const existing = await readRecoveryPolicyOperation({ ...input, dataRoot });
+    if (existing.state !== "RECONCILIATION_REQUIRED" || existing.serviceDisabledStateBefore === undefined || existing.serviceTargetMaintenanceResolution !== undefined)
+      throw new RuntimeError("CONTROL_DENIED", "Only an unresolved stop with a durable disabled-state baseline can be maintenance-resolved");
+    const evidence = await verifyServiceTargetStopMaintenanceResolution({ ...input, dataRoot }, existing);
+    const resolvedAt = new Date().toISOString();
+    const signedEvidence = { ...evidence, resolvedAt };
+    const observationSha256 = createHash("sha256").update(JSON.stringify({ operation: existing, evidence: signedEvidence })).digest("hex");
+    const operations = current.operations.map((entry) => entry.transactionId === input.transactionId && entry.operation === input.operation
+      ? { ...entry, serviceTargetMaintenanceResolution: { ...signedEvidence, observationSha256 } }
+      : entry);
+    if (!operations.some((entry) => entry.transactionId === input.transactionId && entry.operation === input.operation))
+      throw new RuntimeError("CONTROL_DENIED", "Unknown stop transaction is not in the current policy");
+    const next = { ...current, operations, audit: [...current.audit, { event: "SERVICE_TARGET_STOP_MAINTENANCE_RESOLVED" as const, operation: input.operation, requestId: input.requestId, transactionId: input.transactionId, state: "RECONCILIATION_REQUIRED" as const, at: resolvedAt }] };
+    await writeSigned(filename, sign(next, secret));
+    return next;
   });
 }
 
@@ -607,7 +654,7 @@ export async function readRecoveryPolicyOperation(input: RecoveryPolicyOperation
       "Recovery policy identity does not match",
     );
   const entry = current.operations.find((candidate) => candidate.transactionId === input.transactionId && candidate.requestId === input.requestId && candidate.operation === input.operation);
-  if (entry === undefined || entry.sourceSha !== input.sourceSha || entry.sourceTree !== input.sourceTree || entry.sourceRoot !== input.sourceRoot || entry.controlScript !== input.controlScript || entry.executable !== input.executable || (entry.executableSha256 ?? null) !== (input.executableSha256 ?? null) || JSON.stringify(entry.executableArguments) !== JSON.stringify(input.executableArguments) || entry.runtimePreflightSha256 !== input.runtimePreflightSha256 || entry.runtimeLoaderSha256 !== input.runtimeLoaderSha256 || entry.beforeMetadataSha256 !== input.beforeMetadataSha256 || entry.beforePlistSha256 !== input.beforePlistSha256 || entry.recordedSourceRoot !== input.recordedSourceRoot || entry.recordedSourceSha !== input.recordedSourceSha || entry.recordedSourceTree !== input.recordedSourceTree || JSON.stringify(entry.serviceTarget ?? null) !== JSON.stringify(input.serviceTarget ?? null) || !sameInitialInstall(entry.initialInstall, input.initialInstall) || entry.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) || (entry.machineId ?? null) !== (input.machineId ?? null)) throw new RuntimeError("CONTROL_DENIED", "Recovery policy operation binding is not authenticated");
+  if (entry === undefined || entry.sourceSha !== input.sourceSha || entry.sourceTree !== input.sourceTree || entry.sourceRoot !== input.sourceRoot || entry.controlScript !== input.controlScript || entry.executable !== input.executable || (entry.executableSha256 ?? null) !== (input.executableSha256 ?? null) || JSON.stringify(entry.executableArguments) !== JSON.stringify(input.executableArguments) || entry.runtimePreflightSha256 !== input.runtimePreflightSha256 || entry.runtimeLoaderSha256 !== input.runtimeLoaderSha256 || entry.beforeMetadataSha256 !== input.beforeMetadataSha256 || entry.beforePlistSha256 !== input.beforePlistSha256 || entry.recordedSourceRoot !== input.recordedSourceRoot || entry.recordedSourceSha !== input.recordedSourceSha || entry.recordedSourceTree !== input.recordedSourceTree || JSON.stringify(entry.serviceTarget ?? null) !== JSON.stringify(input.serviceTarget ?? null) || input.serviceDisabledStateBefore !== undefined && entry.serviceDisabledStateBefore !== input.serviceDisabledStateBefore || !sameInitialInstall(entry.initialInstall, input.initialInstall) || entry.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) || (entry.machineId ?? null) !== (input.machineId ?? null)) throw new RuntimeError("CONTROL_DENIED", "Recovery policy operation binding is not authenticated");
   return entry;
 }
 
@@ -1118,6 +1165,8 @@ function validateOperation(input: RecoveryPolicyOperationInput): void {
     throw new RuntimeError("INVALID_REQUEST", "Service-target identity is only valid for its dedicated recovery operation");
   if (input.initialInstall !== undefined && input.operation !== "SUPERVISOR_BOOTSTRAP")
     throw new RuntimeError("INVALID_REQUEST", "Absent installation authority cannot authorize migration or tunnel recovery");
+  if (input.serviceDisabledStateBefore !== undefined && (input.operation !== "SUPERVISOR_SERVICE_TARGET_STOP" || !["EXPLICIT_ENABLED", "EXPLICIT_DISABLED", "NO_EXPLICIT_OVERRIDE"].includes(input.serviceDisabledStateBefore)))
+    throw new RuntimeError("INVALID_REQUEST", "Service-target disabled-state baseline is invalid");
   if (
     !isUuid(input.policyId) ||
     !isUuid(input.requestId) ||
@@ -1172,6 +1221,9 @@ function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolic
     && record.operations.length <= MAX_ENTRIES
     && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && validBeforeImage(entry as RecoveryPolicyOperationJournal) && ((entry as RecoveryPolicyOperationJournal).recordedSourceRoot === undefined || isCanonicalRecordedSourceRoot((entry as RecoveryPolicyOperationJournal).recordedSourceRoot)) && ((entry as RecoveryPolicyOperationJournal).operation !== "SUPERVISOR_NO_PID_RECOVERY" || (entry as RecoveryPolicyOperationJournal).recordedSourceRoot !== undefined) && ((entry as RecoveryPolicyOperationJournal).recoveryDisposition === undefined || (entry as RecoveryPolicyOperationJournal).operation === "SUPERVISOR_NO_PID_RECOVERY" && isNoPidRecoveryDisposition((entry as RecoveryPolicyOperationJournal).recoveryDisposition)) && ((entry as RecoveryPolicyOperationJournal).state !== "RECONCILIATION_REQUIRED" || (entry as RecoveryPolicyOperationJournal).operation !== "SUPERVISOR_NO_PID_RECOVERY" || (entry as RecoveryPolicyOperationJournal).recoveryDisposition !== undefined) && ((entry as RecoveryPolicyOperationJournal).initialInstall === undefined || (entry as RecoveryPolicyOperationJournal).operation === "SUPERVISOR_BOOTSTRAP") && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && (!requiresHostBinding((entry as RecoveryPolicyOperationJournal).operation) || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "FAILED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
     && record.operations.every((entry) => entry.ownerAcknowledgement === undefined || isResolvedNoPidObservation(entry))
+    && record.operations.every((entry) => entry.serviceDisabledStateBefore === undefined || entry.operation === "SUPERVISOR_SERVICE_TARGET_STOP" && ["EXPLICIT_ENABLED", "EXPLICIT_DISABLED", "NO_EXPLICIT_OVERRIDE"].includes(entry.serviceDisabledStateBefore))
+    && record.operations.every((entry) => entry.serviceTargetMaintenanceResolution === undefined || isResolvedServiceTargetStopMaintenance(entry))
+    && record.operations.every((entry) => entry.serviceTargetMaintenanceResolution === undefined || entry.operation === "SUPERVISOR_SERVICE_TARGET_STOP")
     && record.operations.every((entry) => entry.operation !== "SUPERVISOR_SERVICE_TARGET_STOP" || isCanonicalRecordedSourceRoot(entry.recordedSourceRoot) && HASH40.test(entry.recordedSourceSha ?? "") && HASH40.test(entry.recordedSourceTree ?? "") && isRecoveryPolicyServiceTarget(entry.serviceTarget))
     && record.operations.every((entry) => entry.operation === "SUPERVISOR_SERVICE_TARGET_STOP" || entry.recordedSourceSha === undefined && entry.recordedSourceTree === undefined && entry.serviceTarget === undefined)
     && Array.isArray(record.audit)
@@ -1191,7 +1243,22 @@ function allPolicyOperations(record: RecoveryPolicyPublicRecord): readonly Recov
 }
 
 function isUnresolvedPolicyOperation(entry: RecoveryPolicyOperationJournal): boolean {
-  return entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED" && !isResolvedNoPidObservation(entry);
+  return entry.state === "RESERVED" || entry.state === "RECONCILIATION_REQUIRED" && !isResolvedNoPidObservation(entry) && !isResolvedServiceTargetStopMaintenance(entry);
+}
+
+function isResolvedServiceTargetStopMaintenance(entry: RecoveryPolicyOperationJournal): boolean {
+  const resolution = entry.serviceTargetMaintenanceResolution;
+  if (entry.operation !== "SUPERVISOR_SERVICE_TARGET_STOP" || entry.state !== "RECONCILIATION_REQUIRED" || resolution === undefined
+    || entry.serviceDisabledStateBefore === undefined || resolution.serviceState !== "ABSENT" || resolution.registeredPlistState !== "MISSING"
+    || resolution.processState !== "DEAD" || resolution.metadataSha256 !== entry.beforeMetadataSha256
+    || resolution.privatePlistSha256 !== entry.beforePlistSha256 || resolution.disabledStateBefore !== entry.serviceDisabledStateBefore
+    || resolution.disabledStateAfter !== entry.serviceDisabledStateBefore || !HASH64.test(resolution.observationSha256)
+    || !Number.isFinite(Date.parse(resolution.resolvedAt))) return false;
+  const evidence = { serviceState: resolution.serviceState, registeredPlistState: resolution.registeredPlistState, processState: resolution.processState,
+    metadataSha256: resolution.metadataSha256, privatePlistSha256: resolution.privatePlistSha256,
+    disabledStateBefore: resolution.disabledStateBefore, disabledStateAfter: resolution.disabledStateAfter, resolvedAt: resolution.resolvedAt };
+  const original = Object.fromEntries(Object.entries(entry).filter(([key]) => key !== "serviceTargetMaintenanceResolution"));
+  return resolution.observationSha256 === createHash("sha256").update(JSON.stringify({ operation: original, evidence })).digest("hex");
 }
 
 function isResolvedNoPidObservation(entry: RecoveryPolicyOperationJournal): boolean {
