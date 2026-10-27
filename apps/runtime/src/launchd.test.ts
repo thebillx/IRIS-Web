@@ -62,6 +62,8 @@ interface FakeLaunchd {
   afterBootstrap: (() => Promise<void>) | null;
   beforeProcessObservation: ((count: number) => void) | null;
   processObservationCount: number;
+  beforeServiceObservation: ((count: number) => void) | null;
+  serviceObservationCount: number;
   readonly live: {
     pid: number | null;
     processStartMarker: string;
@@ -91,6 +93,8 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
     afterBootstrap: null,
     beforeProcessObservation: null,
     processObservationCount: 0,
+    beforeServiceObservation: null,
+    serviceObservationCount: 0,
     live: {
       pid: 4242,
       processStartMarker: '1:000001',
@@ -121,6 +125,8 @@ function fakeLaunchd(homeDirectory: string, dataRoot: string, executable: string
         return { stdout: `gui/${uid}` };
       }
       if (command === 'print' && target === `gui/${uid}/${LAUNCH_AGENT_LABEL}`) {
+        fake.serviceObservationCount += 1;
+        fake.beforeServiceObservation?.(fake.serviceObservationCount);
         if (fake.queryError !== null) throw fake.queryError;
         if (fake.bootout === 'delayed-success' && fake.bootoutDelay > 0) {
           fake.bootoutDelay -= 1;
@@ -1054,25 +1060,37 @@ describe('Owner-authorized service-target stop', () => {
     expect(identityDrift.subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
   });
 
-  it('keeps a same-label service-definition rebind at the bootout boundary unresolved without replay', async () => {
-    const { subject, policy } = await loadedNoPidFixture();
-    subject.fake.bootout = 'unknown-success';
-    subject.fake.beforeBootout = () => {
+  it('rejects same-label executable and argument drift observed during the reserved second preflight', async () => {
+    const { subject, paths, policy } = await loadedNoPidFixture();
+    const beforeImages = await Promise.all([paths.plist, paths.registeredPlist, paths.metadata].map((file) => readFile(file, 'utf8')));
+    const firstObservation = subject.fake.serviceObservationCount;
+    let injectionWitness = false;
+    subject.fake.beforeServiceObservation = (count) => {
+      if (count !== firstObservation + 2) return;
       subject.fake.live.executable = path.join(os.tmpdir(), 'foreign-supervisor');
       subject.fake.live.arguments = [subject.fake.live.executable, 'foreign-control.ts', 'supervisor'];
+      injectionWitness = true;
     };
     const requestId = randomUUID();
-    const input = { dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId };
 
-    await expect(stopLoadedLaunchAgentByServiceTarget(input, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies))
-      .rejects.toThrow(/do not retry/);
-    expect(subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
-    expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0])
-      .toMatchObject({ operation: 'SUPERVISOR_SERVICE_TARGET_STOP', state: 'RECONCILIATION_REQUIRED' });
+    await expect(stopLoadedLaunchAgentByServiceTarget({
+      dataRoot: subject.dataRoot,
+      recoveryPolicyId: policy.policyId,
+      requestId,
+    }, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies))
+      .rejects.toThrow(/Loaded service definition conflicts with recorded LaunchAgent identity/);
 
-    await expect(stopLoadedLaunchAgentByServiceTarget(input, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies))
-      .rejects.toThrow(/must not be replayed/);
-    expect(subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
+    expect(injectionWitness).toBe(true);
+    expect(subject.fake.serviceObservationCount).toBe(firstObservation + 2);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout '))).toHaveLength(0);
+    const policyAfter = await readRecoveryAuthorizationPolicy(subject.dataRoot);
+    expect(policyAfter?.operations).toContainEqual(expect.objectContaining({
+      operation: 'SUPERVISOR_SERVICE_TARGET_STOP',
+      requestId,
+      state: 'FAILED',
+    }));
+    expect(policyAfter?.operations.some((operation) => operation.requestId === requestId && operation.state === 'COMMITTED')).toBe(false);
+    expect(await Promise.all([paths.plist, paths.registeredPlist, paths.metadata].map((file) => readFile(file, 'utf8')))).toEqual(beforeImages);
   });
 
   it('records a post-stop disabled-state race as unresolved without disabling the service', async () => {

@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -36,6 +36,59 @@ async function temp(prefix: string): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), prefix));
   roots.push(root);
   return root;
+}
+
+async function fixtureCommand(command: string, args: string[], cwd: string, timeout = 60_000): Promise<string> {
+  const result = await exec(command, args, { cwd, encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024 });
+  return result.stdout;
+}
+
+async function sourceManifest(root: string) {
+  const [head, tree, status, activation] = await Promise.all([
+    fixtureCommand('git', ['rev-parse', 'HEAD'], root),
+    fixtureCommand('git', ['rev-parse', 'HEAD^{tree}'], root),
+    fixtureCommand('git', ['status', '--porcelain', '--untracked-files=no'], root),
+    inspectActivationSourceIdentity(root),
+  ]);
+  return { head: head.trim(), tree: tree.trim(), trackedStatus: status.trim(), activation };
+}
+
+async function syntheticRelease(baseCommit: string, sourceMarker: 'SOURCE_A' | 'SOURCE_B', store: string) {
+  const container = await temp(`iris-r09-${sourceMarker.toLowerCase()}-`);
+  const release = path.join(container, 'source');
+  await fixtureCommand('git', ['clone', '--shared', '--no-checkout', sourceRoot, release], sourceRoot, 120_000);
+  await fixtureCommand('git', ['checkout', '--detach', baseCommit], release);
+  const entrypoint = path.join(release, 'apps/runtime/src/main.ts');
+  const original = await readFile(entrypoint, 'utf8');
+  const markerPrelude = [
+    "import { appendFileSync } from 'node:fs';",
+    "import path from 'node:path';",
+    "import { startDaemon } from './daemon.js';",
+    'const r09MarkerRoot = process.env.IRIS_RUNTIME_DATA_ROOT;',
+    "if (r09MarkerRoot === undefined) throw new Error('R09 fixture data root is missing');",
+    `appendFileSync(path.join(r09MarkerRoot, 'r09-source-marker'), ${JSON.stringify(sourceMarker + '\n')});`,
+  ].join('\n');
+  const instrumented = original.replace("import { startDaemon } from './daemon.js';", markerPrelude);
+  if (instrumented === original) throw new Error('Synthetic source marker insertion point was not found');
+  await writeFile(entrypoint, instrumented);
+  await fixtureCommand('git', ['add', '--', 'apps/runtime/src/main.ts'], release);
+  await fixtureCommand('git', [
+    '-c', 'user.name=IRIS Disposable Test',
+    '-c', 'user.email=iris-disposable@example.invalid',
+    'commit', '-m', `R09 ${sourceMarker} immutable executable fixture`,
+  ], release);
+  const syntheticHead = (await fixtureCommand('git', ['rev-parse', 'HEAD'], release)).trim();
+  if ((await fixtureCommand('git', ['rev-parse', 'HEAD^'], release)).trim() !== baseCommit) {
+    throw new Error(`${sourceMarker} synthetic source parent changed`);
+  }
+  await fixtureCommand('pnpm', [
+    'install', '--frozen-lockfile', '--ignore-scripts', '--store-dir', store,
+  ], release, 300_000);
+  const manifest = await sourceManifest(release);
+  if (manifest.head !== syntheticHead || manifest.trackedStatus.length !== 0) {
+    throw new Error(`${sourceMarker} source failed immutable manifest attestation`);
+  }
+  return { path: release, head: syntheticHead, baseCommit, parent: baseCommit, manifest };
 }
 
 async function json<T>(url: string, init: RequestInit = {}): Promise<T> {
@@ -149,6 +202,220 @@ describe('runtime lifecycle integration', () => {
       if ((await runtimeStatus(dataRoot)).state === 'running') await stopRuntime(dataRoot, 15_000);
     }
   }, 45_000);
+
+
+  it('selects a distinct attested executable only after source A fails health and preserves a fallback abort', async () => {
+    const dataRootA = await temp('iris-r09-runtime-source-a-data-');
+    const dataRootB = await temp('iris-r09-runtime-source-b-data-');
+    managedRuntimeRoots.add(dataRootA);
+    managedRuntimeRoots.add(dataRootB);
+    const store = process.env.IRIS_R09_PNPM_STORE ?? path.join(await temp('iris-r09-pnpm-store-'), 'store');
+    await mkdir(store, { recursive: true, mode: 0o700 });
+    const evidenceDirectory = process.env.IRIS_R09_EVIDENCE_DIR ?? await temp('iris-r09-evidence-');
+    await mkdir(evidenceDirectory, { recursive: true, mode: 0o700 });
+    const evidencePath = path.join(evidenceDirectory, 'r09-two-source-fallback.json');
+    const receipt: Record<string, unknown> = {
+      schemaVersion: 1,
+      scenario: 'synthetic-two-source-executable-fallback',
+      sourceA: null,
+      sourceB: null,
+      health: [],
+      executableWitnesses: [],
+      cleanup: [],
+      outcome: 'IN_PROGRESS',
+    };
+    let releaseA: Awaited<ReturnType<typeof syntheticRelease>> | undefined;
+    let releaseB: Awaited<ReturnType<typeof syntheticRelease>> | undefined;
+    let assertionFailed = false;
+    let unresolvedCleanup = false;
+    try {
+      const baselineA = 'dee5eee8682c9f929e5c41dec00ad76c78d1c5b8';
+      const baselineB = '0aea216efe662395fc6789ef11ec7592887408ed';
+      releaseA = await syntheticRelease(baselineA, 'SOURCE_A', store);
+      releaseB = await syntheticRelease(baselineB, 'SOURCE_B', store);
+      expect(releaseA.head).not.toBe(releaseB.head);
+      expect(releaseA.manifest.activation.candidateFingerprint).not.toBe(releaseB.manifest.activation.candidateFingerprint);
+      receipt.sourceA = { path: releaseA.path, head: releaseA.head, parent: releaseA.parent, baseCommit: releaseA.baseCommit, manifest: releaseA.manifest };
+      receipt.sourceB = { path: releaseB.path, head: releaseB.head, parent: releaseB.parent, baseCommit: releaseB.baseCommit, manifest: releaseB.manifest };
+
+      const canonicalA = await canonicalDataRoot(dataRootA);
+      const runtimeIdA = await loadOrCreateRuntimeId(canonicalA);
+      const machineIdA = await loadOrCreateMachineId(canonicalA);
+      await initializeConnectorRegistry(canonicalA, {
+        fullTunnelId: `tunnel_${'a'.repeat(32)}`,
+        proTunnelId: `tunnel_${'b'.repeat(32)}`,
+      });
+      await bindConnectorRuntime(canonicalA, runtimeIdA, machineIdA);
+      const startedAReady = await startRuntime({
+        dataRoot: dataRootA, preferredPort: 0, startupDeadlineMs: 20_000,
+        sourceRoot: releaseA.path, expectedSourceIdentity: releaseA.manifest.activation,
+      });
+      expect(startedAReady.state).toBe('running');
+      expect(startedAReady.endpoint).toMatchObject({ runtimeId: runtimeIdA, machineId: machineIdA });
+      expect(startedAReady.health).toMatchObject({
+        status: 'ready', identityState: 'COHERENT', authority: 'owned',
+        runtimeId: startedAReady.endpoint?.runtimeId,
+        instanceId: startedAReady.endpoint?.instanceId,
+        pid: startedAReady.endpoint?.pid,
+        apiUrl: startedAReady.endpoint?.apiUrl,
+        mcpUrl: startedAReady.endpoint?.mcpUrl,
+        agentExecutorType: 'development',
+        machineId: machineIdA,
+      });
+      const readyMarkerA = await readFile(path.join(canonicalA, 'r09-source-marker'), 'utf8');
+      expect(readyMarkerA).toBe('SOURCE_A\\n');
+      (receipt.executableWitnesses as unknown[]).push({ source: 'A', phase: 'ready', marker: readyMarkerA, head: releaseA.head });
+      (receipt.health as unknown[]).push({
+        phase: 'A-ready',
+        state: startedAReady.state,
+        status: startedAReady.health?.status,
+        identityState: startedAReady.health?.identityState,
+        runtimeId: startedAReady.endpoint?.runtimeId,
+        instanceId: startedAReady.endpoint?.instanceId,
+      });
+      const stoppedAReady = await stopRuntime(dataRootA, 15_000);
+      expect(stoppedAReady.state).toBe('stopped');
+      await expect(probeRuntimeAuthority(canonicalA)).resolves.toEqual({ state: 'unowned' });
+      (receipt.cleanup as unknown[]).push({ source: 'A-ready', state: 'STOP_COMPLETE', authority: 'unowned' });
+
+      // Inject synthetic identity drift only after the healthy A cold-start completed.
+      await bindConnectorRuntime(canonicalA, randomUUID(), machineIdA);
+      const startedAFailed = await startRuntime({
+        dataRoot: dataRootA, preferredPort: 0, startupDeadlineMs: 20_000,
+        sourceRoot: releaseA.path, expectedSourceIdentity: releaseA.manifest.activation,
+      });
+      expect(startedAFailed.state).toBe('running');
+      expect(startedAFailed.endpoint).not.toBeNull();
+      expect(startedAFailed.health).toMatchObject({
+        status: 'failed', identityState: 'SPLIT', authority: 'owned',
+        runtimeId: startedAFailed.endpoint?.runtimeId,
+        instanceId: startedAFailed.endpoint?.instanceId,
+        pid: startedAFailed.endpoint?.pid,
+        apiUrl: startedAFailed.endpoint?.apiUrl,
+        mcpUrl: startedAFailed.endpoint?.mcpUrl,
+        agentExecutorType: 'development',
+      });
+      const markerAAfterFailure = await readFile(path.join(canonicalA, 'r09-source-marker'), 'utf8');
+      expect(markerAAfterFailure).toBe('SOURCE_A\\nSOURCE_A\\n');
+      (receipt.executableWitnesses as unknown[]).push({
+        source: 'A', phase: 'controlled-failure', marker: markerAAfterFailure, head: releaseA.head,
+      });
+      (receipt.health as unknown[]).push({
+        phase: 'A-controlled-health-failure',
+        state: startedAFailed.state,
+        status: startedAFailed.health?.status,
+        identityState: startedAFailed.health?.identityState,
+        runtimeId: startedAFailed.endpoint?.runtimeId,
+        instanceId: startedAFailed.endpoint?.instanceId,
+      });
+      const stoppedAFailed = await stopRuntime(dataRootA, 15_000);
+      expect(stoppedAFailed.state).toBe('stopped');
+      await expect(probeRuntimeAuthority(canonicalA)).resolves.toEqual({ state: 'unowned' });
+      (receipt.cleanup as unknown[]).push({ source: 'A-failed', state: 'STOP_COMPLETE', authority: 'unowned' });
+
+      const canonicalB = await canonicalDataRoot(dataRootB);
+      const runtimeIdB = await loadOrCreateRuntimeId(canonicalB);
+      const machineIdB = await loadOrCreateMachineId(canonicalB);
+      await initializeConnectorRegistry(canonicalB, {
+        fullTunnelId: `tunnel_${'c'.repeat(32)}`,
+        proTunnelId: `tunnel_${'d'.repeat(32)}`,
+      });
+      await bindConnectorRuntime(canonicalB, runtimeIdB, machineIdB);
+      const abortEvidence = path.join(canonicalB, 'r09-fallback-abort-evidence.json');
+      await writeFile(abortEvidence, '{"scenario":"stale-source-attestation","preserve":true}\n', { mode: 0o600 });
+      const staleB = { ...releaseB.manifest.activation, candidateFingerprint: '0'.repeat(64) };
+      await expect(startRuntime({
+        dataRoot: dataRootB, preferredPort: 0, startupDeadlineMs: 20_000,
+        sourceRoot: releaseB.path, expectedSourceIdentity: staleB,
+      })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+      await expect(runtimeStatus(dataRootB)).resolves.toMatchObject({ state: 'stopped' });
+      await expect(readEndpoint(dataRootB)).resolves.toBeNull();
+      await expect(readRuntimeControl(dataRootB)).resolves.toBeNull();
+      await expect(readFile(abortEvidence, 'utf8')).resolves.toContain('"preserve":true');
+      await expect(readFile(path.join(canonicalB, 'r09-source-marker'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+      (receipt.cleanup as unknown[]).push({ source: 'B-aborted-attestation', state: 'NOT_STARTED', evidencePreserved: true });
+
+      const selectedB = await startRuntime({
+        dataRoot: dataRootB, preferredPort: 0, startupDeadlineMs: 20_000,
+        sourceRoot: releaseB.path, expectedSourceIdentity: releaseB.manifest.activation,
+      });
+      expect(selectedB.state).toBe('running');
+      expect(selectedB.endpoint).not.toBeNull();
+      expect(selectedB.health).toMatchObject({
+        status: 'ready',
+        identityState: 'COHERENT',
+        authority: 'owned',
+        agentExecutorType: 'development',
+        runtimeId: selectedB.endpoint?.runtimeId,
+        instanceId: selectedB.endpoint?.instanceId,
+        pid: selectedB.endpoint?.pid,
+        apiUrl: selectedB.endpoint?.apiUrl,
+        mcpUrl: selectedB.endpoint?.mcpUrl,
+        machineId: machineIdB,
+      });
+      const markerB = await readFile(path.join(canonicalB, 'r09-source-marker'), 'utf8');
+      expect(markerB).toBe('SOURCE_B\n');
+      (receipt.executableWitnesses as unknown[]).push({ source: 'B', marker: markerB, head: releaseB.head });
+      (receipt.health as unknown[]).push({
+        phase: 'B-fallback-ready',
+        state: selectedB.state,
+        status: selectedB.health?.status,
+        identityState: selectedB.health?.identityState,
+        runtimeId: selectedB.endpoint?.runtimeId,
+        instanceId: selectedB.endpoint?.instanceId,
+        pid: selectedB.endpoint?.pid,
+        apiUrl: selectedB.endpoint?.apiUrl,
+        mcpUrl: selectedB.endpoint?.mcpUrl,
+        machineId: machineIdB,
+      });
+      const stoppedB = await stopRuntime(dataRootB, 15_000);
+      expect(stoppedB.state).toBe('stopped');
+      await expect(probeRuntimeAuthority(canonicalB)).resolves.toEqual({ state: 'unowned' });
+      (receipt.cleanup as unknown[]).push({ source: 'B', state: 'STOP_COMPLETE', authority: 'unowned' });
+
+      const afterA = await sourceManifest(releaseA.path);
+      const afterB = await sourceManifest(releaseB.path);
+      receipt.sourceA = { before: receipt.sourceA, after: afterA };
+      receipt.sourceB = { before: receipt.sourceB, after: afterB };
+      expect(afterA).toEqual(releaseA.manifest);
+      expect(afterB).toEqual(releaseB.manifest);
+      receipt.selection = 'Harness selected B after A returned failed health; no product auto-fallback API is claimed';
+      receipt.outcome = 'PASS';
+    } catch (error) {
+      assertionFailed = true;
+      receipt.outcome = 'FAIL';
+      receipt.error = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      for (const [label, dataRoot] of [['A', dataRootA], ['B', dataRootB]] as const) {
+        try {
+          const status = await runtimeStatus(dataRoot);
+          if (status.state === 'running') {
+            const stopped = await stopRuntime(dataRoot, 15_000);
+            (receipt.cleanup as unknown[]).push({ source: label, state: stopped.state, phase: 'finally' });
+          }
+          const finalStatus = await runtimeStatus(dataRoot);
+          if (finalStatus.state === 'stopped') managedRuntimeRoots.delete(dataRoot);
+          else {
+            unresolvedCleanup = true;
+            (receipt.cleanup as unknown[]).push({ source: label, state: finalStatus.state, reason: finalStatus.reason ?? 'unknown', dataPreserved: true });
+          }
+        } catch (cleanupError) {
+          unresolvedCleanup = true;
+          (receipt.cleanup as unknown[]).push({
+            source: label,
+            state: 'UNRESOLVED',
+            error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+            dataPreserved: true,
+          });
+        }
+      }
+      if (releaseA !== undefined) receipt.sourceA = { initial: releaseA.manifest, after: await sourceManifest(releaseA.path).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })) };
+      if (releaseB !== undefined) receipt.sourceB = { initial: releaseB.manifest, after: await sourceManifest(releaseB.path).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })) };
+      await writeFile(evidencePath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+      if (unresolvedCleanup && !assertionFailed) throw new Error('Synthetic fallback cleanup is unresolved; preserve fixture data and diagnostics');
+    }
+  }, 480_000);
 
   it('rejects an identity-valid but unhydrated activation candidate before runtime spawn', async () => {
     const dataRoot = await temp('iris-lifecycle-unhydrated-');
