@@ -1,45 +1,47 @@
-name: R09 hosted disposable recovery proof
-run-name: R09 exact-source disposable proof ${{ inputs.target_sha }}
+name: R09 hosted disposable proof
+run-name: R09 exact-source proof ${{ github.sha }}
 
 on:
-  workflow_dispatch:
-    inputs:
-      target_sha:
-        description: Exact candidate commit SHA
-        required: true
-        type: string
-      target_tree:
-        description: Exact candidate tree SHA
-        required: true
-        type: string
+  push:
+    branches:
+      - codex/r09-hosted-proof-execution-v2
+    paths:
+      - .github/workflows/r09-hosted-disposable-proof.yml
+      - apps/runtime/src/launchd.test.ts
+      - apps/runtime/src/lifecycle.integration.test.ts
 
 permissions:
   contents: read
 
 concurrency:
-  group: r09-disposable-proof-${{ inputs.target_sha }}
+  group: r09-disposable-proof-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   disposable-proof:
-    if: github.ref == 'refs/heads/review/r09-hosted-disposable-proof-dee5eee8'
+    if: >-
+      github.repository == 'thebillx/IRIS-Web' &&
+      github.ref == 'refs/heads/codex/r09-hosted-proof-execution-v2' &&
+      github.event_name == 'push' &&
+      github.event.created == true &&
+      github.event.deleted == false
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
-      TARGET_SHA: ${{ inputs.target_sha }}
-      TARGET_TREE: ${{ inputs.target_tree }}
-      APPROVED_TARGET_SHA: 5f332b3db0f46ccbbf825e7eca9f0a66ecc776da
-      APPROVED_TARGET_TREE: 5fdc31d947a225bafedf9ab7bb409c303c9605c9
+      TARGET_SOURCE_SHA: a8006481e0082e48fea35ba054cd0cf5dd800fd3
+      TARGET_SOURCE_TREE: e3fc1ec4a74e6b61e4a766cb52f8fcdccb09c281
+      TARGET_SOURCE_PARENT_SHA: 0aea216efe662395fc6789ef11ec7592887408ed
       DEE5_SHA: dee5eee8682c9f929e5c41dec00ad76c78d1c5b8
       DEE5_TREE: 22dc3776007fec1243535577834e0c60b7ed3371
-      R09_TMP: ${{ runner.temp }}/iris-r09/tmp
+      IRIS_AGENT_EXECUTOR: development
     steps:
-      - name: Create job-local scratch roots
+      - name: Confine job-local paths before checkout or package setup
         shell: bash
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/iris-r09"
-          mkdir -p "$root"/{home,cache,config,data,state,corepack,pnpm,tmp,source}
+          mkdir -p "$root"/{home,cache/npm,config,data,state,corepack,pnpm-tool,pnpm-store,tmp,evidence}
+          chmod 700 "$root" "$root"/{home,cache,config,data,state,corepack,pnpm-tool,pnpm-store,tmp,evidence}
           {
             printf 'HOME=%s\n' "$root/home"
             printf 'XDG_CACHE_HOME=%s\n' "$root/cache"
@@ -47,108 +49,207 @@ jobs:
             printf 'XDG_DATA_HOME=%s\n' "$root/data"
             printf 'XDG_STATE_HOME=%s\n' "$root/state"
             printf 'COREPACK_HOME=%s\n' "$root/corepack"
-            printf 'PNPM_HOME=%s\n' "$root/pnpm"
-            printf 'TMPDIR=%s\n' "$root/tmp"
+            printf 'PNPM_HOME=%s\n' "$root/pnpm-tool"
             printf 'npm_config_cache=%s\n' "$root/cache/npm"
+            printf 'TMPDIR=%s\n' "$root/tmp"
+            printf 'IRIS_R09_PNPM_STORE=%s\n' "$root/pnpm-store"
+            printf 'IRIS_R09_EVIDENCE_DIR=%s\n' "$root/evidence"
           } >> "$GITHUB_ENV"
-          printf '%s\n' "$root/pnpm" >> "$GITHUB_PATH"
-          test -d "$root/source" && test -d "$root/tmp"
+          printf '%s\n' "$root/pnpm-tool" >> "$GITHUB_PATH"
+          test -d "$root/tmp"
+          test -d "$root/evidence"
 
-      - name: Validate dispatch identity
+      - name: Validate the immutable push event
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          [[ "$TARGET_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          test "$TARGET_SHA" = "$APPROVED_TARGET_SHA"
-          test "$TARGET_TREE" = "$APPROVED_TARGET_TREE"
-          test "$GITHUB_REF" = 'refs/heads/review/r09-hosted-disposable-proof-dee5eee8'
+          test "$GITHUB_EVENT_NAME" = 'push'
+          test "$GITHUB_REPOSITORY" = 'thebillx/IRIS-Web'
+          test "$GITHUB_REF" = 'refs/heads/codex/r09-hosted-proof-execution-v2'
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$TARGET_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$TARGET_SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
 
-      - name: Check out the immutable event commit
+      - name: Check out the immutable workflow event commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: refs/heads/review/r09-hosted-disposable-proof-dee5eee8
-          path: ${{ runner.temp }}/iris-r09/source
+          ref: ${{ github.sha }}
+          path: .r09-event
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify exact candidate and test-only delta
+      - name: Verify workflow commit separately from tested source
+        id: workflow-identity
         shell: bash
-        working-directory: ${{ runner.temp }}/iris-r09/source
+        working-directory: .r09-event
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/review/r09-hosted-disposable-proof-dee5eee8
-          git checkout --detach "$TARGET_SHA"
-          test "$(git rev-parse 'HEAD^{commit}')" = "$TARGET_SHA"
-          test "$(git rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
-          test "$(git rev-parse 'HEAD^1^{commit}')" = "$DEE5_SHA"
-          test "$(git rev-parse "$DEE5_SHA^{tree}")" = "$DEE5_TREE"
+          workspace="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+          checkout="$(pwd -P)"
+          case "$checkout/" in "$workspace/"*) ;; *) echo 'Checkout escaped GITHUB_WORKSPACE' >&2; exit 1 ;; esac
+          workflow_sha="$(git rev-parse 'HEAD^{commit}')"
+          workflow_tree="$(git rev-parse 'HEAD^{tree}')"
+          workflow_parent="$(git rev-parse 'HEAD^1^{commit}')"
+          test "$workflow_sha" = "$GITHUB_SHA"
+          test "$workflow_parent" = "$TARGET_SOURCE_SHA"
+          test "$(git rev-parse "$TARGET_SOURCE_SHA^{tree}")" = "$TARGET_SOURCE_TREE"
+          workflow_paths="$(git diff --name-only --no-renames "$TARGET_SOURCE_SHA" "$workflow_sha" | LC_ALL=C sort)"
+          test "$workflow_paths" = '.github/workflows/r09-hosted-disposable-proof.yml'
           test -z "$(git status --porcelain --untracked-files=no)"
-          diff -u <(printf '%s\n' \
+          {
+            printf 'R09_WORKFLOW_SHA=%s\n' "$workflow_sha"
+            printf 'R09_WORKFLOW_TREE=%s\n' "$workflow_tree"
+            printf 'R09_WORKFLOW_PARENT=%s\n' "$workflow_parent"
+          } >> "$GITHUB_ENV"
+          {
+            printf '### Workflow event identity\n\n'
+            printf -- '- Event commit: `%s`\n- Tree: `%s`\n- Parent/test-source: `%s`\n' "$workflow_sha" "$workflow_tree" "$workflow_parent"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Detach to and verify the exact test source
+        id: source-identity
+        shell: bash
+        working-directory: .r09-event
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "$TARGET_SOURCE_SHA^1^{commit}")" = "$TARGET_SOURCE_PARENT_SHA"
+          test "$(git rev-parse "$DEE5_SHA^{tree}")" = "$DEE5_TREE"
+          test "$(git rev-parse "$TARGET_SOURCE_SHA^{tree}")" = "$TARGET_SOURCE_TREE"
+          git checkout --detach "$TARGET_SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{commit}')" = "$TARGET_SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$TARGET_SOURCE_TREE"
+          test "$(git rev-parse 'HEAD^1^{commit}')" = "$TARGET_SOURCE_PARENT_SHA"
+          expected_paths="$(printf '%s\n' \
             '.github/workflows/r09-hosted-disposable-proof.yml' \
             'apps/runtime/src/launchd.test.ts' \
-            'apps/runtime/src/lifecycle.integration.test.ts') \
-            <(git diff --name-only --no-renames "$DEE5_SHA" "$TARGET_SHA" | LC_ALL=C sort)
-          printf 'Source `%s` / tree `%s`\nParent `%s`\n' "$TARGET_SHA" "$TARGET_TREE" "$DEE5_SHA" >> "$GITHUB_STEP_SUMMARY"
+            'apps/runtime/src/lifecycle.integration.test.ts' | LC_ALL=C sort)"
+          actual_paths="$(git diff --name-only --no-renames "$DEE5_SHA" "$TARGET_SOURCE_SHA" | LC_ALL=C sort)"
+          test "$actual_paths" = "$expected_paths"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          {
+            printf 'R09_SOURCE_SHA=%s\n' "$TARGET_SOURCE_SHA"
+            printf 'R09_SOURCE_TREE=%s\n' "$TARGET_SOURCE_TREE"
+            printf 'R09_SOURCE_PARENT=%s\n' "$TARGET_SOURCE_PARENT_SHA"
+          } >> "$GITHUB_ENV"
+          printf '\n### Tested application source\n\n- Source: `%s`\n- Tree: `%s`\n- Parent: `%s`\n- DEE5 delta: exactly the three reviewed paths\n' "$TARGET_SOURCE_SHA" "$TARGET_SOURCE_TREE" "$TARGET_SOURCE_PARENT_SHA" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Node 24
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.20.0
 
-      - name: Set up pnpm
+      - name: Set up pnpm in runner-local storage
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10.15.0
+          dest: ${{ runner.temp }}/iris-r09/pnpm-tool
 
-      - name: Verify toolchain and install frozen dependencies
+      - name: Verify effective tool and cache paths
+        id: toolchain
         shell: bash
-        working-directory: ${{ runner.temp }}/iris-r09/source
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/iris-r09"
+          test "$(node --version)" = 'v24.20.0'
+          test "$(pnpm --version)" = '10.15.0'
+          pnpm_bin="$(command -v pnpm)"
+          node - "$root" "$pnpm_bin" <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const root = fs.realpathSync(process.argv[2]);
+          const within = value => value === root || value.startsWith(root + path.sep);
+          for (const name of ['HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'COREPACK_HOME', 'npm_config_cache', 'TMPDIR', 'PNPM_HOME', 'IRIS_R09_PNPM_STORE']) {
+            const value = process.env[name];
+            if (!value || !within(fs.realpathSync(value))) throw new Error(`${name} escaped runner temp`);
+          }
+          if (!within(fs.realpathSync(process.argv[3]))) throw new Error('Resolved pnpm executable escaped runner temp');
+          NODE
+          printf 'Toolchain preflight passed: Node %s, pnpm %s\n' "$(node --version)" "$(pnpm --version)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install frozen dependencies without lifecycle scripts
+        id: dependencies
+        shell: bash
+        working-directory: .r09-event
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile --ignore-scripts --store-dir "$IRIS_R09_PNPM_STORE"
+          test "$(git rev-parse 'HEAD^{commit}')" = "$TARGET_SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$TARGET_SOURCE_TREE"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Run observable same-label rebind and no-replay tests
+        id: rebind
+        shell: bash
+        working-directory: .r09-event
+        run: |
+          set -euo pipefail
+          pnpm --filter @iris/runtime exec vitest run src/launchd.test.ts \
+            -t 'rejects same-label executable and argument drift observed during the reserved second preflight|keeps an unknown bootout unresolved and prevents a duplicate stop' \
+            --testTimeout=30000 --reporter=json --outputFile="$IRIS_R09_EVIDENCE_DIR/launchd-vitest.json"
+
+      - name: Run two-source executable fallback and abort tests
+        id: fallback
+        shell: bash
+        working-directory: .r09-event
+        run: |
+          set -euo pipefail
+          pnpm --filter @iris/runtime exec vitest run src/lifecycle.integration.test.ts \
+            -t 'selects a distinct attested executable only after source A fails health and preserves a fallback abort' \
+            --testTimeout=480000 --reporter=json --outputFile="$IRIS_R09_EVIDENCE_DIR/fallback-vitest.json"
+
+      - name: Typecheck, build, lint and diff checks
+        id: quality
+        shell: bash
+        working-directory: .r09-event
         run: |
           set -euo pipefail
           test "$(node --version)" = 'v24.20.0'
           test "$(pnpm --version)" = '10.15.0'
-          pnpm install --frozen-lockfile --ignore-scripts --store-dir "$PNPM_HOME/store"
-
-      - name: Run service-target unknown-outcome and rebind boundary tests
-        shell: bash
-        working-directory: ${{ runner.temp }}/iris-r09/source
-        run: |
-          set -euo pipefail
-          pnpm --filter @iris/runtime exec vitest run src/launchd.test.ts \
-            -t 'same-label service-definition rebind at the bootout boundary|keeps an unknown bootout unresolved and prevents a duplicate stop' \
-            --testTimeout=30000
-
-      - name: Run verified-source runtime fallback health and teardown test
-        shell: bash
-        working-directory: ${{ runner.temp }}/iris-r09/source
-        run: |
-          set -euo pipefail
-          pnpm --filter @iris/runtime exec vitest run src/lifecycle.integration.test.ts \
-            -t 'starts the verified source after rejecting a stale launch identity and tears it down cleanly' \
-            --testTimeout=45000
-
-      - name: Typecheck and build Runtime
-        shell: bash
-        working-directory: ${{ runner.temp }}/iris-r09/source
-        run: |
-          set -euo pipefail
           pnpm --filter @iris/runtime typecheck
           pnpm --filter @iris/runtime build
-
-      - name: Lint candidate tests and verify diff
-        shell: bash
-        working-directory: ${{ runner.temp }}/iris-r09/source
-        run: |
-          set -euo pipefail
           pnpm exec eslint apps/runtime/src/launchd.test.ts apps/runtime/src/lifecycle.integration.test.ts
-          git diff --check "$DEE5_SHA" "$TARGET_SHA"
+          git diff --check "$DEE5_SHA" "$TARGET_SOURCE_SHA"
+
+      - name: Preserve machine-readable phase results and cleanup diagnostics
+        if: always()
+        shell: bash
+        env:
+          R09_EVENT_SHA: ${{ github.sha }}
+          R09_EVENT_REF: ${{ github.ref }}
+          R09_RUNNER_OS: ${{ runner.os }}
+          R09_RUNNER_ARCH: ${{ runner.arch }}
+          R09_REBIND_OUTCOME: ${{ steps.rebind.outcome }}
+          R09_FALLBACK_OUTCOME: ${{ steps.fallback.outcome }}
+          R09_QUALITY_OUTCOME: ${{ steps.quality.outcome }}
+        run: |
+          set -u
+          root="$RUNNER_TEMP/iris-r09"
+          mkdir -p "$root/evidence"
+          receipt="$root/evidence/workflow-result.json"
+          printf '{"workflow_sha":"%s","workflow_tree":"%s","workflow_parent":"%s","tested_source_sha":"%s","tested_source_tree":"%s","tested_source_parent":"%s","event_ref":"%s","runner_os":"%s","runner_arch":"%s","rebind_step":"%s","fallback_step":"%s","quality_step":"%s"}\n' \
+            "${R09_WORKFLOW_SHA:-$R09_EVENT_SHA}" "${R09_WORKFLOW_TREE:-}" "${R09_WORKFLOW_PARENT:-}" \
+            "${R09_SOURCE_SHA:-}" "${R09_SOURCE_TREE:-}" "${R09_SOURCE_PARENT:-}" \
+            "$R09_EVENT_REF" "$R09_RUNNER_OS" "$R09_RUNNER_ARCH" \
+            "$R09_REBIND_OUTCOME" "$R09_FALLBACK_OUTCOME" "$R09_QUALITY_OUTCOME" > "$receipt"
+          {
+            printf '### R09 machine-readable execution receipt\n\n'
+            printf '`%s`\n\n' "$receipt"
+            printf '\n#### Test output files (included even after failure)\n'
+            for file in "$root"/evidence/*.json; do
+              [ -f "$file" ] || continue
+              printf '\n##### %s\n\n```json\n' "$(basename "$file")"
+              cat "$file"
+              printf '\n```\n'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$receipt" >> "$GITHUB_STEP_SUMMARY"
 
       - name: State proof limitations
+        if: always()
         shell: bash
         run: |
-          set -euo pipefail
           {
-            printf '%s\n' 'Disposable tests do not establish real launchd same-UID actor exclusion.'
-            printf '%s\n' 'This workflow does not prove runnable historical rollback on RARW.'
+            printf '%s\n' 'This harness selects source B after source A returns failed health; no product automatic-fallback API is claimed.'
+            printf '%s\n' 'The synthetic two-source proof does not establish historical RARW rollback or same-UID actor exclusion.'
+            printf '%s\n' 'Private review publication does not match this workflow trigger. Hosted execution requires a separately reviewed exact source grant and a qualifying public execution-ref push.'
           } >> "$GITHUB_STEP_SUMMARY"
