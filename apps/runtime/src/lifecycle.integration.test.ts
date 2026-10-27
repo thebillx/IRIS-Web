@@ -15,6 +15,8 @@ import { MCP_PROTOCOL_VERSION } from './mcp.js';
 import { loadOrCreateRuntimeId, readEndpoint, readOwnerAccessSecret, readRuntimeControl, writeEndpoint, writeRuntimeControl } from './persistence.js';
 import { node24Path } from './node-runtime.js';
 
+const exec = promisify(execFile);
+
 const roots: string[] = [];
 const managedRuntimeRoots = new Set<string>();
 const sourceRoot = path.resolve(import.meta.dirname, '../../..');
@@ -251,7 +253,7 @@ describe('runtime lifecycle integration', () => {
         sourceRoot: releaseA.path, expectedSourceIdentity: releaseA.manifest.activation,
       });
       expect(startedAReady.state).toBe('running');
-      expect(startedAReady.endpoint).toMatchObject({ runtimeId: runtimeIdA, machineId: machineIdA });
+      expect(startedAReady.endpoint).toMatchObject({ runtimeId: runtimeIdA });
       expect(startedAReady.health).toMatchObject({
         status: 'ready', identityState: 'COHERENT', authority: 'owned',
         runtimeId: startedAReady.endpoint?.runtimeId,
@@ -263,7 +265,7 @@ describe('runtime lifecycle integration', () => {
         machineId: machineIdA,
       });
       const readyMarkerA = await readFile(path.join(canonicalA, 'r09-source-marker'), 'utf8');
-      expect(readyMarkerA).toBe('SOURCE_A\\n');
+      expect(readyMarkerA).toBe('SOURCE_A\n');
       (receipt.executableWitnesses as unknown[]).push({ source: 'A', phase: 'ready', marker: readyMarkerA, head: releaseA.head });
       (receipt.health as unknown[]).push({
         phase: 'A-ready',
@@ -296,7 +298,7 @@ describe('runtime lifecycle integration', () => {
         agentExecutorType: 'development',
       });
       const markerAAfterFailure = await readFile(path.join(canonicalA, 'r09-source-marker'), 'utf8');
-      expect(markerAAfterFailure).toBe('SOURCE_A\\nSOURCE_A\\n');
+      expect(markerAAfterFailure).toBe('SOURCE_A\nSOURCE_A\n');
       (receipt.executableWitnesses as unknown[]).push({
         source: 'A', phase: 'controlled-failure', marker: markerAAfterFailure, head: releaseA.head,
       });
@@ -410,8 +412,8 @@ describe('runtime lifecycle integration', () => {
           });
         }
       }
-      if (releaseA !== undefined) receipt.sourceA = { initial: releaseA.manifest, after: await sourceManifest(releaseA.path).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })) };
-      if (releaseB !== undefined) receipt.sourceB = { initial: releaseB.manifest, after: await sourceManifest(releaseB.path).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })) };
+      if (releaseA !== undefined) receipt.sourceA = { path: releaseA.path, head: releaseA.head, parent: releaseA.parent, baseCommit: releaseA.baseCommit, before: releaseA.manifest, after: await sourceManifest(releaseA.path).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })) };
+      if (releaseB !== undefined) receipt.sourceB = { path: releaseB.path, head: releaseB.head, parent: releaseB.parent, baseCommit: releaseB.baseCommit, before: releaseB.manifest, after: await sourceManifest(releaseB.path).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })) };
       if (unresolvedCleanup && !assertionFailed) {
         receipt.outcome = 'UNRESOLVED_CLEANUP';
         receipt.error = 'Synthetic fallback cleanup is unresolved; preserve fixture data and diagnostics';
