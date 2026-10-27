@@ -1054,6 +1054,27 @@ describe('Owner-authorized service-target stop', () => {
     expect(identityDrift.subject.fake.calls.some((call) => call.startsWith('bootout '))).toBe(false);
   });
 
+  it('keeps a same-label service-definition rebind at the bootout boundary unresolved without replay', async () => {
+    const { subject, policy } = await loadedNoPidFixture();
+    subject.fake.bootout = 'unknown-success';
+    subject.fake.beforeBootout = () => {
+      subject.fake.live.executable = path.join(os.tmpdir(), 'foreign-supervisor');
+      subject.fake.live.arguments = [subject.fake.live.executable, 'foreign-control.ts', 'supervisor'];
+    };
+    const requestId = randomUUID();
+    const input = { dataRoot: subject.dataRoot, recoveryPolicyId: policy.policyId, requestId };
+
+    await expect(stopLoadedLaunchAgentByServiceTarget(input, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies))
+      .rejects.toThrow(/do not retry/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
+    expect((await readRecoveryAuthorizationPolicy(subject.dataRoot))?.operations[0])
+      .toMatchObject({ operation: 'SUPERVISOR_SERVICE_TARGET_STOP', state: 'RECONCILIATION_REQUIRED' });
+
+    await expect(stopLoadedLaunchAgentByServiceTarget(input, 'STOP IRIS SUPERVISOR SERVICE TARGET', subject.fake.dependencies))
+      .rejects.toThrow(/must not be replayed/);
+    expect(subject.fake.calls.filter((call) => call.startsWith('bootout --wait '))).toHaveLength(1);
+  });
+
   it('records a post-stop disabled-state race as unresolved without disabling the service', async () => {
     const { subject, policy } = await loadedNoPidFixture();
     subject.fake.beforeBootout = () => { subject.fake.disabled = true; };

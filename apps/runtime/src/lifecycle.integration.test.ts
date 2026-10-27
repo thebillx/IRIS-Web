@@ -113,6 +113,43 @@ describe('runtime lifecycle integration', () => {
     }
   }, 30_000);
 
+  it('starts the verified source after rejecting a stale launch identity and tears it down cleanly', async () => {
+    const dataRoot = await temp('iris-lifecycle-source-fallback-');
+    managedRuntimeRoots.add(dataRoot);
+    const actualIdentity = await inspectActivationSourceIdentity(sourceRoot);
+    const staleIdentity = { ...actualIdentity, candidateFingerprint: '0'.repeat(64) };
+
+    try {
+      await expect(startRuntime({
+        dataRoot,
+        preferredPort: 0,
+        startupDeadlineMs: 15_000,
+        sourceRoot,
+        expectedSourceIdentity: staleIdentity,
+      })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+      await expect(runtimeStatus(dataRoot)).resolves.toMatchObject({ state: 'stopped' });
+      await expect(readEndpoint(dataRoot)).resolves.toBeNull();
+      await expect(readRuntimeControl(dataRoot)).resolves.toBeNull();
+
+      const started = await startRuntime({
+        dataRoot,
+        preferredPort: 0,
+        startupDeadlineMs: 15_000,
+        sourceRoot,
+        expectedSourceIdentity: actualIdentity,
+      });
+      expect(started.state).toBe('running');
+      expect(started.endpoint).not.toBeNull();
+      expect(started.health?.authority).toBe('owned');
+
+      const stopped = await stopRuntime(dataRoot, 15_000);
+      expect(stopped.state).toBe('stopped');
+      expect(await probeRuntimeAuthority(dataRoot)).toEqual({ state: 'unowned' });
+    } finally {
+      if ((await runtimeStatus(dataRoot)).state === 'running') await stopRuntime(dataRoot, 15_000);
+    }
+  }, 45_000);
+
   it('rejects an identity-valid but unhydrated activation candidate before runtime spawn', async () => {
     const dataRoot = await temp('iris-lifecycle-unhydrated-');
     const candidate = await temp('iris-lifecycle-unhydrated-source-');
