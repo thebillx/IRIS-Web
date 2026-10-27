@@ -28,10 +28,10 @@ jobs:
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       TARGET_TREE: ${{ inputs.target_tree }}
-      EVENT_SHA: ${{ github.sha }}
+      APPROVED_TARGET_SHA: 5f332b3db0f46ccbbf825e7eca9f0a66ecc776da
+      APPROVED_TARGET_TREE: 5fdc31d947a225bafedf9ab7bb409c303c9605c9
       DEE5_SHA: dee5eee8682c9f929e5c41dec00ad76c78d1c5b8
       DEE5_TREE: 22dc3776007fec1243535577834e0c60b7ed3371
-      R09_SOURCE_DIR: ${{ runner.temp }}/iris-r09/source
       R09_TMP: ${{ runner.temp }}/iris-r09/tmp
     steps:
       - name: Create job-local scratch roots
@@ -60,13 +60,14 @@ jobs:
           set -euo pipefail
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$TARGET_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          test "$TARGET_SHA" = "$EVENT_SHA"
+          test "$TARGET_SHA" = "$APPROVED_TARGET_SHA"
+          test "$TARGET_TREE" = "$APPROVED_TARGET_TREE"
           test "$GITHUB_REF" = 'refs/heads/review/r09-hosted-disposable-proof-dee5eee8'
 
       - name: Check out the immutable event commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.sha }}
+          ref: refs/heads/review/r09-hosted-disposable-proof-dee5eee8
           path: ${{ runner.temp }}/iris-r09/source
           fetch-depth: 0
           persist-credentials: false
@@ -76,6 +77,8 @@ jobs:
         working-directory: ${{ runner.temp }}/iris-r09/source
         run: |
           set -euo pipefail
+          git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/review/r09-hosted-disposable-proof-dee5eee8
+          git checkout --detach "$TARGET_SHA"
           test "$(git rev-parse 'HEAD^{commit}')" = "$TARGET_SHA"
           test "$(git rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
           test "$(git rev-parse 'HEAD^1^{commit}')" = "$DEE5_SHA"
@@ -138,7 +141,7 @@ jobs:
         working-directory: ${{ runner.temp }}/iris-r09/source
         run: |
           set -euo pipefail
-          pnpm --filter @iris/runtime exec eslint src/launchd.test.ts src/lifecycle.integration.test.ts
+          pnpm exec eslint apps/runtime/src/launchd.test.ts apps/runtime/src/lifecycle.integration.test.ts
           git diff --check "$DEE5_SHA" "$TARGET_SHA"
 
       - name: State proof limitations
