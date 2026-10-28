@@ -432,7 +432,7 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
   try { await writeDurableExclusive(intentPath, intent); }
   catch (error: unknown) { if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'EEXIST') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery intent already exists; explicit reconciliation is required'); throw error; }
   const cleanup: Array<{ readonly source: 'A' | 'B'; readonly outcome: 'STOPPED' | 'UNRESOLVED' }> = [];
-  const base: Omit<RecoveryReceipt, 'outcome' | 'selectedSource' | 'primaryFailure' | 'sourceAFailure' | 'sourceBFailure' | 'cleanup'> = { schemaVersion: 2, requestId: input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA: sourceA.descriptor, sourceB: sourceB.descriptor, sourceAFailure: null, sourceBFailure: null, createdAt: new Date().toISOString() };
+  const base: Omit<RecoveryReceipt, 'outcome' | 'selectedSource' | 'primaryFailure' | 'sourceAFailure' | 'sourceBFailure' | 'cleanup'> = { schemaVersion: 2, requestId: input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA: sourceA.descriptor, sourceB: sourceB.descriptor, createdAt: new Date().toISOString() };
   let primaryFailure: string | null = null; let sourceAFailure: string | null = null; let sourceBFailure: string | null = null; let aStartAttempted = false;
   const existingRuntime = await runtime.status(dataRoot);
   if (existingRuntime.state === 'running') { const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: 'An unrelated runtime is already running', sourceAFailure: null, sourceBFailure: null, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_CHANGED', 'A pre-existing runtime cannot be attributed to Source A'); }
@@ -486,9 +486,13 @@ async function canonicalReceiptPath(dataRoot: string, requested: string): Promis
   return lexical;
 }
 function assertRecoveryEnvelope(receipt: RecoveryReceipt, requestId: string, dataRoot: string, startupDeadlineMs: number, shutdownDeadlineMs: number, sourceA: RecoverySourceDescriptor, sourceB: RecoverySourceDescriptor): void {
-  if (receipt.schemaVersion !== 2 || receipt.requestId !== requestId || receipt.dataRoot !== dataRoot || receipt.startupDeadlineMs !== startupDeadlineMs || receipt.shutdownDeadlineMs !== shutdownDeadlineMs || !sameRecoveryIdentity(receipt.sourceA, sourceA) || !sameRecoveryIdentity(receipt.sourceB, sourceB)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery receipt envelope does not match the request');
+  if (receipt.schemaVersion !== 2 || receipt.requestId !== requestId || receipt.dataRoot !== dataRoot || receipt.startupDeadlineMs !== startupDeadlineMs || receipt.shutdownDeadlineMs !== shutdownDeadlineMs || !exactRecoveryEnvelopeEqual(receipt, requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA, sourceB)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery receipt envelope does not match the request');
 }
-function immutableContentIdentityEqual(left: RecoverySourceDescriptor, right: RecoverySourceDescriptor): boolean { return left.commitSha === right.commitSha && left.treeSha === right.treeSha && left.entrypoint === right.entrypoint && left.entrypointGitBlob === right.entrypointGitBlob; }
+function immutableContentIdentityEqual(left: RecoverySourceDescriptor, right: RecoverySourceDescriptor): boolean { return left.treeSha === right.treeSha && left.entrypoint === right.entrypoint && left.entrypointGitBlob === right.entrypointGitBlob; }
+function exactRecoveryEnvelopeEqual(receipt: RecoveryReceipt, requestId: string, dataRoot: string, startupDeadlineMs: number, shutdownDeadlineMs: number, sourceA: RecoverySourceDescriptor, sourceB: RecoverySourceDescriptor): boolean {
+  return receipt.schemaVersion === 2 && receipt.requestId === requestId && receipt.dataRoot === dataRoot && receipt.startupDeadlineMs === startupDeadlineMs && receipt.shutdownDeadlineMs === shutdownDeadlineMs && exactDescriptorEqual(receipt.sourceA, sourceA) && exactDescriptorEqual(receipt.sourceB, sourceB);
+}
+function exactDescriptorEqual(left: RecoverySourceDescriptor, right: RecoverySourceDescriptor): boolean { return left.commitSha === right.commitSha && left.treeSha === right.treeSha && left.sourceRoot === right.sourceRoot && left.entrypoint === right.entrypoint && left.entrypointGitBlob === right.entrypointGitBlob; }
 async function writeDurableExclusive(filename: string, value: unknown): Promise<void> {
   const handle = await open(filename, 'wx', 0o600); try { await handle.writeFile(`${JSON.stringify(value)}\n`, 'utf8'); await handle.sync(); } finally { await handle.close(); } await syncParentDirectory(filename);
 }
