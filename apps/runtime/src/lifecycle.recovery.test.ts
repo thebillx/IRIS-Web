@@ -47,6 +47,7 @@ describe('product-owned runtime source fallback', () => {
     const [a, b, data] = await Promise.all([sourceFixture('a'), sourceFixture('b'), mkdtemp(path.join(os.tmpdir(), 'iris-r10-data-'))]);
     const calls: string[] = [];
     const runtime: RecoveryRuntimeAdapter = {
+      status: async () => stopped(),
       start: async (options) => { calls.push(options.sourceRoot ?? 'missing'); return running(); },
       stop: async () => stopped(),
     };
@@ -63,6 +64,7 @@ describe('product-owned runtime source fallback', () => {
     const calls: string[] = [];
     let stops = 0;
     const runtime: RecoveryRuntimeAdapter = {
+      status: async () => stopped(),
       start: async (options) => { calls.push(options.sourceRoot ?? 'missing'); if (calls.length === 1) throw new Error('A health failed'); return running(); },
       stop: async () => { stops += 1; return stopped(); },
     };
@@ -79,6 +81,7 @@ describe('product-owned runtime source fallback', () => {
     const receiptPath = path.join(data, 'receipt.json');
     let starts = 0;
     const runtime: RecoveryRuntimeAdapter = {
+      status: async () => stopped(),
       start: async () => { starts += 1; throw new Error('A health failed'); },
       stop: async () => { throw new Error('unknown stop outcome'); },
     };
@@ -95,6 +98,7 @@ describe('product-owned runtime source fallback', () => {
     const [a, b, data] = await Promise.all([sourceFixture('a'), sourceFixture('b'), mkdtemp(path.join(os.tmpdir(), 'iris-r10-data-'))]);
     const calls: string[] = [];
     const runtime: RecoveryRuntimeAdapter = {
+      status: async () => stopped(),
       start: async (options) => {
         calls.push(options.sourceRoot ?? 'missing');
         await writeFile(path.join(b.root, b.descriptor.entrypoint), 'drifted\n');
@@ -107,4 +111,38 @@ describe('product-owned runtime source fallback', () => {
       expect(calls).toEqual([a.root]);
     } finally { await cleanup(a.root, b.root, data); }
   });
+  it('rejects identical source descriptors and receipt escape', async () => {
+    const [a, data] = await Promise.all([sourceFixture('same'), mkdtemp(path.join(os.tmpdir(), 'iris-r10-data-'))]);
+    try {
+      await expect(recoverRuntimeWithSourceFallback({
+        requestId: 'r10-identical', dataRoot: data, receiptPath: path.join(data, 'receipt.json'),
+        sourceA: a.descriptor, sourceB: a.descriptor, runtime: { status: async () => stopped(), start: async () => running(), stop: async () => stopped() },
+      })).rejects.toThrow('distinct immutable identities');
+      await expect(recoverRuntimeWithSourceFallback({
+        requestId: 'r10-escape', dataRoot: data, receiptPath: path.join(data, '..', 'receipt.json'),
+        sourceA: a.descriptor, sourceB: { ...a.descriptor, commitSha: '0000000000000000000000000000000000000000' },
+        runtime: { status: async () => stopped(), start: async () => running(), stop: async () => stopped() },
+      })).rejects.toThrow();
+    } finally { await cleanup(a.root, data); }
+  });
+
+  it('allows one durable claim and refuses an existing in-progress claim', async () => {
+    const [a, b, data] = await Promise.all([sourceFixture('a'), sourceFixture('b'), mkdtemp(path.join(os.tmpdir(), 'iris-r10-data-'))]);
+    const input = { requestId: 'r10-claim', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const runtime: RecoveryRuntimeAdapter = {
+      status: async () => stopped(),
+      start: async () => { await gate; return running(); },
+      stop: async () => stopped(),
+    };
+    try {
+      const first = recoverRuntimeWithSourceFallback({ ...input, runtime });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await expect(recoverRuntimeWithSourceFallback({ ...input, runtime })).rejects.toThrow('intent already exists');
+      release();
+      await first;
+    } finally { release(); await cleanup(a.root, b.root, data); }
+  });
+
 });
