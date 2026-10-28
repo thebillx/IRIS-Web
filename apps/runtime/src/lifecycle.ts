@@ -417,6 +417,7 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
   const runtime = input.runtime ?? { status: runtimeStatus, start: startRuntime, stop: stopRuntime };
   const sourceA = await attestRecoverySource(input.sourceA); const sourceB = await attestRecoverySource(input.sourceB);
   if (immutableContentIdentityEqual(sourceA.descriptor, sourceB.descriptor)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery sources must be distinct immutable identities');
+  const intentPath = `${receiptPath}.intent`;
   const existing = await readRecoveryReceipt(receiptPath);
   if (existing !== null) { assertRecoveryEnvelope(existing, input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA.descriptor, sourceB.descriptor); if (existing.outcome === 'RECONCILIATION_REQUIRED') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery outcome requires explicit reconciliation'); return existing; }
   const intentPath = \`${receiptPath}.intent\`;
