@@ -419,24 +419,24 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
   catch (error: unknown) { if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'EEXIST') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery intent already exists; explicit reconciliation is required'); throw error; }
   const cleanup: Array<{ readonly source: 'A' | 'B'; readonly outcome: 'STOPPED' | 'UNRESOLVED' }> = [];
   const base: Omit<RecoveryReceipt, 'outcome' | 'selectedSource' | 'primaryFailure' | 'cleanup'> = { schemaVersion: 2, requestId: input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA: sourceA.descriptor, sourceB: sourceB.descriptor, createdAt: new Date().toISOString() };
-  let primaryFailure: string | null = null; let aStartAttempted = false;
+  let primaryFailure: string | null = null; let sourceAFailure: string | null = null; let sourceBFailure: string | null = null; let aStartAttempted = false;
   const existingRuntime = await runtime.status(dataRoot);
   if (existingRuntime.state === 'running') { const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: 'An unrelated runtime is already running', cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_CHANGED', 'A pre-existing runtime cannot be attributed to Source A'); }
   try {
-    aStartAttempted = true; await assertActivationSourceIdentity(sourceA.descriptor.sourceRoot, sourceA.activationIdentity, 'Source A changed at the launch boundary');
+    await assertActivationSourceIdentity(sourceA.descriptor.sourceRoot, sourceA.activationIdentity, 'Source A changed at the launch boundary');
     aStartAttempted = true;
     const statusA = await runtime.start({ dataRoot, sourceRoot: sourceA.descriptor.sourceRoot, expectedSourceIdentity: sourceA.activationIdentity, startupDeadlineMs });
-    if (statusA.state === 'running' && statusA.health?.status === 'ready') { const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'A', primaryFailure: null, cleanup: [] }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); return receipt; }
+    if (statusA.state === 'running' && statusA.health?.status === 'ready') { const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'A', primaryFailure: null, sourceAFailure: null, sourceBFailure: null, cleanup: [] }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); return receipt; }
     primaryFailure = statusA.reason ?? 'Source A did not reach ready health';
     sourceAFailure = primaryFailure;
   } catch (error: unknown) { primaryFailure = error instanceof Error ? error.message : String(error); }
   if (aStartAttempted) {
     try { const stopped = await runtime.stop(dataRoot, shutdownDeadlineMs); if (stopped.state !== 'stopped') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Source A cleanup was not proven'); cleanup.push({ source: 'A', outcome: 'STOPPED' }); }
-    catch (error: unknown) { cleanup.push({ source: 'A', outcome: 'UNRESOLVED' }); const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_INDETERMINATE', error instanceof Error ? error.message : String(error)); }
+    catch (error: unknown) { cleanup.push({ source: 'A', outcome: 'UNRESOLVED' }); const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure, sourceAFailure, sourceBFailure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_INDETERMINATE', error instanceof Error ? error.message : String(error)); }
   }
   let bStartAttempted = false;
   try {
-    const reattestedB = await attestRecoverySource(sourceB.descriptor); bStartAttempted = true; await assertActivationSourceIdentity(reattestedB.descriptor.sourceRoot, reattestedB.activationIdentity, 'Source B changed at the launch boundary');
+    const reattestedB = await attestRecoverySource(sourceB.descriptor); await assertActivationSourceIdentity(reattestedB.descriptor.sourceRoot, reattestedB.activationIdentity, 'Source B changed at the launch boundary');
     bStartAttempted = true;
     const statusB = await runtime.start({ dataRoot, sourceRoot: reattestedB.descriptor.sourceRoot, expectedSourceIdentity: reattestedB.activationIdentity, startupDeadlineMs });
     if (statusB.state !== 'running' || statusB.health?.status !== 'ready') throw new RuntimeError('RUNTIME_NOT_RUNNING', statusB.reason ?? 'Source B did not reach ready health');
