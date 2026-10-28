@@ -4,7 +4,7 @@ run-name: R09 exact-source proof ${{ github.sha }}
 on:
   push:
     branches:
-      - codex/r09-hosted-proof-execution-v2
+      - codex/r09-hosted-proof-execution-v4
     paths:
       - .github/workflows/r09-hosted-disposable-proof.yml
       - apps/runtime/src/launchd.test.ts
@@ -21,16 +21,16 @@ jobs:
   disposable-proof:
     if: >-
       github.repository == 'thebillx/IRIS-Web' &&
-      github.ref == 'refs/heads/codex/r09-hosted-proof-execution-v2' &&
+      github.ref == 'refs/heads/codex/r09-hosted-proof-execution-v4' &&
       github.event_name == 'push' &&
       github.event.created == true &&
       github.event.deleted == false
     runs-on: macos-15
     timeout-minutes: 90
     env:
-      TARGET_SOURCE_SHA: 9d6a16b81ee08734f7ef7d75673dd83956f8e085
-      TARGET_SOURCE_TREE: fe272ffd091f410464ae157c19b370ac2dad67d4
-      TARGET_SOURCE_PARENT_SHA: 1a64eb7cc0ff4fff6ef4486f975245731eda24b0
+      TARGET_SOURCE_SHA: 36c14824c34f81359090d024829adf550d01374c
+      TARGET_SOURCE_TREE: d823aebbebc670c62d90b01bbbbaec4038332b0d
+      TARGET_SOURCE_PARENT_SHA: 2439221fdc2cbced4f5731c8d60919a6eb24590c
       DEE5_SHA: dee5eee8682c9f929e5c41dec00ad76c78d1c5b8
       DEE5_TREE: 22dc3776007fec1243535577834e0c60b7ed3371
       IRIS_AGENT_EXECUTOR: development
@@ -65,7 +65,7 @@ jobs:
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = 'push'
           test "$GITHUB_REPOSITORY" = 'thebillx/IRIS-Web'
-          test "$GITHUB_REF" = 'refs/heads/codex/r09-hosted-proof-execution-v2'
+          test "$GITHUB_REF" = 'refs/heads/codex/r09-hosted-proof-execution-v4'
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$TARGET_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$TARGET_SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
@@ -210,7 +210,7 @@ jobs:
           pnpm exec eslint apps/runtime/src/launchd.test.ts apps/runtime/src/lifecycle.integration.test.ts
           git diff --check "$DEE5_SHA" "$TARGET_SOURCE_SHA"
 
-      - name: Preserve machine-readable phase results and cleanup diagnostics
+      - name: Preserve bounded redacted phase and cleanup diagnostics
         if: always()
         shell: bash
         env:
@@ -222,27 +222,132 @@ jobs:
           R09_FALLBACK_OUTCOME: ${{ steps.fallback.outcome }}
           R09_QUALITY_OUTCOME: ${{ steps.quality.outcome }}
         run: |
-          set -u
-          root="$RUNNER_TEMP/iris-r09"
-          mkdir -p "$root/evidence"
-          receipt="$root/evidence/workflow-result.json"
-          printf '{"workflow_sha":"%s","workflow_tree":"%s","workflow_parent":"%s","tested_source_sha":"%s","tested_source_tree":"%s","tested_source_parent":"%s","event_ref":"%s","runner_os":"%s","runner_arch":"%s","rebind_step":"%s","fallback_step":"%s","quality_step":"%s"}\n' \
-            "${R09_WORKFLOW_SHA:-$R09_EVENT_SHA}" "${R09_WORKFLOW_TREE:-}" "${R09_WORKFLOW_PARENT:-}" \
-            "${R09_SOURCE_SHA:-}" "${R09_SOURCE_TREE:-}" "${R09_SOURCE_PARENT:-}" \
-            "$R09_EVENT_REF" "$R09_RUNNER_OS" "$R09_RUNNER_ARCH" \
-            "$R09_REBIND_OUTCOME" "$R09_FALLBACK_OUTCOME" "$R09_QUALITY_OUTCOME" > "$receipt"
-          {
-            printf '### R09 machine-readable execution receipt\n\n'
-            printf '`%s`\n\n' "$receipt"
-            printf '\n#### Test output files (included even after failure)\n'
-            for file in "$root"/evidence/*.json; do
-              [ -f "$file" ] || continue
-              printf '\n##### %s\n\n```json\n' "$(basename "$file")"
-              cat "$file"
-              printf '\n```\n'
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
-          cat "$receipt" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const evidence = path.join(process.env.RUNNER_TEMP, 'iris-r09', 'evidence');
+          fs.mkdirSync(evidence, { recursive: true });
+          const issues = [];
+          const lines = ['### R09 bounded redacted diagnostics', ''];
+          const label = value => String(value ?? 'UNKNOWN').replace(/[^A-Za-z0-9_. /-]/g, '').slice(0, 160);
+          const hash = value => /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(String(value ?? '')) ? value : 'UNVERIFIED';
+          const detail = value => String(value ?? '').replace(/\u001b\[[0-9;]*m/g, '').split(/\r?\n/).slice(0, 4)
+            .map(line => /authorization|cookie|password|secret|token|api[_ -]?key|credential/i.test(line) ? '[REDACTED_SENSITIVE_LINE]'
+              : line.replace(/\b(?:https?|file):\/\/\S+/gi, '[REDACTED_URL]')
+                .replace(/\b(?:gh[pousr]_|github_pat_|sk-(?:proj-)?)\S+/g, '[REDACTED_TOKEN]')
+                .replace(/\b[A-Za-z0-9_-]{48,}\b/g, '[REDACTED_OPAQUE_VALUE]')
+                .replace(/\/(?:Users|home|private|tmp|workspaces|workspace|var)\/[^\s"'<>]*/g, '[REDACTED_PATH]')
+                .replace(/\x60/g, "'").slice(0, 240)).join('\n').slice(0, 960);
+          function readReceipt(name) {
+            try {
+              const file = path.join(evidence, name);
+              const stat = fs.lstatSync(file);
+              if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error('INVALID_FILE_OR_SIZE');
+              const result = JSON.parse(fs.readFileSync(file, 'utf8'));
+              if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('INVALID_JSON_OBJECT');
+              return result;
+            } catch (error) {
+              const reason = error.code === 'ENOENT' ? 'MISSING' : 'INVALID_OR_UNREADABLE';
+              issues.push(name + ':' + reason);
+              lines.push(name + ': ' + reason);
+              return null;
+            }
+          }
+          const phases = Object.fromEntries(['REBIND', 'FALLBACK', 'QUALITY'].map(name =>
+            [name.toLowerCase(), label(process.env['R09_' + name + '_OUTCOME'] || 'NOT_REPORTED')]));
+          lines.push('phase outcomes: ' + JSON.stringify(phases));
+          const selected = [];
+          function summarizeTests(file, expected) {
+            lines.push('', '#### ' + file);
+            const report = readReceipt(file);
+            if (!report) return;
+            const counts = Object.fromEntries(['numTotalTests', 'numPassedTests', 'numFailedTests', 'numPendingTests', 'numTodoTests']
+              .map(key => [key, Number.isSafeInteger(report[key]) && report[key] >= 0 ? report[key] : null]));
+            lines.push('counts: ' + JSON.stringify(counts));
+            const assertions = (Array.isArray(report.testResults) ? report.testResults : []).slice(0, 50)
+              .flatMap(suite => Array.isArray(suite.assertionResults) ? suite.assertionResults.slice(0, 1000) : []);
+            for (const name of expected) {
+              const matches = assertions.filter(assertion => assertion.title === name);
+              const status = matches.length === 1 ? label(matches[0].status) : 'MISSING_OR_DUPLICATE';
+              selected.push({ name, status, matchCount: matches.length });
+              lines.push('assertion: ' + name + ' | status=' + status + ' | matches=' + matches.length);
+              if (status !== 'passed') issues.push('SELECTED_ASSERTION_NOT_PASSED:' + name);
+              for (const message of (matches.length === 1 && Array.isArray(matches[0].failureMessages) ? matches[0].failureMessages : []).slice(0, 2))
+                lines.push('failure excerpt (redacted):', detail(message));
+            }
+          }
+          summarizeTests('launchd-vitest.json', [
+            'rejects same-label executable and argument drift observed during the reserved second preflight',
+            'keeps an unknown bootout unresolved and prevents a duplicate stop',
+          ]);
+          summarizeTests('fallback-vitest.json', [
+            'selects a distinct attested executable only after source A fails health and preserves a fallback abort',
+          ]);
+          lines.push('', '#### Synthetic source, health phase and cleanup receipt');
+          const fallback = readReceipt('r09-two-source-fallback.json');
+          if (fallback) {
+            lines.push('fallback outcome: ' + label(fallback.outcome));
+            if (fallback.outcome !== 'PASS') issues.push('FALLBACK_RECEIPT_NOT_PASS');
+            for (const name of ['sourceA', 'sourceB']) {
+              const source = fallback[name];
+              if (!source || typeof source !== 'object') { lines.push(name + ': NOT_RECORDED'); issues.push(name + ':NOT_RECORDED'); continue; }
+              lines.push(name + ': head=' + hash(source.head) + ' parent=' + hash(source.parent)
+                + ' base=' + hash(source.baseCommit) + ' beforeTree=' + hash(source.before?.tree) + ' afterTree=' + hash(source.after?.tree));
+              const parity = source.before && source.after ? JSON.stringify(source.before) === JSON.stringify(source.after) : 'NOT_RECORDED';
+              lines.push(name + ' before/after manifest parity: ' + parity);
+              for (const phase of ['before', 'after']) {
+                const manifest = source[phase];
+                lines.push(name + ' ' + phase + ' activation: head=' + hash(manifest?.activation?.head)
+                  + ' candidateFingerprint=' + hash(manifest?.activation?.candidateFingerprint)
+                  + ' trackedModifiedCount=' + (Number.isSafeInteger(manifest?.activation?.trackedModifiedCount) ? manifest.activation.trackedModifiedCount : 'UNVERIFIED')
+                  + ' trackedStatus=' + (manifest?.trackedStatus === '' ? 'CLEAN' : 'NONEMPTY_OR_NOT_RECORDED'));
+                const entrypoint = manifest?.entrypoint;
+                if (entrypoint) lines.push(name + ' ' + phase + ' entrypoint: gitBlob=' + hash(entrypoint.gitBlob)
+                  + ' contentSha256=' + hash(entrypoint.contentSha256) + ' byteLength=' + (Number.isSafeInteger(entrypoint.byteLength) ? entrypoint.byteLength : 'UNVERIFIED'));
+              }
+            }
+            for (const phase of (Array.isArray(fallback.health) ? fallback.health : []).slice(0, 12))
+              lines.push('health phase: ' + label(phase.phase) + ' state=' + label(phase.state) + ' status=' + label(phase.status) + ' identity=' + label(phase.identityState));
+            const witnesses = Array.isArray(fallback.executableWitnesses) ? fallback.executableWitnesses : [];
+            lines.push('executable witness entries: ' + witnesses.length);
+            for (const witness of witnesses.slice(0, 8)) {
+              const marker = typeof witness.marker === 'string' && /^(?:SOURCE_[AB]\n){1,4}$/.test(witness.marker)
+                ? witness.marker : '[UNEXPECTED_OR_MISSING_MARKER]';
+              lines.push('executable witness: source=' + label(witness.source) + ' phase=' + label(witness.phase)
+                + ' head=' + hash(witness.head) + ' marker=' + JSON.stringify(marker));
+            }
+            const cleanup = Array.isArray(fallback.cleanup) ? fallback.cleanup : [];
+            lines.push('cleanup entries: ' + cleanup.length);
+            for (const entry of cleanup.slice(0, 16)) {
+              lines.push('cleanup: source=' + label(entry.source) + ' phase=' + label(entry.phase) + ' state=' + label(entry.state)
+                + ' authority=' + label(entry.authority) + ' dataPreserved=' + (entry.dataPreserved === true));
+              if (entry.error || entry.reason) lines.push('cleanup detail (redacted):', detail(entry.error || entry.reason));
+            }
+            if (fallback.error) lines.push('fallback detail (redacted):', detail(fallback.error));
+          }
+          const receipt = {
+            workflow_sha: hash(process.env.R09_WORKFLOW_SHA || process.env.R09_EVENT_SHA),
+            workflow_tree: hash(process.env.R09_WORKFLOW_TREE), workflow_parent: hash(process.env.R09_WORKFLOW_PARENT),
+            tested_source_sha: hash(process.env.R09_SOURCE_SHA), tested_source_tree: hash(process.env.R09_SOURCE_TREE),
+            tested_source_parent: hash(process.env.R09_SOURCE_PARENT), event_ref: label(process.env.R09_EVENT_REF),
+            runner_os: label(process.env.R09_RUNNER_OS), runner_arch: label(process.env.R09_RUNNER_ARCH),
+            rebind_step: phases.rebind, fallback_step: phases.fallback, quality_step: phases.quality,
+            phases, selected_assertions: selected, diagnostic_status: issues.length ? 'INCOMPLETE' : 'COMPLETE', diagnostic_issues: issues,
+          };
+          fs.writeFileSync(path.join(evidence, 'workflow-result.json'), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
+          const fence = String.fromCharCode(96).repeat(3);
+          lines.push('', '#### Machine-readable execution receipt', fence + 'json', JSON.stringify(receipt, null, 2), fence);
+          const fullOutput = lines.join('\n') + '\n';
+          const truncated = Buffer.byteLength(fullOutput, 'utf8') > 32 * 1024;
+          const rendered = (truncated ? Buffer.from(fullOutput).subarray(0, 32 * 1024).toString('utf8') : fullOutput)
+            + '\nDIAGNOSTIC_OUTPUT_TRUNCATED=' + String(truncated) + '\n';
+          if (truncated) process.exitCode = 1;
+          process.stdout.write(rendered);
+          if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, rendered);
+          else { process.stderr.write('GITHUB_STEP_SUMMARY unavailable; stdout retained.\n'); issues.push('SUMMARY_UNAVAILABLE'); }
+          if (issues.length || Object.values(phases).some(outcome => outcome !== 'success')) process.exitCode = 1;
+          NODE
 
       - name: State proof limitations
         if: always()
