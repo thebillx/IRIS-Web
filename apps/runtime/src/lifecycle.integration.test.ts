@@ -292,7 +292,7 @@ describe('runtime lifecycle integration', () => {
         pid: startedAReady.endpoint?.pid,
         apiUrl: startedAReady.endpoint?.apiUrl,
         mcpUrl: startedAReady.endpoint?.mcpUrl,
-        agentExecutorType: 'development',
+        agentExecutorType: 'local-development-executor',
         machineId: machineIdA,
       });
       const readyMarkerA = await readFile(path.join(canonicalA, 'r09-source-marker'), 'utf8');
@@ -326,7 +326,7 @@ describe('runtime lifecycle integration', () => {
         pid: startedAFailed.endpoint?.pid,
         apiUrl: startedAFailed.endpoint?.apiUrl,
         mcpUrl: startedAFailed.endpoint?.mcpUrl,
-        agentExecutorType: 'development',
+        agentExecutorType: 'local-development-executor',
       });
       const markerAAfterFailure = await readFile(path.join(canonicalA, 'r09-source-marker'), 'utf8');
       expect(markerAAfterFailure).toBe('SOURCE_A\nSOURCE_A\n');
@@ -378,7 +378,7 @@ describe('runtime lifecycle integration', () => {
         status: 'ready',
         identityState: 'COHERENT',
         authority: 'owned',
-        agentExecutorType: 'development',
+        agentExecutorType: 'local-development-executor',
         runtimeId: selectedB.endpoint?.runtimeId,
         instanceId: selectedB.endpoint?.instanceId,
         pid: selectedB.endpoint?.pid,
