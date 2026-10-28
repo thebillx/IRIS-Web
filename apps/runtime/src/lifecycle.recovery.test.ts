@@ -35,7 +35,7 @@ async function sourceFixture(label: string): Promise<{ root: string; descriptor:
   };
 }
 
-const running = (): RuntimeObservedStatus => ({ state: 'running', endpoint: null, health: null });
+const running = (): RuntimeObservedStatus => ({ state: 'running', endpoint: null, health: { status: 'ready' } as NonNullable<RuntimeObservedStatus['health']> });
 const stopped = (): RuntimeObservedStatus => ({ state: 'stopped', endpoint: null, health: null });
 
 async function cleanup(...roots: string[]): Promise<void> {

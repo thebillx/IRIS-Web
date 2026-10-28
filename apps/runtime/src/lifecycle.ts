@@ -451,7 +451,7 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
       sourceRoot: sourceA.sourceRoot,
       startupDeadlineMs: input.startupDeadlineMs,
     });
-    if (statusA.state === 'running') {
+    if (statusA.state === 'running' && statusA.health?.status === 'ready') {
       const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'A', primaryFailure: null, cleanup: [] };
       await writePrivateJsonAtomic(input.receiptPath, receipt);
       return receipt;
@@ -479,7 +479,7 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
       sourceRoot: sourceB.sourceRoot,
       startupDeadlineMs: input.startupDeadlineMs,
     });
-    if (statusB.state !== 'running') throw new RuntimeError('RUNTIME_NOT_RUNNING', statusB.reason ?? 'Source B did not reach running health');
+    if (statusB.state !== 'running' || statusB.health?.status !== 'ready') throw new RuntimeError('RUNTIME_NOT_RUNNING', statusB.reason ?? 'Source B did not reach ready health');
     const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'B', primaryFailure, cleanup };
     await writePrivateJsonAtomic(input.receiptPath, receipt);
     return receipt;
