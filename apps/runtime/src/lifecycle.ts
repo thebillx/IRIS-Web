@@ -472,8 +472,8 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
     throw new RuntimeError('AUTHORITY_INDETERMINATE', error instanceof Error ? error.message : String(error));
   }
 
-  await attestRecoverySource(sourceB);
   try {
+    await attestRecoverySource(sourceB);
     const statusB = await runtime.start({
       dataRoot: input.dataRoot,
       sourceRoot: sourceB.sourceRoot,
