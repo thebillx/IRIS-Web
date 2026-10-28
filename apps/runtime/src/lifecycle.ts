@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { IRIS_VERSION, RuntimeError, type RuntimeHealth, type RuntimeIdentity } from '@iris/domain';
 import { AGENT_EXECUTOR_ENV, OPENAI_API_KEY_ENV, OPENAI_MODEL_ENV } from './agent-executor.js';
@@ -11,6 +13,7 @@ import { readEndpoint, readRuntimeControl, type EndpointDocument, type RuntimeCo
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
 
 import { confirmChildSpawn } from './spawn-outcome.js';
+import { writePrivateJsonAtomic } from './credentials.js';
 
 export interface RuntimeObservedStatus {
   readonly state: 'running' | 'stopped' | 'stale' | 'indeterminate';
@@ -378,4 +381,162 @@ function bounded(value: number, min: number, max: number): number {
 
 async function conditionPoll(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 25));
+}
+
+
+const execFileForRecovery = promisify(execFile);
+
+export interface RecoverySourceDescriptor {
+  readonly commitSha: string;
+  readonly treeSha: string;
+  readonly sourceRoot: string;
+  readonly entrypoint: string;
+  readonly entrypointGitBlob: string;
+}
+
+export interface RecoveryReceipt {
+  readonly schemaVersion: 1;
+  readonly requestId: string;
+  readonly outcome: 'COMMITTED' | 'FAILED' | 'RECONCILIATION_REQUIRED';
+  readonly selectedSource: 'A' | 'B' | null;
+  readonly sourceA: RecoverySourceDescriptor;
+  readonly sourceB: RecoverySourceDescriptor;
+  readonly primaryFailure: string | null;
+  readonly cleanup: readonly { readonly source: 'A' | 'B'; readonly outcome: 'STOPPED' | 'UNRESOLVED' }[];
+  readonly createdAt: string;
+}
+
+export interface RecoveryRuntimeAdapter {
+  readonly start: (options: StartRuntimeOptions) => Promise<RuntimeObservedStatus>;
+  readonly stop: (dataRoot: string, deadlineMs: number) => Promise<RuntimeObservedStatus>;
+}
+
+export interface RecoveryFallbackInput {
+  readonly requestId: string;
+  readonly dataRoot: string;
+  readonly receiptPath: string;
+  readonly sourceA: RecoverySourceDescriptor;
+  readonly sourceB: RecoverySourceDescriptor;
+  readonly startupDeadlineMs?: number;
+  readonly shutdownDeadlineMs?: number;
+  readonly runtime?: RecoveryRuntimeAdapter;
+}
+
+export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackInput): Promise<RecoveryReceipt> {
+  const existing = await readRecoveryReceipt(input.receiptPath);
+  if (existing !== null) {
+    if (existing.requestId !== input.requestId) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery request identity changed');
+    if (existing.outcome === 'RECONCILIATION_REQUIRED') {
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery outcome requires explicit reconciliation');
+    }
+    return existing;
+  }
+
+  const sourceA = await attestRecoverySource(input.sourceA);
+  const sourceB = await attestRecoverySource(input.sourceB);
+  const runtime = input.runtime ?? { start: startRuntime, stop: stopRuntime };
+  const cleanup: Array<{ readonly source: 'A' | 'B'; readonly outcome: 'STOPPED' | 'UNRESOLVED' }> = [];
+  const base: Omit<RecoveryReceipt, 'outcome' | 'selectedSource' | 'primaryFailure' | 'cleanup'> = {
+    schemaVersion: 1,
+    requestId: input.requestId,
+    sourceA,
+    sourceB,
+    createdAt: new Date().toISOString(),
+  };
+  let primaryFailure: string | null = null;
+
+  try {
+    const statusA = await runtime.start({
+      dataRoot: input.dataRoot,
+      sourceRoot: sourceA.sourceRoot,
+      startupDeadlineMs: input.startupDeadlineMs,
+    });
+    if (statusA.state === 'running') {
+      const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'A', primaryFailure: null, cleanup: [] };
+      await writePrivateJsonAtomic(input.receiptPath, receipt);
+      return receipt;
+    }
+    primaryFailure = statusA.reason ?? 'Source A did not reach running health';
+  } catch (error: unknown) {
+    primaryFailure = error instanceof Error ? error.message : String(error);
+  }
+
+  try {
+    const stopped = await runtime.stop(input.dataRoot, input.shutdownDeadlineMs ?? 10_000);
+    if (stopped.state !== 'stopped') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Source A cleanup was not proven');
+    cleanup.push({ source: 'A', outcome: 'STOPPED' });
+  } catch (error: unknown) {
+    cleanup.push({ source: 'A', outcome: 'UNRESOLVED' });
+    const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure, cleanup };
+    await writePrivateJsonAtomic(input.receiptPath, receipt);
+    throw new RuntimeError('AUTHORITY_INDETERMINATE', error instanceof Error ? error.message : String(error));
+  }
+
+  await attestRecoverySource(sourceB);
+  try {
+    const statusB = await runtime.start({
+      dataRoot: input.dataRoot,
+      sourceRoot: sourceB.sourceRoot,
+      startupDeadlineMs: input.startupDeadlineMs,
+    });
+    if (statusB.state !== 'running') throw new RuntimeError('RUNTIME_NOT_RUNNING', statusB.reason ?? 'Source B did not reach running health');
+    const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'B', primaryFailure, cleanup };
+    await writePrivateJsonAtomic(input.receiptPath, receipt);
+    return receipt;
+  } catch (error: unknown) {
+    const failure = error instanceof Error ? error.message : String(error);
+    try {
+      const stopped = await runtime.stop(input.dataRoot, input.shutdownDeadlineMs ?? 10_000);
+      if (stopped.state !== 'stopped') throw new Error('Source B cleanup was not proven');
+      cleanup.push({ source: 'B', outcome: 'STOPPED' });
+    } catch {
+      cleanup.push({ source: 'B', outcome: 'UNRESOLVED' });
+      const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: failure, cleanup };
+      await writePrivateJsonAtomic(input.receiptPath, receipt);
+      throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery cleanup is unresolved');
+    }
+    const receipt: RecoveryReceipt = { ...base, outcome: 'FAILED', selectedSource: null, primaryFailure: failure, cleanup };
+    await writePrivateJsonAtomic(input.receiptPath, receipt);
+    throw error;
+  }
+}
+
+async function attestRecoverySource(descriptor: RecoverySourceDescriptor): Promise<RecoverySourceDescriptor> {
+  if (!/^[0-9a-f]{40}$/.test(descriptor.commitSha) || !/^[0-9a-f]{40}$/.test(descriptor.treeSha) || !/^[0-9a-f]{40}$/.test(descriptor.entrypointGitBlob)) {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Recovery source identity is not canonical');
+  }
+  const root = await realpath(descriptor.sourceRoot);
+  const entrypoint = path.resolve(root, descriptor.entrypoint);
+  if (path.relative(root, entrypoint).startsWith('..') || path.isAbsolute(path.relative(root, entrypoint))) {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Recovery entrypoint escapes source root');
+  }
+  const entrypointPhysical = await realpath(entrypoint);
+  if (path.relative(root, entrypointPhysical).startsWith('..') || path.isAbsolute(path.relative(root, entrypointPhysical))) {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Recovery entrypoint symlink escapes source root');
+  }
+  const metadata = await lstat(entrypointPhysical);
+  if (!metadata.isFile()) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery entrypoint is not a regular file');
+  const contentDigest = createHash('sha256').update(await readFile(entrypointPhysical)).digest('hex');
+  const { stdout: head } = await execFileForRecovery('git', ['-C', root, 'rev-parse', 'HEAD']);
+  const { stdout: tree } = await execFileForRecovery('git', ['-C', root, 'rev-parse', 'HEAD^{tree}']);
+  const { stdout: blob } = await execFileForRecovery('git', ['-C', root, 'hash-object', '--', descriptor.entrypoint]);
+  if (head.trim() !== descriptor.commitSha || tree.trim() !== descriptor.treeSha || blob.trim() !== descriptor.entrypointGitBlob) {
+    throw new RuntimeError('PRECONDITION_FAILED', 'Recovery source attestation changed');
+  }
+  if (contentDigest.length !== 64) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery entrypoint digest is invalid');
+  return { ...descriptor, sourceRoot: root, entrypoint: path.relative(root, entrypointPhysical) };
+}
+
+async function readRecoveryReceipt(filename: string): Promise<RecoveryReceipt | null> {
+  try {
+    const value: unknown = JSON.parse(await readFile(filename, 'utf8'));
+    if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.requestId !== 'string'
+      || !['COMMITTED', 'FAILED', 'RECONCILIATION_REQUIRED'].includes(String(value.outcome))) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Recovery receipt is invalid');
+    }
+    return value as unknown as RecoveryReceipt;
+  } catch (error: unknown) {
+    if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
 }
