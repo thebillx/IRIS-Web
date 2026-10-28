@@ -47,9 +47,10 @@ describe('product-owned runtime source fallback', () => {
     const [a, b, data] = await Promise.all([sourceFixture('a'), sourceFixture('b'), mkdtemp(path.join(os.tmpdir(), 'iris-r10-data-'))]);
     const calls: string[] = [];
     let stops = 0;
+    let expectedSourceIdentity: unknown;
     const runtime: RecoveryRuntimeAdapter = {
       status: async () => stopped(),
-      start: async (options) => { calls.push(options.sourceRoot ?? 'missing'); return running(); },
+      start: async (options) => { expectedSourceIdentity = options.expectedSourceIdentity; calls.push(options.sourceRoot ?? 'missing'); return running(); },
       stop: async () => { stops += 1; return stopped(); },
     };
     try {
@@ -58,6 +59,7 @@ describe('product-owned runtime source fallback', () => {
       expect(receipt.selectedSource).toBe('A');
       expect(calls).toEqual([a.root]);
       expect(stops).toBe(0);
+      expect(expectedSourceIdentity).toBeDefined();
       expect(JSON.parse(await readFile(path.join(data, 'receipt.json'), 'utf8')).sourceAFailure).toBeNull();
       expect(JSON.parse(await readFile(path.join(data, 'receipt.json.intent'), 'utf8')).state).toBe('FINALIZED');
     } finally { await cleanup(a.root, b.root, data); }

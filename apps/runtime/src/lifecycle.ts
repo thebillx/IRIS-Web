@@ -416,7 +416,7 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
   const startupDeadlineMs = bounded(input.startupDeadlineMs ?? 10_000, 500, 60_000); const shutdownDeadlineMs = bounded(input.shutdownDeadlineMs ?? 10_000, 500, 60_000);
   const runtime = input.runtime ?? { status: runtimeStatus, start: startRuntime, stop: stopRuntime };
   const sourceA = await attestRecoverySource(input.sourceA); const sourceB = await attestRecoverySource(input.sourceB);
-  if (sameRecoveryIdentity(sourceA.descriptor, sourceB.descriptor)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery sources must be distinct immutable identities');
+  if (immutableContentIdentityEqual(sourceA.descriptor, sourceB.descriptor)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery sources must be distinct immutable identities');
   const existing = await readRecoveryReceipt(receiptPath);
   if (existing !== null) { assertRecoveryEnvelope(existing, input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA.descriptor, sourceB.descriptor); if (existing.outcome === 'RECONCILIATION_REQUIRED') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery outcome requires explicit reconciliation'); return existing; }
   const intentPath = \`${receiptPath}.intent\`;
@@ -480,7 +480,9 @@ async function canonicalReceiptPath(dataRoot: string, requested: string): Promis
 function assertRecoveryEnvelope(receipt: RecoveryReceipt, requestId: string, dataRoot: string, startupDeadlineMs: number, shutdownDeadlineMs: number, sourceA: RecoverySourceDescriptor, sourceB: RecoverySourceDescriptor): void {
   if (receipt.schemaVersion !== 2 || receipt.requestId !== requestId || receipt.dataRoot !== dataRoot || receipt.startupDeadlineMs !== startupDeadlineMs || receipt.shutdownDeadlineMs !== shutdownDeadlineMs || !sameRecoveryIdentity(receipt.sourceA, sourceA) || !sameRecoveryIdentity(receipt.sourceB, sourceB)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery receipt envelope does not match the request');
 }
-function sameRecoveryIdentity(left: RecoverySourceDescriptor, right: RecoverySourceDescriptor): boolean { return left.commitSha === right.commitSha && left.treeSha === right.treeSha && left.entrypointGitBlob === right.entrypointGitBlob; }
+function immutableContentIdentityEqual(left: RecoverySourceDescriptor, right: RecoverySourceDescriptor): boolean { return left.commitSha === right.commitSha && left.treeSha === right.treeSha && left.entrypoint === right.entrypoint && left.entrypointGitBlob === right.entrypointGitBlob; }
+function exactRecoveryEnvelopeEqual(receipt: RecoveryReceipt, requestId: string, dataRoot: string, startupDeadlineMs: number, shutdownDeadlineMs: number, sourceA: RecoverySourceDescriptor, sourceB: RecoverySourceDescriptor): boolean { return receipt.schemaVersion === 2 && receipt.requestId === requestId && receipt.dataRoot === dataRoot && receipt.startupDeadlineMs === startupDeadlineMs && receipt.shutdownDeadlineMs === shutdownDeadlineMs && exactDescriptorEqual(receipt.sourceA, sourceA) && exactDescriptorEqual(receipt.sourceB, sourceB); }
+function exactDescriptorEqual(left: RecoverySourceDescriptor, right: RecoverySourceDescriptor): boolean { return left.commitSha === right.commitSha && left.treeSha === right.treeSha && left.sourceRoot === right.sourceRoot && left.entrypoint === right.entrypoint && left.entrypointGitBlob === right.entrypointGitBlob; }
 async function writeDurableExclusive(filename: string, value: unknown): Promise<void> {
   const handle = await open(filename, 'wx', 0o600); try { await handle.writeFile(`${JSON.stringify(value)}\n`, 'utf8'); await handle.sync(); } finally { await handle.close(); } await syncParentDirectory(filename);
 }
@@ -493,6 +495,7 @@ async function persistRecoveryReceipt(receiptPath: string, intentPath: string, i
   await writeDurableJson(intentPath, { ...intent, state: 'FINALIZED', outcome: receipt.outcome });
 }
 
+async function readRecoveryIntent(filename: string): Promise<{ readonly state: string; readonly outcome?: string } | null> { try { const value: unknown = JSON.parse(await readFile(filename, 'utf8')); if (!isRecord(value) || typeof value.state !== 'string') throw new RuntimeError('PERSISTENCE_FAILURE', 'Recovery intent is invalid'); return value as { readonly state: string; readonly outcome?: string }; } catch (error: unknown) { if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; } }
 async function readRecoveryReceipt(filename: string): Promise<RecoveryReceipt | null> {
   try {
     const value: unknown = JSON.parse(await readFile(filename, 'utf8'));
