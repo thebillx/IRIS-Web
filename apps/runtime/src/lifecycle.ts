@@ -423,7 +423,10 @@ export interface RecoveryFallbackInput {
 }
 
 export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackInput): Promise<RecoveryReceipt> {
-  const existing = await readRecoveryReceipt(input.receiptPath);
+  const dataRoot = path.resolve(input.dataRoot);
+  const receiptPath = path.resolve(input.receiptPath);
+  if (!pathWithin(dataRoot, receiptPath)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery receipt escapes the runtime data root');
+  const existing = await readRecoveryReceipt(receiptPath);
   if (existing !== null) {
     if (existing.requestId !== input.requestId) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery request identity changed');
     if (existing.outcome === 'RECONCILIATION_REQUIRED') {
@@ -447,13 +450,13 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
 
   try {
     const statusA = await runtime.start({
-      dataRoot: input.dataRoot,
+      dataRoot,
       sourceRoot: sourceA.sourceRoot,
       startupDeadlineMs: input.startupDeadlineMs,
     });
     if (statusA.state === 'running' && statusA.health?.status === 'ready') {
       const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'A', primaryFailure: null, cleanup: [] };
-      await writePrivateJsonAtomic(input.receiptPath, receipt);
+      await writePrivateJsonAtomic(receiptPath, receipt);
       return receipt;
     }
     primaryFailure = statusA.reason ?? 'Source A did not reach running health';
@@ -462,41 +465,41 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
   }
 
   try {
-    const stopped = await runtime.stop(input.dataRoot, input.shutdownDeadlineMs ?? 10_000);
+    const stopped = await runtime.stop(dataRoot, input.shutdownDeadlineMs ?? 10_000);
     if (stopped.state !== 'stopped') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Source A cleanup was not proven');
     cleanup.push({ source: 'A', outcome: 'STOPPED' });
   } catch (error: unknown) {
     cleanup.push({ source: 'A', outcome: 'UNRESOLVED' });
     const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure, cleanup };
-    await writePrivateJsonAtomic(input.receiptPath, receipt);
+    await writePrivateJsonAtomic(receiptPath, receipt);
     throw new RuntimeError('AUTHORITY_INDETERMINATE', error instanceof Error ? error.message : String(error));
   }
 
   try {
     await attestRecoverySource(sourceB);
     const statusB = await runtime.start({
-      dataRoot: input.dataRoot,
+      dataRoot,
       sourceRoot: sourceB.sourceRoot,
       startupDeadlineMs: input.startupDeadlineMs,
     });
     if (statusB.state !== 'running' || statusB.health?.status !== 'ready') throw new RuntimeError('RUNTIME_NOT_RUNNING', statusB.reason ?? 'Source B did not reach ready health');
     const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'B', primaryFailure, cleanup };
-    await writePrivateJsonAtomic(input.receiptPath, receipt);
+    await writePrivateJsonAtomic(receiptPath, receipt);
     return receipt;
   } catch (error: unknown) {
     const failure = error instanceof Error ? error.message : String(error);
     try {
-      const stopped = await runtime.stop(input.dataRoot, input.shutdownDeadlineMs ?? 10_000);
+      const stopped = await runtime.stop(dataRoot, input.shutdownDeadlineMs ?? 10_000);
       if (stopped.state !== 'stopped') throw new Error('Source B cleanup was not proven');
       cleanup.push({ source: 'B', outcome: 'STOPPED' });
     } catch {
       cleanup.push({ source: 'B', outcome: 'UNRESOLVED' });
       const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: failure, cleanup };
-      await writePrivateJsonAtomic(input.receiptPath, receipt);
+      await writePrivateJsonAtomic(receiptPath, receipt);
       throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery cleanup is unresolved');
     }
     const receipt: RecoveryReceipt = { ...base, outcome: 'FAILED', selectedSource: null, primaryFailure: failure, cleanup };
-    await writePrivateJsonAtomic(input.receiptPath, receipt);
+    await writePrivateJsonAtomic(receiptPath, receipt);
     throw error;
   }
 }
@@ -539,4 +542,9 @@ async function readRecoveryReceipt(filename: string): Promise<RecoveryReceipt | 
     if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
   }
+}
+
+function pathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
