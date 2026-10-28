@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -46,13 +46,33 @@ async function fixtureCommand(command: string, args: string[], cwd: string, time
 }
 
 async function sourceManifest(root: string) {
-  const [head, tree, status, activation] = await Promise.all([
+  const entrypointPath = 'apps/runtime/src/main.ts';
+  const [head, tree, status, activation, entrypointBlob, committedEntrypoint, actualEntrypoint] = await Promise.all([
     fixtureCommand('git', ['rev-parse', 'HEAD'], root),
     fixtureCommand('git', ['rev-parse', 'HEAD^{tree}'], root),
     fixtureCommand('git', ['status', '--porcelain', '--untracked-files=no'], root),
     inspectActivationSourceIdentity(root),
+    fixtureCommand('git', ['rev-parse', `HEAD:${entrypointPath}`], root),
+    exec('git', ['cat-file', 'blob', `HEAD:${entrypointPath}`], {
+      cwd: root, encoding: 'buffer', timeout: 60_000, maxBuffer: 16 * 1024 * 1024,
+    }),
+    readFile(path.join(root, entrypointPath)),
   ]);
-  return { head: head.trim(), tree: tree.trim(), trackedStatus: status.trim(), activation };
+  if (actualEntrypoint.length === 0 || !actualEntrypoint.equals(committedEntrypoint.stdout)) {
+    throw new Error('Synthetic executable entrypoint must be nonempty and match its committed bytes');
+  }
+  return {
+    head: head.trim(),
+    tree: tree.trim(),
+    trackedStatus: status.trim(),
+    activation,
+    entrypoint: {
+      path: entrypointPath,
+      gitBlob: entrypointBlob.trim(),
+      contentSha256: createHash('sha256').update(actualEntrypoint).digest('hex'),
+      byteLength: actualEntrypoint.length,
+    },
+  };
 }
 
 async function syntheticRelease(baseCommit: string, sourceMarker: 'SOURCE_A' | 'SOURCE_B', store: string) {
@@ -235,8 +255,19 @@ describe('runtime lifecycle integration', () => {
       const baselineB = '0aea216efe662395fc6789ef11ec7592887408ed';
       releaseA = await syntheticRelease(baselineA, 'SOURCE_A', store);
       releaseB = await syntheticRelease(baselineB, 'SOURCE_B', store);
+      for (const release of [releaseA, releaseB]) {
+        expect(release.manifest.head).toBe(release.head);
+        expect(release.manifest.activation.head).toBe(release.head);
+        expect(release.manifest.activation.trackedModifiedCount).toBe(0);
+        expect(release.manifest.trackedStatus).toBe('');
+        expect(release.manifest.entrypoint.gitBlob).toMatch(/^[0-9a-f]{40}$/);
+        expect(release.manifest.entrypoint.contentSha256).toMatch(/^[0-9a-f]{64}$/);
+        expect(release.manifest.entrypoint.byteLength).toBeGreaterThan(0);
+      }
       expect(releaseA.head).not.toBe(releaseB.head);
-      expect(releaseA.manifest.activation.candidateFingerprint).not.toBe(releaseB.manifest.activation.candidateFingerprint);
+      expect(releaseA.manifest.tree).not.toBe(releaseB.manifest.tree);
+      expect(releaseA.manifest.entrypoint.gitBlob).not.toBe(releaseB.manifest.entrypoint.gitBlob);
+      expect(releaseA.manifest.entrypoint.contentSha256).not.toBe(releaseB.manifest.entrypoint.contentSha256);
       receipt.sourceA = { path: releaseA.path, head: releaseA.head, parent: releaseA.parent, baseCommit: releaseA.baseCommit, manifest: releaseA.manifest };
       receipt.sourceB = { path: releaseB.path, head: releaseB.head, parent: releaseB.parent, baseCommit: releaseB.baseCommit, manifest: releaseB.manifest };
 
