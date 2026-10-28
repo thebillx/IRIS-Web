@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { lstat, open, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import { lstat, open, readFile, realpath, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
@@ -419,10 +419,17 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
   if (immutableContentIdentityEqual(sourceA.descriptor, sourceB.descriptor)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery sources must be distinct immutable identities');
   const intentPath = `${receiptPath}.intent`;
   const existing = await readRecoveryReceipt(receiptPath);
-  if (existing !== null) { assertRecoveryEnvelope(existing, input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA.descriptor, sourceB.descriptor); if (existing.outcome === 'RECONCILIATION_REQUIRED') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery outcome requires explicit reconciliation'); return existing; }
-  const intentPath = \`${receiptPath}.intent\`;
+  if (existing !== null) {
+    assertRecoveryEnvelope(existing, input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA.descriptor, sourceB.descriptor);
+    const finalizedIntent = await readRecoveryIntent(intentPath);
+    if (finalizedIntent?.state !== 'FINALIZED' || finalizedIntent.outcome !== existing.outcome) {
+      throw new RuntimeError('PERSISTENCE_FAILURE', 'Recovery receipt and intent disagree');
+    }
+    if (existing.outcome === 'RECONCILIATION_REQUIRED') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery outcome requires explicit reconciliation');
+    return existing;
+  }
   const intent = { schemaVersion: 2 as const, state: 'IN_PROGRESS' as const, requestId: input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA: sourceA.descriptor, sourceB: sourceB.descriptor };
-  try { await writeFile(intentPath, \`${JSON.stringify(intent)}\\n\`, { encoding: 'utf8', flag: 'wx', mode: 0o600 }); }
+  try { await writeDurableExclusive(intentPath, intent); }
   catch (error: unknown) { if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'EEXIST') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery intent already exists; explicit reconciliation is required'); throw error; }
   const cleanup: Array<{ readonly source: 'A' | 'B'; readonly outcome: 'STOPPED' | 'UNRESOLVED' }> = [];
   const base: Omit<RecoveryReceipt, 'outcome' | 'selectedSource' | 'primaryFailure' | 'sourceAFailure' | 'sourceBFailure' | 'cleanup'> = { schemaVersion: 2, requestId: input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA: sourceA.descriptor, sourceB: sourceB.descriptor, sourceAFailure: null, sourceBFailure: null, createdAt: new Date().toISOString() };
