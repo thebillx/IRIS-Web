@@ -445,12 +445,12 @@ describe('runtime lifecycle integration', () => {
       }
       if (releaseA !== undefined) receipt.sourceA = { path: releaseA.path, head: releaseA.head, parent: releaseA.parent, baseCommit: releaseA.baseCommit, before: releaseA.manifest, after: await sourceManifest(releaseA.path).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })) };
       if (releaseB !== undefined) receipt.sourceB = { path: releaseB.path, head: releaseB.head, parent: releaseB.parent, baseCommit: releaseB.baseCommit, before: releaseB.manifest, after: await sourceManifest(releaseB.path).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })) };
-      if (unresolvedCleanup && !assertionFailed) {
-        receipt.outcome = 'UNRESOLVED_CLEANUP';
-        receipt.error = 'Synthetic fallback cleanup is unresolved; preserve fixture data and diagnostics';
-      }
       await writeFile(evidencePath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
-      if (unresolvedCleanup && !assertionFailed) throw new Error('Synthetic fallback cleanup is unresolved; preserve fixture data and diagnostics');
+    }
+    if (unresolvedCleanup && !assertionFailed) {
+      receipt.outcome = 'UNRESOLVED_CLEANUP';
+      receipt.error = 'Synthetic fallback cleanup is unresolved; preserve fixture data and diagnostics';
+      throw new Error('Synthetic fallback cleanup is unresolved; preserve fixture data and diagnostics');
     }
   }, 480_000);
 
