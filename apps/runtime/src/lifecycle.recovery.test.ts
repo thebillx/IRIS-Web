@@ -46,17 +46,20 @@ describe('product-owned runtime source fallback', () => {
   it('keeps B untouched when A reaches verified health', async () => {
     const [a, b, data] = await Promise.all([sourceFixture('a'), sourceFixture('b'), mkdtemp(path.join(os.tmpdir(), 'iris-r10-data-'))]);
     const calls: string[] = [];
+    let stops = 0;
     const runtime: RecoveryRuntimeAdapter = {
       status: async () => stopped(),
       start: async (options) => { calls.push(options.sourceRoot ?? 'missing'); return running(); },
-      stop: async () => stopped(),
+      stop: async () => { stops += 1; return stopped(); },
     };
     try {
       const receipt = await recoverRuntimeWithSourceFallback({ requestId: 'r10-a', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor, runtime });
       expect(receipt.outcome).toBe('COMMITTED');
       expect(receipt.selectedSource).toBe('A');
       expect(calls).toEqual([a.root]);
-      expect(stops).toBe(1);
+      expect(stops).toBe(0);
+      expect(JSON.parse(await readFile(path.join(data, 'receipt.json'), 'utf8')).sourceAFailure).toBeNull();
+      expect(JSON.parse(await readFile(path.join(data, 'receipt.json.intent'), 'utf8')).state).toBe('FINALIZED');
     } finally { await cleanup(a.root, b.root, data); }
   });
 
@@ -74,6 +77,9 @@ describe('product-owned runtime source fallback', () => {
       expect(receipt.selectedSource).toBe('B');
       expect(calls).toEqual([a.root, b.root]);
       expect(stops).toBe(1);
+      const saved = JSON.parse(await readFile(path.join(data, 'receipt.json'), 'utf8')) as { sourceAFailure: string; sourceBFailure: null };
+      expect(saved.sourceAFailure).toBe('A health failed');
+      expect(saved.sourceBFailure).toBeNull();
     } finally { await cleanup(a.root, b.root, data); }
   });
 

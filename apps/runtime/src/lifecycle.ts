@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { lstat, readFile, realpath, writeFile } from 'node:fs/promises';
+import { lstat, open, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
@@ -160,11 +160,15 @@ export async function startRuntime(options: StartRuntimeOptions = {}): Promise<R
   child.unref();
   const pid = await confirmChildSpawn(child);
   await options.onSpawn?.(pid);
-  return waitForRunningRuntime(
+  const ready = await waitForRunningRuntime(
     dataRoot,
     options.startupDeadlineMs ?? 10_000,
     existing.state === 'stale' ? existing.endpoint : null,
   );
+  if (options.expectedSourceIdentity !== undefined) {
+    await assertActivationSourceIdentity(runtimeSourceRoot, options.expectedSourceIdentity, 'Candidate source identity changed after runtime became ready');
+  }
+  return ready;
 }
 
 export async function stopRuntime(dataRootInput?: string, shutdownDeadlineMs = 10_000): Promise<RuntimeObservedStatus> {
@@ -394,6 +398,7 @@ export interface RecoveryReceipt {
   readonly schemaVersion: 2; readonly requestId: string; readonly dataRoot: string; readonly startupDeadlineMs: number; readonly shutdownDeadlineMs: number;
   readonly outcome: 'COMMITTED' | 'FAILED' | 'RECONCILIATION_REQUIRED'; readonly selectedSource: 'A' | 'B' | null;
   readonly sourceA: RecoverySourceDescriptor; readonly sourceB: RecoverySourceDescriptor; readonly primaryFailure: string | null;
+  readonly sourceAFailure: string | null; readonly sourceBFailure: string | null;
   readonly cleanup: readonly { readonly source: 'A' | 'B'; readonly outcome: 'STOPPED' | 'UNRESOLVED' }[]; readonly createdAt: string;
 }
 export interface RecoveryRuntimeAdapter {
@@ -418,10 +423,10 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
   try { await writeFile(intentPath, \`${JSON.stringify(intent)}\\n\`, { encoding: 'utf8', flag: 'wx', mode: 0o600 }); }
   catch (error: unknown) { if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'EEXIST') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery intent already exists; explicit reconciliation is required'); throw error; }
   const cleanup: Array<{ readonly source: 'A' | 'B'; readonly outcome: 'STOPPED' | 'UNRESOLVED' }> = [];
-  const base: Omit<RecoveryReceipt, 'outcome' | 'selectedSource' | 'primaryFailure' | 'cleanup'> = { schemaVersion: 2, requestId: input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA: sourceA.descriptor, sourceB: sourceB.descriptor, createdAt: new Date().toISOString() };
+  const base: Omit<RecoveryReceipt, 'outcome' | 'selectedSource' | 'primaryFailure' | 'sourceAFailure' | 'sourceBFailure' | 'cleanup'> = { schemaVersion: 2, requestId: input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA: sourceA.descriptor, sourceB: sourceB.descriptor, sourceAFailure: null, sourceBFailure: null, createdAt: new Date().toISOString() };
   let primaryFailure: string | null = null; let sourceAFailure: string | null = null; let sourceBFailure: string | null = null; let aStartAttempted = false;
   const existingRuntime = await runtime.status(dataRoot);
-  if (existingRuntime.state === 'running') { const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: 'An unrelated runtime is already running', cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_CHANGED', 'A pre-existing runtime cannot be attributed to Source A'); }
+  if (existingRuntime.state === 'running') { const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: 'An unrelated runtime is already running', sourceAFailure: null, sourceBFailure: null, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_CHANGED', 'A pre-existing runtime cannot be attributed to Source A'); }
   try {
     await assertActivationSourceIdentity(sourceA.descriptor.sourceRoot, sourceA.activationIdentity, 'Source A changed at the launch boundary');
     aStartAttempted = true;
@@ -429,7 +434,7 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
     if (statusA.state === 'running' && statusA.health?.status === 'ready') { const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'A', primaryFailure: null, sourceAFailure: null, sourceBFailure: null, cleanup: [] }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); return receipt; }
     primaryFailure = statusA.reason ?? 'Source A did not reach ready health';
     sourceAFailure = primaryFailure;
-  } catch (error: unknown) { primaryFailure = error instanceof Error ? error.message : String(error); }
+  } catch (error: unknown) { primaryFailure = error instanceof Error ? error.message : String(error); sourceAFailure = primaryFailure; }
   if (aStartAttempted) {
     try { const stopped = await runtime.stop(dataRoot, shutdownDeadlineMs); if (stopped.state !== 'stopped') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Source A cleanup was not proven'); cleanup.push({ source: 'A', outcome: 'STOPPED' }); }
     catch (error: unknown) { cleanup.push({ source: 'A', outcome: 'UNRESOLVED' }); const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure, sourceAFailure, sourceBFailure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_INDETERMINATE', error instanceof Error ? error.message : String(error)); }
@@ -440,13 +445,13 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
     bStartAttempted = true;
     const statusB = await runtime.start({ dataRoot, sourceRoot: reattestedB.descriptor.sourceRoot, expectedSourceIdentity: reattestedB.activationIdentity, startupDeadlineMs });
     if (statusB.state !== 'running' || statusB.health?.status !== 'ready') throw new RuntimeError('RUNTIME_NOT_RUNNING', statusB.reason ?? 'Source B did not reach ready health');
-    const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'B', primaryFailure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); return receipt;
+    const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'B', primaryFailure, sourceAFailure, sourceBFailure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); return receipt;
   } catch (error: unknown) {
     const failure = error instanceof Error ? error.message : String(error);
     sourceBFailure = failure;
     if (bStartAttempted) { try { const stopped = await runtime.stop(dataRoot, shutdownDeadlineMs); if (stopped.state !== 'stopped') throw new Error('Source B cleanup was not proven'); cleanup.push({ source: 'B', outcome: 'STOPPED' }); }
-      catch { cleanup.push({ source: 'B', outcome: 'UNRESOLVED' }); const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: failure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery cleanup is unresolved'); } }
-    const receipt: RecoveryReceipt = { ...base, outcome: 'FAILED', selectedSource: null, primaryFailure: failure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw error;
+      catch { cleanup.push({ source: 'B', outcome: 'UNRESOLVED' }); const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: failure, sourceAFailure, sourceBFailure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery cleanup is unresolved'); } }
+    const receipt: RecoveryReceipt = { ...base, outcome: 'FAILED', selectedSource: null, primaryFailure: failure, sourceAFailure, sourceBFailure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw error;
   }
 }
 async function attestRecoverySource(descriptor: RecoverySourceDescriptor): Promise<AttestedRecoverySource> {
@@ -475,9 +480,16 @@ function assertRecoveryEnvelope(receipt: RecoveryReceipt, requestId: string, dat
   if (receipt.schemaVersion !== 2 || receipt.requestId !== requestId || receipt.dataRoot !== dataRoot || receipt.startupDeadlineMs !== startupDeadlineMs || receipt.shutdownDeadlineMs !== shutdownDeadlineMs || !sameRecoveryIdentity(receipt.sourceA, sourceA) || !sameRecoveryIdentity(receipt.sourceB, sourceB)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery receipt envelope does not match the request');
 }
 function sameRecoveryIdentity(left: RecoverySourceDescriptor, right: RecoverySourceDescriptor): boolean { return left.commitSha === right.commitSha && left.treeSha === right.treeSha && left.entrypointGitBlob === right.entrypointGitBlob; }
+async function writeDurableExclusive(filename: string, value: unknown): Promise<void> {
+  const handle = await open(filename, 'wx', 0o600); try { await handle.writeFile(`${JSON.stringify(value)}\n`, 'utf8'); await handle.sync(); } finally { await handle.close(); } await syncParentDirectory(filename);
+}
+async function writeDurableJson(filename: string, value: unknown): Promise<void> {
+  const temporary = `${filename}.${randomUUID()}.tmp`; const handle = await open(temporary, 'wx', 0o600); try { await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8'); await handle.sync(); } finally { await handle.close(); } await rename(temporary, filename); await syncParentDirectory(filename);
+}
+async function syncParentDirectory(filename: string): Promise<void> { const directory = await open(path.dirname(filename), 'r'); try { await directory.sync(); } finally { await directory.close(); } }
 async function persistRecoveryReceipt(receiptPath: string, intentPath: string, intent: Record<string, unknown>, receipt: RecoveryReceipt): Promise<void> {
-  await writePrivateJsonAtomic(receiptPath, receipt);
-  await writePrivateJsonAtomic(intentPath, { ...intent, state: 'FINALIZED', outcome: receipt.outcome });
+  await writeDurableJson(receiptPath, receipt);
+  await writeDurableJson(intentPath, { ...intent, state: 'FINALIZED', outcome: receipt.outcome });
 }
 
 async function readRecoveryReceipt(filename: string): Promise<RecoveryReceipt | null> {
