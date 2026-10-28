@@ -56,6 +56,7 @@ describe('product-owned runtime source fallback', () => {
       expect(receipt.outcome).toBe('COMMITTED');
       expect(receipt.selectedSource).toBe('A');
       expect(calls).toEqual([a.root]);
+      expect(stops).toBe(1);
     } finally { await cleanup(a.root, b.root, data); }
   });
 
@@ -97,6 +98,7 @@ describe('product-owned runtime source fallback', () => {
   it('rejects a drifted B before fallback startup', async () => {
     const [a, b, data] = await Promise.all([sourceFixture('a'), sourceFixture('b'), mkdtemp(path.join(os.tmpdir(), 'iris-r10-data-'))]);
     const calls: string[] = [];
+    let stops = 0;
     const runtime: RecoveryRuntimeAdapter = {
       status: async () => stopped(),
       start: async (options) => {
@@ -104,7 +106,7 @@ describe('product-owned runtime source fallback', () => {
         await writeFile(path.join(b.root, b.descriptor.entrypoint), 'drifted\n');
         throw new Error('A health failed');
       },
-      stop: async () => stopped(),
+      stop: async () => { stops += 1; return stopped(); },
     };
     try {
       await expect(recoverRuntimeWithSourceFallback({ requestId: 'r10-drift', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor, runtime })).rejects.toThrow('Recovery source attestation changed');
@@ -130,15 +132,17 @@ describe('product-owned runtime source fallback', () => {
     const [a, b, data] = await Promise.all([sourceFixture('a'), sourceFixture('b'), mkdtemp(path.join(os.tmpdir(), 'iris-r10-data-'))]);
     const input = { requestId: 'r10-claim', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor };
     let release!: () => void;
+    let enteredResolve!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const runtime: RecoveryRuntimeAdapter = {
       status: async () => stopped(),
-      start: async () => { await gate; return running(); },
+      start: async () => { enteredResolve(); await gate; return running(); },
       stop: async () => stopped(),
     };
     try {
       const first = recoverRuntimeWithSourceFallback({ ...input, runtime });
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await entered;
       await expect(recoverRuntimeWithSourceFallback({ ...input, runtime })).rejects.toThrow('intent already exists');
       release();
       await first;

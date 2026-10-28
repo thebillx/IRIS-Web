@@ -421,28 +421,32 @@ export async function recoverRuntimeWithSourceFallback(input: RecoveryFallbackIn
   const base: Omit<RecoveryReceipt, 'outcome' | 'selectedSource' | 'primaryFailure' | 'cleanup'> = { schemaVersion: 2, requestId: input.requestId, dataRoot, startupDeadlineMs, shutdownDeadlineMs, sourceA: sourceA.descriptor, sourceB: sourceB.descriptor, createdAt: new Date().toISOString() };
   let primaryFailure: string | null = null; let aStartAttempted = false;
   const existingRuntime = await runtime.status(dataRoot);
-  if (existingRuntime.state === 'running') { const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: 'An unrelated runtime is already running', cleanup }; await writePrivateJsonAtomic(receiptPath, receipt); throw new RuntimeError('AUTHORITY_CHANGED', 'A pre-existing runtime cannot be attributed to Source A'); }
+  if (existingRuntime.state === 'running') { const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: 'An unrelated runtime is already running', cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_CHANGED', 'A pre-existing runtime cannot be attributed to Source A'); }
   try {
     aStartAttempted = true; await assertActivationSourceIdentity(sourceA.descriptor.sourceRoot, sourceA.activationIdentity, 'Source A changed at the launch boundary');
+    aStartAttempted = true;
     const statusA = await runtime.start({ dataRoot, sourceRoot: sourceA.descriptor.sourceRoot, expectedSourceIdentity: sourceA.activationIdentity, startupDeadlineMs });
-    if (statusA.state === 'running' && statusA.health?.status === 'ready') { const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'A', primaryFailure: null, cleanup: [] }; await writePrivateJsonAtomic(receiptPath, receipt); return receipt; }
+    if (statusA.state === 'running' && statusA.health?.status === 'ready') { const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'A', primaryFailure: null, cleanup: [] }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); return receipt; }
     primaryFailure = statusA.reason ?? 'Source A did not reach ready health';
+    sourceAFailure = primaryFailure;
   } catch (error: unknown) { primaryFailure = error instanceof Error ? error.message : String(error); }
   if (aStartAttempted) {
     try { const stopped = await runtime.stop(dataRoot, shutdownDeadlineMs); if (stopped.state !== 'stopped') throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Source A cleanup was not proven'); cleanup.push({ source: 'A', outcome: 'STOPPED' }); }
-    catch (error: unknown) { cleanup.push({ source: 'A', outcome: 'UNRESOLVED' }); const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure, cleanup }; await writePrivateJsonAtomic(receiptPath, receipt); throw new RuntimeError('AUTHORITY_INDETERMINATE', error instanceof Error ? error.message : String(error)); }
+    catch (error: unknown) { cleanup.push({ source: 'A', outcome: 'UNRESOLVED' }); const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_INDETERMINATE', error instanceof Error ? error.message : String(error)); }
   }
   let bStartAttempted = false;
   try {
     const reattestedB = await attestRecoverySource(sourceB.descriptor); bStartAttempted = true; await assertActivationSourceIdentity(reattestedB.descriptor.sourceRoot, reattestedB.activationIdentity, 'Source B changed at the launch boundary');
+    bStartAttempted = true;
     const statusB = await runtime.start({ dataRoot, sourceRoot: reattestedB.descriptor.sourceRoot, expectedSourceIdentity: reattestedB.activationIdentity, startupDeadlineMs });
     if (statusB.state !== 'running' || statusB.health?.status !== 'ready') throw new RuntimeError('RUNTIME_NOT_RUNNING', statusB.reason ?? 'Source B did not reach ready health');
-    const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'B', primaryFailure, cleanup }; await writePrivateJsonAtomic(receiptPath, receipt); return receipt;
+    const receipt: RecoveryReceipt = { ...base, outcome: 'COMMITTED', selectedSource: 'B', primaryFailure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); return receipt;
   } catch (error: unknown) {
     const failure = error instanceof Error ? error.message : String(error);
+    sourceBFailure = failure;
     if (bStartAttempted) { try { const stopped = await runtime.stop(dataRoot, shutdownDeadlineMs); if (stopped.state !== 'stopped') throw new Error('Source B cleanup was not proven'); cleanup.push({ source: 'B', outcome: 'STOPPED' }); }
-      catch { cleanup.push({ source: 'B', outcome: 'UNRESOLVED' }); const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: failure, cleanup }; await writePrivateJsonAtomic(receiptPath, receipt); throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery cleanup is unresolved'); } }
-    const receipt: RecoveryReceipt = { ...base, outcome: 'FAILED', selectedSource: null, primaryFailure: failure, cleanup }; await writePrivateJsonAtomic(receiptPath, receipt); throw error;
+      catch { cleanup.push({ source: 'B', outcome: 'UNRESOLVED' }); const receipt: RecoveryReceipt = { ...base, outcome: 'RECONCILIATION_REQUIRED', selectedSource: null, primaryFailure: failure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw new RuntimeError('AUTHORITY_INDETERMINATE', 'Recovery cleanup is unresolved'); } }
+    const receipt: RecoveryReceipt = { ...base, outcome: 'FAILED', selectedSource: null, primaryFailure: failure, cleanup }; await persistRecoveryReceipt(receiptPath, intentPath, intent, receipt); throw error;
   }
 }
 async function attestRecoverySource(descriptor: RecoverySourceDescriptor): Promise<AttestedRecoverySource> {
@@ -470,12 +474,19 @@ async function canonicalReceiptPath(dataRoot: string, requested: string): Promis
 function assertRecoveryEnvelope(receipt: RecoveryReceipt, requestId: string, dataRoot: string, startupDeadlineMs: number, shutdownDeadlineMs: number, sourceA: RecoverySourceDescriptor, sourceB: RecoverySourceDescriptor): void {
   if (receipt.schemaVersion !== 2 || receipt.requestId !== requestId || receipt.dataRoot !== dataRoot || receipt.startupDeadlineMs !== startupDeadlineMs || receipt.shutdownDeadlineMs !== shutdownDeadlineMs || !sameRecoveryIdentity(receipt.sourceA, sourceA) || !sameRecoveryIdentity(receipt.sourceB, sourceB)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery receipt envelope does not match the request');
 }
-function sameRecoveryIdentity(left: RecoverySourceDescriptor, right: RecoverySourceDescriptor): boolean { return left.commitSha === right.commitSha && left.treeSha === right.treeSha && left.sourceRoot === right.sourceRoot && left.entrypoint === right.entrypoint && left.entrypointGitBlob === right.entrypointGitBlob; }
+function sameRecoveryIdentity(left: RecoverySourceDescriptor, right: RecoverySourceDescriptor): boolean { return left.commitSha === right.commitSha && left.treeSha === right.treeSha && left.entrypointGitBlob === right.entrypointGitBlob; }
+async function persistRecoveryReceipt(receiptPath: string, intentPath: string, intent: Record<string, unknown>, receipt: RecoveryReceipt): Promise<void> {
+  await writePrivateJsonAtomic(receiptPath, receipt);
+  await writePrivateJsonAtomic(intentPath, { ...intent, state: 'FINALIZED', outcome: receipt.outcome });
+}
+
 async function readRecoveryReceipt(filename: string): Promise<RecoveryReceipt | null> {
   try {
     const value: unknown = JSON.parse(await readFile(filename, 'utf8'));
-    if (!isRecord(value) || value.schemaVersion !== 2 || typeof value.requestId !== 'string' || typeof value.dataRoot !== 'string' || !Number.isSafeInteger(value.startupDeadlineMs) || !Number.isSafeInteger(value.shutdownDeadlineMs) || !['COMMITTED', 'FAILED', 'RECONCILIATION_REQUIRED'].includes(String(value.outcome)) || !Array.isArray(value.cleanup) || !isRecord(value.sourceA) || !isRecord(value.sourceB)) throw new RuntimeError('PERSISTENCE_FAILURE', 'Recovery receipt is invalid');
+    if (!isRecord(value) || value.schemaVersion !== 2 || typeof value.requestId !== 'string' || value.requestId.length === 0 || typeof value.dataRoot !== 'string' || !path.isAbsolute(value.dataRoot) || !Number.isSafeInteger(value.startupDeadlineMs) || !Number.isSafeInteger(value.shutdownDeadlineMs) || !['COMMITTED', 'FAILED', 'RECONCILIATION_REQUIRED'].includes(String(value.outcome)) || !['A', 'B'].includes(String(value.selectedSource)) && value.selectedSource !== null || typeof value.primaryFailure !== 'string' && value.primaryFailure !== null || typeof value.sourceAFailure !== 'string' && value.sourceAFailure !== null || typeof value.sourceBFailure !== 'string' && value.sourceBFailure !== null || !Array.isArray(value.cleanup) || !isRecord(value.sourceA) || !isRecord(value.sourceB) || typeof value.createdAt !== 'string' || Number.isNaN(Date.parse(value.createdAt))) throw new RuntimeError('PERSISTENCE_FAILURE', 'Recovery receipt is invalid');
+    for (const descriptor of [value.sourceA, value.sourceB]) if (!/^[0-9a-f]{40}$/.test(String(descriptor.commitSha)) || !/^[0-9a-f]{40}$/.test(String(descriptor.treeSha)) || !/^[0-9a-f]{40}$/.test(String(descriptor.entrypointGitBlob)) || typeof descriptor.sourceRoot !== 'string' || typeof descriptor.entrypoint !== 'string') throw new RuntimeError('PERSISTENCE_FAILURE', 'Recovery receipt descriptor is invalid');
     for (const item of value.cleanup) if (!isRecord(item) || !['A', 'B'].includes(String(item.source)) || !['STOPPED', 'UNRESOLVED'].includes(String(item.outcome))) throw new RuntimeError('PERSISTENCE_FAILURE', 'Recovery receipt cleanup is invalid');
+    if (value.outcome === 'COMMITTED' && value.selectedSource === null || value.outcome !== 'COMMITTED' && value.selectedSource !== null) throw new RuntimeError('PERSISTENCE_FAILURE', 'Recovery receipt outcome is inconsistent');
     return value as unknown as RecoveryReceipt;
   } catch (error: unknown) { if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
 }
