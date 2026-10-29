@@ -14,7 +14,6 @@ import { readEndpoint, readRuntimeControl, type EndpointDocument, type RuntimeCo
 import { assertSupportedNodeVersion, canonicalNodeRuntime, node24Path } from './node-runtime.js';
 
 import { confirmChildSpawn } from './spawn-outcome.js';
-import { writePrivateJsonAtomic } from './credentials.js';
 
 export interface RuntimeObservedStatus {
   readonly state: 'running' | 'stopped' | 'stale' | 'indeterminate';

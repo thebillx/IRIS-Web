@@ -10,6 +10,7 @@ import {
   type RecoverySourceDescriptor,
   type RuntimeObservedStatus,
 } from './lifecycle.js';
+import type { ActivationSourceIdentity } from './activation-source-identity.js';
 
 const exec = promisify(execFile);
 
@@ -117,8 +118,9 @@ describe('product-owned runtime source fallback', () => {
       stop: async () => { stops += 1; return stopped(); },
     };
     try {
-      await expect(recoverRuntimeWithSourceFallback({ requestId: 'r10-drift', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor, runtime })).rejects.toThrow('Recovery source attestation changed');
+      await expect(recoverRuntimeWithSourceFallback({ requestId: 'r10-drift', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor, runtime })).rejects.toThrow('Recovery source is dirty or contains untracked files');
       expect(calls).toEqual([a.root]);
+      expect(stops).toBe(1);
     } finally { await cleanup(a.root, b.root, data); }
   });
   it('rejects identical source descriptors and receipt escape', async () => {
@@ -189,16 +191,26 @@ describe('product-owned runtime source fallback', () => {
 
   it('passes launch-boundary identity and preserves manifest parity', async () => {
     const [a, b, data] = await Promise.all([sourceFixture('boundary-a'), sourceFixture('boundary-b'), mkdtemp(path.join(os.tmpdir(), 'iris-r10-data-'))]);
-    let observed: unknown;
+    const observed: ActivationSourceIdentity[] = [];
     const runtime: RecoveryRuntimeAdapter = {
       status: async () => stopped(),
-      start: async (options) => { observed = options.expectedSourceIdentity; throw new Error('launch boundary drift'); },
+      start: async (options) => {
+        if (options.expectedSourceIdentity === undefined) throw new Error('missing launch-boundary identity');
+        observed.push(options.expectedSourceIdentity);
+        throw new Error(observed.length === 1 ? 'A launch boundary drift' : 'B launch boundary drift');
+      },
       stop: async () => stopped(),
     };
     try {
-      await expect(recoverRuntimeWithSourceFallback({ requestId: 'r10-boundary', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor, runtime })).rejects.toThrow('launch boundary drift');
-      expect(observed).toBeDefined();
-      expect((observed as { head: string }).head).toBe(a.descriptor.commitSha);
+      await expect(recoverRuntimeWithSourceFallback({ requestId: 'r10-boundary', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor, runtime })).rejects.toThrow('B launch boundary drift');
+      expect(observed).toHaveLength(2);
+      expect(observed[0].head).toBe(a.descriptor.commitSha);
+      expect(observed[1].head).toBe(b.descriptor.commitSha);
+      for (const identity of observed) {
+        expect(identity.candidateFingerprint).toBeTruthy();
+        expect(identity.trackedModifiedCount).toBe(0);
+        expect(identity.fingerprintAlgorithm).toBeTruthy();
+      }
       expect((await exec('git', ['-C', a.root, 'status', '--porcelain'])).stdout.trim()).toBe('');
       expect((await exec('git', ['-C', b.root, 'status', '--porcelain'])).stdout.trim()).toBe('');
     } finally { await cleanup(a.root, b.root, data); }
@@ -235,7 +247,7 @@ describe('product-owned runtime source fallback', () => {
       stop: async () => { stops += 1; return stopped(); },
     };
     try {
-      await expect(recoverRuntimeWithSourceFallback({ requestId: 'r10-zero-stop', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor, runtime })).rejects.toThrow('Recovery source attestation changed');
+      await expect(recoverRuntimeWithSourceFallback({ requestId: 'r10-zero-stop', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor, runtime })).rejects.toThrow('Recovery source is dirty or contains untracked files');
       expect(stops).toBe(1);
     } finally { await cleanup(a.root, b.root, data); }
   });
