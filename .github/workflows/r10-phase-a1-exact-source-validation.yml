@@ -1,0 +1,226 @@
+name: R10 Phase A1 exact-source validation
+run-name: R10 exact-source validation ${{ github.sha }}
+
+on:
+  push:
+    branches:
+      - codex/r10-phase-a1-validation-v8
+    paths:
+      - .github/workflows/r10-phase-a1-exact-source-validation.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r10-phase-a1-exact-source-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: >-
+      github.repository == 'thebillx/IRIS-Web' &&
+      github.ref == 'refs/heads/codex/r10-phase-a1-validation-v8' &&
+      github.event_name == 'push' &&
+      github.event.created == true &&
+      github.event.deleted == false
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      SOURCE_SHA: 0cc6fdb91307425cab0b595399ca2b6cb761ad4a
+      SOURCE_TREE: a9972e540ea52192ff8c80f59fd64f305af19fbd
+      SOURCE_PARENT: bb5cea94b68841050921dd0597534ecc4e7c1bdb
+      PRODUCTION_BLOB: 059d37b29c1eed028c8efa72fa8c5c579265e0aa
+      TEST_BLOB: 6533be26c73e5d88fb262ff8aac3d517fc63bd34
+      LOCKFILE_SHA256: dd3da87633c543bb04465df788f39aa5271639186546c1fd38e6d39e9b497e4b
+    steps:
+      - name: Confine runner-local paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/iris-r10-a1"
+          mkdir -p "$root"/{home,cache,config,data,state,corepack,pnpm,pnpm-store,tmp,evidence}
+          chmod 700 "$root" "$root"/{home,cache,config,data,state,corepack,pnpm,pnpm-store,tmp,evidence}
+          {
+            printf 'HOME=%s\n' "$root/home"
+            printf 'XDG_CACHE_HOME=%s\n' "$root/cache"
+            printf 'XDG_CONFIG_HOME=%s\n' "$root/config"
+            printf 'XDG_DATA_HOME=%s\n' "$root/data"
+            printf 'XDG_STATE_HOME=%s\n' "$root/state"
+            printf 'COREPACK_HOME=%s\n' "$root/corepack"
+            printf 'PNPM_HOME=%s\n' "$root/pnpm"
+            printf 'npm_config_cache=%s\n' "$root/cache/npm"
+            printf 'TMPDIR=%s\n' "$root/tmp"
+            printf 'IRIS_R10_A1_PNPM_STORE=%s\n' "$root/pnpm-store"
+            printf 'IRIS_R10_A1_EVIDENCE=%s\n' "$root/evidence"
+          } >> "$GITHUB_ENV"
+          printf '%s\n' "$root/pnpm" >> "$GITHUB_PATH"
+
+      - name: Validate immutable push identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'thebillx/IRIS-Web'
+          test "$GITHUB_REF" = 'refs/heads/codex/r10-phase-a1-validation-v8'
+          test "$GITHUB_EVENT_NAME" = 'push'
+          test "$(jq -r '.created' "$GITHUB_EVENT_PATH")" = 'true'
+          test "$(jq -r '.deleted' "$GITHUB_EVENT_PATH")" = 'false'
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Check out the workflow event commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .r10-event
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify workflow event and exact source objects
+        id: identity
+        working-directory: .r10-event
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow_sha="$(git rev-parse 'HEAD^{commit}')"
+          workflow_parent="$(git rev-parse 'HEAD^1^{commit}')"
+          test "$workflow_sha" = "$GITHUB_SHA"
+          test "$(git cat-file -p "$workflow_sha" | awk '$1 == "parent" { count++ } END { print count + 0 }')" = 1
+          test "$workflow_parent" = "$SOURCE_SHA"
+          test "$(git rev-parse "$SOURCE_SHA^{tree}")" = "$SOURCE_TREE"
+          test "$(git rev-parse "$SOURCE_SHA^1^{commit}")" = "$SOURCE_PARENT"
+          test "$(git rev-parse "$SOURCE_SHA:apps/runtime/src/recovery-policy.ts")" = "$PRODUCTION_BLOB"
+          test "$(git rev-parse "$SOURCE_SHA:apps/runtime/src/recovery-policy.test.ts")" = "$TEST_BLOB"
+          actual_paths="$(git diff --name-only --no-renames "$SOURCE_SHA" "$workflow_sha" | LC_ALL=C sort)"
+          test "$actual_paths" = '.github/workflows/r10-phase-a1-exact-source-validation.yml'
+          test -z "$(git status --porcelain --untracked-files=no)"
+          {
+            printf 'R10_A1_WORKFLOW_EVENT_SHA=%s\n' "$workflow_sha"
+            printf 'R10_A1_WORKFLOW_PARENT=%s\n' "$workflow_parent"
+          } >> "$GITHUB_ENV"
+
+      - name: Detach to the exact reviewed source
+        id: source
+        working-directory: .r10-event
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach "$SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          test "$(git rev-parse 'HEAD^1^{commit}')" = "$SOURCE_PARENT"
+          test "$(git rev-parse 'HEAD:apps/runtime/src/recovery-policy.ts')" = "$PRODUCTION_BLOB"
+          test "$(git rev-parse 'HEAD:apps/runtime/src/recovery-policy.test.ts')" = "$TEST_BLOB"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Set up Node 24.20.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.20.0
+
+      - name: Set up pnpm 10.15.0
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.15.0
+          dest: ${{ runner.temp }}/iris-r10-a1/pnpm
+
+      - name: Verify toolchain and lockfile
+        shell: bash
+        working-directory: .r10-event
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = 'v24.20.0'
+          test "$(pnpm --version)" = '10.15.0'
+          test "$(shasum -a 256 pnpm-lock.yaml | awk '{print $1}')" = "$LOCKFILE_SHA256"
+
+      - name: Install frozen dependencies without scripts
+        id: dependencies
+        working-directory: .r10-event
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile --ignore-scripts --store-dir "$IRIS_R10_A1_PNPM_STORE"
+
+      - name: Run focused recovery-policy tests
+        id: focused
+        if: ${{ always() && steps.dependencies.outcome == 'success' }}
+        working-directory: .r10-event
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --filter @iris/runtime exec vitest run src/recovery-policy.test.ts \
+            --reporter=default --reporter=json \
+            --outputFile="$IRIS_R10_A1_EVIDENCE/recovery-policy-vitest.json"
+
+      - name: Validate focused test evidence
+        id: focused-evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$IRIS_R10_A1_EVIDENCE/recovery-policy-vitest.json"
+          node - "$IRIS_R10_A1_EVIDENCE/recovery-policy-vitest.json" <<'NODE'
+          const fs = require('node:fs');
+          const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+          if (report.success !== true) throw new Error('focused tests did not report success');
+          if (!Number.isSafeInteger(report.numTotalTests) || report.numTotalTests < 1) throw new Error('missing focused test count');
+          if (report.numFailedTests !== 0 || report.numFailedTestSuites !== 0) throw new Error('focused test failures reported');
+          fs.appendFileSync(process.env.GITHUB_ENV, `R10_A1_FOCUSED_TEST_COUNT=${report.numTotalTests}\n`);
+          NODE
+
+      - name: Runtime typecheck
+        id: typecheck
+        if: ${{ always() && steps.dependencies.outcome == 'success' }}
+        working-directory: .r10-event
+        shell: bash
+        run: pnpm --filter @iris/runtime typecheck
+
+      - name: Runtime build
+        id: build
+        if: ${{ always() && steps.dependencies.outcome == 'success' }}
+        working-directory: .r10-event
+        shell: bash
+        run: pnpm --filter @iris/runtime build
+
+      - name: Scoped lint
+        id: lint
+        if: ${{ always() && steps.dependencies.outcome == 'success' }}
+        working-directory: .r10-event
+        shell: bash
+        run: pnpm exec eslint apps/runtime/src/recovery-policy.ts apps/runtime/src/recovery-policy.test.ts
+
+      - name: Verify source integrity after validation
+        id: integrity
+        if: always()
+        working-directory: .r10-event
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Write bounded redacted summary
+        if: always()
+        shell: bash
+        env:
+          IDENTITY_OUTCOME: ${{ steps.identity.outcome }}
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          FOCUSED_OUTCOME: ${{ steps.focused.outcome }}
+          FOCUSED_EVIDENCE_OUTCOME: ${{ steps.focused-evidence.outcome }}
+          TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          INTEGRITY_OUTCOME: ${{ steps.integrity.outcome }}
+        run: |
+          set -euo pipefail
+          overall=PASS
+          for outcome in "$IDENTITY_OUTCOME" "$SOURCE_OUTCOME" "$FOCUSED_OUTCOME" "$FOCUSED_EVIDENCE_OUTCOME" "$TYPECHECK_OUTCOME" "$BUILD_OUTCOME" "$LINT_OUTCOME" "$INTEGRITY_OUTCOME"; do
+            test "$outcome" = success || overall=FAIL
+          done
+          {
+            printf '### R10 Phase A1 bounded redacted summary\n\n'
+            printf -- '- source_sha: `%s`\n- source_tree: `%s`\n- source_parent: `%s`\n' "$SOURCE_SHA" "$SOURCE_TREE" "$SOURCE_PARENT"
+            printf -- '- production_blob: `%s`\n- test_blob: `%s`\n' "$PRODUCTION_BLOB" "$TEST_BLOB"
+            printf -- '- workflow_event_sha: `%s`\n- workflow_parent: `%s`\n' "${R10_A1_WORKFLOW_EVENT_SHA:-UNKNOWN}" "${R10_A1_WORKFLOW_PARENT:-UNKNOWN}"
+            printf -- '- identity_status: %s\n- focused_test_status: %s\n- focused_test_count: %s\n' "$IDENTITY_OUTCOME/$SOURCE_OUTCOME" "$FOCUSED_OUTCOME" "${R10_A1_FOCUSED_TEST_COUNT:-UNKNOWN}"
+            printf -- '- typecheck_status: %s\n- build_status: %s\n- lint_status: %s\n- worktree_status: %s\n- overall_status: %s\n' "$TYPECHECK_OUTCOME" "$BUILD_OUTCOME" "$LINT_OUTCOME" "$INTEGRITY_OUTCOME" "$overall"
+          } >> "$GITHUB_STEP_SUMMARY"
