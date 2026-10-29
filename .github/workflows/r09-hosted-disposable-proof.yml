@@ -118,11 +118,11 @@ jobs:
           test "$(git rev-parse 'HEAD^{commit}')" = "$TARGET_SOURCE_SHA"
           test "$(git rev-parse 'HEAD^{tree}')" = "$TARGET_SOURCE_TREE"
           test "$(git rev-parse 'HEAD^1^{commit}')" = "$TARGET_SOURCE_PARENT_SHA"
-          expected_paths="$(printf '%s\n' \\
-            '.github/workflows/r09-hosted-disposable-proof.yml' \\
-            'apps/runtime/src/launchd.test.ts' \\
-            'apps/runtime/src/lifecycle.integration.test.ts' \\
-            'apps/runtime/src/lifecycle.recovery.test.ts' \\
+          expected_paths="$(printf '%s\n' \
+            '.github/workflows/r09-hosted-disposable-proof.yml' \
+            'apps/runtime/src/launchd.test.ts' \
+            'apps/runtime/src/lifecycle.integration.test.ts' \
+            'apps/runtime/src/lifecycle.recovery.test.ts' \
             'apps/runtime/src/lifecycle.ts' | LC_ALL=C sort)"
           actual_paths="$(git diff --name-only --no-renames "$DEE5_SHA" "$TARGET_SOURCE_SHA" | LC_ALL=C sort)"
           test "$actual_paths" = "$expected_paths"
