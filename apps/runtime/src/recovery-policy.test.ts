@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import os from 'node:os';
@@ -53,7 +53,7 @@ async function fixture() {
   roots.push(root);
   await mkdir(path.join(root, 'launchd'), { mode: 0o700 });
   await loadOrCreateOwnerAccessSecret(root);
-  return root;
+  return realpath(root);
 }
 
 afterEach(async () => { vi.useRealTimers(); vi.restoreAllMocks(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -628,6 +628,15 @@ describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
     await expect(issue(base, ['SOURCE_MIGRATION'])).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
   });
 
+  it('enforces child containment while rejecting root, parent and prefix siblings', async () => {
+    const dataRoot = await fixture();
+    const base = envelope(dataRoot);
+    await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback: { ...base, receiptPath: dataRoot } })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback: { ...base, receiptPath: path.join(dataRoot, '..', 'receipt.json') } })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback: { ...base, receiptPath: `${dataRoot}-other/receipt.json` } })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback: base })).resolves.toMatchObject({ sourceFallback: base });
+  });
+
   it('reserves once and rejects replay or envelope mutation', async () => {
     const dataRoot = await fixture();
     const sourceFallback = envelope(dataRoot);
@@ -755,7 +764,9 @@ describe('RUNTIME_SOURCE_FALLBACK host binding and confinement', () => {
     const secret = await loadOrCreateOwnerAccessSecret(dataRoot);
     const record = parsePersistedTestRecord(await readFile(recoveryPolicyPath(dataRoot), 'utf8'));
     const changedEnvelope = { ...sourceFallback, startupTimeoutMs: sourceFallback.startupTimeoutMs + 1 };
-    record.operations[0].sourceFallback = changedEnvelope;
+    const firstOperation = record.operations[0];
+    if (firstOperation === undefined || firstOperation === null || typeof firstOperation !== 'object') throw new Error('persisted recovery policy test record has no valid first operation');
+    firstOperation.sourceFallback = changedEnvelope;
     record.signature = signTestRecord(record, secret);
     await writeFile(recoveryPolicyPath(dataRoot), `${JSON.stringify(record, null, 2)}\n`, 'utf8');
     await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
@@ -779,7 +790,9 @@ describe('RUNTIME_SOURCE_FALLBACK host binding and confinement', () => {
     await reserveRecoveryPolicyOperation(operation);
     const secret = await loadOrCreateOwnerAccessSecret(dataRoot);
     const record = parsePersistedTestRecord(await readFile(recoveryPolicyPath(dataRoot), 'utf8'));
-    record.operations[0].sourceFallback = envelopeForA1(dataRoot);
+    const firstOperation = record.operations[0];
+    if (firstOperation === undefined || firstOperation === null || typeof firstOperation !== 'object') throw new Error('persisted recovery policy test record has no valid first operation');
+    firstOperation.sourceFallback = envelopeForA1(dataRoot);
     record.signature = signTestRecord(record, secret);
     await writeFile(recoveryPolicyPath(dataRoot), `${JSON.stringify(record, null, 2)}\n`, 'utf8');
     await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
