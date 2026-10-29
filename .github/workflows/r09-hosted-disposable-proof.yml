@@ -1,36 +1,35 @@
-name: R09 hosted disposable proof
-run-name: R09 exact-source proof ${{ github.sha }}
+name: R10 hosted disposable proof
+run-name: R10 exact-source proof ${{ github.sha }}
 
 on:
   push:
     branches:
-      - codex/r09-hosted-proof-execution-v6
+      - codex/r10-product-recovery-v6
     paths:
       - .github/workflows/r09-hosted-disposable-proof.yml
-      - apps/runtime/src/launchd.test.ts
-      - apps/runtime/src/lifecycle.integration.test.ts
+      - apps/runtime/src/lifecycle.ts
+      - apps/runtime/src/lifecycle.recovery.test.ts
 
 permissions:
   contents: read
 
 concurrency:
-  group: r09-disposable-proof-${{ github.ref }}
+  group: r10-disposable-proof-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   disposable-proof:
     if: >-
       github.repository == 'thebillx/IRIS-Web' &&
-      github.ref == 'refs/heads/codex/r09-hosted-proof-execution-v6' &&
+      github.ref == 'refs/heads/codex/r10-product-recovery-v6' &&
       github.event_name == 'push' &&
-      github.event.created == true &&
       github.event.deleted == false
     runs-on: macos-15
     timeout-minutes: 90
     env:
-      TARGET_SOURCE_SHA: d94cbb8df438351fee48d8c396c873ef9d4c256a
-      TARGET_SOURCE_TREE: bf98b91e421a886fcbe995b5480a3f3d37002b2a
-      TARGET_SOURCE_PARENT_SHA: c778d16ee57357bf6e78a0e73bb884bc86ab8889
+      TARGET_SOURCE_SHA: 894ad6935e0b78a87795deeaef857690bef7f6b2
+      TARGET_SOURCE_TREE: e41f061f6672664268d94f5cd39da96d9723f702
+      TARGET_SOURCE_PARENT_SHA: 938e972039ae9aa1330c7a5e9feadba4313a42c2
       DEE5_SHA: dee5eee8682c9f929e5c41dec00ad76c78d1c5b8
       DEE5_TREE: 22dc3776007fec1243535577834e0c60b7ed3371
       IRIS_AGENT_EXECUTOR: development
@@ -39,7 +38,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/iris-r09"
+          root="$RUNNER_TEMP/iris-r10"
           mkdir -p "$root"/{home,cache/npm,config,data,state,corepack,pnpm-tool,pnpm-store,tmp,evidence}
           chmod 700 "$root" "$root"/{home,cache,config,data,state,corepack,pnpm-tool,pnpm-store,tmp,evidence}
           {
@@ -52,8 +51,8 @@ jobs:
             printf 'PNPM_HOME=%s\n' "$root/pnpm-tool"
             printf 'npm_config_cache=%s\n' "$root/cache/npm"
             printf 'TMPDIR=%s\n' "$root/tmp"
-            printf 'IRIS_R09_PNPM_STORE=%s\n' "$root/pnpm-store"
-            printf 'IRIS_R09_EVIDENCE_DIR=%s\n' "$root/evidence"
+            printf 'IRIS_R10_PNPM_STORE=%s\n' "$root/pnpm-store"
+            printf 'IRIS_R10_EVIDENCE_DIR=%s\n' "$root/evidence"
           } >> "$GITHUB_ENV"
           printf '%s\n' "$root/pnpm-tool" >> "$GITHUB_PATH"
           test -d "$root/tmp"
@@ -65,7 +64,7 @@ jobs:
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = 'push'
           test "$GITHUB_REPOSITORY" = 'thebillx/IRIS-Web'
-          test "$GITHUB_REF" = 'refs/heads/codex/r09-hosted-proof-execution-v6'
+          test "$GITHUB_REF" = 'refs/heads/codex/r10-product-recovery-v6'
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$TARGET_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$TARGET_SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
@@ -74,14 +73,14 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
-          path: .r09-event
+          path: .r10-event
           fetch-depth: 0
           persist-credentials: false
 
       - name: Verify workflow commit separately from tested source
         id: workflow-identity
         shell: bash
-        working-directory: .r09-event
+        working-directory: .r10-event
         run: |
           set -euo pipefail
           workspace="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
@@ -97,9 +96,9 @@ jobs:
           test "$workflow_paths" = '.github/workflows/r09-hosted-disposable-proof.yml'
           test -z "$(git status --porcelain --untracked-files=no)"
           {
-            printf 'R09_WORKFLOW_SHA=%s\n' "$workflow_sha"
-            printf 'R09_WORKFLOW_TREE=%s\n' "$workflow_tree"
-            printf 'R09_WORKFLOW_PARENT=%s\n' "$workflow_parent"
+            printf 'R10_WORKFLOW_SHA=%s\n' "$workflow_sha"
+            printf 'R10_WORKFLOW_TREE=%s\n' "$workflow_tree"
+            printf 'R10_WORKFLOW_PARENT=%s\n' "$workflow_parent"
           } >> "$GITHUB_ENV"
           {
             printf '### Workflow event identity\n\n'
@@ -109,7 +108,7 @@ jobs:
       - name: Detach to and verify the exact test source
         id: source-identity
         shell: bash
-        working-directory: .r09-event
+        working-directory: .r10-event
         run: |
           set -euo pipefail
           test "$(git rev-parse "$TARGET_SOURCE_SHA^1^{commit}")" = "$TARGET_SOURCE_PARENT_SHA"
@@ -120,16 +119,15 @@ jobs:
           test "$(git rev-parse 'HEAD^{tree}')" = "$TARGET_SOURCE_TREE"
           test "$(git rev-parse 'HEAD^1^{commit}')" = "$TARGET_SOURCE_PARENT_SHA"
           expected_paths="$(printf '%s\n' \
-            '.github/workflows/r09-hosted-disposable-proof.yml' \
-            'apps/runtime/src/launchd.test.ts' \
-            'apps/runtime/src/lifecycle.integration.test.ts' | LC_ALL=C sort)"
+            'apps/runtime/src/lifecycle.ts' \
+            'apps/runtime/src/lifecycle.recovery.test.ts' | LC_ALL=C sort)"
           actual_paths="$(git diff --name-only --no-renames "$DEE5_SHA" "$TARGET_SOURCE_SHA" | LC_ALL=C sort)"
           test "$actual_paths" = "$expected_paths"
           test -z "$(git status --porcelain --untracked-files=no)"
           {
-            printf 'R09_SOURCE_SHA=%s\n' "$TARGET_SOURCE_SHA"
-            printf 'R09_SOURCE_TREE=%s\n' "$TARGET_SOURCE_TREE"
-            printf 'R09_SOURCE_PARENT=%s\n' "$TARGET_SOURCE_PARENT_SHA"
+            printf 'R10_SOURCE_SHA=%s\n' "$TARGET_SOURCE_SHA"
+            printf 'R10_SOURCE_TREE=%s\n' "$TARGET_SOURCE_TREE"
+            printf 'R10_SOURCE_PARENT=%s\n' "$TARGET_SOURCE_PARENT_SHA"
           } >> "$GITHUB_ENV"
           printf '\n### Tested application source\n\n- Source: `%s`\n- Tree: `%s`\n- Parent: `%s`\n- DEE5 delta: exactly the three reviewed paths\n' "$TARGET_SOURCE_SHA" "$TARGET_SOURCE_TREE" "$TARGET_SOURCE_PARENT_SHA" >> "$GITHUB_STEP_SUMMARY"
 
@@ -142,14 +140,14 @@ jobs:
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10.15.0
-          dest: ${{ runner.temp }}/iris-r09/pnpm-tool
+          dest: ${{ runner.temp }}/iris-r10/pnpm-tool
 
       - name: Verify effective tool and cache paths
         id: toolchain
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/iris-r09"
+          root="$RUNNER_TEMP/iris-r10"
           test "$(node --version)" = 'v24.20.0'
           test "$(pnpm --version)" = '10.15.0'
           pnpm_bin="$(command -v pnpm)"
@@ -158,7 +156,7 @@ jobs:
           const path = require('node:path');
           const root = fs.realpathSync(process.argv[2]);
           const within = value => value === root || value.startsWith(root + path.sep);
-          for (const name of ['HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'COREPACK_HOME', 'npm_config_cache', 'TMPDIR', 'PNPM_HOME', 'IRIS_R09_PNPM_STORE']) {
+          for (const name of ['HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'COREPACK_HOME', 'npm_config_cache', 'TMPDIR', 'PNPM_HOME', 'IRIS_R10_PNPM_STORE']) {
             const value = process.env[name];
             if (!value || !within(fs.realpathSync(value))) throw new Error(`${name} escaped runner temp`);
           }
@@ -169,67 +167,55 @@ jobs:
       - name: Install frozen dependencies without lifecycle scripts
         id: dependencies
         shell: bash
-        working-directory: .r09-event
+        working-directory: .r10-event
         run: |
           set -euo pipefail
-          pnpm install --frozen-lockfile --ignore-scripts --store-dir "$IRIS_R09_PNPM_STORE"
+          pnpm install --frozen-lockfile --ignore-scripts --store-dir "$IRIS_R10_PNPM_STORE"
           test "$(git rev-parse 'HEAD^{commit}')" = "$TARGET_SOURCE_SHA"
           test "$(git rev-parse 'HEAD^{tree}')" = "$TARGET_SOURCE_TREE"
           test -z "$(git status --porcelain --untracked-files=no)"
 
-      - name: Run observable same-label rebind and no-replay tests
-        id: rebind
+      - name: Run R10 lifecycle recovery tests
+        id: lifecycle
         shell: bash
-        working-directory: .r09-event
+        working-directory: .r10-event
         run: |
           set -euo pipefail
-          pnpm --filter @iris/runtime exec vitest run src/launchd.test.ts \
-            -t 'rejects same-label executable and argument drift observed during the reserved second preflight|keeps an unknown bootout unresolved and prevents a duplicate stop' \
-            --testTimeout=30000 --reporter=json --outputFile="$IRIS_R09_EVIDENCE_DIR/launchd-vitest.json"
-
-      - name: Run two-source executable fallback and abort tests
-        id: fallback
-        shell: bash
-        working-directory: .r09-event
-        run: |
-          set -euo pipefail
-          pnpm --filter @iris/runtime exec vitest run src/lifecycle.integration.test.ts \
-            -t 'selects a distinct attested executable only after source A fails health and preserves a fallback abort' \
-            --testTimeout=480000 --reporter=json --outputFile="$IRIS_R09_EVIDENCE_DIR/fallback-vitest.json"
+          pnpm --filter @iris/runtime exec vitest run src/lifecycle.recovery.test.ts \
+            --testTimeout=480000 --reporter=json --outputFile="$IRIS_R10_EVIDENCE_DIR/r10-lifecycle-vitest.json"
 
       - name: Typecheck, build, lint and diff checks
         id: quality
         shell: bash
-        working-directory: .r09-event
+        working-directory: .r10-event
         run: |
           set -euo pipefail
           test "$(node --version)" = 'v24.20.0'
           test "$(pnpm --version)" = '10.15.0'
           pnpm --filter @iris/runtime typecheck
           pnpm --filter @iris/runtime build
-          pnpm exec eslint apps/runtime/src/launchd.test.ts apps/runtime/src/lifecycle.integration.test.ts
+          pnpm exec eslint apps/runtime/src/lifecycle.ts apps/runtime/src/lifecycle.recovery.test.ts
           git diff --check "$DEE5_SHA" "$TARGET_SOURCE_SHA"
 
       - name: Preserve bounded redacted phase and cleanup diagnostics
         if: always()
         shell: bash
         env:
-          R09_EVENT_SHA: ${{ github.sha }}
-          R09_EVENT_REF: ${{ github.ref }}
-          R09_RUNNER_OS: ${{ runner.os }}
-          R09_RUNNER_ARCH: ${{ runner.arch }}
-          R09_REBIND_OUTCOME: ${{ steps.rebind.outcome }}
-          R09_FALLBACK_OUTCOME: ${{ steps.fallback.outcome }}
-          R09_QUALITY_OUTCOME: ${{ steps.quality.outcome }}
+          R10_EVENT_SHA: ${{ github.sha }}
+          R10_EVENT_REF: ${{ github.ref }}
+          R10_RUNNER_OS: ${{ runner.os }}
+          R10_RUNNER_ARCH: ${{ runner.arch }}
+          R10_LIFECYCLE_OUTCOME: ${{ steps.lifecycle.outcome }}
+          R10_QUALITY_OUTCOME: ${{ steps.quality.outcome }}
         run: |
           set -euo pipefail
           node <<'NODE'
           const fs = require('node:fs');
           const path = require('node:path');
-          const evidence = path.join(process.env.RUNNER_TEMP, 'iris-r09', 'evidence');
+          const evidence = path.join(process.env.RUNNER_TEMP, 'iris-r10', 'evidence');
           fs.mkdirSync(evidence, { recursive: true });
           const issues = [];
-          const lines = ['### R09 bounded redacted diagnostics', ''];
+          const lines = ['### R10 bounded redacted diagnostics', ''];
           const label = value => String(value ?? 'UNKNOWN').replace(/[^A-Za-z0-9_. /-]/g, '').slice(0, 160);
           const hash = value => /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(String(value ?? '')) ? value : 'UNVERIFIED';
           const detail = value => String(value ?? '').replace(/\u001b\[[0-9;]*m/g, '').split(/\r?\n/).slice(0, 4)
@@ -254,8 +240,8 @@ jobs:
               return null;
             }
           }
-          const phases = Object.fromEntries(['REBIND', 'FALLBACK', 'QUALITY'].map(name =>
-            [name.toLowerCase(), label(process.env['R09_' + name + '_OUTCOME'] || 'NOT_REPORTED')]));
+          const phases = Object.fromEntries(['LIFECYCLE', 'QUALITY'].map(name =>
+            [name.toLowerCase(), label(process.env['R10_' + name + '_OUTCOME'] || 'NOT_REPORTED')]));
           lines.push('phase outcomes: ' + JSON.stringify(phases));
           const selected = [];
           function summarizeTests(file, expected) {
@@ -277,63 +263,19 @@ jobs:
                 lines.push('failure excerpt (redacted):', detail(message));
             }
           }
-          summarizeTests('launchd-vitest.json', [
-            'rejects same-label executable and argument drift observed during the reserved second preflight',
-            'keeps an unknown bootout unresolved and prevents a duplicate stop',
+          summarizeTests('r10-lifecycle-vitest.json', [
+            'keeps B untouched when A reaches verified health',
+            'selects B only after A failure and proven cleanup',
+            'records B cleanup reconciliation before surfacing cleanup failure',
+            'rejects a drifted B before fallback startup',
           ]);
-          summarizeTests('fallback-vitest.json', [
-            'selects a distinct attested executable only after source A fails health and preserves a fallback abort',
-          ]);
-          lines.push('', '#### Synthetic source, health phase and cleanup receipt');
-          const fallback = readReceipt('r09-two-source-fallback.json');
-          if (fallback) {
-            lines.push('fallback outcome: ' + label(fallback.outcome));
-            if (fallback.outcome !== 'PASS') issues.push('FALLBACK_RECEIPT_NOT_PASS');
-            for (const name of ['sourceA', 'sourceB']) {
-              const source = fallback[name];
-              if (!source || typeof source !== 'object') { lines.push(name + ': NOT_RECORDED'); issues.push(name + ':NOT_RECORDED'); continue; }
-              lines.push(name + ': head=' + hash(source.head) + ' parent=' + hash(source.parent)
-                + ' base=' + hash(source.baseCommit) + ' beforeTree=' + hash(source.before?.tree) + ' afterTree=' + hash(source.after?.tree));
-              const parity = source.before && source.after ? JSON.stringify(source.before) === JSON.stringify(source.after) : 'NOT_RECORDED';
-              lines.push(name + ' before/after manifest parity: ' + parity);
-              for (const phase of ['before', 'after']) {
-                const manifest = source[phase];
-                lines.push(name + ' ' + phase + ' activation: head=' + hash(manifest?.activation?.head)
-                  + ' candidateFingerprint=' + hash(manifest?.activation?.candidateFingerprint)
-                  + ' trackedModifiedCount=' + (Number.isSafeInteger(manifest?.activation?.trackedModifiedCount) ? manifest.activation.trackedModifiedCount : 'UNVERIFIED')
-                  + ' trackedStatus=' + (manifest?.trackedStatus === '' ? 'CLEAN' : 'NONEMPTY_OR_NOT_RECORDED'));
-                const entrypoint = manifest?.entrypoint;
-                if (entrypoint) lines.push(name + ' ' + phase + ' entrypoint: gitBlob=' + hash(entrypoint.gitBlob)
-                  + ' contentSha256=' + hash(entrypoint.contentSha256) + ' byteLength=' + (Number.isSafeInteger(entrypoint.byteLength) ? entrypoint.byteLength : 'UNVERIFIED'));
-              }
-            }
-            for (const phase of (Array.isArray(fallback.health) ? fallback.health : []).slice(0, 12))
-              lines.push('health phase: ' + label(phase.phase) + ' state=' + label(phase.state) + ' status=' + label(phase.status) + ' identity=' + label(phase.identityState));
-            const witnesses = Array.isArray(fallback.executableWitnesses) ? fallback.executableWitnesses : [];
-            lines.push('executable witness entries: ' + witnesses.length);
-            for (const witness of witnesses.slice(0, 8)) {
-              const marker = typeof witness.marker === 'string' && /^(?:SOURCE_[AB]\n){1,4}$/.test(witness.marker)
-                ? witness.marker : '[UNEXPECTED_OR_MISSING_MARKER]';
-              lines.push('executable witness: source=' + label(witness.source) + ' phase=' + label(witness.phase)
-                + ' head=' + hash(witness.head) + ' marker=' + JSON.stringify(marker));
-            }
-            const cleanup = Array.isArray(fallback.cleanup) ? fallback.cleanup : [];
-            lines.push('cleanup entries: ' + cleanup.length);
-            for (const entry of cleanup.slice(0, 16)) {
-              lines.push('cleanup: source=' + label(entry.source) + ' phase=' + label(entry.phase) + ' state=' + label(entry.state)
-                + ' authority=' + label(entry.authority) + ' dataPreserved=' + (entry.dataPreserved === true));
-              if (entry.error || entry.reason) lines.push('cleanup detail (redacted):', detail(entry.error || entry.reason));
-            }
-            if (fallback.error) lines.push('fallback detail (redacted):', detail(fallback.error));
-          }
           const receipt = {
-            workflow_sha: hash(process.env.R09_WORKFLOW_SHA || process.env.R09_EVENT_SHA),
-            workflow_tree: hash(process.env.R09_WORKFLOW_TREE), workflow_parent: hash(process.env.R09_WORKFLOW_PARENT),
-            tested_source_sha: hash(process.env.R09_SOURCE_SHA), tested_source_tree: hash(process.env.R09_SOURCE_TREE),
-            tested_source_parent: hash(process.env.R09_SOURCE_PARENT), event_ref: label(process.env.R09_EVENT_REF),
-            runner_os: label(process.env.R09_RUNNER_OS), runner_arch: label(process.env.R09_RUNNER_ARCH),
-            rebind_step: phases.rebind, fallback_step: phases.fallback, quality_step: phases.quality,
-            phases, selected_assertions: selected, diagnostic_status: issues.length ? 'INCOMPLETE' : 'COMPLETE', diagnostic_issues: issues,
+            workflow_sha: hash(process.env.R10_WORKFLOW_SHA || process.env.R10_EVENT_SHA),
+            workflow_tree: hash(process.env.R10_WORKFLOW_TREE), workflow_parent: hash(process.env.R10_WORKFLOW_PARENT),
+            tested_source_sha: hash(process.env.R10_SOURCE_SHA), tested_source_tree: hash(process.env.R10_SOURCE_TREE),
+            tested_source_parent: hash(process.env.R10_SOURCE_PARENT), event_ref: label(process.env.R10_EVENT_REF),
+            runner_os: label(process.env.R10_RUNNER_OS), runner_arch: label(process.env.R10_RUNNER_ARCH),
+            phases: { lifecycle: phases.lifecycle, quality: phases.quality }, selected_assertions: selected, diagnostic_status: issues.length ? 'INCOMPLETE' : 'COMPLETE', diagnostic_issues: issues,
           };
           fs.writeFileSync(path.join(evidence, 'workflow-result.json'), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
           const fence = String.fromCharCode(96).repeat(3);
