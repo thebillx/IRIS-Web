@@ -571,3 +571,73 @@ describe('typed absent-state recovery authority', () => {
     await expect(readRecoveryPolicyOperation({ ...operation, ...reservation })).rejects.toThrow();
   });
 });
+
+
+describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
+  const envelope = (dataRoot: string) => ({
+    schemaVersion: 1 as const,
+    candidates: [
+      { role: 'primary' as const, sourceRoot: '/tmp/runtime-source-a', sourceSha: '1'.repeat(40), sourceTree: '2'.repeat(40), entrypoint: 'apps/runtime/dist/main.js', entrypointGitBlob: '3'.repeat(40) },
+      { role: 'fallback' as const, sourceRoot: '/tmp/runtime-source-b', sourceSha: '4'.repeat(40), sourceTree: '5'.repeat(40), entrypoint: 'apps/runtime/dist/main.js', entrypointGitBlob: '6'.repeat(40) },
+    ] as const,
+    dataRoot,
+    receiptPath: path.join(dataRoot, 'recovery', 'receipt.json'),
+    startupTimeoutMs: 5_000,
+    readinessTimeoutMs: 5_000,
+    cleanupTimeoutMs: 5_000,
+    overallTimeoutMs: 20_000,
+  });
+
+  it('issues and round-trips a complete immutable fallback envelope', async () => {
+    const dataRoot = await fixture();
+    const sourceFallback = envelope(dataRoot);
+    const policy = await issueRecoveryAuthorizationPolicy({
+      dataRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha,
+      allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback,
+    });
+    expect(policy.sourceFallback).toEqual(sourceFallback);
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({ sourceFallback });
+  });
+
+  it('rejects incomplete, malformed, ambiguous and unsafe fallback envelopes', async () => {
+    const dataRoot = await fixture();
+    const base = envelope(dataRoot);
+    const issue = async (sourceFallback: unknown, allowedOperations: readonly any[] = ['RUNTIME_SOURCE_FALLBACK']) =>
+      issueRecoveryAuthorizationPolicy({
+        dataRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha,
+        allowedOperations, maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        sourceFallback: sourceFallback as any,
+      });
+    await expect(issue(undefined)).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, candidates: [base.candidates[0]] } as any)).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, candidates: [{ ...base.candidates[0], role: 'fallback' }, base.candidates[1]] } as any)).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, candidates: [{ ...base.candidates[0], sourceSha: base.candidates[1].sourceSha }, base.candidates[1]] } as any)).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, receiptPath: path.join(dataRoot, '..', 'receipt.json') })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, startupTimeoutMs: 0 })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, overallTimeoutMs: 1_000 })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, extra: true } as any)).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue(base, ['SOURCE_MIGRATION'])).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+  });
+
+  it('reserves once and rejects replay or envelope mutation', async () => {
+    const dataRoot = await fixture();
+    const sourceFallback = envelope(dataRoot);
+    const policy = await issueRecoveryAuthorizationPolicy({
+      dataRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha,
+      allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback,
+    });
+    const operation = {
+      dataRoot, policyId: policy.policyId, operation: 'RUNTIME_SOURCE_FALLBACK' as const,
+      requestId: crypto.randomUUID(), transactionId: undefined, ...sourceBinding,
+      beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, sourceFallback,
+    };
+    const first = await reserveRecoveryPolicyOperation(operation);
+    expect(first.state).toBe('RESERVED');
+    await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID(), sourceFallback: { ...sourceFallback, receiptPath: path.join(dataRoot, 'other.json') } }))
+      .rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+    await expect(reserveRecoveryPolicyOperation({ ...operation, sourceFallback: { ...sourceFallback, startupTimeoutMs: 6_000 } }))
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+  });
+});
