@@ -30,7 +30,7 @@ jobs:
       TARGET_SOURCE_SHA: 3f14e1a6ef0181c23feb08a5653a2d6b860c9f4e
       TARGET_SOURCE_TREE: 8b6a9c560d456e21aae9cd6bc42e64b5afbfb47b
       TARGET_SOURCE_PARENT_SHA: 6cb5c6ad7872e234f4bb0527c0191420f64460a9
-      EXPECTED_WORKFLOW_PARENT_SHA: 3f14e1a6ef0181c23feb08a5653a2d6b860c9f4e
+      EXPECTED_WORKFLOW_PARENT_SHA: 8d34a278fb88a35a054d35ba540232bf800144e4
       DEE5_SHA: dee5eee8682c9f929e5c41dec00ad76c78d1c5b8
       DEE5_TREE: 22dc3776007fec1243535577834e0c60b7ed3371
       IRIS_AGENT_EXECUTOR: development
@@ -103,7 +103,7 @@ jobs:
           } >> "$GITHUB_ENV"
           {
             printf '### Workflow event identity\n\n'
-            printf -- '- Event commit: `%s`\n- Tree: `%s`\n- Parent/test-source: `%s`\n' "$workflow_sha" "$workflow_tree" "$workflow_parent"
+            printf -- '- Event commit: `%s`\n- Tree: `%s`\n- Direct workflow parent: `%s`\n' "$workflow_sha" "$workflow_tree" "$workflow_parent"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Detach to and verify the exact test source
@@ -190,7 +190,7 @@ jobs:
 
       - name: Typecheck, build, lint and diff checks
         id: quality
-        if: always()
+        if: ${{ always() && steps.dependencies.outcome == 'success' }}
         shell: bash
         working-directory: .r10-event
         run: |
