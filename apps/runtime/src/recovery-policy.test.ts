@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -640,8 +641,43 @@ describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
     expect(first.state).toBe('RESERVED');
     await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID(), sourceFallback: { ...sourceFallback, receiptPath: path.join(dataRoot, 'other.json') } }))
       .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
-    await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({ operations: [] });
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({
+      operations: [{
+        transactionId: first.transactionId,
+        requestId: operation.requestId,
+        operation: 'RUNTIME_SOURCE_FALLBACK',
+        state: 'RESERVED',
+        sourceFallback,
+      }],
+    });
+    const afterSubstitution = await readRecoveryAuthorizationPolicy(dataRoot);
+    expect(afterSubstitution?.audit.filter((event) => event.event === 'RESERVED')).toHaveLength(1);
     await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID() })).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+    await expect(reserveRecoveryPolicyOperation({ ...operation, sourceFallback: { ...sourceFallback, startupTimeoutMs: 6_000 } }))
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(reserveRecoveryPolicyOperation({ ...operation, sourceSha: sourceSha.slice(0, 39) + '0' }))
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+  });
+
+  it('reads the same fallback reservation idempotently and rejects a changed binding', async () => {
+    const dataRoot = await fixture();
+    const sourceFallback = envelope(dataRoot);
+    const policy = await issueRecoveryAuthorizationPolicy({
+      dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha,
+      allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback,
+    });
+    const operation = {
+      dataRoot, policyId: policy.policyId, operation: 'RUNTIME_SOURCE_FALLBACK' as const,
+      requestId: crypto.randomUUID(), transactionId: undefined, ...fallbackBinding,
+      machineId: policy.machineId!, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, sourceFallback,
+    };
+    const first = await reserveRecoveryPolicyOperation(operation);
+    const replay = await reserveRecoveryPolicyOperation(operation);
+    expect(replay).toEqual(first);
+    const persisted = await readRecoveryAuthorizationPolicy(dataRoot);
+    expect(persisted?.operations).toHaveLength(1);
+    expect(persisted?.audit.filter((event) => event.event === 'RESERVED')).toHaveLength(1);
     await expect(reserveRecoveryPolicyOperation({ ...operation, sourceFallback: { ...sourceFallback, startupTimeoutMs: 6_000 } }))
       .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
   });
@@ -682,18 +718,70 @@ describe('RUNTIME_SOURCE_FALLBACK host binding and confinement', () => {
     await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
   });
 
-  it('consumes fallback authority after every terminal outcome', async () => {
+  it('keeps each fallback outcome single-use in an isolated policy', async () => {
+    for (const state of ['RESERVED', 'COMMITTED', 'FAILED', 'RECONCILIATION_REQUIRED'] as const) {
+      const dataRoot = await fixture();
+      const sourceFallback = envelopeForA1(dataRoot);
+      const machineId = crypto.randomUUID();
+      const policy = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId, expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback });
+      const operation = { dataRoot, policyId: policy.policyId, operation: 'RUNTIME_SOURCE_FALLBACK' as const, requestId: crypto.randomUUID(), ...fallbackBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, sourceFallback, machineId };
+      const reservation = await reserveRecoveryPolicyOperation(operation);
+      if (state === 'COMMITTED' || state === 'FAILED') await finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state });
+      if (state === 'RECONCILIATION_REQUIRED') await reconcileRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId });
+      const expected = state === 'RESERVED' || state === 'RECONCILIATION_REQUIRED' ? 'SUPERVISOR_NOT_RUNNING' : 'CONTROL_DENIED';
+      await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID() })).rejects.toMatchObject({ code: expected });
+      const persisted = await readRecoveryAuthorizationPolicy(dataRoot);
+      expect(persisted?.operations).toHaveLength(1);
+      expect(persisted?.operations[0]?.state).toBe(state);
+      if (state === 'FAILED') {
+        await expect(readRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId })).resolves.toMatchObject({ state: 'FAILED' });
+        await expect(reserveRecoveryPolicyOperation(operation)).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+      }
+    }
+  });
+
+  it('rejects an internally signed journal envelope mismatch and accepts a matching record', async () => {
     const dataRoot = await fixture();
     const sourceFallback = envelopeForA1(dataRoot);
     const machineId = crypto.randomUUID();
     const policy = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId, expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback });
     const operation = { dataRoot, policyId: policy.policyId, operation: 'RUNTIME_SOURCE_FALLBACK' as const, requestId: crypto.randomUUID(), ...fallbackBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, sourceFallback, machineId };
-    const reservation = await reserveRecoveryPolicyOperation(operation);
-    await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID() })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
-    await finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state: 'FAILED' });
-    await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID() })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await reserveRecoveryPolicyOperation(operation);
+    const secret = await loadOrCreateOwnerAccessSecret(dataRoot);
+    const record = JSON.parse(await readFile(recoveryPolicyPath(dataRoot), 'utf8')) as Record<string, any>;
+    const changedEnvelope = { ...sourceFallback, startupTimeoutMs: sourceFallback.startupTimeoutMs + 1 };
+    record.operations[0].sourceFallback = changedEnvelope;
+    record.signature = signTestRecord(record, secret);
+    await writeFile(recoveryPolicyPath(dataRoot), `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+
+    const positiveRoot = await fixture();
+    const positiveFallback = envelopeForA1(positiveRoot);
+    const positivePolicy = await issueRecoveryAuthorizationPolicy({ dataRoot: positiveRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback: positiveFallback });
+    const positiveOperation = { dataRoot: positiveRoot, policyId: positivePolicy.policyId, operation: 'RUNTIME_SOURCE_FALLBACK' as const, requestId: crypto.randomUUID(), ...fallbackBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, sourceFallback: positiveFallback, machineId: positivePolicy.machineId! };
+    await reserveRecoveryPolicyOperation(positiveOperation);
+    await expect(readRecoveryAuthorizationPolicy(positiveRoot)).resolves.toMatchObject({ sourceFallback: positiveFallback, operations: [{ sourceFallback: positiveFallback }] });
+  });
+
+  it('rejects an internally signed non-fallback journal envelope', async () => {
+    const dataRoot = await fixture();
+    const policy = await issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    const operation = { dataRoot, policyId: policy.policyId, operation: 'SOURCE_MIGRATION' as const, requestId: crypto.randomUUID(), ...sourceBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha };
+    await reserveRecoveryPolicyOperation(operation);
+    const secret = await loadOrCreateOwnerAccessSecret(dataRoot);
+    const record = JSON.parse(await readFile(recoveryPolicyPath(dataRoot), 'utf8')) as Record<string, any>;
+    record.operations[0].sourceFallback = envelopeForA1(dataRoot);
+    record.signature = signTestRecord(record, secret);
+    await writeFile(recoveryPolicyPath(dataRoot), `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
   });
 });
+
+function signTestRecord(record: Record<string, unknown>, secret: string): string {
+  const payload = { ...record };
+  delete payload.signature;
+  return createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');
+}
 
 function envelopeForA1(dataRoot: string) {
   return {
