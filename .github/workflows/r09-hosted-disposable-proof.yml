@@ -27,10 +27,10 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     env:
-      TARGET_SOURCE_SHA: 894ad6935e0b78a87795deeaef857690bef7f6b2
-      TARGET_SOURCE_TREE: e41f061f6672664268d94f5cd39da96d9723f702
-      TARGET_SOURCE_PARENT_SHA: 938e972039ae9aa1330c7a5e9feadba4313a42c2
-      EXPECTED_WORKFLOW_PARENT_SHA: 44124a03f846fb61f2b7a85f0f6bae8dcdd6bc0c
+      TARGET_SOURCE_SHA: 3f14e1a6ef0181c23feb08a5653a2d6b860c9f4e
+      TARGET_SOURCE_TREE: 8b6a9c560d456e21aae9cd6bc42e64b5afbfb47b
+      TARGET_SOURCE_PARENT_SHA: 6cb5c6ad7872e234f4bb0527c0191420f64460a9
+      EXPECTED_WORKFLOW_PARENT_SHA: 3f14e1a6ef0181c23feb08a5653a2d6b860c9f4e
       DEE5_SHA: dee5eee8682c9f929e5c41dec00ad76c78d1c5b8
       DEE5_TREE: 22dc3776007fec1243535577834e0c60b7ed3371
       IRIS_AGENT_EXECUTOR: development
@@ -186,10 +186,11 @@ jobs:
         run: |
           set -euo pipefail
           pnpm --filter @iris/runtime exec vitest run src/lifecycle.recovery.test.ts \
-            --testTimeout=480000 --reporter=json --outputFile="$IRIS_R10_EVIDENCE_DIR/r10-lifecycle-vitest.json"
+            --testTimeout=480000 --reporter=default --reporter=json --outputFile.json="$IRIS_R10_EVIDENCE_DIR/r10-lifecycle-vitest.json"
 
       - name: Typecheck, build, lint and diff checks
         id: quality
+        if: always()
         shell: bash
         working-directory: .r10-event
         run: |
@@ -248,14 +249,39 @@ jobs:
             [name.toLowerCase(), label(process.env['R10_' + name + '_OUTCOME'] || 'NOT_REPORTED')]));
           lines.push('phase outcomes: ' + JSON.stringify(phases));
           const selected = [];
+          const testSummaries = [];
           function summarizeTests(file, expected) {
             lines.push('', '#### ' + file);
             const report = readReceipt(file);
             if (!report) return;
-            const counts = Object.fromEntries(['numTotalTests', 'numPassedTests', 'numFailedTests', 'numPendingTests', 'numTodoTests']
+            const counts = Object.fromEntries(['numTotalTests', 'numPassedTests', 'numFailedTests', 'numPendingTests', 'numTodoTests', 'numTotalTestSuites', 'numFailedTestSuites', 'numRuntimeErrorTestSuites']
               .map(key => [key, Number.isSafeInteger(report[key]) && report[key] >= 0 ? report[key] : null]));
+            const success = report.success === true;
+            const suites = (Array.isArray(report.testResults) ? report.testResults : []).slice(0, 50);
+            const suiteSummary = suites.map(suite => ({
+              basename: label(path.basename(String(suite.name ?? 'UNKNOWN'))),
+              status: label(suite.status ?? 'UNKNOWN'),
+              message: detail(suite.message ?? '').slice(0, 240),
+            }));
+            const consoleErrors = (Array.isArray(report.console) ? report.console : [])
+              .filter(entry => entry && (entry.type === 'error' || entry.level === 'error'))
+              .slice(0, 4)
+              .map(entry => detail(entry.message ?? entry.text ?? entry))
+              .filter(Boolean);
+            const summary = { counts, success, suites: suiteSummary, consoleErrors };
+            testSummaries.push({ file, ...summary });
             lines.push('counts: ' + JSON.stringify(counts));
-            const assertions = (Array.isArray(report.testResults) ? report.testResults : []).slice(0, 50)
+            lines.push('success: ' + String(success));
+            for (const suite of suiteSummary)
+              lines.push('suite: basename=' + suite.basename + ' | status=' + suite.status + ' | message=' + suite.message);
+            for (const excerpt of consoleErrors)
+              lines.push('console-error excerpt (redacted): ' + excerpt);
+            if (counts.numTotalTests === 0) {
+              issues.push(file + ':COLLECTION_OR_IMPORT_FAILED');
+              lines.push('classification: COLLECTION_OR_IMPORT_FAILED');
+              return;
+            }
+            const assertions = suites
               .flatMap(suite => Array.isArray(suite.assertionResults) ? suite.assertionResults.slice(0, 1000) : []);
             for (const name of expected) {
               const matches = assertions.filter(assertion => assertion.title === name);
@@ -279,7 +305,7 @@ jobs:
             tested_source_sha: hash(process.env.R10_SOURCE_SHA), tested_source_tree: hash(process.env.R10_SOURCE_TREE),
             tested_source_parent: hash(process.env.R10_SOURCE_PARENT), event_ref: label(process.env.R10_EVENT_REF),
             runner_os: label(process.env.R10_RUNNER_OS), runner_arch: label(process.env.R10_RUNNER_ARCH),
-            phases: { lifecycle: phases.lifecycle, quality: phases.quality }, selected_assertions: selected, diagnostic_status: issues.length ? 'INCOMPLETE' : 'COMPLETE', diagnostic_issues: issues,
+            phases: { lifecycle: phases.lifecycle, quality: phases.quality }, test_summary: testSummaries, selected_assertions: selected, diagnostic_status: issues.length ? 'INCOMPLETE' : 'COMPLETE', diagnostic_issues: issues,
           };
           fs.writeFileSync(path.join(evidence, 'workflow-result.json'), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
           const fence = String.fromCharCode(96).repeat(3);
