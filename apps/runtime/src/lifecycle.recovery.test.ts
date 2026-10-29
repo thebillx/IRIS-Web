@@ -204,8 +204,12 @@ describe('product-owned runtime source fallback', () => {
     try {
       await expect(recoverRuntimeWithSourceFallback({ requestId: 'r10-boundary', dataRoot: data, receiptPath: path.join(data, 'receipt.json'), sourceA: a.descriptor, sourceB: b.descriptor, runtime })).rejects.toThrow('B launch boundary drift');
       expect(observed).toHaveLength(2);
-      expect(observed[0].head).toBe(a.descriptor.commitSha);
-      expect(observed[1].head).toBe(b.descriptor.commitSha);
+      const [observedA, observedB] = observed;
+      if (observedA === undefined || observedB === undefined) {
+        throw new Error('Expected exactly two launch-boundary identities');
+      }
+      expect(observedA.head).toBe(a.descriptor.commitSha);
+      expect(observedB.head).toBe(b.descriptor.commitSha);
       for (const identity of observed) {
         expect(identity.candidateFingerprint).toBeTruthy();
         expect(identity.trackedModifiedCount).toBe(0);
