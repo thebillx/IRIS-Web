@@ -471,7 +471,7 @@ async function attestRecoverySource(descriptor: RecoverySourceDescriptor): Promi
   const metadata = await lstat(entrypointPhysical); if (!metadata.isFile()) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery entrypoint is not a regular file');
   const status = (await execFileForRecovery('git', ['-C', root, 'status', '--porcelain=v1', '--untracked-files=all'])).stdout.trim(); if (status !== '') throw new RuntimeError('PRECONDITION_FAILED', 'Recovery source is dirty or contains untracked files');
   const head = (await execFileForRecovery('git', ['-C', root, 'rev-parse', 'HEAD'])).stdout.trim(); const tree = (await execFileForRecovery('git', ['-C', root, 'rev-parse', 'HEAD^{tree}'])).stdout.trim();
-  const committedBlob = (await execFileForRecovery('git', ['-C', root, 'rev-parse', \`HEAD:\${descriptor.entrypoint}\`])).stdout.trim();
+  const committedBlob = (await execFileForRecovery('git', ['-C', root, 'rev-parse', `HEAD:${descriptor.entrypoint}`])).stdout.trim();
   const physicalBlob = (await execFileForRecovery('git', ['-C', root, 'hash-object', '--', descriptor.entrypoint])).stdout.trim();
   const contentDigest = createHash('sha256').update(await readFile(entrypointPhysical)).digest('hex');
   if (head !== descriptor.commitSha || tree !== descriptor.treeSha || committedBlob !== descriptor.entrypointGitBlob || physicalBlob !== committedBlob || !/^[0-9a-f]{64}$/.test(contentDigest)) throw new RuntimeError('PRECONDITION_FAILED', 'Recovery source attestation changed');
