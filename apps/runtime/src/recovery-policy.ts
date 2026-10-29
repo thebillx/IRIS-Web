@@ -861,8 +861,8 @@ async function acquirePolicyAdvisoryLock(filename: string): Promise<() => Promis
     "flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW",
     "fd = os.open(sys.argv[1], flags, 0o600)",
     "metadata = os.fstat(fd)",
-    "if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
-    raise RuntimeError('unsafe advisory lock anchor')",
+    "if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:",
+    "    raise RuntimeError('unsafe advisory lock anchor')",
     "parent = int(sys.argv[2])",
     "while True:",
     "    if os.getppid() != parent: sys.exit(75)",
@@ -873,13 +873,11 @@ async function acquirePolicyAdvisoryLock(filename: string): Promise<() => Promis
     "        if error.errno != errno.EWOULDBLOCK: raise",
     "        ready, _, _ = select.select([sys.stdin], [], [], 0.25)",
     "        if ready and sys.stdin.readline() == '': sys.exit(75)",
-    "sys.stdout.write('READY\
-'); sys.stdout.flush()",
+    "sys.stdout.write('READY\\n'); sys.stdout.flush()",
     "while os.getppid() == parent:",
     "    ready, _, _ = select.select([sys.stdin], [], [], 0.25)",
     "    if ready and sys.stdin.readline() == '': break",
-  ].join("
-");
+  ].join("\n");
   const child = spawn("/usr/bin/python3", ["-I", "-S", "-c", script, filename, String(process.pid)], { stdio: ["pipe", "pipe", "ignore"] });
   let output = "";
   let timeout: NodeJS.Timeout | undefined;
@@ -887,8 +885,7 @@ async function acquirePolicyAdvisoryLock(filename: string): Promise<() => Promis
     await new Promise<void>((resolve, reject) => {
       const onData = (chunk: Buffer | string) => {
         output += String(chunk);
-        if (output.includes("READY
-")) resolve();
+        if (output.includes("READY\n")) resolve();
       };
       child.stdout?.on("data", onData);
       child.once("error", reject);
