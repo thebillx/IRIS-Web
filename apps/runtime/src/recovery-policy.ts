@@ -12,7 +12,7 @@ import {
 import { readOwnerAccessSecret } from "./persistence.js";
 import { observeProcessStart } from "./macos-safety.js";
 
-export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP" | "ADMIN_TUNNEL_START" | "SUPERVISOR_NO_PID_RECOVERY" | "SUPERVISOR_SERVICE_TARGET_STOP";
+export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP" | "ADMIN_TUNNEL_START" | "SUPERVISOR_NO_PID_RECOVERY" | "SUPERVISOR_SERVICE_TARGET_STOP" | "RUNTIME_SOURCE_FALLBACK";
 export type RecoveryPolicyState = "ISSUED" | "REVOKED" | "EXPIRED";
 export type RecoveryPolicyOperationState =
   "RESERVED" | "COMMITTED" | "FAILED" | "RECONCILIATION_REQUIRED";
@@ -24,7 +24,7 @@ const HASH64 = /^[a-f0-9]{64}$/;
 const MAX_OPERATIONS = 16;
 const MAX_ENTRIES = 32;
 const MAX_RETIRED_POLICIES = 8;
-const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START", "SUPERVISOR_NO_PID_RECOVERY", "SUPERVISOR_SERVICE_TARGET_STOP"];
+const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START", "SUPERVISOR_NO_PID_RECOVERY", "SUPERVISOR_SERVICE_TARGET_STOP", "RUNTIME_SOURCE_FALLBACK"];
 const HOST_BOUND_OPERATIONS: readonly RecoveryPolicyOperation[] = ["SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START", "SUPERVISOR_NO_PID_RECOVERY", "SUPERVISOR_SERVICE_TARGET_STOP"];
 const requiresHostBinding = (operation: RecoveryPolicyOperation): boolean => HOST_BOUND_OPERATIONS.includes(operation);
 
@@ -41,6 +41,24 @@ interface RecoveryPolicyLockRecord {
   readonly processStartMarker: string;
 }
 
+export interface RuntimeSourceFallbackCandidate {
+  readonly role: "primary" | "fallback";
+  readonly sourceRoot: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly entrypoint: string;
+  readonly entrypointGitBlob: string;
+}
+export interface RuntimeSourceFallbackEnvelope {
+  readonly schemaVersion: 1;
+  readonly candidates: readonly [RuntimeSourceFallbackCandidate, RuntimeSourceFallbackCandidate];
+  readonly dataRoot: string;
+  readonly receiptPath: string;
+  readonly startupTimeoutMs: number;
+  readonly readinessTimeoutMs: number;
+  readonly cleanupTimeoutMs: number;
+  readonly overallTimeoutMs: number;
+}
 export interface RecoveryPolicyBinding {
   readonly sourceSha: string;
   readonly sourceTree: string;
@@ -181,6 +199,7 @@ export interface RecoveryPolicyOperationJournal {
   readonly state: RecoveryPolicyOperationState;
   readonly createdAt: string;
   readonly finalizedAt?: string;
+  readonly sourceFallback?: RuntimeSourceFallbackEnvelope;
   readonly ownerAcknowledgement?: {
     readonly observationSha256: string;
     readonly serviceState: "ABSENT";
@@ -246,6 +265,7 @@ export async function issueRecoveryAuthorizationPolicy(input: RecoveryPolicyIssu
 
 async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIssueInput): Promise<RecoveryPolicyPublicRecord> {
   validateIssue(input);
+  validateRuntimeSourceFallbackEnvelope(input.allowedOperations, input.sourceFallback, dataRootForValidation(input.dataRoot));
   const dataRoot = await canonicalDataRoot(input.dataRoot);
   const secret = await ownerSecret(dataRoot);
   const filename = recoveryPolicyPath(dataRoot);
@@ -323,6 +343,7 @@ async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIss
     operations: [],
     audit: [{ event: "ISSUED", at: now }],
     ...(input.supersedesPolicyId === undefined ? {} : { supersedesPolicyId: input.supersedesPolicyId }),
+    ...(input.sourceFallback === undefined ? {} : { sourceFallback: input.sourceFallback }),
     ...(existing === null ? {} : {
       retiredPolicies: [
         ...(existing.retiredPolicies ?? []),
@@ -447,7 +468,8 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       existing.serviceDisabledStateBefore !== input.serviceDisabledStateBefore ||
       !sameInitialInstall(existing.initialInstall, input.initialInstall) ||
       existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) ||
-      (existing.machineId ?? null) !== (input.machineId ?? null)
+      (existing.machineId ?? null) !== (input.machineId ?? null) ||
+      JSON.stringify(existing.sourceFallback ?? null) !== JSON.stringify(input.sourceFallback ?? null)
     )
       throw new RuntimeError(
         "CONTROL_DENIED",
@@ -511,6 +533,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
     ...(input.initialInstall === undefined ? {} : { initialInstall: input.initialInstall }),
     protectedReferenceRoot: input.protectedReferenceRoot ?? null,
     ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
+    ...(input.sourceFallback === undefined ? {} : { sourceFallback: input.sourceFallback }),
     state: "RESERVED",
     createdAt: now.toISOString(),
   };
@@ -787,7 +810,8 @@ async function withPolicyLock<T>(dataRoot: string, operation: () => Promise<T>):
     lockId: randomUUID(),
     pid: process.pid,
     processStartMarker: processStart.marker,
-  } satisfies RecoveryPolicyLockRecord)}\n`;
+  } satisfies RecoveryPolicyLockRecord)}
+`;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   let lockOwned = false;
   let result!: T;
@@ -829,7 +853,8 @@ async function acquirePolicyAdvisoryLock(filename: string): Promise<() => Promis
     "flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW",
     "fd = os.open(sys.argv[1], flags, 0o600)",
     "metadata = os.fstat(fd)",
-    "if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:\n    raise RuntimeError('unsafe advisory lock anchor')",
+    "if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+    raise RuntimeError('unsafe advisory lock anchor')",
     "parent = int(sys.argv[2])",
     "while True:",
     "    if os.getppid() != parent: sys.exit(75)",
@@ -840,11 +865,13 @@ async function acquirePolicyAdvisoryLock(filename: string): Promise<() => Promis
     "        if error.errno != errno.EWOULDBLOCK: raise",
     "        ready, _, _ = select.select([sys.stdin], [], [], 0.25)",
     "        if ready and sys.stdin.readline() == '': sys.exit(75)",
-    "sys.stdout.write('READY\\n'); sys.stdout.flush()",
+    "sys.stdout.write('READY\
+'); sys.stdout.flush()",
     "while os.getppid() == parent:",
     "    ready, _, _ = select.select([sys.stdin], [], [], 0.25)",
     "    if ready and sys.stdin.readline() == '': break",
-  ].join("\n");
+  ].join("
+");
   const child = spawn("/usr/bin/python3", ["-I", "-S", "-c", script, filename, String(process.pid)], { stdio: ["pipe", "pipe", "ignore"] });
   let output = "";
   let timeout: NodeJS.Timeout | undefined;
@@ -852,7 +879,8 @@ async function acquirePolicyAdvisoryLock(filename: string): Promise<() => Promis
     await new Promise<void>((resolve, reject) => {
       const onData = (chunk: Buffer | string) => {
         output += String(chunk);
-        if (output.includes("READY\n")) resolve();
+        if (output.includes("READY
+")) resolve();
       };
       child.stdout?.on("data", onData);
       child.once("error", reject);
@@ -991,7 +1019,8 @@ async function writeSigned(
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(temporary, "wx", 0o600);
-    await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+    await handle.writeFile(`${JSON.stringify(record, null, 2)}
+`, "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
@@ -1003,7 +1032,8 @@ async function writeSigned(
       await directoryHandle.close();
     }
     const readback = await inspectPrivateRegularFile(filename, "Recovery authorization policy");
-    if (readback.state !== "ok" || readback.content !== `${JSON.stringify(record, null, 2)}\n`) throw new RuntimeError("PERSISTENCE_FAILURE", "Recovery policy readback did not match the committed record");
+    if (readback.state !== "ok" || readback.content !== `${JSON.stringify(record, null, 2)}
+`) throw new RuntimeError("PERSISTENCE_FAILURE", "Recovery policy readback did not match the committed record");
   } catch (error) {
     await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
@@ -1151,6 +1181,7 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
 }
 
 function validateOperation(input: RecoveryPolicyOperationInput): void {
+  validateRuntimeSourceFallbackEnvelope([input.operation], input.sourceFallback, dataRootForValidation(input.dataRoot));
   if (input.operation === "SUPERVISOR_NO_PID_RECOVERY" && !isCanonicalRecordedSourceRoot(input.recordedSourceRoot))
     throw new RuntimeError("INVALID_REQUEST", "Loaded/no-PID recovery operation requires an exact recorded source path");
   if (input.recoveryDisposition !== undefined && (input.operation !== "SUPERVISOR_NO_PID_RECOVERY" || !["ABSENT", "LOADED_NO_VERIFIED_PID", "LOADED_WITH_VERIFIED_LIVE_PROCESS", "IDENTITY_CONFLICT", "OBSERVATION_UNKNOWN"].includes(input.recoveryDisposition)))
@@ -1189,6 +1220,46 @@ function validateOperation(input: RecoveryPolicyOperationInput): void {
     throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap operation requires an executable digest");
 }
 
+function dataRootForValidation(value: string): string { return path.resolve(value); }
+function validateRuntimeSourceFallbackEnvelope(
+  operations: readonly RecoveryPolicyOperation[],
+  envelope: RuntimeSourceFallbackEnvelope | undefined,
+  dataRoot: string,
+): void {
+  if (operations.includes("RUNTIME_SOURCE_FALLBACK") !== (envelope !== undefined)) throw new RuntimeError("INVALID_REQUEST", "RUNTIME_SOURCE_FALLBACK requires exactly one complete envelope");
+  if (envelope === undefined) return;
+  if (!validateRuntimeSourceFallbackEnvelopeValue(envelope)) throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback envelope is invalid");
+  if (envelope.dataRoot !== dataRoot) throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback data root binding is invalid");
+}
+function validateRuntimeSourceFallbackEnvelopeValue(envelope: unknown): envelope is RuntimeSourceFallbackEnvelope {
+  if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) return false;
+  const value = envelope as Record<string, unknown>;
+  const keys = Object.keys(value).sort();
+  const allowed = ["candidates","dataRoot","overallTimeoutMs","readinessTimeoutMs","receiptPath","schemaVersion","startupTimeoutMs","cleanupTimeoutMs"].sort();
+  if (JSON.stringify(keys) !== JSON.stringify(allowed) || value.schemaVersion !== 1 || !Array.isArray(value.candidates) || value.candidates.length !== 2) return false;
+  if (value.dataRoot !== path.normalize(String(value.dataRoot)) || !path.isAbsolute(String(value.dataRoot))) return false;
+  const dataRoot = String(value.dataRoot); const receipt = String(value.receiptPath);
+  if (!path.isAbsolute(receipt) || path.normalize(receipt) !== receipt || !pathWithin(dataRoot, receipt) || receipt === dataRoot) return false;
+  const timeouts = [value.startupTimeoutMs, value.readinessTimeoutMs, value.cleanupTimeoutMs, value.overallTimeoutMs];
+  if (timeouts.some((timeout) => !Number.isSafeInteger(timeout) || Number(timeout) <= 0 || Number(timeout) > 600_000)) return false;
+  if (Number(value.overallTimeoutMs) < Number(value.startupTimeoutMs) + Number(value.readinessTimeoutMs) + Number(value.cleanupTimeoutMs)) return false;
+  const [a,b] = value.candidates as unknown[];
+  if (!isRuntimeSourceFallbackCandidate(a) || !isRuntimeSourceFallbackCandidate(b) || a.role !== "primary" || b.role !== "fallback") return false;
+  const immutable = (candidate: RuntimeSourceFallbackCandidate) => [candidate.sourceRoot,candidate.sourceSha,candidate.sourceTree,candidate.entrypoint,candidate.entrypointGitBlob].join("\u0000");
+  return immutable(a) !== immutable(b);
+}
+function isRuntimeSourceFallbackCandidate(value: unknown): value is RuntimeSourceFallbackCandidate {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  const keys = Object.keys(candidate).sort();
+  const allowed = ["entrypoint","entrypointGitBlob","role","sourceRoot","sourceSha","sourceTree"].sort();
+  if (JSON.stringify(keys) !== JSON.stringify(allowed)) return false;
+  if (candidate.role !== "primary" && candidate.role !== "fallback") return false;
+  if (typeof candidate.sourceRoot !== "string" || !path.isAbsolute(candidate.sourceRoot) || path.normalize(candidate.sourceRoot) !== candidate.sourceRoot) return false;
+  if (typeof candidate.entrypoint !== "string" || candidate.entrypoint.length === 0 || path.isAbsolute(candidate.entrypoint) || path.relative(".", candidate.entrypoint).startsWith("..")) return false;
+  return HASH40.test(String(candidate.sourceSha)) && HASH40.test(String(candidate.sourceTree)) && HASH40.test(String(candidate.entrypointGitBlob));
+}
+
 function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolicy {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Partial<SignedRecoveryPolicy>;
@@ -1207,6 +1278,8 @@ function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolic
     && (record.recordedSourceSha === undefined || HASH40.test(record.recordedSourceSha))
     && (record.recordedSourceTree === undefined || HASH40.test(record.recordedSourceTree))
     && (record.serviceTarget === undefined || isRecoveryPolicyServiceTarget(record.serviceTarget))
+    && (record.sourceFallback === undefined || validateRuntimeSourceFallbackEnvelopeValue(record.sourceFallback))
+    && (record.allowedOperations.includes("RUNTIME_SOURCE_FALLBACK") === (record.sourceFallback !== undefined))
     && (record.initialInstall === undefined || record.allowedOperations?.length === 1 && record.allowedOperations[0] === "SUPERVISOR_BOOTSTRAP" && record.maxOperationCount === 1)
     && typeof record.maxOperationCount === "number"
     && Array.isArray(record.allowedOperations)
