@@ -1162,6 +1162,8 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
       "INVALID_REQUEST",
       "Recovery policy operations are invalid",
     );
+  if (input.allowedOperations.includes("RUNTIME_SOURCE_FALLBACK") && (input.allowedOperations.length !== 1 || input.maxOperationCount !== 1))
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback authorizes one operation only");
   if (input.allowedOperations.includes("SUPERVISOR_NO_PID_RECOVERY") && (input.allowedOperations.length !== 1 || input.maxOperationCount !== 1))
     throw new RuntimeError("INVALID_REQUEST", "Loaded/no-PID recovery authorizes one operation only");
   if (input.machineId !== undefined && !isUuid(input.machineId))
@@ -1182,6 +1184,10 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
 
 function validateOperation(input: RecoveryPolicyOperationInput): void {
   validateRuntimeSourceFallbackEnvelope([input.operation], input.sourceFallback, dataRootForValidation(input.dataRoot));
+  if (input.operation === "RUNTIME_SOURCE_FALLBACK" && input.sourceFallback === undefined)
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback requires its complete envelope");
+  if (input.operation === "RUNTIME_SOURCE_FALLBACK" && input.sourceFallback !== undefined && !validateRuntimeSourceFallbackEnvelopeValue(input.sourceFallback))
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback envelope is invalid");
   if (input.operation === "SUPERVISOR_NO_PID_RECOVERY" && !isCanonicalRecordedSourceRoot(input.recordedSourceRoot))
     throw new RuntimeError("INVALID_REQUEST", "Loaded/no-PID recovery operation requires an exact recorded source path");
   if (input.recoveryDisposition !== undefined && (input.operation !== "SUPERVISOR_NO_PID_RECOVERY" || !["ABSENT", "LOADED_NO_VERIFIED_PID", "LOADED_WITH_VERIFIED_LIVE_PROCESS", "IDENTITY_CONFLICT", "OBSERVATION_UNKNOWN"].includes(input.recoveryDisposition)))
