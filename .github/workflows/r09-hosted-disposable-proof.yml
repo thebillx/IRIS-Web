@@ -118,9 +118,12 @@ jobs:
           test "$(git rev-parse 'HEAD^{commit}')" = "$TARGET_SOURCE_SHA"
           test "$(git rev-parse 'HEAD^{tree}')" = "$TARGET_SOURCE_TREE"
           test "$(git rev-parse 'HEAD^1^{commit}')" = "$TARGET_SOURCE_PARENT_SHA"
-          expected_paths="$(printf '%s\n' \
-            'apps/runtime/src/lifecycle.ts' \
-            'apps/runtime/src/lifecycle.recovery.test.ts' | LC_ALL=C sort)"
+          expected_paths="$(printf '%s\n' \\
+            '.github/workflows/r09-hosted-disposable-proof.yml' \\
+            'apps/runtime/src/launchd.test.ts' \\
+            'apps/runtime/src/lifecycle.integration.test.ts' \\
+            'apps/runtime/src/lifecycle.recovery.test.ts' \\
+            'apps/runtime/src/lifecycle.ts' | LC_ALL=C sort)"
           actual_paths="$(git diff --name-only --no-renames "$DEE5_SHA" "$TARGET_SOURCE_SHA" | LC_ALL=C sort)"
           test "$actual_paths" = "$expected_paths"
           test -z "$(git status --porcelain --untracked-files=no)"
@@ -129,7 +132,7 @@ jobs:
             printf 'R10_SOURCE_TREE=%s\n' "$TARGET_SOURCE_TREE"
             printf 'R10_SOURCE_PARENT=%s\n' "$TARGET_SOURCE_PARENT_SHA"
           } >> "$GITHUB_ENV"
-          printf '\n### Tested application source\n\n- Source: `%s`\n- Tree: `%s`\n- Parent: `%s`\n- DEE5 delta: exactly the three reviewed paths\n' "$TARGET_SOURCE_SHA" "$TARGET_SOURCE_TREE" "$TARGET_SOURCE_PARENT_SHA" >> "$GITHUB_STEP_SUMMARY"
+          printf '\n### Tested application source\n\n- Source: `%s`\n- Tree: `%s`\n- Parent: `%s`\n- DEE5 delta: exactly the five reviewed paths\n' "$TARGET_SOURCE_SHA" "$TARGET_SOURCE_TREE" "$TARGET_SOURCE_PARENT_SHA" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Node 24
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
