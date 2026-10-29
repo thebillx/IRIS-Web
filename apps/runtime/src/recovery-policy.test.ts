@@ -39,6 +39,8 @@ const sourceBinding = {
   runtimePreflightSha256: 'c'.repeat(64),
   runtimeLoaderSha256: 'd'.repeat(64),
 };
+const fallbackBinding = { ...sourceBinding, executableSha256: 'e'.repeat(64) };
+
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'iris-recovery-policy-'));
@@ -574,7 +576,6 @@ describe('typed absent-state recovery authority', () => {
 
 
 describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
-  const fallbackBinding = { ...sourceBinding, executableSha256: 'e'.repeat(64) };
   const envelope = (dataRoot: string) => ({
     schemaVersion: 1 as const,
     candidates: [
@@ -638,7 +639,9 @@ describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
     const first = await reserveRecoveryPolicyOperation(operation);
     expect(first.state).toBe('RESERVED');
     await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID(), sourceFallback: { ...sourceFallback, receiptPath: path.join(dataRoot, 'other.json') } }))
-      .rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+      .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toMatchObject({ operations: [] });
+    await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID() })).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
     await expect(reserveRecoveryPolicyOperation({ ...operation, sourceFallback: { ...sourceFallback, startupTimeoutMs: 6_000 } }))
       .rejects.toMatchObject({ code: 'CONTROL_DENIED' });
   });
@@ -646,11 +649,18 @@ describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
 
 
 describe('RUNTIME_SOURCE_FALLBACK host binding and confinement', () => {
-  it('requires machine identity and executable digest for issuance', async () => {
+  it('rejects missing machine identity without a policy artifact', async () => {
     const dataRoot = await fixture();
     const sourceFallback = envelopeForA1(dataRoot);
-    await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
-    await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toBeNull();
+  });
+
+  it('rejects missing executable digest without a policy artifact', async () => {
+    const dataRoot = await fixture();
+    const sourceFallback = envelopeForA1(dataRoot);
+    await expect(issueRecoveryAuthorizationPolicy({ dataRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['RUNTIME_SOURCE_FALLBACK'], maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sourceFallback })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).resolves.toBeNull();
   });
 
   it('rejects a mismatched machine reservation before journal mutation', async () => {
