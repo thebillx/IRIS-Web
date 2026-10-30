@@ -611,20 +611,26 @@ describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
   it('rejects incomplete, malformed, ambiguous and unsafe fallback envelopes', async () => {
     const dataRoot = await fixture();
     const base = envelope(dataRoot);
-    const issue = async (sourceFallback: unknown, allowedOperations: RecoveryPolicyIssueInput['allowedOperations'] = ['RUNTIME_SOURCE_FALLBACK']) =>
-      issueRecoveryAuthorizationPolicy({
+    const issue = async (sourceFallback: unknown, allowedOperations: RecoveryPolicyIssueInput['allowedOperations'] = ['RUNTIME_SOURCE_FALLBACK']) => {
+      const fallbackInput = sourceFallback === undefined
+        ? {}
+        : {
+          sourceFallback: sourceFallback as NonNullable<RecoveryPolicyIssueInput['sourceFallback']>,
+        };
+      return issueRecoveryAuthorizationPolicy({
         dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha,
         allowedOperations, maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
-        sourceFallback: sourceFallback as RecoveryPolicyIssueInput['sourceFallback'],
+        ...fallbackInput,
       });
+    };
     await expect(issue(undefined)).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
-    await expect(issue({ ...base, candidates: [base.candidates[0]] } as RecoveryPolicyIssueInput['sourceFallback'])).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
-    await expect(issue({ ...base, candidates: [{ ...base.candidates[0], role: 'fallback' }, base.candidates[1]] } as RecoveryPolicyIssueInput['sourceFallback'])).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
-    await expect(issue({ ...base, candidates: [{ ...base.candidates[0] }, { ...base.candidates[0], role: 'fallback' as const }] } as RecoveryPolicyIssueInput['sourceFallback'])).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, candidates: [base.candidates[0]] })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, candidates: [{ ...base.candidates[0], role: 'fallback' }, base.candidates[1]] })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, candidates: [{ ...base.candidates[0] }, { ...base.candidates[0], role: 'fallback' as const }] })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
     await expect(issue({ ...base, receiptPath: path.join(dataRoot, '..', 'receipt.json') })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
     await expect(issue({ ...base, startupTimeoutMs: 0 })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
     await expect(issue({ ...base, overallTimeoutMs: 1_000 })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
-    await expect(issue({ ...base, extra: true } as RecoveryPolicyIssueInput['sourceFallback'])).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue({ ...base, extra: true })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
     await expect(issue(base, ['SOURCE_MIGRATION'])).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
   });
 
