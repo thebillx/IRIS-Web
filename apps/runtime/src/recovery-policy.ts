@@ -1,7 +1,7 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { open, realpath, rename, rm } from "node:fs/promises";
+import { lstat, open, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { RuntimeError } from "@iris/domain";
 import {
@@ -11,7 +11,7 @@ import {
 import { readOwnerAccessSecret } from "./persistence.js";
 import { observeProcessStart } from "./macos-safety.js";
 
-export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP" | "ADMIN_TUNNEL_START";
+export type RecoveryPolicyOperation = "MIGRATION_APPROVAL" | "SOURCE_MIGRATION" | "SUPERVISOR_BOOTSTRAP" | "ADMIN_TUNNEL_START" | "RUNTIME_SOURCE_FALLBACK";
 export type RecoveryPolicyState = "ISSUED" | "REVOKED" | "EXPIRED";
 export type RecoveryPolicyOperationState =
   "RESERVED" | "COMMITTED" | "FAILED" | "RECONCILIATION_REQUIRED";
@@ -22,8 +22,8 @@ const HASH64 = /^[a-f0-9]{64}$/;
 const MAX_OPERATIONS = 16;
 const MAX_ENTRIES = 32;
 const MAX_RETIRED_POLICIES = 8;
-const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START"];
-const HOST_BOUND_OPERATIONS: readonly RecoveryPolicyOperation[] = ["SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START"];
+const POLICY_OPERATIONS: readonly RecoveryPolicyOperation[] = ["MIGRATION_APPROVAL", "SOURCE_MIGRATION", "SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START", "RUNTIME_SOURCE_FALLBACK"];
+const HOST_BOUND_OPERATIONS: readonly RecoveryPolicyOperation[] = ["SUPERVISOR_BOOTSTRAP", "ADMIN_TUNNEL_START", "RUNTIME_SOURCE_FALLBACK"];
 const requiresHostBinding = (operation: RecoveryPolicyOperation): boolean => HOST_BOUND_OPERATIONS.includes(operation);
 
 interface RecoveryPolicyLockRecord {
@@ -31,6 +31,26 @@ interface RecoveryPolicyLockRecord {
   readonly lockId: string;
   readonly pid: number;
   readonly processStartMarker: string;
+}
+
+export interface RuntimeSourceFallbackCandidate {
+  readonly role: "primary" | "fallback";
+  readonly sourceRoot: string;
+  readonly sourceSha: string;
+  readonly sourceTree: string;
+  readonly entrypoint: string;
+  readonly entrypointGitBlob: string;
+}
+
+export interface RuntimeSourceFallbackEnvelope {
+  readonly schemaVersion: 1;
+  readonly candidates: readonly [RuntimeSourceFallbackCandidate, RuntimeSourceFallbackCandidate];
+  readonly dataRoot: string;
+  readonly receiptPath: string;
+  readonly startupTimeoutMs: number;
+  readonly readinessTimeoutMs: number;
+  readonly cleanupTimeoutMs: number;
+  readonly overallTimeoutMs: number;
 }
 
 export interface RecoveryPolicyBinding {
@@ -50,6 +70,7 @@ export interface RecoveryPolicyIssueInput {
   readonly sourceBindings: readonly RecoveryPolicyBinding[];
   readonly protectedReferenceRoot?: string | undefined;
   readonly machineId?: string | undefined;
+  readonly sourceFallback?: RuntimeSourceFallbackEnvelope;
   readonly beforeMetadataSha256: string;
   readonly beforePlistSha256: string;
   readonly allowedOperations: readonly RecoveryPolicyOperation[];
@@ -70,6 +91,7 @@ export interface RecoveryPolicyOperationInput {
   readonly beforePlistSha256: string;
   readonly protectedReferenceRoot?: string | undefined;
   readonly machineId?: string | undefined;
+  readonly sourceFallback?: RuntimeSourceFallbackEnvelope;
   readonly sourceRoot: string;
   readonly controlScript: string;
   readonly executable: string;
@@ -87,6 +109,7 @@ export interface RecoveryPolicyPublicRecord {
   readonly sourceBindings: readonly RecoveryPolicyBinding[];
   readonly protectedReferenceRoot: string | null;
   readonly machineId?: string | null;
+  readonly sourceFallback?: RuntimeSourceFallbackEnvelope;
   readonly beforeMetadataSha256: string;
   readonly beforePlistSha256: string;
   readonly allowedOperations: readonly RecoveryPolicyOperation[];
@@ -123,6 +146,7 @@ export interface RecoveryPolicyOperationJournal {
   readonly state: RecoveryPolicyOperationState;
   readonly createdAt: string;
   readonly finalizedAt?: string;
+  readonly sourceFallback?: RuntimeSourceFallbackEnvelope;
 }
 
 export interface RecoveryPolicyAudit {
@@ -181,7 +205,9 @@ export async function issueRecoveryAuthorizationPolicy(input: RecoveryPolicyIssu
 
 async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIssueInput): Promise<RecoveryPolicyPublicRecord> {
   validateIssue(input);
+  validateRuntimeSourceFallbackEnvelope(input.allowedOperations, input.sourceFallback, path.resolve(input.dataRoot));
   const dataRoot = await canonicalDataRoot(input.dataRoot);
+  if (input.sourceFallback !== undefined) await validateRuntimeSourceFallbackPathComponents(input.sourceFallback, dataRoot);
   const secret = await ownerSecret(dataRoot);
   const filename = recoveryPolicyPath(dataRoot);
   const existing = await readSigned(filename, secret);
@@ -253,6 +279,7 @@ async function issueRecoveryAuthorizationPolicyUnlocked(input: RecoveryPolicyIss
     operations: [],
     audit: [{ event: "ISSUED", at: now }],
     ...(input.supersedesPolicyId === undefined ? {} : { supersedesPolicyId: input.supersedesPolicyId }),
+    ...(input.sourceFallback === undefined ? {} : { sourceFallback: input.sourceFallback }),
     ...(existing === null ? {} : {
       retiredPolicies: [
         ...(existing.retiredPolicies ?? []),
@@ -281,6 +308,7 @@ export async function reserveRecoveryPolicyOperation(input: RecoveryPolicyOperat
 async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOperationInput): Promise<{ readonly transactionId: string; readonly state: "RESERVED" }> {
   validateOperation(input);
   const dataRoot = await canonicalDataRoot(input.dataRoot);
+  if (input.sourceFallback !== undefined) await validateRuntimeSourceFallbackPathComponents(input.sourceFallback, dataRoot);
   const secret = await ownerSecret(dataRoot);
   const filename = recoveryPolicyPath(dataRoot);
   const current = await requirePolicy(filename, secret);
@@ -345,6 +373,8 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       "CONTROL_DENIED",
       "Recovery policy before-image does not match",
     );
+  if (input.operation === "RUNTIME_SOURCE_FALLBACK" && !sameRuntimeSourceFallbackEnvelope(current.sourceFallback, input.sourceFallback))
+    throw new RuntimeError("CONTROL_DENIED", "Recovery policy fallback envelope does not match issued authority");
   const existing = current.operations.find(
     (entry) =>
       entry.requestId === input.requestId && entry.operation === input.operation,
@@ -364,7 +394,8 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       existing.beforeMetadataSha256 !== input.beforeMetadataSha256 ||
       existing.beforePlistSha256 !== input.beforePlistSha256 ||
       existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) ||
-      (existing.machineId ?? null) !== (input.machineId ?? null)
+      (existing.machineId ?? null) !== (input.machineId ?? null) ||
+      !sameRuntimeSourceFallbackEnvelope(existing.sourceFallback, input.sourceFallback)
     )
       throw new RuntimeError(
         "CONTROL_DENIED",
@@ -392,9 +423,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
       "SUPERVISOR_NOT_RUNNING",
       "Recovery policy has an unresolved operation",
     );
-  const count = current.operations.filter(
-    (entry) => entry.state === "COMMITTED",
-  ).length;
+  const count = current.operations.filter((entry) => entry.operation === "RUNTIME_SOURCE_FALLBACK" || entry.state === "COMMITTED").length;
   if (count >= current.maxOperationCount)
     throw new RuntimeError(
       "CONTROL_DENIED",
@@ -423,6 +452,7 @@ async function reserveRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOpera
     beforePlistSha256: input.beforePlistSha256,
     protectedReferenceRoot: input.protectedReferenceRoot ?? null,
     ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
+    ...(input.sourceFallback === undefined ? {} : { sourceFallback: input.sourceFallback }),
     state: "RESERVED",
     createdAt: now.toISOString(),
   };
@@ -470,7 +500,7 @@ export async function assertRecoveryPolicyOperationCommitted(input: RecoveryPoli
       "Recovery policy identity does not match",
     );
   const entry = current.operations.find((candidate) => candidate.transactionId === input.transactionId && candidate.requestId === input.requestId && candidate.operation === input.operation);
-  if (entry === undefined || entry.state !== "COMMITTED" || entry.sourceSha !== input.sourceSha || entry.sourceTree !== input.sourceTree || entry.sourceRoot !== input.sourceRoot || entry.controlScript !== input.controlScript || entry.executable !== input.executable || (entry.executableSha256 ?? null) !== (input.executableSha256 ?? null) || JSON.stringify(entry.executableArguments) !== JSON.stringify(input.executableArguments) || entry.runtimePreflightSha256 !== input.runtimePreflightSha256 || entry.runtimeLoaderSha256 !== input.runtimeLoaderSha256 || entry.beforeMetadataSha256 !== input.beforeMetadataSha256 || entry.beforePlistSha256 !== input.beforePlistSha256 || entry.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) || (entry.machineId ?? null) !== (input.machineId ?? null)) throw new RuntimeError("CONTROL_DENIED", "Recovery policy operation is not durably committed");
+  if (entry === undefined || entry.state !== "COMMITTED" || entry.sourceSha !== input.sourceSha || entry.sourceTree !== input.sourceTree || entry.sourceRoot !== input.sourceRoot || entry.controlScript !== input.controlScript || entry.executable !== input.executable || (entry.executableSha256 ?? null) !== (input.executableSha256 ?? null) || JSON.stringify(entry.executableArguments) !== JSON.stringify(input.executableArguments) || entry.runtimePreflightSha256 !== input.runtimePreflightSha256 || entry.runtimeLoaderSha256 !== input.runtimeLoaderSha256 || entry.beforeMetadataSha256 !== input.beforeMetadataSha256 || entry.beforePlistSha256 !== input.beforePlistSha256 || entry.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) || (entry.machineId ?? null) !== (input.machineId ?? null) || !sameRuntimeSourceFallbackEnvelope(entry.sourceFallback, input.sourceFallback)) throw new RuntimeError("CONTROL_DENIED", "Recovery policy operation is not durably committed");
 }
 
 async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOperationInput & { readonly transactionId: string; readonly state: Exclude<RecoveryPolicyOperationState, "RESERVED"> }): Promise<RecoveryPolicyPublicRecord> {
@@ -513,6 +543,7 @@ async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOper
     existing.runtimeLoaderSha256 !== input.runtimeLoaderSha256 ||
     existing.beforeMetadataSha256 !== input.beforeMetadataSha256 ||
     existing.beforePlistSha256 !== input.beforePlistSha256 ||
+    !sameRuntimeSourceFallbackEnvelope(existing.sourceFallback, input.sourceFallback) ||
     existing.protectedReferenceRoot !== (input.protectedReferenceRoot ?? null) ||
     (existing.machineId ?? null) !== (input.machineId ?? null)
   )
@@ -520,8 +551,8 @@ async function finalizeRecoveryPolicyOperationUnlocked(input: RecoveryPolicyOper
       "CONTROL_DENIED",
       "Recovery transaction source binding changed",
     );
-  if (input.state === "FAILED" && (existing.state !== "RECONCILIATION_REQUIRED" || existing.operation !== "ADMIN_TUNNEL_START"))
-    throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Only a reconciliation-required ADMIN tunnel start may be resolved as failed");
+  if (input.state === "FAILED" && !((existing.state === "RECONCILIATION_REQUIRED" && existing.operation === "ADMIN_TUNNEL_START") || (existing.state === "RESERVED" && existing.operation === "RUNTIME_SOURCE_FALLBACK")))
+    throw new RuntimeError("SUPERVISOR_NOT_RUNNING", "Only a reconciliation-required ADMIN tunnel start or reserved fallback may be resolved as failed");
   const resolvingFailedAdminTunnel = input.state === "FAILED" && existing.state === "RECONCILIATION_REQUIRED" && existing.operation === "ADMIN_TUNNEL_START";
   if (existing.state !== "RESERVED" && !resolvingFailedAdminTunnel) {
     if (existing.state === input.state) return current;
@@ -637,7 +668,8 @@ async function acquirePolicyAdvisoryLock(filename: string): Promise<() => Promis
     "flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW",
     "fd = os.open(sys.argv[1], flags, 0o600)",
     "metadata = os.fstat(fd)",
-    "if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:\n    raise RuntimeError('unsafe advisory lock anchor')",
+    "if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:",
+    "    raise RuntimeError('unsafe advisory lock anchor')",
     "parent = int(sys.argv[2])",
     "while True:",
     "    if os.getppid() != parent: sys.exit(75)",
@@ -872,7 +904,8 @@ function sameIssue(
     JSON.stringify(existing.sourceBindings) ===
       JSON.stringify(input.sourceBindings) &&
     JSON.stringify(existing.allowedOperations) ===
-      JSON.stringify([...new Set(input.allowedOperations)])
+      JSON.stringify([...new Set(input.allowedOperations)]) &&
+    sameRuntimeSourceFallbackEnvelope(existing.sourceFallback, input.sourceFallback)
   );
 }
 
@@ -920,6 +953,10 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
       "INVALID_REQUEST",
       "Recovery policy operations are invalid",
     );
+  if (input.allowedOperations.includes("RUNTIME_SOURCE_FALLBACK") && (input.allowedOperations.length !== 1 || input.maxOperationCount !== 1))
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback authorizes one operation only");
+  if (input.allowedOperations.includes("RUNTIME_SOURCE_FALLBACK") && (input.machineId === undefined || input.sourceFallback === undefined))
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback requires machine binding and envelope");
   if (input.machineId !== undefined && !isUuid(input.machineId))
     throw new RuntimeError("INVALID_REQUEST", "Recovery policy machine identity is invalid");
   if (input.supersedesPolicyId !== undefined && !isUuid(input.supersedesPolicyId))
@@ -937,6 +974,11 @@ function validateIssue(input: RecoveryPolicyIssueInput): void {
 }
 
 function validateOperation(input: RecoveryPolicyOperationInput): void {
+  validateRuntimeSourceFallbackEnvelope([input.operation], input.sourceFallback, path.resolve(input.dataRoot));
+  if (input.operation === "RUNTIME_SOURCE_FALLBACK" && input.sourceFallback === undefined)
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback requires its complete envelope");
+  if (input.operation === "RUNTIME_SOURCE_FALLBACK" && input.sourceFallback !== undefined && !validateRuntimeSourceFallbackEnvelopeValue(input.sourceFallback))
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback envelope is invalid");
   if (
     !isUuid(input.policyId) ||
     !isUuid(input.requestId) ||
@@ -960,6 +1002,83 @@ function validateOperation(input: RecoveryPolicyOperationInput): void {
     throw new RuntimeError("INVALID_REQUEST", "Supervisor bootstrap operation requires an executable digest");
 }
 
+function validateRuntimeSourceFallbackEnvelope(
+  operations: readonly RecoveryPolicyOperation[],
+  envelope: RuntimeSourceFallbackEnvelope | undefined,
+  dataRoot: string,
+): void {
+  if (operations.includes("RUNTIME_SOURCE_FALLBACK") !== (envelope !== undefined))
+    throw new RuntimeError("INVALID_REQUEST", "RUNTIME_SOURCE_FALLBACK requires exactly one complete envelope");
+  if (envelope === undefined) return;
+  if (!validateRuntimeSourceFallbackEnvelopeValue(envelope))
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback envelope is invalid");
+  if (envelope.dataRoot !== dataRoot)
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback data root binding is invalid");
+}
+
+function pathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === ""
+    || (
+      relative !== ".."
+      && !relative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(relative)
+    );
+}
+
+function validateRuntimeSourceFallbackEnvelopeValue(envelope: unknown): envelope is RuntimeSourceFallbackEnvelope {
+  if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) return false;
+  const value = envelope as Record<string, unknown>;
+  const keys = Object.keys(value).sort();
+  const allowed = ["candidates", "dataRoot", "overallTimeoutMs", "readinessTimeoutMs", "receiptPath", "schemaVersion", "startupTimeoutMs", "cleanupTimeoutMs"].sort();
+  if (JSON.stringify(keys) !== JSON.stringify(allowed) || value.schemaVersion !== 1 || !Array.isArray(value.candidates) || value.candidates.length !== 2) return false;
+  if (value.dataRoot !== path.normalize(String(value.dataRoot)) || !path.isAbsolute(String(value.dataRoot))) return false;
+  const dataRoot = String(value.dataRoot);
+  const receipt = String(value.receiptPath);
+  if (!path.isAbsolute(receipt) || path.normalize(receipt) !== receipt || !pathWithin(dataRoot, receipt) || receipt === dataRoot) return false;
+  const timeouts = [value.startupTimeoutMs, value.readinessTimeoutMs, value.cleanupTimeoutMs, value.overallTimeoutMs];
+  if (timeouts.some((timeout) => !Number.isSafeInteger(timeout) || Number(timeout) <= 0 || Number(timeout) > 600_000)) return false;
+  if (Number(value.overallTimeoutMs) < Number(value.startupTimeoutMs) + Number(value.readinessTimeoutMs) + Number(value.cleanupTimeoutMs)) return false;
+  const [primary, fallback] = value.candidates as unknown[];
+  if (!isRuntimeSourceFallbackCandidate(primary) || !isRuntimeSourceFallbackCandidate(fallback) || primary.role !== "primary" || fallback.role !== "fallback") return false;
+  const immutable = (candidate: RuntimeSourceFallbackCandidate) => [candidate.sourceRoot, candidate.sourceSha, candidate.sourceTree, candidate.entrypoint, candidate.entrypointGitBlob].join("\u0000");
+  return immutable(primary) !== immutable(fallback);
+}
+
+function isRuntimeSourceFallbackCandidate(value: unknown): value is RuntimeSourceFallbackCandidate {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  const keys = Object.keys(candidate).sort();
+  const allowed = ["entrypoint", "entrypointGitBlob", "role", "sourceRoot", "sourceSha", "sourceTree"].sort();
+  if (JSON.stringify(keys) !== JSON.stringify(allowed)) return false;
+  if (candidate.role !== "primary" && candidate.role !== "fallback") return false;
+  if (typeof candidate.sourceRoot !== "string" || !path.isAbsolute(candidate.sourceRoot) || path.normalize(candidate.sourceRoot) !== candidate.sourceRoot) return false;
+  if (typeof candidate.entrypoint !== "string" || candidate.entrypoint.length === 0 || path.isAbsolute(candidate.entrypoint) || path.relative(".", candidate.entrypoint).startsWith("..")) return false;
+  return HASH40.test(String(candidate.sourceSha)) && HASH40.test(String(candidate.sourceTree)) && HASH40.test(String(candidate.entrypointGitBlob));
+}
+
+function sameRuntimeSourceFallbackEnvelope(left: RuntimeSourceFallbackEnvelope | undefined, right: RuntimeSourceFallbackEnvelope | undefined): boolean {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+async function validateRuntimeSourceFallbackPathComponents(envelope: RuntimeSourceFallbackEnvelope, dataRoot: string): Promise<void> {
+  const root = path.resolve(dataRoot);
+  const receipt = path.resolve(envelope.receiptPath);
+  if (!pathWithin(root, receipt) || receipt === root)
+    throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback receipt path is outside the data root");
+  const relative = path.relative(root, receipt);
+  let current = root;
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    const stats = await lstat(current).catch((error: unknown) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return null;
+      throw error;
+    });
+    if (stats?.isSymbolicLink()) throw new RuntimeError("INVALID_REQUEST", "Runtime source fallback receipt path contains a symlink");
+  }
+}
+
 function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolicy {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Partial<SignedRecoveryPolicy>;
@@ -973,6 +1092,7 @@ function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolic
     && record.sourceBindings.every((binding) => isRecoveryPolicyBinding(binding))
     && (typeof record.protectedReferenceRoot === "string" || record.protectedReferenceRoot === null)
     && (record.machineId === undefined || record.machineId === null || isUuid(record.machineId))
+    && (record.sourceFallback === undefined || validateRuntimeSourceFallbackEnvelopeValue(record.sourceFallback))
     && HASH64.test(record.beforeMetadataSha256 ?? "")
     && HASH64.test(record.beforePlistSha256 ?? "")
     && typeof record.maxOperationCount === "number"
@@ -983,7 +1103,29 @@ function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolic
     && (!record.allowedOperations.some(requiresHostBinding) || record.sourceBindings.every((binding) => binding.executableSha256 !== undefined))
     && Array.isArray(record.operations)
     && record.operations.length <= MAX_ENTRIES
-    && record.operations.every((entry) => typeof entry === "object" && entry !== null && isUuid((entry as RecoveryPolicyOperationJournal).transactionId) && isUuid((entry as RecoveryPolicyOperationJournal).requestId) && POLICY_OPERATIONS.includes((entry as RecoveryPolicyOperationJournal).operation) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceSha) && HASH40.test((entry as RecoveryPolicyOperationJournal).sourceTree) && typeof (entry as RecoveryPolicyOperationJournal).sourceRoot === "string" && typeof (entry as RecoveryPolicyOperationJournal).controlScript === "string" && typeof (entry as RecoveryPolicyOperationJournal).executable === "string" && Array.isArray((entry as RecoveryPolicyOperationJournal).executableArguments) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimePreflightSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).runtimeLoaderSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforeMetadataSha256) && HASH64.test((entry as RecoveryPolicyOperationJournal).beforePlistSha256) && (typeof (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === "string" || (entry as RecoveryPolicyOperationJournal).protectedReferenceRoot === null) && ((entry as RecoveryPolicyOperationJournal).machineId === undefined || (entry as RecoveryPolicyOperationJournal).machineId === null || isUuid((entry as RecoveryPolicyOperationJournal).machineId)) && (!requiresHostBinding((entry as RecoveryPolicyOperationJournal).operation) || (entry as RecoveryPolicyOperationJournal).machineId !== undefined && (entry as RecoveryPolicyOperationJournal).machineId !== null) && ((entry as RecoveryPolicyOperationJournal).state === "RESERVED" || (entry as RecoveryPolicyOperationJournal).state === "COMMITTED" || (entry as RecoveryPolicyOperationJournal).state === "FAILED" || (entry as RecoveryPolicyOperationJournal).state === "RECONCILIATION_REQUIRED"))
+    && record.operations.every((entry) => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const journal = entry as RecoveryPolicyOperationJournal;
+      return isUuid(journal.transactionId)
+        && isUuid(journal.requestId)
+        && POLICY_OPERATIONS.includes(journal.operation)
+        && HASH40.test(journal.sourceSha)
+        && HASH40.test(journal.sourceTree)
+        && typeof journal.sourceRoot === "string"
+        && typeof journal.controlScript === "string"
+        && typeof journal.executable === "string"
+        && Array.isArray(journal.executableArguments)
+        && HASH64.test(journal.runtimePreflightSha256)
+        && HASH64.test(journal.runtimeLoaderSha256)
+        && HASH64.test(journal.beforeMetadataSha256)
+        && HASH64.test(journal.beforePlistSha256)
+        && (typeof journal.protectedReferenceRoot === "string" || journal.protectedReferenceRoot === null)
+        && (journal.machineId === undefined || journal.machineId === null || isUuid(journal.machineId))
+        && (!requiresHostBinding(journal.operation) || journal.machineId !== undefined && journal.machineId !== null)
+        && (journal.state === "RESERVED" || journal.state === "COMMITTED" || journal.state === "FAILED" || journal.state === "RECONCILIATION_REQUIRED")
+        && (journal.operation === "RUNTIME_SOURCE_FALLBACK" ? validateRuntimeSourceFallbackEnvelopeValue(journal.sourceFallback) && journal.sourceFallback !== undefined : journal.sourceFallback === undefined)
+        && (journal.operation !== "RUNTIME_SOURCE_FALLBACK" || sameRuntimeSourceFallbackEnvelope(journal.sourceFallback, record.sourceFallback));
+    })
     && Array.isArray(record.audit)
     && typeof record.expiresAt === "string"
     && typeof record.issuedAt === "string"

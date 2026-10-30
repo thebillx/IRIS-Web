@@ -1,4 +1,5 @@
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { createHmac } from 'node:crypto';
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import os from 'node:os';
@@ -35,13 +36,19 @@ const sourceBinding = {
   runtimePreflightSha256: 'c'.repeat(64),
   runtimeLoaderSha256: 'd'.repeat(64),
 };
+const fallbackBinding = { ...sourceBinding, executableSha256: 'e'.repeat(64) };
+type PersistedTestRecord = {
+  [key: string]: unknown;
+  operations: Array<Record<string, unknown>>;
+  signature: string;
+};
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'iris-recovery-policy-'));
   roots.push(root);
   await mkdir(path.join(root, 'launchd'), { mode: 0o700 });
   await loadOrCreateOwnerAccessSecret(root);
-  return root;
+  return realpath(root);
 }
 
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -456,3 +463,122 @@ describe('recovery authorization policy', () => {
     await expect(issueRecoveryAuthorizationPolicy(policyInput)).resolves.toMatchObject({ state: 'ISSUED' });
   });
 });
+
+describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
+  const envelope = (dataRoot: string) => ({
+    schemaVersion: 1 as const,
+    candidates: [
+      { role: 'primary' as const, sourceRoot: '/tmp/runtime-source-a', sourceSha: '1'.repeat(40), sourceTree: '2'.repeat(40), entrypoint: 'apps/runtime/dist/main.js', entrypointGitBlob: '3'.repeat(40) },
+      { role: 'fallback' as const, sourceRoot: '/tmp/runtime-source-b', sourceSha: '4'.repeat(40), sourceTree: '5'.repeat(40), entrypoint: 'apps/runtime/dist/main.js', entrypointGitBlob: '6'.repeat(40) },
+    ] as const,
+    dataRoot,
+    receiptPath: path.join(dataRoot, 'recovery', 'receipt.json'),
+    startupTimeoutMs: 5_000,
+    readinessTimeoutMs: 5_000,
+    cleanupTimeoutMs: 5_000,
+    overallTimeoutMs: 20_000,
+  });
+
+  const issue = async (dataRoot: string, sourceFallback: unknown, allowedOperations: RecoveryPolicyIssueInput['allowedOperations'] = ['RUNTIME_SOURCE_FALLBACK']) => {
+    const fallbackInput = sourceFallback === undefined ? {} : { sourceFallback: sourceFallback as NonNullable<RecoveryPolicyIssueInput['sourceFallback']> };
+    return issueRecoveryAuthorizationPolicy({
+      dataRoot, sourceBindings: [fallbackBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha,
+      allowedOperations, maxOperationCount: 1, machineId: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString(), ...fallbackInput,
+    });
+  };
+
+  it('round-trips and rejects malformed fallback envelopes', async () => {
+    const dataRoot = await fixture();
+    const base = envelope(dataRoot);
+    await expect(issue(dataRoot, base)).resolves.toMatchObject({ sourceFallback: base });
+    await expect(issue(dataRoot, undefined)).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue(dataRoot, { ...base, candidates: [base.candidates[0]] })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue(dataRoot, { ...base, receiptPath: path.join(dataRoot, '..', 'receipt.json') })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue(dataRoot, { ...base, startupTimeoutMs: 0 })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue(dataRoot, base, ['SOURCE_MIGRATION'])).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+  });
+
+  it('enforces receipt containment and symlink rejection', async () => {
+    const dataRoot = await fixture();
+    const base = envelope(dataRoot);
+    await expect(issue(dataRoot, { ...base, receiptPath: dataRoot })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(issue(dataRoot, { ...base, receiptPath: `${dataRoot}-other/receipt.json` })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    const redirected = path.join(dataRoot, 'redirected');
+    await mkdir(redirected, { mode: 0o700 });
+    const link = path.join(dataRoot, 'receipt-link');
+    await symlink(redirected, link);
+    await expect(issue(dataRoot, { ...base, receiptPath: path.join(link, 'receipt.json') })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+  });
+
+  it('preserves the issued envelope and makes reservation authority single-use', async () => {
+    const dataRoot = await fixture();
+    const sourceFallback = envelope(dataRoot);
+    const policy = await issue(dataRoot, sourceFallback);
+    const operation = { dataRoot, policyId: policy.policyId, operation: 'RUNTIME_SOURCE_FALLBACK' as const, requestId: crypto.randomUUID(), ...fallbackBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, sourceFallback, machineId: policy.machineId! };
+    const first = await reserveRecoveryPolicyOperation(operation);
+    expect(await reserveRecoveryPolicyOperation(operation)).toEqual(first);
+    await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID() })).rejects.toMatchObject({ code: 'SUPERVISOR_NOT_RUNNING' });
+    await expect(reserveRecoveryPolicyOperation({ ...operation, sourceFallback: { ...sourceFallback, startupTimeoutMs: 6_000 } })).rejects.toMatchObject({ code: 'CONTROL_DENIED' });
+    const persisted = await readRecoveryAuthorizationPolicy(dataRoot);
+    expect(persisted?.operations).toHaveLength(1);
+    expect(persisted?.operations[0]).toMatchObject({ transactionId: first.transactionId, state: 'RESERVED', sourceFallback });
+    expect(persisted?.audit.filter((event) => event.event === 'RESERVED')).toHaveLength(1);
+  });
+
+  it('keeps each fallback terminal outcome isolated and single-use', async () => {
+    for (const state of ['RESERVED', 'COMMITTED', 'FAILED', 'RECONCILIATION_REQUIRED'] as const) {
+      const dataRoot = await fixture();
+      const sourceFallback = envelope(dataRoot);
+      const policy = await issue(dataRoot, sourceFallback);
+      const operation = { dataRoot, policyId: policy.policyId, operation: 'RUNTIME_SOURCE_FALLBACK' as const, requestId: crypto.randomUUID(), ...fallbackBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, sourceFallback, machineId: policy.machineId! };
+      const reservation = await reserveRecoveryPolicyOperation(operation);
+      if (state === 'COMMITTED' || state === 'FAILED') await finalizeRecoveryPolicyOperation({ ...operation, ...reservation, state });
+      if (state === 'RECONCILIATION_REQUIRED') await finalizeRecoveryPolicyOperation({ ...operation, transactionId: reservation.transactionId, state });
+      const expected = state === 'RESERVED' || state === 'RECONCILIATION_REQUIRED' ? 'SUPERVISOR_NOT_RUNNING' : 'CONTROL_DENIED';
+      await expect(reserveRecoveryPolicyOperation({ ...operation, requestId: crypto.randomUUID() })).rejects.toMatchObject({ code: expected });
+      const persisted = await readRecoveryAuthorizationPolicy(dataRoot);
+      expect(persisted?.operations).toHaveLength(1);
+      expect(persisted?.operations[0]?.state).toBe(state);
+    }
+  });
+
+  it('rejects signed journal envelope mismatches and non-fallback envelopes', async () => {
+    const dataRoot = await fixture();
+    const sourceFallback = envelope(dataRoot);
+    const policy = await issue(dataRoot, sourceFallback);
+    const operation = { dataRoot, policyId: policy.policyId, operation: 'RUNTIME_SOURCE_FALLBACK' as const, requestId: crypto.randomUUID(), ...fallbackBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, sourceFallback, machineId: policy.machineId! };
+    await reserveRecoveryPolicyOperation(operation);
+    const secret = await loadOrCreateOwnerAccessSecret(dataRoot);
+    const record = parsePersistedTestRecord(await readFile(recoveryPolicyPath(dataRoot), 'utf8'));
+    const firstOperation = record.operations[0];
+    if (firstOperation === undefined || firstOperation === null || typeof firstOperation !== 'object') throw new Error('persisted recovery policy test record has no valid first operation');
+    firstOperation.sourceFallback = { ...sourceFallback, startupTimeoutMs: 6_000 };
+    record.signature = signTestRecord(record, secret);
+    await writeFile(recoveryPolicyPath(dataRoot), `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+    await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+
+    const ordinaryRoot = await fixture();
+    const ordinaryPolicy = await issueRecoveryAuthorizationPolicy({ dataRoot: ordinaryRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha, allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    await reserveRecoveryPolicyOperation({ dataRoot: ordinaryRoot, policyId: ordinaryPolicy.policyId, operation: 'SOURCE_MIGRATION', requestId: crypto.randomUUID(), ...sourceBinding, beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha });
+    const ordinarySecret = await loadOrCreateOwnerAccessSecret(ordinaryRoot);
+    const ordinaryRecord = parsePersistedTestRecord(await readFile(recoveryPolicyPath(ordinaryRoot), 'utf8'));
+    const ordinaryOperation = ordinaryRecord.operations[0];
+    if (ordinaryOperation === undefined || ordinaryOperation === null || typeof ordinaryOperation !== 'object') throw new Error('persisted recovery policy test record has no valid first operation');
+    ordinaryOperation.sourceFallback = envelope(ordinaryRoot);
+    ordinaryRecord.signature = signTestRecord(ordinaryRecord, ordinarySecret);
+    await writeFile(recoveryPolicyPath(ordinaryRoot), `${JSON.stringify(ordinaryRecord, null, 2)}\n`, 'utf8');
+    await expect(readRecoveryAuthorizationPolicy(ordinaryRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+  });
+});
+
+function signTestRecord(record: Record<string, unknown>, secret: string): string {
+  const payload = { ...record };
+  delete payload.signature;
+  return createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');
+}
+
+function parsePersistedTestRecord(raw: string): PersistedTestRecord {
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== 'object' || parsed === null || !Array.isArray((parsed as { operations?: unknown }).operations) || typeof (parsed as { signature?: unknown }).signature !== 'string') throw new Error('persisted recovery policy test record is malformed');
+  return parsed as PersistedTestRecord;
+}
