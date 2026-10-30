@@ -593,6 +593,23 @@ describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
     await writeFile(recoveryPolicyPath(fallbackRoot), `${JSON.stringify(fallbackRecord, null, 2)}\n`, 'utf8');
     await expect(readRecoveryAuthorizationPolicy(fallbackRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
   });
+
+  it('rejects correctly signed records with malformed allowedOperations without leaking TypeError', async () => {
+    for (const malformed of ['missing', 'non-array'] as const) {
+      const dataRoot = await fixture();
+      await issueRecoveryAuthorizationPolicy({
+        dataRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha,
+        allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      const secret = await loadOrCreateOwnerAccessSecret(dataRoot);
+      const record = parsePersistedTestRecord(await readFile(recoveryPolicyPath(dataRoot), 'utf8'));
+      if (malformed === 'missing') delete record.allowedOperations;
+      else record.allowedOperations = 'SOURCE_MIGRATION';
+      record.signature = signTestRecord(record, secret);
+      await writeFile(recoveryPolicyPath(dataRoot), `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+      await expect(readRecoveryAuthorizationPolicy(dataRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+    }
+  });
 });
 
 function signTestRecord(record: Record<string, unknown>, secret: string): string {
