@@ -1093,6 +1093,7 @@ function isSignedPolicy(value: unknown, depth = 0): value is SignedRecoveryPolic
     && (typeof record.protectedReferenceRoot === "string" || record.protectedReferenceRoot === null)
     && (record.machineId === undefined || record.machineId === null || isUuid(record.machineId))
     && (record.sourceFallback === undefined || validateRuntimeSourceFallbackEnvelopeValue(record.sourceFallback))
+    && (record.allowedOperations.includes("RUNTIME_SOURCE_FALLBACK") === (record.sourceFallback !== undefined))
     && HASH64.test(record.beforeMetadataSha256 ?? "")
     && HASH64.test(record.beforePlistSha256 ?? "")
     && typeof record.maxOperationCount === "number"

@@ -569,6 +569,30 @@ describe('RUNTIME_SOURCE_FALLBACK authority envelope', () => {
     await writeFile(recoveryPolicyPath(ordinaryRoot), `${JSON.stringify(ordinaryRecord, null, 2)}\n`, 'utf8');
     await expect(readRecoveryAuthorizationPolicy(ordinaryRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
   });
+
+  it('rejects correctly signed top-level fallback envelope equivalence violations', async () => {
+    const ordinaryRoot = await fixture();
+    await issueRecoveryAuthorizationPolicy({
+      dataRoot: ordinaryRoot, sourceBindings: [sourceBinding], beforeMetadataSha256: metadataSha, beforePlistSha256: plistSha,
+      allowedOperations: ['SOURCE_MIGRATION'], maxOperationCount: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const ordinarySecret = await loadOrCreateOwnerAccessSecret(ordinaryRoot);
+    const ordinaryRecord = parsePersistedTestRecord(await readFile(recoveryPolicyPath(ordinaryRoot), 'utf8'));
+    ordinaryRecord.sourceFallback = envelope(ordinaryRoot);
+    ordinaryRecord.signature = signTestRecord(ordinaryRecord, ordinarySecret);
+    await writeFile(recoveryPolicyPath(ordinaryRoot), `${JSON.stringify(ordinaryRecord, null, 2)}\n`, 'utf8');
+    await expect(readRecoveryAuthorizationPolicy(ordinaryRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+
+    const fallbackRoot = await fixture();
+    const fallbackEnvelope = envelope(fallbackRoot);
+    await issue(fallbackRoot, fallbackEnvelope);
+    const fallbackSecret = await loadOrCreateOwnerAccessSecret(fallbackRoot);
+    const fallbackRecord = parsePersistedTestRecord(await readFile(recoveryPolicyPath(fallbackRoot), 'utf8'));
+    delete fallbackRecord.sourceFallback;
+    fallbackRecord.signature = signTestRecord(fallbackRecord, fallbackSecret);
+    await writeFile(recoveryPolicyPath(fallbackRoot), `${JSON.stringify(fallbackRecord, null, 2)}\n`, 'utf8');
+    await expect(readRecoveryAuthorizationPolicy(fallbackRoot)).rejects.toMatchObject({ code: 'PERSISTENCE_FAILURE' });
+  });
 });
 
 function signTestRecord(record: Record<string, unknown>, secret: string): string {
