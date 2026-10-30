@@ -4,7 +4,7 @@ run-name: R10 exact-source validation ${{ github.sha }}
 on:
   push:
     branches:
-      - codex/r10-phase-a1-validation-v8
+      - codex/r10-phase-a1-validation-v11
     paths:
       - .github/workflows/r10-phase-a1-exact-source-validation.yml
 
@@ -19,18 +19,18 @@ jobs:
   validate:
     if: >-
       github.repository == 'thebillx/IRIS-Web' &&
-      github.ref == 'refs/heads/codex/r10-phase-a1-validation-v8' &&
+      github.ref == 'refs/heads/codex/r10-phase-a1-validation-v11' &&
       github.event_name == 'push' &&
       github.event.created == true &&
       github.event.deleted == false
     runs-on: macos-15
     timeout-minutes: 60
     env:
-      SOURCE_SHA: 0cc6fdb91307425cab0b595399ca2b6cb761ad4a
-      SOURCE_TREE: a9972e540ea52192ff8c80f59fd64f305af19fbd
-      SOURCE_PARENT: bb5cea94b68841050921dd0597534ecc4e7c1bdb
+      SOURCE_SHA: 62bdeac48dd3f437f68e6448c5f086eb76f989ff
+      SOURCE_TREE: d86b03678a7caacfc0d2b4a8ab99a0968537a4ab
+      SOURCE_PARENT: b25fe9852a56aaceb28a8f769f162b6eb7b84282
       PRODUCTION_BLOB: 059d37b29c1eed028c8efa72fa8c5c579265e0aa
-      TEST_BLOB: 6533be26c73e5d88fb262ff8aac3d517fc63bd34
+      TEST_BLOB: 5771afd75f43deaece5d5ef3a1dd044ee2d9009e
       LOCKFILE_SHA256: dd3da87633c543bb04465df788f39aa5271639186546c1fd38e6d39e9b497e4b
     steps:
       - name: Confine runner-local paths
@@ -60,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = 'thebillx/IRIS-Web'
-          test "$GITHUB_REF" = 'refs/heads/codex/r10-phase-a1-validation-v8'
+          test "$GITHUB_REF" = 'refs/heads/codex/r10-phase-a1-validation-v11'
           test "$GITHUB_EVENT_NAME" = 'push'
           test "$(jq -r '.created' "$GITHUB_EVENT_PATH")" = 'true'
           test "$(jq -r '.deleted' "$GITHUB_EVENT_PATH")" = 'false'
