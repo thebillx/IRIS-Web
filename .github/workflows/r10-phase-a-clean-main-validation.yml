@@ -1,0 +1,273 @@
+name: IRIS Phase A exact-source validation
+
+on:
+  push:
+    branches:
+      - codex/r10-phase-a-clean-validation-v1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iris-phase-a-clean-validation-v1
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 3f424b778b8ded8ee76136094d7d9ff69680f374
+  SOURCE_TREE: 548093143909b195a59881e86b5a4c25e738eb0c
+  SOURCE_PARENT: 1a9f0a14db7fe9c938d1e8a4db8a430dd811404f
+  MAIN_BASE: 4bea901fb5d0819024ef449c87dba7c1461acf99
+  MAIN_TREE: 5fe9d247ab72838f695b62b9f85145782a42e1ee
+  PRODUCTION_BLOB: 5ae6cd76fab7c7f8e39f4e40cf7cb35a1aa6fdaf
+  TEST_BLOB: ef6567011e083dd6f146b827641ed48cc9541b15
+  LOCKFILE_SHA256: dd3da87633c543bb04465df788f39aa5271639186546c1fd38e6d39e9b497e4b
+
+jobs:
+  validate:
+    if: >-
+      github.repository == 'thebillx/IRIS-Web' &&
+      github.ref == 'refs/heads/codex/r10-phase-a-clean-validation-v1' &&
+      github.event_name == 'push' &&
+      github.event.created == true &&
+      github.event.deleted == false
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HOME: ${{ runner.temp }}/iris-home
+      XDG_CACHE_HOME: ${{ runner.temp }}/iris-cache
+      XDG_CONFIG_HOME: ${{ runner.temp }}/iris-config
+      XDG_DATA_HOME: ${{ runner.temp }}/iris-data
+      XDG_STATE_HOME: ${{ runner.temp }}/iris-state
+      PNPM_HOME: ${{ runner.temp }}/iris-pnpm
+      PNPM_STORE_PATH: ${{ runner.temp }}/iris-pnpm-store
+      TMPDIR: ${{ runner.temp }}/iris-tmp
+      TEST_JSON: ${{ runner.temp }}/iris-evidence/recovery-policy.json
+    steps:
+      - name: Check out the workflow event
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable workflow identity and source scope
+        id: identity
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$(git rev-parse 'HEAD^{commit}')"
+          test "$(git rev-list --count HEAD^@)" = 1
+          test "$(git rev-parse HEAD^1^{commit})" = "$SOURCE_SHA"
+          test "$(git diff --name-only --no-renames HEAD^1 HEAD)" = ".github/workflows/r10-phase-a-clean-main-validation.yml"
+          test "$(git rev-parse "$SOURCE_SHA^{tree}")" = "$SOURCE_TREE"
+          test "$(git rev-parse "$SOURCE_SHA^1^{commit}")" = "$SOURCE_PARENT"
+          test "$(git rev-parse "$MAIN_BASE^{tree}")" = "$MAIN_TREE"
+          test "$(git merge-base "$MAIN_BASE" "$SOURCE_SHA")" = "$MAIN_BASE"
+          read -r behind ahead < <(git rev-list --left-right --count "$MAIN_BASE...$SOURCE_SHA")
+          test "$behind" = 0
+          test "$ahead" = 3
+          test "$(git diff --name-only --no-renames "$MAIN_BASE" "$SOURCE_SHA")" = $'apps/runtime/src/recovery-policy.test.ts\napps/runtime/src/recovery-policy.ts'
+          test "$(git rev-parse "$SOURCE_SHA:apps/runtime/src/recovery-policy.ts")" = "$PRODUCTION_BLOB"
+          test "$(git rev-parse "$SOURCE_SHA:apps/runtime/src/recovery-policy.test.ts")" = "$TEST_BLOB"
+
+      - name: Parse workflow YAML
+        id: yaml_parser
+        continue-on-error: true
+        run: ruby -e 'require "yaml"; YAML.load_file(".github/workflows/r10-phase-a-clean-main-validation.yml")'
+
+      - name: Check out immutable source detached
+        id: source_checkout
+        run: |
+          set -euo pipefail
+          git checkout --detach "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Prepare confined directories
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$PNPM_HOME" "$PNPM_STORE_PATH" "$TMPDIR" "$(dirname "$TEST_JSON")"
+
+      - name: Set up Node.js 24
+        id: node
+        continue-on-error: true
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.20.0
+
+      - name: Verify Node.js version
+        id: node_version
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v24.20.0
+          echo "Node: $(node --version)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install pnpm
+        id: pnpm
+        continue-on-error: true
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.15.0
+
+      - name: Verify pnpm version
+        id: pnpm_version
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          test "$(pnpm --version)" = 10.15.0
+          echo "pnpm: $(pnpm --version)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install frozen dependencies
+        id: install
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          test "$(shasum -a 256 pnpm-lock.yaml | awk '{print $1}')" = "$LOCKFILE_SHA256"
+          pnpm config set store-dir "$PNPM_STORE_PATH"
+          pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Parse TypeScript sources
+        id: parser
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          pnpm exec node --input-type=module -e '
+            import ts from "typescript";
+            import { readFileSync } from "node:fs";
+            for (const file of ["apps/runtime/src/recovery-policy.ts", "apps/runtime/src/recovery-policy.test.ts"]) {
+              const result = ts.transpileModule(readFileSync(file, "utf8"), { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 }, reportDiagnostics: true });
+              if (result.diagnostics?.length) throw new Error(`${file} failed TypeScript parsing`);
+            }
+          '
+
+      - name: Run focused recovery-policy tests
+        id: focused
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$TEST_JSON")"
+          pnpm --filter @iris/runtime exec vitest run src/recovery-policy.test.ts --reporter=json --outputFile="$TEST_JSON"
+
+      - name: Validate bounded test JSON
+        id: test_evidence
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          test -s "$TEST_JSON"
+          node --input-type=module - "$TEST_JSON" "$GITHUB_STEP_SUMMARY" <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const [file, summary] = process.argv.slice(2);
+          const data = JSON.parse(readFileSync(file, 'utf8'));
+          const keys = ['numTotalTests', 'numPassedTests', 'numFailedTests', 'numPendingTests'];
+          if (typeof data.success !== 'boolean' || !keys.every((key) => Number.isInteger(data[key]) && data[key] >= 0)) throw new Error('malformed test JSON');
+          const { numTotalTests: total, numPassedTests: passed, numFailedTests: failed, numPendingTests: pending } = data;
+          const expected = failed === 0 && total === passed + failed + pending;
+          if (data.success !== expected) throw new Error('contradictory test JSON');
+          const failures = (data.testResults ?? []).flatMap((suite) => suite.assertionResults ?? []).filter((test) => test.status === 'failed').slice(0, 10);
+          const lines = [`- total_tests: ${total}`, `- passed_tests: ${passed}`, `- failed_tests: ${failed}`, `- skipped_pending_tests: ${pending}`, `- test_success: ${data.success}`];
+          for (const test of failures) {
+            const name = String(test.fullName ?? test.title ?? 'unnamed').replace(/[\r\n`]/g, ' ').slice(0, 200);
+            const message = String((test.failureMessages ?? []).join(' ')).replace(/[\r\n`]/g, ' ').slice(0, 400);
+            lines.push(`- failed_test: ${name}`, `  message: ${message}`);
+          }
+          appendFileSync(summary, `${lines.join('\n')}\n`);
+          NODE
+
+      - name: Run runtime typecheck
+        id: typecheck
+        continue-on-error: true
+        run: pnpm --filter @iris/runtime typecheck
+
+      - name: Run runtime build
+        id: build
+        continue-on-error: true
+        run: pnpm --filter @iris/runtime build
+
+      - name: Run scoped lint
+        id: lint
+        continue-on-error: true
+        run: pnpm exec eslint apps/runtime/src/recovery-policy.ts apps/runtime/src/recovery-policy.test.ts
+
+      - name: Verify source integrity after validation
+        id: integrity
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
+          test "$(git rev-parse HEAD:apps/runtime/src/recovery-policy.ts)" = "$PRODUCTION_BLOB"
+          test "$(git rev-parse HEAD:apps/runtime/src/recovery-policy.test.ts)" = "$TEST_BLOB"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Cleanup confined runner directories
+        id: cleanup
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          prefix="${RUNNER_TEMP%/}/"
+          targets=("$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$PNPM_HOME" "$PNPM_STORE_PATH" "$TMPDIR" "$(dirname "$TEST_JSON")")
+          for target in "${targets[@]}"; do
+            test -n "$target"
+            case "$target" in "$prefix"*) ;; *) exit 1 ;; esac
+            printf -- '- cleanup_target: %s\n' "${target#"$RUNNER_TEMP"/}" >> "$GITHUB_STEP_SUMMARY"
+            rm -rf -- "$target"
+          done
+          echo '- CLEANUP=PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce final fail-closed result
+        if: always()
+        env:
+          IDENTITY: ${{ steps.identity.outcome }}
+          YAML: ${{ steps.yaml_parser.outcome }}
+          SOURCE: ${{ steps.source_checkout.outcome }}
+          NODE: ${{ steps.node.outcome }}
+          NODE_VERSION: ${{ steps.node_version.outcome }}
+          PNPM: ${{ steps.pnpm.outcome }}
+          PNPM_VERSION: ${{ steps.pnpm_version.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          PARSER: ${{ steps.parser.outcome }}
+          FOCUSED: ${{ steps.focused.outcome }}
+          JSON: ${{ steps.test_evidence.outcome }}
+          TYPECHECK: ${{ steps.typecheck.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          LINT: ${{ steps.lint.outcome }}
+          INTEGRITY: ${{ steps.integrity.outcome }}
+          CLEANUP: ${{ steps.cleanup.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo "- workflow_event_sha: $GITHUB_SHA"
+            echo "- source_sha: $SOURCE_SHA"
+            echo "- source_tree: $SOURCE_TREE"
+            echo "- source_parent: $SOURCE_PARENT"
+            echo "- main_base: $MAIN_BASE"
+            echo "- main_tree: $MAIN_TREE"
+            echo "- production_blob: $PRODUCTION_BLOB"
+            echo "- test_blob: $TEST_BLOB"
+            echo "- identity: $IDENTITY"
+            echo "- yaml: $YAML"
+            echo "- source_checkout: $SOURCE"
+            echo "- node: $NODE ($NODE_VERSION)"
+            echo "- pnpm: $PNPM ($PNPM_VERSION)"
+            echo "- install: $INSTALL"
+            echo "- parser: $PARSER"
+            echo "- focused_tests: $FOCUSED"
+            echo "- json_evidence: $JSON"
+            echo "- typecheck: $TYPECHECK"
+            echo "- build: $BUILD"
+            echo "- lint: $LINT"
+            echo "- integrity: $INTEGRITY"
+            echo "- cleanup: $CLEANUP"
+          } >> "$GITHUB_STEP_SUMMARY"
+          failures=0
+          for outcome in "$IDENTITY" "$YAML" "$SOURCE" "$NODE" "$NODE_VERSION" "$PNPM" "$PNPM_VERSION" "$INSTALL" "$PARSER" "$FOCUSED" "$JSON" "$TYPECHECK" "$BUILD" "$LINT" "$INTEGRITY" "$CLEANUP"; do
+            [ "$outcome" = success ] || failures=$((failures + 1))
+          done
+          if [ "$failures" -eq 0 ]; then
+            echo '- OVERALL_STATUS=PASS' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '- OVERALL_STATUS=FAIL' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
